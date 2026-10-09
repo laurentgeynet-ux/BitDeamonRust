@@ -1,0 +1,59 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/bitdaemon",
+    "crates/bitdaemon-bencode",
+    "crates/bitdaemon-cli",
+    "crates/bitdaemon-common",
+    "crates/bitdaemon-core",
+    "crates/bitdaemon-dht",
+    "crates/bitdaemon-disk",
+    "crates/bitdaemon-net",
+    "crates/bitdaemon-session",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "BSD-2-Clause"
+repository = "https://github.com/laurentgeynet-ux/BitDeamonRust"
+homepage = "https://github.com/laurentgeynet-ux/BitDeamonRust"
+description = "A BitTorrent client library ported from libtorrent (Rasterbar) to safe Rust"
+keywords = ["bittorrent", "torrent", "p2p"]
+categories = ["network-programming"]
+
+[workspace.dependencies]
+# internal crates
+bitdaemon = { path = "crates/bitdaemon", version = "0.1.0" }
+bitdaemon-common = { path = "crates/bitdaemon-common", version = "0.1.0" }
+bitdaemon-bencode = { path = "crates/bitdaemon-bencode", version = "0.1.0" }
+bitdaemon-core = { path = "crates/bitdaemon-core", version = "0.1.0" }
+bitdaemon-disk = { path = "crates/bitdaemon-disk", version = "0.1.0" }
+bitdaemon-net = { path = "crates/bitdaemon-net", version = "0.1.0" }
+bitdaemon-dht = { path = "crates/bitdaemon-dht", version = "0.1.0" }
+bitdaemon-session = { path = "crates/bitdaemon-session", version = "0.1.0" }
+
+# external dependencies — pin minor versions, bump deliberately (see ADR-0007)
+bytes = "1.5"
+thiserror = "2"
+sha1 = "0.10"
+sha2 = "0.10"
+crc32c = "0.6"
+rand = "0.9"
+bitvec = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+url = "2"
+clap = { version = "4", features = ["derive"] }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

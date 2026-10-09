@@ -1,0 +1,19 @@
+[package]
+name = "bitdaemon-cli"
+description = "Example/test client for BitDaemon (port of libtorrent's client_test)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "bitdaemon"
+path = "src/main.rs"
+
+[dependencies]
+bitdaemon.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

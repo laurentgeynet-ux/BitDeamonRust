@@ -1,0 +1,23 @@
+[package]
+name = "bitdaemon"
+description = "BitDaemon — a BitTorrent client library ported from libtorrent (Rasterbar) to safe Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+bitdaemon-common.workspace = true
+bitdaemon-bencode.workspace = true
+bitdaemon-core.workspace = true
+bitdaemon-disk.workspace = true
+bitdaemon-net.workspace = true
+bitdaemon-dht.workspace = true
+bitdaemon-session.workspace = true

@@ -1,0 +1,21 @@
+[package]
+name = "bitdaemon-net"
+description = "Networking: peer wire protocol, trackers, uTP, proxies, UPnP/NAT-PMP, LSD, stream encryption"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bitdaemon-common.workspace = true
+bitdaemon-bencode.workspace = true
+bitdaemon-core.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+tracing.workspace = true
+url.workspace = true
+rand.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "bitdaemon-core"
+description = "Torrent metainfo: TorrentInfo, FileStorage, magnet URIs, torrent creation, resume data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bitdaemon-common.workspace = true
+bitdaemon-bencode.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+url.workspace = true
+serde.workspace = true

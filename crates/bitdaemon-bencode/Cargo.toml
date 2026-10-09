@@ -1,0 +1,12 @@
+[package]
+name = "bitdaemon-bencode"
+description = "Bencode decoder/encoder and the dynamic `entry` value type (port of libtorrent bdecode/entry)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true

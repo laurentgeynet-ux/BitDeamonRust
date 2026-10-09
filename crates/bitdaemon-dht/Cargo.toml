@@ -1,0 +1,19 @@
+[package]
+name = "bitdaemon-dht"
+description = "Mainline DHT (BEP-5): Kademlia node, routing table, RPC manager, storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bitdaemon-common.workspace = true
+bitdaemon-bencode.workspace = true
+bitdaemon-net.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rand.workspace = true
+serde.workspace = true
