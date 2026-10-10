@@ -8,6 +8,17 @@ Until `1.0.0`, breaking changes may occur in any release.
 ## [Unreleased]
 
 ### Added
+- Peer wire niceties: engine sends keepalives after 60 s of idle
+  upstream ~2 min `inactivity_timeout`, `graceful_pause` flag +
+  `SessionHandle`-visible `set_paused_graceful` (stop issuing
+  requests, drain in-flight writes; flag lifts when the last
+  outstanding block request is consumed).
+- `TorrentHandle::set_upload_limit`/`set_download_limit` per-torrent
+  rate limits (per-ih `RateLimiter` in the engine pump), global
+  `upload_rate_limit`/`download_rate_limit` session settings.
+- Super-seeding: initial `Bitfield`/`Have`-per-piece advertisement
+  on `peer_connected`, `superseed_piece` per peer, `have` on the
+  super-seeded piece picks the next rarest candidate.
 - BitTorrent v2 session support: per-file merkle trees on `Torrent`,
   `async_hash` returns per-block SHA-256s, `verify_v2_blocks` via
   `HashPicker.set_block_hash`, `hash_request`/`hashes`/`hash_reject`
