@@ -71,6 +71,9 @@ pub mod bep10;
 /// `bt_peer_connection` — async wire driver over PeerStream.
 pub mod bt_peer_conn;
 /// `aux_/http_parser` — incremental HTTP parser.
+pub mod http_conn;
+
+/// `http_parser.cpp` — incremental status/header/body/chunked parser.
 pub mod http_parser;
 /// `aux_/http_stream` — HTTP CONNECT proxy handshake.
 pub mod http_stream;
