@@ -229,3 +229,46 @@ fn connect_candidates_backoff_on_failure() {
         .connect_candidates(200, &st);
     assert_eq!(c, vec![ep]);
 }
+
+#[test]
+fn ip_filter_bans_and_disconnects() {
+    use bitdaemon_net::ip_filter::{self, IpFilter};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let mut s = Session::new();
+    let ih = Sha1Hash::from_bytes(&[3; 20]).unwrap();
+    let mut t = Torrent::new(
+        ih,
+        1,
+        16384,
+        bitdaemon_common::Bitfield::with_size(1),
+        StorageIndex(0),
+    );
+    let bad = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 66, 0, 1)), 6881);
+    let good = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 66, 0, 2)), 6881);
+    t.add_swarm_peer(bad, bitdaemon_common::flags::PeerSourceFlags::TRACKER, true);
+    t.add_swarm_peer(
+        good,
+        bitdaemon_common::flags::PeerSourceFlags::TRACKER,
+        true,
+    );
+    t.add_peer(1, PeerConn::new(1, PeerPipeline::new(1, 1, 1), 0));
+    s.add_torrent(t);
+    // pretend peer 1 is connected from `bad`
+    s.torrents
+        .get_mut(&ih)
+        .unwrap()
+        .peers
+        .get_mut(&1)
+        .unwrap()
+        .remote = Some(bad);
+
+    let mut f = IpFilter::new();
+    f.add_rule(bad.ip(), bad.ip(), ip_filter::BLOCKED);
+    let mut out = Vec::new();
+    s.set_ip_filter(f, &mut out);
+    let t = &s.torrents[&ih];
+    // banned + erased: only `good` remains, live conn dropped
+    assert_eq!(t.peer_list.num_peers(), 1);
+    assert!(t.peers.is_empty());
+}

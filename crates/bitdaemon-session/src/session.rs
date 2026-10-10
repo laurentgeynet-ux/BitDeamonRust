@@ -103,6 +103,8 @@ pub struct Session {
     /// `m_session_time` — seconds since session start, bumped once
     /// per `tick` (peer_list reconnect backoff epoch).
     pub session_time: i32,
+    /// `m_ip_filter` — access filter applied to new + existing peers.
+    ip_filter: bitdaemon_net::ip_filter::IpFilter,
 }
 
 /// A disk job's result, delivered back onto the session thread.
@@ -172,6 +174,7 @@ impl Default for Session {
             lsd_cookie: rand::random::<u32>(),
             last_lsd: None,
             session_time: 0,
+            ip_filter: bitdaemon_net::ip_filter::IpFilter::new(),
             disk_tx,
             disk_rx,
         }
@@ -559,6 +562,48 @@ impl Session {
             t.piece_verified(piece, passed, &mut eff);
         }
         self.route(*ih, eff, out);
+    }
+
+    /// `session_impl::set_ip_filter` — swap the filter and apply it:
+    /// disconnected banned peers are erased, live ones disconnected
+    /// (`ip_filter_updated` → `peer_list::apply_ip_filter`).
+    pub fn set_ip_filter(
+        &mut self,
+        filter: bitdaemon_net::ip_filter::IpFilter,
+        out: &mut Vec<SessionOut>,
+    ) {
+        self.ip_filter = filter;
+        let f = self.ip_filter.clone();
+        let mut pending: Vec<(Sha1Hash, Vec<TorrentEffect>)> = Vec::new();
+        for t in self.torrents.values_mut() {
+            let banned = t
+                .peer_list
+                .apply_ip_filter(|a| f.access(a) == bitdaemon_net::ip_filter::BLOCKED);
+            if banned.is_empty() {
+                continue;
+            }
+            // disconnect live connections to banned endpoints
+            let mut eff = Vec::new();
+            let ids: Vec<u64> = t
+                .peers
+                .iter()
+                .filter(|(_, c)| c.remote.is_some_and(|r| banned.contains(&r.ip())))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in ids {
+                t.remove_peer(id, &mut eff);
+            }
+            pending.push((t.info_hash, eff));
+        }
+        for (ih, eff) in pending {
+            self.route(ih, eff, out);
+        }
+    }
+
+    /// current access rule for `addr` (`ip_filter::access`).
+    #[must_use]
+    pub fn ip_access(&self, addr: std::net::IpAddr) -> u32 {
+        self.ip_filter.access(addr)
     }
 
     /// `start_dht` — bind the DHT node for `bind_ip`'s family.

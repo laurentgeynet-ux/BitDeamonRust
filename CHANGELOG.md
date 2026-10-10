@@ -9,6 +9,13 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `Session::set_ip_filter` (`session_impl::set_ip_filter` /
+  `peer_list::apply_ip_filter`) : les pairs bannis déconnectés sont
+  effacés, les connexions vivantes vers des IP filtrées sont coupées
+  (`ip_filter_updated` upstream).
+
+### Added
+
 - `identify_client` (`src/identify_client.cpp`) : 4 styles de peer-id
   (azureus, shadow, transmission legacy, mainline) + 102 codes
   `name_map` + 37 `generic_mappings` verbatim ; `peer_info.client`
