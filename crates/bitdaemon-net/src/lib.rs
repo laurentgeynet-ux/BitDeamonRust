@@ -68,12 +68,16 @@ pub type Result<T> = std::result::Result<T, NetError>;
 pub struct PeerWireCodec;
 /// BEP-10 extended handshake build/parse + framing.
 pub mod bep10;
+/// `aux_/http_parser` — incremental HTTP parser.
+pub mod http_parser;
 /// `aux_/http_stream` — HTTP CONNECT proxy handshake.
 pub mod http_stream;
 /// `http_tracker_connection` — announce query + response parsing.
 pub mod http_tracker;
 /// `lsd` — BEP-14 BT-SEARCH announce parse/render.
 pub mod lsd;
+/// `parse_url.cpp` — URL components/split/validation.
+pub mod parse_url;
 /// `socks5_stream` — SOCKS4/5 handshake over any async stream.
 pub mod socks;
 /// `udp_socket::wrap`/`socks5_unwrap` — SOCKS5-UDP relay framing.

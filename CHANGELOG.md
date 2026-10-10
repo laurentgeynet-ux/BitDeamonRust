@@ -329,6 +329,15 @@ Until `1.0.0`, breaking changes may occur in any release.
   a queued `outbox` delivered by the injected `DatagramSocket`
   (ADR-0008); upstream callbacks become pollable state. Tests:
   two-socket handshake/data/FIN + out-of-order reorder, e2e green.
+- `bitdaemon_net` HTTP/URL layer: `http_parser` (incremental
+  status/request line → header multimap → body; content-length,
+  content-range with `strtoll` semantics, connection-close, chunked
+  ranges + tail headers, `parse_chunk_header`, 100-continue restart)
+  and `parse_url` (`parse_url_components` verbatim grammar — auth,
+  v6 literals, LDH check, path `/`-injection — `split_url`,
+  `same_origin`, `is_valid_tracker_url`, `is_idna`,
+  `has_tracker_query_string`). `socks_udp` (SOCKS5 datagram
+  wrap/unwrap, FRAG rejected, atyp 1/3/4).
 - Tests: 67 conformance cases ported from `test_bdecode.cpp`, 16 from
   `test_bitfield.cpp`, 8 from `test_sliding_average.cpp`, 5 from
   `test_bloom_filter.cpp`, `test_crc32.cpp` vectors (RFC 3720 B.4),

@@ -577,3 +577,125 @@ fn socks5_udp_v6_hostname_frag() {
     // too short
     assert!(socks5_unwrap(&[0u8; 10]).is_none());
 }
+
+// ---------- parse_url ----------
+
+use bitdaemon_net::parse_url::*;
+
+#[test]
+fn url_components() {
+    let c = parse_url_components("http://user:pw@host.com:8080/p?q=1").unwrap();
+    assert_eq!(c.protocol, "http");
+    assert_eq!(c.auth, "user:pw");
+    assert_eq!(c.hostname, "host.com");
+    assert_eq!(c.port, 8080);
+    assert_eq!(c.path, "/p?q=1");
+
+    let c = parse_url_components("udp://[fe80::1]:6969/").unwrap();
+    assert_eq!(c.hostname, "fe80::1");
+    assert_eq!(c.port, 6969);
+
+    // missing path → "/"
+    assert_eq!(parse_url_components("http://h").unwrap().path, "/");
+    // query without path → "/?…"
+    assert_eq!(parse_url_components("http://h?x").unwrap().path, "/?x");
+    // invalid
+    assert!(parse_url_components("noscheme").is_err());
+    assert!(parse_url_components("http://bad host/").is_err());
+    assert!(parse_url_components("http://h:xx/").is_err());
+    assert!(parse_url_components("http://[fe80::1/").is_err());
+}
+
+#[test]
+fn url_helpers() {
+    assert_eq!(
+        split_url("http://h.com/announce").unwrap(),
+        ("http://h.com".to_string(), "/announce".to_string())
+    );
+    assert!(split_url("no-scheme").is_err());
+
+    assert!(is_idna("xn--bcher.example"));
+    assert!(!is_idna("example.com"));
+
+    assert!(has_tracker_query_string("info_hash=x&port=1"));
+    assert!(!has_tracker_query_string("foo=1&bar=2"));
+
+    assert!(same_origin("http://h.com/a", "HTTP://h.com/b"));
+    assert!(same_origin("https://h.com:443/", "https://h.com/x"));
+    assert!(!same_origin("http://h.com/", "https://h.com/"));
+    assert!(!same_origin("http://a.com/", "http://b.com/"));
+
+    assert!(is_valid_tracker_url("http://t/announce"));
+    assert!(is_valid_tracker_url("udp://t:80/"));
+    assert!(!is_valid_tracker_url("ftp://t/"));
+    assert!(!is_valid_tracker_url("http://t/a b")); // space
+}
+
+// ---------- http_parser ----------
+
+use bitdaemon_net::http_parser::HttpParser;
+
+#[test]
+fn http_response() {
+    let mut p = HttpParser::new(0);
+    let mut err = false;
+    let buf = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+    p.incoming(buf, &mut err);
+    assert!(!err);
+    assert!(p.header_finished());
+    assert_eq!(p.status_code(), 200);
+    assert_eq!(p.header("content-length"), Some("5"));
+    assert_eq!(p.content_length(), 5);
+    assert!(p.connection_close());
+    assert_eq!(p.get_body(buf), b"hello");
+    assert!(p.finished());
+}
+
+#[test]
+fn http_request_and_100_continue() {
+    let mut p = HttpParser::new(0);
+    let mut err = false;
+    let buf = b"GET /announce?info_hash=x HTTP/1.1\r\nHost: t\r\n\r\n";
+    p.incoming(buf, &mut err);
+    assert!(!err);
+    assert_eq!(p.method(), "get");
+    assert_eq!(p.path(), "/announce?info_hash=x");
+
+    // 100 Continue → headers restart
+    let mut p = HttpParser::new(0);
+    let buf = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    p.incoming(buf, &mut err);
+    assert!(!err);
+    assert_eq!(p.status_code(), 200);
+}
+
+#[test]
+fn http_chunked() {
+    let mut p = HttpParser::new(0);
+    let mut err = false;
+    let buf =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+    p.incoming(buf, &mut err);
+    assert!(!err);
+    assert!(p.chunked_encoding());
+    assert!(p.finished());
+    assert_eq!(p.chunks().len(), 2);
+    // reassemble body from chunk ranges
+    let body: Vec<u8> = p
+        .chunks()
+        .iter()
+        .flat_map(|&(s, e)| buf[s as usize..e as usize].iter().copied())
+        .collect();
+    assert_eq!(body, b"abcde");
+}
+
+#[test]
+fn http_content_range() {
+    let mut p = HttpParser::new(0);
+    let mut err = false;
+    let buf = b"HTTP/1.1 206 Partial\r\nContent-Range: bytes 10-19/100\r\n\r\n0123456789";
+    p.incoming(buf, &mut err);
+    assert!(!err);
+    assert_eq!(p.content_range(), (10, 19));
+    assert_eq!(p.content_length(), 10);
+}
