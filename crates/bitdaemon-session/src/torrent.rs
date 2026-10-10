@@ -1141,6 +1141,10 @@ impl Torrent {
                 }
             }
         }
+        // upstream re-evaluates `interesting`→`interested` after any
+        // incoming peer message (bitfield/have/have_all flip the
+        // `m_interesting` bit).
+        self.update_interest(peer_id, out);
     }
 
     /// feed one decoded message from `peer` — `dispatch` + effects.
@@ -1391,6 +1395,49 @@ impl Torrent {
 
     /// `request_a_block` for one peer — `drive_requests` emits the
     /// wire `Request`s the caller sends.
+    /// `torrent::update_peer_interest` + `peer_connection::
+    /// update_interest` — recompute whether the peer has anything
+    /// we want, then send `Interested`/`NotInterested` on the wire
+    /// when the state flips. Upstream recalcs per peer on
+    /// bitfield/have/dont_have and when our own bitfield changes
+    /// (piece verified → maybe not interesting anymore).
+    pub fn update_interest(&mut self, peer_id: u64, out: &mut Vec<TorrentEffect>) {
+        let seed = self.is_seed();
+        let Some(c) = self.peers.get_mut(&peer_id) else {
+            return;
+        };
+        // recompute `m_interesting` — upstream re-evaluates the
+        // full predicate each time (sticky-set is a bug: we'd never
+        // send NotInterested after gaining the last wanted piece).
+        c.interesting = (0..self.num_pieces)
+            .any(|i| c.has_piece(PieceIndex(i)) && !self.have.get_bit(i as usize));
+        // seeds are never interested (upstream: interesting only
+        // evaluated for downloaders).
+        let want = !seed && c.interesting && !c.remote_upload_only;
+        if want == c.we_sent_interested {
+            return;
+        }
+        c.we_sent_interested = want;
+        out.push(TorrentEffect::SendTo {
+            peer: peer_id,
+            msg: if want {
+                PeerMessage::Interested
+            } else {
+                PeerMessage::NotInterested
+            },
+        });
+    }
+
+    /// `peer_connection::update_interest` broadcast — after our own
+    /// bitfield changed (`piece_verified`), every peer's interest
+    /// may flip.
+    pub fn update_interest_all(&mut self, out: &mut Vec<TorrentEffect>) {
+        let ids: Vec<u64> = self.peers.keys().copied().collect();
+        for id in ids {
+            self.update_interest(id, out);
+        }
+    }
+
     pub fn drive_peer(&mut self, peer_id: u64, out: &mut Vec<TorrentEffect>) {
         // the full drive needs picker + pipeline borrow — collect
         // requests then translate to effects
@@ -1691,6 +1738,9 @@ impl Torrent {
                 self.finished = true;
                 out.push(TorrentEffect::BecameSeed);
             }
+            // our bitfield changed → peers may stop being
+            // interesting (`update_peer_interest` upstream).
+            self.update_interest_all(out);
             // `remove_time_critical_piece` — the piece just
             // verified; `alert_when_available` → read it back
             if self

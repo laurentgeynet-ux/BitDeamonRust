@@ -1,0 +1,88 @@
+// This file is part of OnionBit.
+// Copyright (C) 2026 Laurent Geynet
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! `update_interest` — Interested/NotInterested emission on
+//! bitfield/have + our own piece_verified.
+
+use bitdaemon_common::Sha1Hash;
+use bitdaemon_common::bitfield::Bitfield;
+use bitdaemon_common::types::{PieceIndex, StorageIndex};
+use bitdaemon_net::peer_wire::PeerMessage;
+use bitdaemon_session::peer_conn::PeerConn;
+use bitdaemon_session::peer_pipeline::PeerPipeline;
+use bitdaemon_session::session::{PeerPacket, Session, SessionOut};
+use bitdaemon_session::torrent::Torrent;
+
+fn mk() -> (Session, Sha1Hash) {
+    let mut s = Session::new();
+    let mut have = Bitfield::new();
+    have.resize_with(4, false);
+    let mut t = Torrent::new(Sha1Hash::from([7u8; 20]), 4, 0x40000, have, StorageIndex(0));
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+    (s, ih)
+}
+
+fn connect(s: &mut Session, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
+    s.peer_connected(
+        ih,
+        1,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        "127.0.0.1:6881".parse().unwrap(),
+        out,
+    );
+}
+
+#[test]
+fn bitfield_sends_interested() {
+    let (mut s, ih) = mk();
+    let mut out = Vec::new();
+    connect(&mut s, &ih, &mut out);
+    out.clear();
+    let p = PeerPacket {
+        info_hash: ih,
+        peer: 1,
+        remote: "127.0.0.1:6881".parse().unwrap(),
+        msg: PeerMessage::Bitfield(bytes::Bytes::from(vec![0b0010_0000u8])),
+    };
+    s.on_peer_message(&p, &mut out);
+    assert!(
+        out.iter().any(|e| matches!(
+            e,
+            SessionOut::ToPeer {
+                msg: PeerMessage::Interested,
+                ..
+            }
+        )),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn piece_verified_sends_not_interested() {
+    let (mut s, ih) = mk();
+    let mut out = Vec::new();
+    connect(&mut s, &ih, &mut out);
+    out.clear();
+    let p = PeerPacket {
+        info_hash: ih,
+        peer: 1,
+        remote: "127.0.0.1:6881".parse().unwrap(),
+        msg: PeerMessage::Bitfield(bytes::Bytes::from(vec![0b1000_0000u8])),
+    };
+    s.on_peer_message(&p, &mut out);
+    out.clear();
+    // we gain the only piece they had → NotInterested
+    s.on_piece_verified(&ih, PieceIndex(0), true, &mut out);
+    assert!(
+        out.iter().any(|o| matches!(
+            o,
+            SessionOut::ToPeer {
+                msg: PeerMessage::NotInterested,
+                ..
+            }
+        )),
+        "{out:?}"
+    );
+}

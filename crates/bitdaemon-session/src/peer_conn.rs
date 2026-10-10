@@ -75,6 +75,9 @@ pub struct PeerConn {
     pub num_pieces: i32,
     /// ms timestamp the connection was established (`m_connect`).
     pub connect_ms: i64,
+    /// `m_interested` — WE sent `interested` (upstream tracks the
+    /// wire state to avoid duplicate sends).
+    pub we_sent_interested: bool,
     /// `m_last_seen` — last session_time a message arrived (peer
     /// timeout bookkeeping).
     pub last_active: i32,
@@ -132,6 +135,7 @@ impl PeerConn {
             stat_down_total: 0,
             stat_up_round: 0,
             stat_down_round: 0,
+            we_sent_interested: false,
             last_unchoke: std::time::Instant::now(),
         }
     }
