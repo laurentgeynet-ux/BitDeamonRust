@@ -153,6 +153,9 @@ pub struct Torrent {
     pub stat_prev_up: i64,
     /// last sample instant.
     pub stat_sample: Option<std::time::Instant>,
+    /// `m_file_priority` — per-file `DownloadPriority` (empty =
+    /// all default). Drives `piece_priority` upstream-style.
+    pub file_priorities: Vec<bitdaemon_common::types::DownloadPriority>,
 }
 
 impl Torrent {
@@ -207,6 +210,7 @@ impl Torrent {
             stat_prev_down: 0,
             stat_prev_up: 0,
             stat_sample: None,
+            file_priorities: Vec::new(),
         }
     }
 
@@ -244,6 +248,11 @@ impl Torrent {
                 t.metadata_raw = Some(ti.info_section().to_vec());
                 t.files = Some(std::sync::Arc::new(ti.files().clone()));
                 t.init_picker(false);
+                // upstream `check_resume` order: file priorities
+                // first, explicit `piece_priorities` override after
+                if !atp.file_priorities.is_empty() {
+                    t.prioritize_files(&atp.file_priorities);
+                }
                 t.apply_resume_data(atp, out);
                 t
             }
@@ -1313,6 +1322,80 @@ impl Torrent {
             }
         }
         self.piece_verified(piece, passed, out);
+    }
+
+    /// `prioritize_files` (upstream `torrent::prioritize_files`) —
+    /// merge `new` into `m_file_priority`, then
+    /// `update_piece_priorities`: every piece's priority becomes
+    /// the max of the files overlapping it.
+    pub fn prioritize_files(&mut self, new: &[bitdaemon_common::types::DownloadPriority]) {
+        let Some(fs) = self.files.clone() else {
+            return;
+        };
+        use bitdaemon_common::types::DownloadPriority;
+        let n = fs.num_files() as usize;
+        self.file_priorities.resize(n, DownloadPriority::DEFAULT);
+        for (i, prio) in new.iter().enumerate().take(n) {
+            self.file_priorities[i] = *prio;
+        }
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        for p in 0..self.num_pieces {
+            let piece = PieceIndex(p);
+            let prio = fs
+                .map_block(piece, 0, i64::from(fs.piece_size(piece)))
+                .iter()
+                .map(|sl| {
+                    self.file_priorities
+                        .get(sl.file_index.0 as usize)
+                        .copied()
+                        .unwrap_or(DownloadPriority::DEFAULT)
+                })
+                .max()
+                .unwrap_or(DownloadPriority::DEFAULT);
+            picker.set_piece_priority(piece, prio);
+        }
+    }
+
+    /// `file_progress` — per-file bytes done (upstream
+    /// `torrent::file_progress`): whole pieces come from `have`,
+    /// partial pieces from the picker's finished blocks.
+    #[must_use]
+    pub fn file_progress(&self) -> Vec<i64> {
+        const BLOCK: i64 = 0x4000;
+        let Some(fs) = &self.files else {
+            return Vec::new();
+        };
+        let mut out = vec![0i64; fs.num_files() as usize];
+        for p in 0..self.num_pieces {
+            let piece = PieceIndex(p);
+            let psize = i64::from(fs.piece_size(piece));
+            if self.have.get_bit(p as usize) {
+                for sl in fs.map_block(piece, 0, psize) {
+                    if sl.file_index.0 >= 0 {
+                        out[sl.file_index.0 as usize] += sl.size;
+                    }
+                }
+            } else if let Some(picker) = &self.picker {
+                let nb = picker.blocks_in_piece(piece) as i64;
+                for b in 0..nb {
+                    let blk = PieceBlock {
+                        piece_index: piece,
+                        block_index: b as i32,
+                    };
+                    if picker.is_finished_block(blk) {
+                        let off = b * BLOCK;
+                        for sl in fs.map_block(piece, off, (psize - off).min(BLOCK)) {
+                            if sl.file_index.0 >= 0 {
+                                out[sl.file_index.0 as usize] += sl.size;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// `torrent_status()` — the snapshot upstream's `status()`

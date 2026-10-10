@@ -9,6 +9,15 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **Priorités par fichier + `file_progress`** —
+  `Torrent::prioritize_files` applique les `DownloadPriority` par
+  fichier puis recalcule les priorités de pièces (max des fichiers
+  chevauchant chaque pièce, ordre upstream `check_resume` : fichiers
+  puis `piece_priorities` explicites). `Torrent::file_progress`
+  attribue les octets par fichier (`have` + blocs `Finished` du
+  picker). API `TorrentHandle::prioritize_files`/`file_priorities`/
+  `file_progress`.
+
 - **`torrent_status` enrichi + `state_update_alert`** — nouveau
   module `session::status` : `TorrentState` (checking/metadata/
   downloading/finished/seeding), compteurs (total_done/wanted/

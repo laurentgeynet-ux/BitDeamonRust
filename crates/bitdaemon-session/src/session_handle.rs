@@ -183,6 +183,31 @@ impl TorrentHandle {
         g.torrents.get(&self.info_hash).map(Torrent::status)
     }
 
+    /// `prioritize_files` — upstream `torrent_handle::prioritize_files`.
+    pub fn prioritize_files(&self, prios: &[bitdaemon_common::types::DownloadPriority]) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.prioritize_files(prios);
+        }
+    }
+
+    /// `file_priorities` — current per-file priorities.
+    #[must_use]
+    pub fn file_priorities(&self) -> Vec<bitdaemon_common::types::DownloadPriority> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or_else(Vec::new, |t| t.file_priorities.clone())
+    }
+
+    /// `file_progress` — per-file downloaded bytes.
+    #[must_use]
+    pub fn file_progress(&self) -> Vec<i64> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or_else(Vec::new, Torrent::file_progress)
+    }
+
     /// `have_piece`.
     #[must_use]
     pub fn have_piece(&self, p: PieceIndex) -> bool {
