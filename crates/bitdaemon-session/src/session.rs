@@ -138,6 +138,12 @@ pub struct Session {
     /// `m_ip_voter` — external-address voting (DHT `ip`, tracker
     /// `external ip`, peer `yourip`).
     pub ip_voter: bitdaemon_net::ip_voter::IpVoter,
+    /// `(v6, lookup idx)` → info_hash — maps DHT traversal events
+    /// back to the torrent they serve.
+    dht_lookup_map: std::collections::BTreeMap<(bool, usize), Sha1Hash>,
+    /// last `session_time` a DHT announce ran per torrent
+    /// (`m_dht_announce_timer` upstream).
+    dht_last_announce: std::collections::BTreeMap<Sha1Hash, i32>,
 }
 
 /// A disk job's result, delivered back onto the session thread.
@@ -210,6 +216,8 @@ impl Default for Session {
             ip_filter: bitdaemon_net::ip_filter::IpFilter::new(),
             settings: crate::settings::SessionSettings::default(),
             ip_voter: bitdaemon_net::ip_voter::IpVoter::new(),
+            dht_lookup_map: std::collections::BTreeMap::new(),
+            dht_last_announce: std::collections::BTreeMap::new(),
             disk_tx,
             disk_rx,
         }
@@ -774,6 +782,8 @@ impl Session {
         self.session_time += 1;
         self.drain_disk_completed(out);
         let wait = self.dht.tick();
+        self.dht_announce_tick();
+        self.dht_drain_events();
         while let Some((pkt, to)) = self.dht.poll() {
             out.push(SessionOut::UdpPacket(pkt, to));
         }
@@ -828,6 +838,88 @@ impl Session {
         }
         self.unchoke_tick(out);
         wait
+    }
+
+    /// `torrent::dht_announce` — every `dht_announce_interval`
+    /// (15 min upstream) a non-private torrent wanting peers runs a
+    /// `get_peers` traversal on each bound node family.
+    fn dht_announce_tick(&mut self) {
+        const DHT_ANNOUNCE_INTERVAL: i32 = 15 * 60;
+        if !self.settings.dht_enabled || self.settings.anonymous_mode {
+            return;
+        }
+        let ihs: Vec<Sha1Hash> = self
+            .torrents
+            .iter()
+            .filter(|(ih, t)| {
+                t.want_peers()
+                    && !t.private
+                    && self
+                        .dht_last_announce
+                        .get(ih)
+                        .is_none_or(|last| self.session_time - last >= DHT_ANNOUNCE_INTERVAL)
+            })
+            .map(|(ih, _)| *ih)
+            .collect();
+        for ih in ihs {
+            self.dht_last_announce.insert(ih, self.session_time);
+            for v6 in [false, true] {
+                if let Some(n) = self.dht.get_node_mut(v6) {
+                    let li = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetPeers, ih);
+                    self.dht_lookup_map.insert((v6, li), ih);
+                }
+            }
+        }
+    }
+
+    /// drain `DhtEvent`s — `get_peers` replies feed `peer_list`
+    /// (source DHT), finished lookups trigger `announce_peer` to
+    /// every node that gave a write token (upstream `dht::announce`
+    /// second phase).
+    fn dht_drain_events(&mut self) {
+        use bitdaemon_dht::dht_node::DhtEvent;
+        for v6 in [false, true] {
+            let Some(n) = self.dht.get_node_mut(v6) else {
+                continue;
+            };
+            for ev in n.drain_events() {
+                match ev {
+                    DhtEvent::Data { lookup, data } => {
+                        let Some(ih) = self.dht_lookup_map.get(&(v6, lookup)).copied() else {
+                            continue;
+                        };
+                        if let Some(t) = self.torrents.get_mut(&ih) {
+                            for ep in data.peers {
+                                t.peer_list.add_peer(
+                                    ep,
+                                    bitdaemon_common::flags::PeerSourceFlags::DHT,
+                                    true,
+                                );
+                            }
+                        }
+                    }
+                    DhtEvent::Done { lookup, tokens } => {
+                        let Some(ih) = self.dht_lookup_map.remove(&(v6, lookup)) else {
+                            continue;
+                        };
+                        if tokens.is_empty() {
+                            continue;
+                        }
+                        // `announce` — tell token-holding nodes we
+                        // are a peer (`announce_peer` second phase)
+                        let addrs: std::collections::BTreeMap<_, _> =
+                            tokens.iter().map(|(id, ep, _)| (*id, *ep)).collect();
+                        let tok_map: std::collections::BTreeMap<_, _> =
+                            tokens.iter().map(|(id, _, t)| (*id, t.clone())).collect();
+                        let seed = self.torrents.get(&ih).is_some_and(|t| t.is_seed());
+                        let port = self.listen_port;
+                        n.announce(&ih, port, seed, false, &addrs, |id| {
+                            tok_map.get(id).cloned()
+                        });
+                    }
+                }
+            }
+        }
     }
 
     /// `session_impl` choker round — every ~10 s upstream picks the

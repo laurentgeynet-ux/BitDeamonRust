@@ -48,8 +48,14 @@ pub enum QueryOutcome {
 pub enum DhtEvent {
     /// lookup `lookup` got data (`get_peers` peers, `get` item…).
     Data { lookup: usize, data: Box<ReplyData> },
-    /// lookup finished.
-    Done { lookup: usize },
+    /// lookup finished — carries `(node id, endpoint, write
+    /// token)` triples for the announce/put phase (upstream keeps
+    /// `m_write_tokens` on the traversal; we hand them over before
+    /// the lookup is dropped).
+    Done {
+        lookup: usize,
+        tokens: Vec<(NodeId, SocketAddr, Vec<u8>)>,
+    },
 }
 
 /// `dht::node` — one address-family's Kademlia node.
@@ -165,7 +171,17 @@ impl DhtNode {
             .into_iter()
             .filter_map(|n| n.id.map(|i| (i, n.endpoint)))
             .collect();
-        let l = Lookup::new(kind, target, self.v6, &self.hooks(), seed);
+        let mut l = Lookup::new(kind, target, self.v6, &self.hooks(), seed);
+        // `find_data::start` also seeds `m_router_nodes` with
+        // no-id observers (flag_initial | no_id).
+        for ep in self.table.router_nodes().copied().collect::<Vec<_>>() {
+            l.algo.add_entry(
+                self.id,
+                ep,
+                crate::traversal::obs_flags::INITIAL | crate::traversal::obs_flags::NO_ID,
+                &self.hooks(),
+            );
+        }
         self.lookups.push(Some(l));
         let idx = self.lookups.len() - 1;
         self.drive(idx);
@@ -336,9 +352,29 @@ impl DhtNode {
             .and_then(Option::as_ref)
             .is_some_and(|l| l.algo.is_done())
         {
+            let tokens = self.take_write_tokens(li);
             self.lookups[li] = None;
-            self.events.push(DhtEvent::Done { lookup: li });
+            self.events.push(DhtEvent::Done { lookup: li, tokens });
         }
+    }
+
+    /// collect `(id, ep, token)` triples for the write tokens a
+    /// lookup accumulated (`m_write_tokens` on `find_data` — the
+    /// `announce`/`put` second phase consumes them).
+    fn take_write_tokens(&self, li: usize) -> Vec<(NodeId, SocketAddr, Vec<u8>)> {
+        let Some(Some(l)) = self.lookups.get(li) else {
+            return Vec::new();
+        };
+        l.write_tokens()
+            .iter()
+            .filter_map(|(id, tok)| {
+                l.algo
+                    .results()
+                    .iter()
+                    .find(|o| o.id == Some(*id))
+                    .map(|o| (*id, o.ep, tok.clone()))
+            })
+            .collect()
     }
 
     fn lookup_failed(&mut self, li: usize, oi: usize, flags: u8) {
@@ -359,8 +395,9 @@ impl DhtNode {
             .and_then(Option::as_ref)
             .is_some_and(|l| l.algo.is_done())
         {
+            let tokens = self.take_write_tokens(li);
             self.lookups[li] = None;
-            self.events.push(DhtEvent::Done { lookup: li });
+            self.events.push(DhtEvent::Done { lookup: li, tokens });
         }
     }
 

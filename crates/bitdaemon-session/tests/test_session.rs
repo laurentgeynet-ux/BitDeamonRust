@@ -514,3 +514,25 @@ fn unchoke_tick_unchokes_top_peer() {
     assert!(!s.torrents[&ih].peers[&1].choked);
     assert!(s.torrents[&ih].peers[&2].choked);
 }
+
+#[test]
+fn dht_announce_tick_issues_get_peers() {
+    use bitdaemon_session::session::SessionOut;
+    let mut s = Session::new();
+    s.enable_dht(
+        "0.0.0.0".parse().unwrap(),
+        None,
+        bitdaemon_dht::dht_settings::DhtSettings::default(),
+    );
+    s.dht_add_node("9.9.9.9:51413".parse().unwrap());
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    s.add_torrent(t);
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    let to_router = out.iter().any(|e| {
+        matches!(e, SessionOut::UdpPacket(pkt, to)
+            if to.port() == 51413 && pkt.windows(9).any(|w| w == b"get_peers"))
+    });
+    assert!(to_router, "expected get_peers datagram to router node");
+}

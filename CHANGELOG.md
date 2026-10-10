@@ -9,6 +9,17 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **DHT announce bout-en-bout** — `Session::dht_announce_tick`
+  (15 min, non-privé, hors anonymat) lance `get_peers` sur chaque
+  famille ; `DhtEvent::Done` emporte désormais les `write_tokens`
+  `(id, ep, token)` et la session émet `announce_peer` vers les
+  nœuds token-holders (phase 2 `dht::announce` upstream). Les
+  peers découverts entrent dans `peer_list` (source DHT).
+- `new_lookup` sème aussi `router_nodes` (observers no-id,
+  `flag_initial`) comme `find_data::start` upstream.
+
+### Added
+
 - **UPnP câblé** — `Engine::portmap_add_device(RootDevice, port,
   desc)` enregistre un `UpnpDriver` par routeur, mappe le port
   d'écoute TCP+UDP et enchaîne `GetExternalIPAddress` →
