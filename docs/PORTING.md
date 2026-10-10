@@ -61,23 +61,23 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 
 | C++ source | Rust target | Status | Notes |
 |---|---|---|---|
-| `torrent_info.cpp` (`torrent_info.hpp`) | `core::torrent_info` | not started | v1+v2+hybrid; merkle verify |
-| `file_storage.cpp` (`file_storage.hpp`), `file_layout.hpp` | `core::file_storage` | not started | path sanitization is security-critical |
+| `torrent_info.cpp` (`torrent_info.hpp`) | `core::torrent_info` | **ported** | v1+v2+hybrid; v2 piece-layer merkle validation; byte-oriented names |
+| `file_storage.cpp` (`file_storage.hpp`), `file_layout.hpp` | `core::file_storage` | **ported** | byte-oriented paths (upstream `std::string` semantics); `test_file_storage.cpp` 28/28 |
 | `create_torrent.cpp` (`create_torrent.hpp`) | `core::create` | not started | |
-| `merkle.cpp`, `merkle_tree.cpp` (`merkle*.hpp`) | `core::merkle` | not started | v2 piece layers |
-| `magnet_uri.cpp` (`magnet_uri.hpp`) | `core::magnet` | not started | |
-| `load_torrent.cpp` (`load_torrent.hpp`) | `core::load` | not started | |
+| `merkle.cpp` (`merkle.hpp`) | `core::merkle` | partial | pure math + `load_piece_layer` root validation done; sparse `merkle_tree` (Phase 3) |
+| `magnet_uri.cpp` (`magnet_uri.hpp`) | `core::magnet_uri` | **ported** | `test_magnet.cpp` parse vectors 24/24 |
+| `load_torrent.cpp` (`load_torrent.hpp`) | `core::torrent_info` (`load_torrent*`) | **ported** | `parse_torrent_file`/`load_torrent_buffer` |
 | `announce_entry.cpp`, `tracker_list.cpp` | `core::tracker` | not started | tier + failover semantics |
 | `web_seed_entry.cpp` (`web_seed_entry.hpp`) | `core::web_seed` | not started | |
 | `fingerprint.cpp`, `identify_client.cpp` | `core::fingerprint` | not started | client identification table |
-| `read_resume_data.cpp`, `write_resume_data.cpp` | `core::resume` | not started | wire-compat required |
+| `read_resume_data.cpp`, `write_resume_data.cpp` | `core::resume_data` | **ported** | file-version 1+2 read, v2 write; `test_read_resume.cpp` vectors + round-trip |
 | `resolve_links.cpp`, `resolve_duplicate_filenames.cpp` | `core::resolve` | not started | |
 | `apply_pad_files.hpp`, `resolve_duplicate_filenames.hpp` | `core::pad` | not started | |
-| `add_torrent_params.cpp` (`add_torrent_params.hpp`) | `core::add_torrent` | not started | |
-| `path.cpp`, `path.hpp`, `directory.cpp`, `drive_info.cpp` | `core::path` | not started | ADS/device-name sanitization |
+| `add_torrent_params.cpp` (`add_torrent_params.hpp`) | `core::add_torrent_params` | **ported** | single canonical struct used by torrent/magnet/resume |
+| `path.cpp` (string helpers), `aux_/path.hpp` | `core::path` | **ported** (string half) | `directory.cpp`/`drive_info.cpp` (fs-dependent) → Phase 3 |
 | `entry`-adjacent `client_data.hpp`, `fwd.hpp`, `version.cpp` | misc | not started | |
-| `session_types.hpp`, `session_status.hpp`, `storage_defs.hpp`, `torrent_status.cpp`, `download_priority.hpp` | `core::types` | not started | shared enums |
-| `socket_io.cpp`, `parse_url.cpp`, `escape_string.cpp`, `utf8.cpp`, `string_util.cpp`, `ip_helpers.cpp` | `core::util` | not started | could move to common/net |
+| `session_types.hpp`, `session_status.hpp`, `storage_defs.hpp`, `torrent_status.cpp`, `download_priority.hpp` | `core::types` | partial | `DownloadPriority` in common; status types later |
+| `escape_string.cpp`, `utf8.cpp`, `parse_url.cpp` (subset) | `core::escape_string`, `core::utf8` | **ported** (subset) | `socket_io`/`string_util`/`ip_helpers` land with net |
 
 ## bitdaemon-disk
 

@@ -8,6 +8,7 @@
 
 /// Generates a `bitfield_flag` newtype: `bitfield_flag!(Name, u64)` then
 /// `Name::bit(n)` / associated consts for each upstream flag.
+#[macro_export]
 macro_rules! bitfield_flag {
     ($(#[$meta:meta])* $name:ident, $ty:ty) => {
         $(#[$meta])*

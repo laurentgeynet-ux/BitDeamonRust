@@ -106,6 +106,8 @@ dependencies = [
  "bitdaemon-common",
  "bytes",
  "serde",
+ "sha1",
+ "sha2",
  "thiserror",
  "url",
 ]

@@ -73,7 +73,7 @@ Phase 3 — it wraps `file_storage`/`stat_file`, not a primitive).
 
 ---
 
-## Phase 2 — Metainfo ⬜
+## Phase 2 — Metainfo 🟨
 
 *~10k LOC C++.* Unlocks loading real `.torrent` files and magnets.
 

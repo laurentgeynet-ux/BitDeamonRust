@@ -58,6 +58,26 @@ Until `1.0.0`, breaking changes may occur in any release.
   `IndexRange`/`IndexStep` (`index_range`), `TimestampHistory` +
   `compare_less_wrap` (uTP base-delay estimator, 20-slot ring).
   `stat_cache` deferred to Phase 3 (wraps `file_storage`/`stat_file`).
+- `bitdaemon_core` Phase-2 first wave (metainfo):
+  `path`/`utf8` byte-oriented helpers (upstream `std::string` semantics,
+  traversal + invalid-char sanitization, ADS/device-name rules),
+  `FileStorage` (file entries, pad files, piece/block mapping, symlink
+  sanitization, path hashing via lowercase CRC32C), `TorrentInfo`
+  (v1/v2/hybrid parse, info-hash SHA-1+SHA-256, file-tree walk,
+  trackers/web-seeds/DHT nodes, `piece layers` **with per-file merkle
+  root validation** — `v2_invalid_piece_layer_root` rejected),
+  `merkle` (BEP-52 tree math: `merkle_num_leafs`, `merkle_pad`,
+  `merkle_root`, `validate_piece_layer`), `escape_string` (`unescape`/
+  `escape`/`escape_path`/`need_encoding`/`base32decode`/`split_string`/
+  `parse_decimal`), `add_torrent_params` (single canonical struct for
+  torrent/magnet/resume), `magnet_uri` (`parse_magnet_uri` +
+  `make_magnet_uri`, `so=` selections, `x.pe`/`dht`/`tr`/`ws`/`dn`/`xt`
+  v1+b32+btmh), `resume_data` (`read_resume_data`/`write_resume_data`
+  file-version 1+2, bitfields, unfinished pieces, merkle trees, peers
+  v4/v6, flags — byte-compatible both directions per ADR-0009).
+  Conformance: `test_file_storage` 28/28, upstream `.torrent` fixtures
+  (valid + invalid incl. piece-layer root), `test_magnet` 24/24,
+  `test_read_resume` vectors + full round-trip.
 - Tests: 67 conformance cases ported from `test_bdecode.cpp`, 16 from
   `test_bitfield.cpp`, 8 from `test_sliding_average.cpp`, 5 from
   `test_bloom_filter.cpp`, `test_crc32.cpp` vectors (RFC 3720 B.4),
