@@ -33,6 +33,7 @@ pub mod error;
 pub mod flags;
 pub mod hash;
 pub mod hex;
+pub mod identify_client;
 pub mod index_range;
 pub mod info_hash;
 pub mod peer_id;

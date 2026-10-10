@@ -643,7 +643,15 @@ impl Torrent {
             local_endpoint: None,
             read_state: BandwidthState::NETWORK,
             write_state: BandwidthState::NETWORK,
-            client: c.client_version.clone(),
+            client: if c.client_version.is_empty() {
+                // `peer_connection::peer_info_struct` fallback —
+                // `identify_client` on the handshake peer id.
+                c.peer_id.as_ref().map_or_else(Vec::new, |pid| {
+                    bitdaemon_common::identify_client::identify_client(pid).into_bytes()
+                })
+            } else {
+                c.client_version.clone()
+            },
         })
     }
 

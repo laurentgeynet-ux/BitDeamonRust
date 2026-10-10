@@ -9,6 +9,14 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `identify_client` (`src/identify_client.cpp`) : 4 styles de peer-id
+  (azureus, shadow, transmission legacy, mainline) + 102 codes
+  `name_map` + 37 `generic_mappings` verbatim ; `peer_info.client`
+  tombe sur le fingerprint quand le `v` de l'ext-handshake est absent
+  (`peer_connection::peer_info_struct` upstream).
+
+### Added
+
 - Cycle de connexion peer_list fidèle : `connect_candidates` marque
   `set_connected` au début du dial (comme le ctor `peer_connection`
   upstream), `peer_connect_failed`/`peer_disconnected_addr` appliquent
