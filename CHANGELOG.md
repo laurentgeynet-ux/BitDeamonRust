@@ -9,6 +9,13 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `.session` persiste `settings` — `SessionSettings` sérialisé en
+  dict bencode (`save_settings`/`read_settings`, durées en ms,
+  champs manquants → défauts, compatible avant/arrière) et
+  appliqué par `Session::load_state` comme upstream.
+
+### Added
+
 - **DHT announce bout-en-bout** — `Session::dht_announce_tick`
   (15 min, non-privé, hors anonymat) lance `get_peers` sur chaque
   famille ; `DhtEvent::Done` emporte désormais les `write_tokens`

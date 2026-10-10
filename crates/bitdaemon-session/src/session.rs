@@ -1226,6 +1226,7 @@ impl Session {
             st.dht_state =
                 bitdaemon_bencode::bencode(&bitdaemon_dht::dht_state::save_dht_state(&ds));
         }
+        st.settings = Some(self.settings.clone());
         st
     }
 
@@ -1236,6 +1237,9 @@ impl Session {
         let Some(st) = crate::session_state::load_session_state(buf) else {
             return 0;
         };
+        if let Some(set) = st.settings {
+            self.settings = set;
+        }
         if let Some(ds) = bitdaemon_dht::dht_state::read_dht_state_bytes(&st.dht_state) {
             for v6 in [false, true] {
                 if let Some(n) = self.dht.get_node_mut(v6) {

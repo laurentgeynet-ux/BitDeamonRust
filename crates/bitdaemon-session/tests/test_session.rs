@@ -536,3 +536,18 @@ fn dht_announce_tick_issues_get_peers() {
     });
     assert!(to_router, "expected get_peers datagram to router node");
 }
+
+#[test]
+fn session_state_roundtrip_settings() {
+    use bitdaemon_session::session_state::{load_session_state, save_session_state_buf};
+    let mut s = Session::new();
+    s.settings.unchoke_slots = 42;
+    s.settings.anonymous_mode = true;
+    let st = s.save_state();
+    let buf = save_session_state_buf(&st);
+    let st2 = load_session_state(&buf).unwrap();
+    let set = st2.settings.unwrap();
+    assert_eq!(set.unchoke_slots, 42);
+    assert!(set.anonymous_mode);
+    assert_eq!(set.connections_limit, 500); // defaults preserved
+}
