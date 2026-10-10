@@ -9,6 +9,16 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `settings_pack::anonymous_mode` : coupe l'émission LSD (déviation
+  OnionBit documentée — upstream ne masque que `ip`/user-agent des
+  announces ; broadcaster les info-hashes sur le LAN trahirait
+  l'anonymat Tribler).
+- `Session::remove_torrent`/`set_paused(true)` émettent l'annonce
+  `stopped` sur les trackers ayant vu `started` (`~torrent` /
+  `do_pause` upstream).
+
+### Added
+
 - Boucle `Engine::run` (`session_impl::run`) : tick 1 Hz +
   `connect_pump` + dials async. `spawn_dial` fait le handshake BT +
   BEP-10 en tâche et rapporte via `connect_rx` (`on_connection_attempt`

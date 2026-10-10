@@ -444,16 +444,49 @@ impl Session {
         Some(ih)
     }
 
-    /// `remove_torrent` — drop the swarm (peers + picker).
-    pub fn remove_torrent(&mut self, ih: &Sha1Hash) -> Option<Torrent> {
+    /// `remove_torrent` — `~torrent`: emit a `stopped` announce to
+    /// every tracker that saw a `started` (upstream sends it on
+    /// graceful shutdown/removal), then drop the swarm.
+    pub fn remove_torrent(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) -> Option<Torrent> {
+        if let Some(t) = self.torrents.get(ih) {
+            self.announce_stopped(t, out);
+        }
         self.torrents.remove(ih)
     }
 
     /// `pause`/`resume` (user pause — the auto-managed queue
-    /// uses `queued` instead, like upstream).
-    pub fn set_paused(&mut self, ih: &Sha1Hash, paused: bool) {
+    /// uses `queued` instead, like upstream). Pausing announces
+    /// `stopped`; resuming re-arms `started` on the next tick.
+    pub fn set_paused(&mut self, ih: &Sha1Hash, paused: bool, out: &mut Vec<SessionOut>) {
         if let Some(t) = self.torrents.get_mut(ih) {
+            if paused && !t.paused {
+                // borrow dance: build stopped announces first
+            }
             t.paused = paused;
+        }
+        if paused {
+            if let Some(t) = self.torrents.get(ih) {
+                self.announce_stopped(t, out);
+            }
+        }
+    }
+
+    /// `torrent::do_pause`/`~torrent` — `stopped` for trackers that
+    /// already announced `started`.
+    fn announce_stopped(&self, t: &Torrent, out: &mut Vec<SessionOut>) {
+        for e in &t.trackers.trackers {
+            let started = e
+                .endpoints
+                .iter()
+                .any(|ep| ep.v1.start_sent || ep.v2.start_sent);
+            if started {
+                out.push(SessionOut::TrackerAnnounce {
+                    ih: t.info_hash,
+                    url: e.url.clone(),
+                    tracker_id: e.tracker_id.clone(),
+                    params: t.announce_params(self.peer_id, self.listen_port, 3, self.key),
+                });
+            }
         }
     }
 
@@ -648,6 +681,10 @@ impl Session {
     /// `lsd::announce` cadence — every 5 min per non-private
     /// torrent, one datagram per multicast group.
     pub fn lsd_tick(&mut self, now: Instant, out: &mut Vec<SessionOut>) {
+        // anonymous sessions must not broadcast info-hashes to the LAN
+        if self.settings.anonymous_mode {
+            return;
+        }
         const LSD_INTERVAL: Duration = Duration::from_secs(300);
         if self
             .last_lsd

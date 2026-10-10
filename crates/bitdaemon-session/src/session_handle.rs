@@ -87,7 +87,9 @@ impl SessionHandle {
 
     /// `remove_torrent`.
     pub fn remove_torrent(&self, ih: &Sha1Hash) {
-        lock(&self.inner).remove_torrent(ih);
+        // the handle drains `stopped` announces — a real engine
+        // routes `Session::remove_torrent`'s out-effects itself
+        lock(&self.inner).remove_torrent(ih, &mut Vec::new());
     }
 
     /// `find_torrent` → handle.
@@ -154,7 +156,7 @@ pub struct TorrentHandle {
 impl TorrentHandle {
     /// `torrent::pause` / `resume`.
     pub fn set_paused(&self, paused: bool) {
-        lock(&self.session).set_paused(&self.info_hash, paused);
+        lock(&self.session).set_paused(&self.info_hash, paused, &mut Vec::new());
     }
 
     /// `torrent::status`.

@@ -65,6 +65,11 @@ pub struct SessionSettings {
     pub max_failcount: i32,
     /// `allow_multiple_connections_per_ip`.
     pub allow_multiple_connections_per_ip: bool,
+    /// `anonymous_mode` — hide identity on the wire; **also**
+    /// suppresses LSD multicasts (OnionBit deviation: upstream only
+    /// strips announce `ip`/user-agent — announcing info-hashes to
+    /// the LAN would defeat the purpose for Tribler).
+    pub anonymous_mode: bool,
 }
 
 impl Default for SessionSettings {
@@ -95,6 +100,7 @@ impl Default for SessionSettings {
             max_peerlist_size: 4000,
             max_failcount: 3,
             allow_multiple_connections_per_ip: false,
+            anonymous_mode: false,
         }
     }
 }

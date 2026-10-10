@@ -272,3 +272,50 @@ fn ip_filter_bans_and_disconnects() {
     assert_eq!(t.peer_list.num_peers(), 1);
     assert!(t.peers.is_empty());
 }
+
+#[test]
+fn anonymous_mode_suppresses_lsd() {
+    let mut s = Session::new();
+    s.settings.anonymous_mode = true;
+    let ih = Sha1Hash::from_bytes(&[11; 20]).unwrap();
+    s.add_torrent(Torrent::new(
+        ih,
+        1,
+        16384,
+        bitdaemon_common::Bitfield::with_size(1),
+        StorageIndex(0),
+    ));
+    let mut out = Vec::new();
+    s.lsd_tick(std::time::Instant::now(), &mut out);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn pause_announces_stopped() {
+    let mut s = Session::new();
+    let ih = Sha1Hash::from_bytes(&[21; 20]).unwrap();
+    let mut t = Torrent::new(
+        ih,
+        1,
+        16384,
+        bitdaemon_common::Bitfield::with_size(1),
+        StorageIndex(0),
+    );
+    let mut e = bitdaemon_session::tracker_list::AnnounceEntry::new("http://t/announce", 0);
+    e.endpoints
+        .push(bitdaemon_session::tracker_list::AnnounceEndpoint::default());
+    e.endpoints[0].v1.start_sent = true;
+    t.trackers.trackers.push(e);
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.set_paused(&ih, true, &mut out);
+    let stopped = out.iter().any(|o| {
+        matches!(
+            o,
+            SessionOut::TrackerAnnounce { ih: i, params, .. }
+                if *i == ih && params.event == 3
+        )
+    });
+    assert!(stopped, "pause should emit a stopped announce");
+}

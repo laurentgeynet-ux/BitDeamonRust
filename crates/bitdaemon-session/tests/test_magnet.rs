@@ -88,7 +88,7 @@ fn auto_managed_queue_limits_downloads() {
     assert_eq!(queued.iter().filter(|q| **q).count(), 2);
     // a paused torrent frees a slot
     let first = *ses.torrents.keys().next().unwrap();
-    ses.set_paused(&first, true);
+    ses.set_paused(&first, true, &mut Vec::new());
     ses.manage_queue(2, -1);
     let queued2 = ses.torrents.values().filter(|t| t.queued).count();
     assert_eq!(queued2, 1);
