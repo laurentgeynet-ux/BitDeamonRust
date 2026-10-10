@@ -9,6 +9,12 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **File d'attente auto-managed** — `Torrent::queue_seq`
+  (`m_sequence_number`, assigné à l'ajout), `Session::queue_position`
+  (rang dans sa classe download/seed, -1 si pause/non-auto-managed),
+  `queue_position_set` (Top/Bottom leap-frog, Up/Down swap voisin).
+  `TorrentHandle::queue_position`/`queue_position_set`.
+
 - **Force-ops + flush** — `Session::force_announce(ih, idx)`
   (effets `TrackerAnnounce` immédiats, un ou tous trackers),
   `force_dht_announce` (`dht_announce_one` factorisé — respecte

@@ -151,3 +151,39 @@ fn force_announce_emits_effects() {
             .any(|a| matches!(a, Alert::CacheFlushed(i) if *i == ih))
     );
 }
+
+#[test]
+fn queue_position_moves() {
+    use bitdaemon_session::session::QueueMove;
+    let mut s = Session::new();
+    let mut ihs = Vec::new();
+    for b in [10u8, 11, 12] {
+        let ih = Sha1Hash::from_bytes(&[b; 20]).unwrap();
+        let mut t = Torrent::new(ih, 2, 128 * 1024, Bitfield::with_size(2), StorageIndex(0));
+        t.finished = false;
+        s.add_torrent(t);
+        ihs.push(ih);
+    }
+    // insertion order → positions 0,1,2 in add order
+    macro_rules! pos {
+        ($i:expr) => {
+            s.queue_position(&ihs[$i])
+        };
+    }
+    assert_eq!((pos!(0), pos!(1), pos!(2)), (0, 1, 2));
+
+    s.queue_position_set(&ihs[2], QueueMove::Up);
+    assert_eq!((pos!(0), pos!(1), pos!(2)), (0, 2, 1));
+
+    s.queue_position_set(&ihs[0], QueueMove::Bottom);
+    // ih2(1) < ih1(2) < ih0(3)
+    assert_eq!((pos!(0), pos!(1), pos!(2)), (2, 1, 0));
+
+    s.queue_position_set(&ihs[0], QueueMove::Top);
+    // ih0(-1) < ih2(1) < ih1(2)
+    assert_eq!((pos!(0), pos!(1), pos!(2)), (0, 2, 1));
+
+    // paused → -1
+    s.torrents.get_mut(&ihs[1]).unwrap().paused = true;
+    assert_eq!(s.queue_position(&ihs[1]), -1);
+}

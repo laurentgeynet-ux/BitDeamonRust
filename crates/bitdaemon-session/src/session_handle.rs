@@ -263,6 +263,17 @@ impl TorrentHandle {
             .map_or_else(Vec::new, Torrent::file_progress)
     }
 
+    /// `queue_position` — index within the auto-managed queue.
+    #[must_use]
+    pub fn queue_position(&self) -> i32 {
+        lock(&self.session).queue_position(&self.info_hash)
+    }
+
+    /// `queue_position_up/down/top/bottom`.
+    pub fn queue_position_set(&self, p: crate::session::QueueMove) {
+        lock(&self.session).queue_position_set(&self.info_hash, p);
+    }
+
     /// `force_reannounce` — announce now (all trackers or one).
     pub fn force_announce(&self, tracker_idx: Option<usize>, out: &mut SessionOutVec) {
         lock(&self.session).force_announce(&self.info_hash, tracker_idx, out);

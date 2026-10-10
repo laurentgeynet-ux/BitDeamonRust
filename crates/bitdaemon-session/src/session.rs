@@ -136,6 +136,10 @@ pub struct Session {
     disk_rx: std::sync::mpsc::Receiver<DiskCompleted>,
     /// `m_cookie` — filters our own multicast loopback (LSD).
     pub lsd_cookie: u32,
+    /// queue sequence counter — each torrent's `queue_seq`
+    /// (upstream `torrent::m_sequence_number`) orders the
+    /// auto-managed queues.
+    pub next_queue_seq: i64,
     /// last LSD broadcast.
     last_lsd: Option<Instant>,
     /// `m_session_time` — seconds since session start, bumped once
@@ -158,6 +162,19 @@ pub struct Session {
 
 /// A disk job's result, delivered back onto the session thread.
 /// (`disk_io_job` completion → `torrent::on_disk_*`.)
+/// `move_queue_position` — upstream `queue_position_set` ops.
+#[derive(Clone, Copy, Debug)]
+pub enum QueueMove {
+    /// `queue_position_top`.
+    Top,
+    /// `queue_position_bottom`.
+    Bottom,
+    /// `queue_position_up` — swap with the previous entry.
+    Up,
+    /// `queue_position_down` — swap with the next entry.
+    Down,
+}
+
 pub enum DiskCompleted {
     /// `async_read` — block ready to send as `Piece`.
     Read {
@@ -253,6 +270,7 @@ impl Default for Session {
                 rand::rng().random::<i32>()
             },
             lsd_cookie: rand::random::<u32>(),
+            next_queue_seq: 0,
             last_lsd: None,
             session_time: 0,
             ip_filter: bitdaemon_net::ip_filter::IpFilter::new(),
@@ -527,8 +545,10 @@ impl Session {
     }
 
     /// `add_torrent` — insert (or replace) a swarm.
-    pub fn add_torrent(&mut self, t: Torrent) -> Sha1Hash {
+    pub fn add_torrent(&mut self, mut t: Torrent) -> Sha1Hash {
         let ih = t.info_hash;
+        t.queue_seq = self.next_queue_seq;
+        self.next_queue_seq += 1;
         self.torrents.insert(ih, t);
         ih
     }
@@ -668,6 +688,74 @@ impl Session {
                     seed_active += 1;
                 } else {
                     dl_active += 1;
+                }
+            }
+        }
+    }
+
+    /// `queue_position` — index of `ih` within its queue class
+    /// (downloaders vs seeds, upstream's two queue lists) ordered
+    /// by `queue_seq`. `-1` for paused or non-auto-managed torrents.
+    #[must_use]
+    pub fn queue_position(&self, ih: &Sha1Hash) -> i32 {
+        let Some(t) = self.torrents.get(ih) else {
+            return -1;
+        };
+        if t.paused || !t.auto_managed {
+            return -1;
+        }
+        let seed = t.is_seed();
+        self.torrents
+            .values()
+            .filter(|o| !o.paused && o.auto_managed && o.is_seed() == seed)
+            .map(|o| (o.queue_seq, o.info_hash))
+            .collect::<std::collections::BTreeSet<_>>()
+            .iter()
+            .position(|(_, i)| i == ih)
+            .map_or(-1, |p| p as i32)
+    }
+
+    /// `queue_position_up/down/top/bottom` — reorder within the
+    /// queue class by rewriting `queue_seq` (upstream
+    /// `queue_position_set`). Returns the torrents whose order
+    /// changed conceptually (for alerts/tests).
+    pub fn queue_position_set(&mut self, ih: &Sha1Hash, p: QueueMove) {
+        let Some(t) = self.torrents.get(ih) else {
+            return;
+        };
+        let seed = t.is_seed();
+        let me = t.queue_seq;
+        // ordered seq list of the same queue class
+        let mut seqs: Vec<(i64, Sha1Hash)> = self
+            .torrents
+            .values()
+            .filter(|o| o.info_hash != *ih && o.is_seed() == seed)
+            .map(|o| (o.queue_seq, o.info_hash))
+            .collect();
+        seqs.sort_unstable();
+        // Up/Down = swap with neighbor; Top/Bottom = leap-frog
+        match p {
+            QueueMove::Up | QueueMove::Down => {
+                if let Some((s0, oih)) = match p {
+                    QueueMove::Up => seqs.iter().rev().find(|(s0, _)| *s0 < me),
+                    _ => seqs.iter().find(|(s0, _)| *s0 > me),
+                } {
+                    let (s0, oih) = (*s0, *oih);
+                    if let Some(other) = self.torrents.get_mut(&oih) {
+                        other.queue_seq = me;
+                    }
+                    if let Some(t) = self.torrents.get_mut(ih) {
+                        t.queue_seq = s0;
+                    }
+                }
+            }
+            QueueMove::Top | QueueMove::Bottom => {
+                let new_seq = match p {
+                    QueueMove::Top => seqs.first().map_or(me, |(s0, _)| s0 - 1),
+                    _ => seqs.last().map_or(me, |(s0, _)| s0 + 1),
+                };
+                if let Some(t) = self.torrents.get_mut(ih) {
+                    t.queue_seq = new_seq;
                 }
             }
         }

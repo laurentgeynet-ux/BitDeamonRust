@@ -176,6 +176,10 @@ pub struct Torrent {
     pub need_save_resume: bool,
     /// last resume dump instant (`auto_save_resume` cadence).
     pub last_saved_resume: Option<Instant>,
+    /// `m_sequence_number` — auto-managed queue order (assigned
+    /// by the session at `add_torrent`, rewritten by
+    /// `queue_position_set`).
+    pub queue_seq: i64,
 }
 
 impl Torrent {
@@ -238,6 +242,7 @@ impl Torrent {
             download_limit: 0,
             need_save_resume: false,
             last_saved_resume: None,
+            queue_seq: 0,
         }
     }
 
