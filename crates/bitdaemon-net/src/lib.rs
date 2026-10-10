@@ -75,6 +75,8 @@ pub mod bt_peer_conn;
 /// `aux_/http_parser` — incremental HTTP parser.
 pub mod http_conn;
 
+/// `enum_net` — netmask/route/gateway helpers (enumeration injected).
+pub mod enum_net;
 /// `http_parser.cpp` — incremental status/header/body/chunked parser.
 pub mod http_parser;
 /// `aux_/http_stream` — HTTP CONNECT proxy handshake.

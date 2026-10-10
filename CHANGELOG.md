@@ -7,6 +7,21 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — peripheral ports (enum_net / i2p / websocket / tracker client)
+
+- `enum_net` — `build_netmask` / `match_addr_mask` / `get_gateway` /
+  `has_internet_route` / `has_any_internet_route` / `device_for_address`;
+  `ip_helpers::is_global`. Interface + route tables injected.
+- `i2p.rs` — SAM handshake (HELLO, SESSION CREATE transient, STREAM
+  CONNECT/ACCEPT, NAMING LOOKUP) over `BoxedPeerStream`.
+- `websocket.rs` — RFC 6455 upgrade builder/validator, accept-key
+  (spec vector), frame encode/decode (masked + extended lengths).
+- `tracker_client.rs` — full announce exchanges: UDP BEP-15 connect +
+  announce with `DatagramSocket`, HTTP GET + bencoded response parse;
+  `TrackerList`-integrated e2e tests.
+- Typed `Alert` variants replacing `Alert(String)` (peer/torrent/session
+  lifecycle + errors).
+
 ### Added — session wave 4: piece-hash verify, peer classes, counters
 
 - `Torrent::piece_hashes` + `expected_hash` — Hash job completion

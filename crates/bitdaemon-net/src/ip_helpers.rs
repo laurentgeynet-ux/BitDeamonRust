@@ -39,6 +39,17 @@ fn is_v6_site_local(a: &std::net::Ipv6Addr) -> bool {
     (a.segments()[0] & 0xffc0) == 0xfec0
 }
 
+/// `is_global` — upstream: v6 = first byte masked by 0xe0 == 0x20
+/// (IANA global unicast range); v4 = !multicast && !unspecified &&
+/// !is_local.
+#[must_use]
+pub fn is_global(a: &IpAddr) -> bool {
+    match a {
+        IpAddr::V6(a6) => (a6.octets()[0] & 0xe0) == 0x20,
+        IpAddr::V4(a4) => !(a4.is_multicast() || a4.is_unspecified() || is_local(a)),
+    }
+}
+
 /// `is_teredo` — `2001::/32` (Teredo prefix, first 4 bytes
 /// `20 01 00 00`).
 #[must_use]
