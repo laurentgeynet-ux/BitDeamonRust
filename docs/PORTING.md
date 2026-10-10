@@ -134,9 +134,9 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `http_connection.cpp`, `http_parser.cpp`, `parse_url.cpp`, `resolver.cpp`, `resolver_interface.hpp` | `net::http` | not started | |
 | `http_tracker_connection.cpp`, `udp_tracker_connection.cpp`, `websocket_tracker_connection.cpp`, `tracker_manager.cpp`, `tracker_list.cpp` (net side) | `net::tracker` | not started | announce retry semantics; UDP tracker consumes `DatagramSocket` (ADR-0008) |
 | `upnp.cpp`, `natpmp.cpp`, `portmap.cpp` | `net::nat` | not started | |
-| `lsd.cpp` (`lsd.hpp`) | `net::lsd` | not started | |
+| `lsd.cpp` (`lsd.hpp`) | `net::lsd` | **ported (wire)** | `render_lsd_packet` byte-exact (`BT-SEARCH * HTTP/1.1`, multicast `239.192.152.143`/`[ff15::efc0:988f]:6771`), `process_packet` parse + cookie self-filter + v2 truncated infohashes; socket/tick loop still pending (needs `net::udp` iface) |
 | `udp_socket.cpp`, `session_udp_sockets.hpp`, `listen_socket_handle.cpp` | `net::udp` | not started | wraps `DatagramSocket` (ADR-0008); default impl = `TokioUdpSocket` |
-| `utp_stream.cpp`, `utp_socket_manager.cpp` | `net::utp` | not started | **Phase 5** (OnionBit peer transport); runs on injected `DatagramSocket`, exposed as `PeerConnector`/`PeerAcceptor` |
+| `utp_stream.cpp`, `utp_socket_manager.cpp` | `net::utp` | started | header codec (5 types, big-endian verbatim) + extension iterator (`UtpExtensions`) + conn-id demux groundwork on `DatagramSocket`; reliable-stream state machine pending |
 | `ip_filter.cpp`, `ip_voter.cpp`, `ip_notifier.cpp`, `enum_net.cpp`, `netlink.cpp`, `route.h`, `bind_to_device.hpp` | `net::iface` | not started | |
 | `bandwidth_limit.cpp`, `bandwidth_manager.cpp`, `bandwidth_queue_entry.cpp`, `bandwidth_socket.hpp` | `net::bandwidth` | **ported** | `BandwidthChannel` token bucket (3 s burst cap, `inf`=INT_MAX), `BwRequest` (priority pro-rata `distribute*prio/tmp`, ttl 20), `BandwidthManager` queue + disconnect quota return; `Rc<BandwidthChannel>`/`Rc<dyn BandwidthSocket>` replace raw ptr/`shared_ptr` |
 | `proxy_base.cpp`, `proxy_settings.cpp` | `net::proxy` | not started | |

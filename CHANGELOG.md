@@ -311,6 +311,15 @@ Until `1.0.0`, breaking changes may occur in any release.
   `test_merkle_tree` 22/22, `test_create_torrent` 8/8,
   `test_identify_client` + generate vectors, `test_resolve_duplicates`
   12/12 (upstream table, POSIX-normalized for Windows separators).
+- `bitdaemon_net` Phase-5 groundwork:
+  `utp` first wave (`UtpPacket` header codec — 20-byte big-endian wire
+  format verbatim, 5 packet types, `UtpExtensions` iterator for
+  sack/close-reason chains, conn-id demux on injected `DatagramSocket`),
+  `lsd` (BEP-14: `render_lsd_packet` byte-exact,
+  `process_packet` parse with own-cookie filter, port validation
+  `1..65535`, v1/v2-truncated infohashes — multicast loop/tick loop
+  still pending `net::udp` interface enumeration). Tests: LSD
+  render/parse vectors incl. self-announce rejection.
 - Tests: 67 conformance cases ported from `test_bdecode.cpp`, 16 from
   `test_bitfield.cpp`, 8 from `test_sliding_average.cpp`, 5 from
   `test_bloom_filter.cpp`, `test_crc32.cpp` vectors (RFC 3720 B.4),

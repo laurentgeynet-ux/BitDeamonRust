@@ -72,7 +72,11 @@ pub mod bep10;
 pub mod http_stream;
 /// `http_tracker_connection` — announce query + response parsing.
 pub mod http_tracker;
+/// `lsd` — BEP-14 BT-SEARCH announce parse/render.
+pub mod lsd;
 /// `socks5_stream` — SOCKS4/5 handshake over any async stream.
 pub mod socks;
 /// `udp_tracker_connection` — BEP-15 announce/scrape over `DatagramSocket`.
 pub mod udp_tracker;
+/// uTP wire layer: `utp_header`, extension walk, conn-id demux.
+pub mod utp;

@@ -499,3 +499,37 @@ fn response_v6() {
     assert_eq!(r.peers.len(), 1);
     assert!(r.peers[0].is_ipv6());
 }
+
+// ---------- lsd (BEP-14) ----------
+
+use bitdaemon_net::lsd::*;
+
+#[test]
+fn lsd_render() {
+    // verbatim format from upstream render_lsd_packet
+    let pkt = render_lsd_packet(
+        6881,
+        "0123456789abcdef0123456789abcdef01234567",
+        0x42,
+        false,
+    );
+    let s = String::from_utf8(pkt).unwrap();
+    assert_eq!(
+        s,
+        "BT-SEARCH * HTTP/1.1\r\nHost: 239.192.152.143:6771\r\nPort: 6881\r\nInfohash: 0123456789abcdef0123456789abcdef01234567\r\ncookie: 42\r\n\r\n\r\n"
+    );
+}
+
+#[test]
+fn lsd_parse() {
+    let pkt = render_lsd_packet(51413, &"ab".repeat(20), 0x99, false);
+    let from = std::net::SocketAddr::from(([192, 168, 1, 5], 6771));
+    // cookie differs → accepted
+    let a = process_packet(&pkt, from, 0x11).unwrap();
+    assert_eq!(a.port, 51413);
+    assert_eq!(a.info_hashes[0][0], 0xab);
+    // our own cookie → ignored
+    assert!(process_packet(&pkt, from, 0x99).is_none());
+    // not BT-SEARCH → ignored
+    assert!(process_packet(b"GET / HTTP/1.1\r\n\r\n", from, 0x99).is_none());
+}
