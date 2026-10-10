@@ -35,6 +35,17 @@ Until `1.0.0`, breaking changes may occur in any release.
 - `Torrent::piece_complete` — `is_piece_finished` bridge.
 
 
+### Added — session wave 3: MSE/PE crypto over the wire driver
+
+- `net::mse` — `bt_peer_connection` PE1–PE4 handshake verbatim:
+  DH-768 exchange, `synchash` scan (PadA ≤512), `hash('req2'|SKEY) ^
+  hash('req3'|S)` skey field, RC4 `[VC][provide][len_pad][pad][len_ia]`
+  cryptofield, responder-side `crypto_select` + piggybacked IA.
+- `net::bt_peer_conn` encrypted path — `run_handshake_encrypted_*`
+  (initiator/responder) + `read`/`write_message_rc4`; BT handshake
+  and messages flow through the negotiated RC4 handler, plaintext
+  `crypto_select` keeps the plain wire. All over `BoxedPeerStream`.
+
 ### Added — session wave 2: wire driver, handles, session-state, web seeds, NAT-PMP
 
 - `net::bt_peer_conn` — `bt_peer_connection` driver: `run_handshake`

@@ -82,6 +82,8 @@ pub mod ip_helpers;
 pub mod ip_voter;
 /// `lsd` — BEP-14 BT-SEARCH announce parse/render.
 pub mod lsd;
+/// MSE handshake (PE1-PE4) — `pe_crypto` on `PeerStream`.
+pub mod mse;
 /// `natpmp` — NAT-PMP/PCP datagram codec.
 pub mod natpmp;
 /// `parse_url.cpp` — URL components/split/validation.
