@@ -87,3 +87,54 @@ fn external_ip_and_fault_parsing() {
     assert_eq!(parse_external_ip(fault), Err(606));
     assert_eq!(soap_error_code(fault), 606);
 }
+
+#[test]
+fn driver_map_flow_and_retries() {
+    use bitdaemon_net::upnp::{RootDevice, UpnpDriver, UpnpOut};
+    let dev = RootDevice {
+        control_url: "/ctl/IPConn".into(),
+        service_namespace: "urn:schemas-upnp-org:service:WANIPConnection:1".into(),
+        ..Default::default()
+    };
+    let mut d = UpnpDriver::new(dev, 3600, "bitdaemon".into());
+    let out = d.set_mappings(vec![(PortmapProtocol::Tcp, 6881, 6881, "10.0.0.2".into())]);
+    assert_eq!(out.len(), 1);
+    let body = match &out[0] {
+        UpnpOut::Post { body, .. } => body.clone(),
+        _ => panic!("expected Post"),
+    };
+    assert!(body.contains("AddPortMapping"));
+
+    // 718 conflict → random port retry
+    let fault718 = "<s><s:Fault><errorCode>718</errorCode></s:Fault></s>";
+    let out = d.on_map_response(0, fault718, 12345);
+    match &out[0] {
+        UpnpOut::Post { body, .. } => {
+            assert!(body.contains("<NewExternalPort>42345</NewExternalPort>"))
+        }
+        _ => panic!("expected retry Post"),
+    }
+
+    // success → Mapped + lease renew armed
+    let ok = "<s><s:Body><u:AddPortMappingResponse/></s:Body></s>";
+    let out = d.on_map_response(0, ok, 0);
+    assert!(matches!(
+        out[0],
+        UpnpOut::Mapped {
+            external_port: 42345,
+            ..
+        }
+    ));
+    assert!(d.mappings[0].expires > 0);
+
+    // renew due → re-add
+    let out = d.renew_due(0, u64::MAX);
+    assert!(matches!(out[0], UpnpOut::Post { .. }));
+
+    // delete flow
+    let out = d.delete_mapping(0);
+    assert!(matches!(out[0], UpnpOut::Post { .. }));
+    let out = d.on_map_response(0, ok, 0);
+    assert!(out.is_empty());
+    assert!(d.mappings[0].protocol.is_none());
+}

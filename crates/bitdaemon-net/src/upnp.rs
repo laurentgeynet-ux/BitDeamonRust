@@ -208,3 +208,294 @@ pub fn soap_error_code(xml: &str) -> i32 {
     });
     error
 }
+
+/// `mapping_t` — per-device mapping state (`portmap_action`).
+#[derive(Debug, Clone)]
+pub struct UpnpMapping {
+    /// `portmap_action`.
+    pub act: MappingAction,
+    /// `portmap_protocol::none` = unmapped.
+    pub protocol: Option<PortmapProtocol>,
+    /// external (router-side) port; randomized on conflicts.
+    pub external_port: u16,
+    /// our listening port.
+    pub local_port: u16,
+    /// our local address (NewInternalClient).
+    pub local_addr: String,
+    /// `m.failcount` — retries before giving up (upstream: 5).
+    pub failcount: u32,
+    /// `m.expires` (renewal due) — epoch secs, 0 = no lease.
+    pub expires: u64,
+}
+
+/// `portmap_action`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MappingAction {
+    /// nothing pending.
+    None,
+    /// create the mapping.
+    Add,
+    /// delete the mapping.
+    Delete,
+}
+
+/// what the caller must do next (upstream performs `post()` /
+/// `on_port_mapping()` inline).
+#[derive(Debug)]
+pub enum UpnpOut {
+    /// POST `body` to `control_url` with `SOAPAction: action`.
+    Post {
+        /// mapping slot index.
+        mapping: usize,
+        /// SOAPAction value.
+        action: String,
+        /// SOAP body.
+        body: String,
+    },
+    /// mapping confirmed → `on_port_mapping` callback.
+    Mapped {
+        /// mapping slot index.
+        mapping: usize,
+        /// external IP reported by the router.
+        external_ip: Option<IpAddr>,
+        /// external port in use.
+        external_port: u16,
+        /// protocol mapped.
+        proto: PortmapProtocol,
+    },
+    /// mapping failed — `return_error` upstream.
+    MapError {
+        /// mapping slot index.
+        mapping: usize,
+        /// UPnP `errorCode`.
+        code: i32,
+    },
+}
+
+/// `upnp` per-device driver — the `update_map`/`next`/`on_upnp_map_response`
+/// state machine, minus io_service.
+#[derive(Debug)]
+pub struct UpnpDriver {
+    /// the gateway.
+    pub dev: RootDevice,
+    /// `d.mapping` — one slot per global mapping.
+    pub mappings: Vec<UpnpMapping>,
+    /// `d.use_lease_duration` — routers that reject leases.
+    pub use_lease_duration: bool,
+    /// `settings_pack::upnp_lease_duration` (0 = permanent).
+    pub lease_duration: u32,
+    /// `mapping_desc` — NewPortMappingDescription.
+    pub description: String,
+}
+
+/// `mapping_t` ctor state.
+impl UpnpDriver {
+    /// a discovered device (`control_url`/`service_namespace` filled).
+    #[must_use]
+    pub fn new(dev: RootDevice, lease_duration: u32, description: String) -> Self {
+        Self {
+            dev,
+            mappings: Vec::new(),
+            use_lease_duration: true,
+            lease_duration,
+            description,
+        }
+    }
+
+    /// `upnp::set_mappings` — sync the per-device table with the
+    /// session's mapping list; returns actions for slots needing
+    /// work (upstream calls `update_map` on each).
+    pub fn set_mappings(&mut self, maps: Vec<(PortmapProtocol, u16, u16, String)>) -> Vec<UpnpOut> {
+        self.mappings.resize(
+            maps.len(),
+            UpnpMapping {
+                act: MappingAction::None,
+                protocol: None,
+                external_port: 0,
+                local_port: 0,
+                local_addr: String::new(),
+                failcount: 0,
+                expires: 0,
+            },
+        );
+        let mut out = Vec::new();
+        for (i, (proto, ext, local, addr)) in maps.into_iter().enumerate() {
+            let m = &mut self.mappings[i];
+            m.act = MappingAction::Add;
+            m.protocol = Some(proto);
+            m.external_port = ext;
+            m.local_port = local;
+            m.local_addr = addr;
+            if !self.dev.service_namespace.is_empty() {
+                out.extend(self.update_map(i));
+            }
+        }
+        out
+    }
+
+    /// `delete_mapping` — upstream marks `act=del` then `update_map`.
+    pub fn delete_mapping(&mut self, i: usize) -> Vec<UpnpOut> {
+        if i >= self.mappings.len() {
+            return Vec::new();
+        }
+        let m = &mut self.mappings[i];
+        m.act = MappingAction::Delete;
+        self.update_map(i)
+    }
+
+    /// `update_map` — next SOAP call for slot `i`, or none when the
+    /// slot needs no work / retries exhausted (`failcount > 5`).
+    pub fn update_map(&mut self, i: usize) -> Vec<UpnpOut> {
+        let Some(m) = self.mappings.get(i).cloned() else {
+            return Vec::new();
+        };
+        match m.act {
+            MappingAction::Add if m.protocol.is_some() => {
+                if m.failcount > 5 {
+                    self.mappings[i].act = MappingAction::None;
+                    return self.next(i);
+                }
+                let lease = if self.use_lease_duration {
+                    self.lease_duration
+                } else {
+                    0
+                };
+                vec![UpnpOut::Post {
+                    mapping: i,
+                    action: soap_action(&self.dev.service_namespace, "AddPortMapping"),
+                    body: build_add_mapping(
+                        &self.dev.service_namespace,
+                        m.external_port,
+                        m.protocol.unwrap_or(PortmapProtocol::Tcp),
+                        m.local_port,
+                        &m.local_addr,
+                        &self.description,
+                        lease,
+                    ),
+                }]
+            }
+            MappingAction::Delete if m.protocol.is_some() => vec![UpnpOut::Post {
+                mapping: i,
+                action: soap_action(&self.dev.service_namespace, "DeletePortMapping"),
+                body: build_delete_mapping(
+                    &self.dev.service_namespace,
+                    m.external_port,
+                    m.protocol.unwrap_or(PortmapProtocol::Tcp),
+                ),
+            }],
+            _ => self.next(i),
+        }
+    }
+
+    /// `next` — advance to the following slot.
+    pub fn next(&mut self, i: usize) -> Vec<UpnpOut> {
+        if i + 1 < self.mappings.len() {
+            self.update_map(i + 1)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// `on_upnp_xml` finished → issue `GetExternalIPAddress`.
+    #[must_use]
+    pub fn discover(&self) -> UpnpOut {
+        UpnpOut::Post {
+            mapping: 0,
+            action: soap_action(&self.dev.service_namespace, "GetExternalIPAddress"),
+            body: build_get_ip(&self.dev.service_namespace),
+        }
+    }
+
+    /// `on_get_ip_address` — store the external IP, then start the
+    /// first mapping.
+    pub fn on_ip_response(&mut self, body: &str) -> Vec<UpnpOut> {
+        if let Ok(ip) = parse_external_ip(body) {
+            self.dev.external_ip = Some(ip);
+        }
+        let mut out = Vec::new();
+        if !self.mappings.is_empty() {
+            out.extend(self.update_map(0));
+        }
+        out
+    }
+
+    /// `on_upnp_map_response` — handle a SOAP reply for slot `i`.
+    /// `body` = HTTP response body (already validated XML).
+    /// Error codes verbatim: 725 permanent-leases-only → retry w/o
+    /// lease; 718/501/716 → external port conflict → random port;
+    /// other → `return_error`.
+    pub fn on_map_response(&mut self, i: usize, body: &str, rand_port: u16) -> Vec<UpnpOut> {
+        let code = soap_error_code(body);
+        let m = &mut self.mappings[i];
+        match code {
+            725 => {
+                self.use_lease_duration = false;
+                m.act = MappingAction::Add;
+                m.failcount += 1;
+                self.update_map(i)
+            }
+            718 | 501 | 716 if m.failcount < 4 => {
+                m.external_port = 40000 + (rand_port % 10000);
+                m.act = MappingAction::Add;
+                m.failcount += 1;
+                self.update_map(i)
+            }
+            -1 => {
+                if m.act == MappingAction::Delete {
+                    m.protocol = None;
+                    m.act = MappingAction::None;
+                    return self.next(i);
+                }
+                let out = UpnpOut::Mapped {
+                    mapping: i,
+                    external_ip: self.dev.external_ip,
+                    external_port: m.external_port,
+                    proto: m.protocol.unwrap_or(PortmapProtocol::Tcp),
+                };
+                let mut v = vec![out];
+                if self.use_lease_duration && self.lease_duration != 0 {
+                    self.mappings[i].expires = now_secs() + u64::from(self.lease_duration) / 2;
+                } else {
+                    self.mappings[i].expires = 0;
+                }
+                self.mappings[i].act = MappingAction::None;
+                v.extend(self.next(i));
+                v
+            }
+            c => {
+                if c == 727 {
+                    m.act = MappingAction::None;
+                }
+                let mut v = vec![UpnpOut::MapError {
+                    mapping: i,
+                    code: c,
+                }];
+                v.extend(self.next(i));
+                v
+            }
+        }
+    }
+
+    /// `map_timer` expiry — `use_lease_duration` mappings renew at
+    /// half the lease (upstream re-adds when `expires` passes).
+    pub fn renew_due(&mut self, i: usize, now: u64) -> Vec<UpnpOut> {
+        let m = &self.mappings[i];
+        if m.act == MappingAction::None
+            && m.protocol.is_some()
+            && m.expires != 0
+            && now >= m.expires
+        {
+            self.mappings[i].act = MappingAction::Add;
+            return self.update_map(i);
+        }
+        Vec::new()
+    }
+}
+
+/// `seconds` clock for leases.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
