@@ -105,3 +105,8 @@ impl<const N: usize> Default for BloomFilter<N> {
         Self::new()
     }
 }
+impl<const N: usize> std::fmt::Debug for BloomFilter<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BloomFilter<…>")
+    }
+}

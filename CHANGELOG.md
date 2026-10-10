@@ -342,6 +342,12 @@ Until `1.0.0`, breaking changes may occur in any release.
   voter identity, 40-entry cap with upstream's stable-sort eviction,
   25-vote provisional / 50-vote or 5-min rotation, 2/3 majority
   rule).
+- `bitdaemon_dht` — storage + crypto: `dht_storage`
+  (announce/get_peers incl. scrape blooms + write-token gate,
+  BEP-44 items with canonical_string verbatim + ed25519-dalek,
+  BEP-51 infohashes sampling, tick expiry), `msg`
+  (`verify_message` schema walker), `item`, `ed25519`,
+  `dos_blocker` (10 s window → 5 min ban).
 - `bitdaemon_dht` — first DHT modules: `node_id` (BEP-42
   generate/verify + secret ids + distance/prefix masks),
   `node_entry` (rtt EMA, fail-count, confirmed semantics),

@@ -15,6 +15,11 @@
 
 pub mod dht_settings;
 pub mod dht_state;
+pub mod dht_storage;
+pub mod dos_blocker;
+pub mod ed25519;
+pub mod item;
+pub mod msg;
 pub mod node_entry;
 pub mod node_id;
 pub mod routing_table;
