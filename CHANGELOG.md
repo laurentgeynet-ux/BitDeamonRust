@@ -9,6 +9,16 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- Boucle `Engine::run` (`session_impl::run`) : tick 1 Hz +
+  `connect_pump` + dials async. `spawn_dial` fait le handshake BT +
+  BEP-10 en tâche et rapporte via `connect_rx` (`on_connection_attempt`
+  → `peer_connected`/`peer_connect_failed`). `peer_list_state()`
+  construit le `torrent_state` depuis `Session::settings` (nouvelles
+  clés `min_reconnect_time`, `max_peerlist_size`, `max_failcount`,
+  `allow_multiple_connections_per_ip`).
+
+### Added
+
 - `Session::set_ip_filter` (`session_impl::set_ip_filter` /
   `peer_list::apply_ip_filter`) : les pairs bannis déconnectés sont
   effacés, les connexions vivantes vers des IP filtrées sont coupées

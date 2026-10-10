@@ -43,6 +43,13 @@ struct InboundPeerMsg {
     packet: PeerPacket,
 }
 
+/// result of an async dial job (`session_impl::on_connection_attempt`).
+struct DialDone {
+    ih: Sha1Hash,
+    remote: SocketAddr,
+    stream: Result<BoxedPeerStream, String>,
+}
+
 /// `Engine` — everything outside `Session` that upstream does in
 /// `session_impl`'s io-context loop.
 pub struct Engine {
@@ -71,6 +78,9 @@ pub struct Engine {
     /// inbound datagrams (DHT, UDP tracker replies).
     udp_rx: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
     udp_tx: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
+    /// outbound dial completions (`connection_attempt` jobs).
+    connect_rx: mpsc::UnboundedReceiver<DialDone>,
+    connect_tx: mpsc::UnboundedSender<DialDone>,
     /// spawned task handles (kept for abort on drop).
     tasks: Vec<JoinHandle<()>>,
     /// pipeline settings handed to every new `PeerConn`
@@ -93,6 +103,7 @@ impl Engine {
         let (announce_tx, announce_rx) = mpsc::unbounded_channel();
         let (gone_tx, gone_rx) = mpsc::unbounded_channel();
         let (udp_tx, udp_rx) = mpsc::unbounded_channel();
+        let (connect_tx, connect_rx) = mpsc::unbounded_channel();
         Self {
             session: Session::new(),
             connector,
@@ -108,6 +119,8 @@ impl Engine {
             gone_tx,
             udp_rx,
             udp_tx,
+            connect_rx,
+            connect_tx,
             tasks: Vec::new(),
             queue_time: 3,
             request_timeout: 60,
@@ -169,6 +182,9 @@ impl Engine {
         }
         while let Ok((from, buf)) = self.udp_rx.try_recv() {
             self.session.on_udp(from, &buf, &mut out);
+        }
+        while let Ok(d) = self.connect_rx.try_recv() {
+            self.on_dial_done(d);
         }
 
         self.session.tick(&mut out);
@@ -407,6 +423,137 @@ impl Engine {
         self.session.peer_connected(ih, peer, conn, remote);
         self.attach_stream(*ih, peer, remote, s);
         Ok(peer)
+    }
+
+    /// `session_impl::on_connection_attempt` — a dial job finished:
+    /// register the peer + attach io tasks, or report the failure
+    /// for the reconnect backoff.
+    fn on_dial_done(&mut self, d: DialDone) {
+        let s = match d.stream {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(remote = %d.remote, err = e, "dial failed");
+                self.session.peer_connect_failed(&d.ih, d.remote);
+                return;
+            }
+        };
+        let num_pieces = self
+            .session
+            .torrents
+            .get(&d.ih)
+            .map_or(0, |t| t.num_pieces as usize);
+        let peer = self.next_peer;
+        self.next_peer += 1;
+        let conn = PeerConn::new(
+            num_pieces,
+            PeerPipeline::new(
+                self.queue_time,
+                self.request_timeout,
+                self.max_out_request_queue,
+            ),
+            0,
+        );
+        self.session.peer_connected(&d.ih, peer, conn, d.remote);
+        self.attach_stream(d.ih, peer, d.remote, s);
+    }
+
+    /// `torrent::connect_to_peer` (async form) — spawn the dial +
+    /// handshake job; the result lands in `connect_rx` and is
+    /// applied by the next `tick`. `max_out_request_queue`+ext ids
+    /// are snapshotted now.
+    pub fn spawn_dial(&mut self, ih: Sha1Hash, remote: SocketAddr, encrypted: bool) {
+        let connector = self.connector.clone();
+        let tx = self.connect_tx.clone();
+        let pid = self.session.peer_id;
+        let ext = self.ext_handshake(&ih);
+        let h = tokio::spawn(async move {
+            let send_err = |e: String| {
+                let _ = tx.send(DialDone {
+                    ih,
+                    remote,
+                    stream: Err(e),
+                });
+            };
+            let mut s = match connector.connect(remote).await {
+                Ok(s) => s,
+                Err(e) => {
+                    send_err(e.to_string());
+                    return;
+                }
+            };
+            let hs = if encrypted {
+                bitdaemon_net::bt_peer_conn::run_handshake_encrypted_initiator(
+                    &mut s,
+                    &ih,
+                    &pid,
+                    false,
+                    false,
+                    bitdaemon_net::mse::CRYPTO_PLAINTEXT | bitdaemon_net::mse::CRYPTO_RC4,
+                    0,
+                )
+                .await
+                .map(|(hs, _)| hs)
+            } else {
+                run_handshake(&mut s, &ih, &pid, false, false).await
+            };
+            if let Err(e) = hs {
+                send_err(e.to_string());
+                return;
+            }
+            if let Err(e) = bitdaemon_net::bt_peer_conn::send_extended_handshake(&mut s, &ext).await
+            {
+                send_err(e.to_string());
+                return;
+            }
+            let _ = tx.send(DialDone {
+                ih,
+                remote,
+                stream: Ok(s),
+            });
+        });
+        self.tasks.push(h);
+    }
+
+    /// `PeerListState` snapshot for `connect_pump` from session
+    /// settings (`session_impl::update_peer_connections` upstream
+    /// builds the same from `settings_pack`).
+    #[must_use]
+    pub fn peer_list_state(&self) -> bitdaemon_net::peer_list::PeerListState {
+        let s = &self.session.settings;
+        bitdaemon_net::peer_list::PeerListState {
+            is_finished: false,
+            external_ip: None,
+            external_port: self.session.listen_port,
+            min_reconnect_time: s.min_reconnect_time,
+            max_peerlist_size: s.max_peerlist_size,
+            max_failcount: s.max_failcount,
+            allow_multiple_connections_per_ip: s.allow_multiple_connections_per_ip,
+        }
+    }
+
+    /// `session_impl::run` — the canonical driver: 1 Hz tick
+    /// (announces, peer drive, disk completions, DHT, LSD) plus the
+    /// connect pump dialing up to `settings.connections_limit`
+    /// candidates. Runs until `stop` resolves.
+    pub async fn run<F: std::future::Future<Output = ()>>(
+        &mut self,
+        stop: F,
+        max_dials_per_tick: usize,
+    ) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        tokio::pin!(stop);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = &mut stop => break,
+            }
+            self.tick(Instant::now()).await;
+            let st = self.peer_list_state();
+            let candidates = self.connect_pump(self.session.session_time, &st, max_dials_per_tick);
+            for (ih, ep) in candidates {
+                self.spawn_dial(ih, ep, false);
+            }
+        }
     }
 
     /// our BEP-10 offer — `ut_metadata`/`ut_pex` ids (matching

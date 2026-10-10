@@ -288,3 +288,51 @@ async fn dht_ping_round_trip() {
     }
     panic!("no dht response routed");
 }
+
+#[tokio::test]
+async fn spawn_dial_connects_peer() {
+    let ih = Sha1Hash::from_bytes(&[42; 20]).unwrap();
+    let (mine, theirs) = tokio::io::duplex(64 * 1024);
+    let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(Some(mine))));
+    let mut eng = Engine::new(conn, None);
+    eng.session.add_torrent(Torrent::new(
+        ih,
+        1,
+        16384,
+        Bitfield::with_size(1),
+        StorageIndex(0),
+    ));
+    let ep = ep();
+    eng.spawn_dial(ih, ep, false);
+
+    // scripted remote: answer our handshake + drain the ext handshake
+    let remote = tokio::spawn(async move {
+        let mut boxed: BoxedPeerStream = Box::new(theirs);
+        let pid = bitdaemon_common::PeerId::default();
+        let _ = bitdaemon_net::bt_peer_conn::run_handshake_responder(
+            &mut boxed,
+            &pid,
+            false,
+            false,
+            |_| true,
+        )
+        .await;
+        let mut tmp = [0u8; 512];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            tokio::io::AsyncReadExt::read(&mut boxed, &mut tmp),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        boxed
+    });
+    for _ in 0..100 {
+        eng.tick(std::time::Instant::now()).await;
+        if !eng.session.torrents[&ih].peers.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(eng.session.torrents[&ih].peers.len(), 1);
+    remote.abort();
+}

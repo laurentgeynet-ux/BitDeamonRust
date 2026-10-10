@@ -105,6 +105,8 @@ pub struct Session {
     pub session_time: i32,
     /// `m_ip_filter` — access filter applied to new + existing peers.
     ip_filter: bitdaemon_net::ip_filter::IpFilter,
+    /// `settings_pack` — typed session knobs (`m_settings` upstream).
+    pub settings: crate::settings::SessionSettings,
 }
 
 /// A disk job's result, delivered back onto the session thread.
@@ -175,6 +177,7 @@ impl Default for Session {
             last_lsd: None,
             session_time: 0,
             ip_filter: bitdaemon_net::ip_filter::IpFilter::new(),
+            settings: crate::settings::SessionSettings::default(),
             disk_tx,
             disk_rx,
         }
