@@ -79,6 +79,8 @@ pub mod http_parser;
 pub mod http_stream;
 /// `http_tracker_connection` — announce query + response parsing.
 pub mod http_tracker;
+/// `i2p_stream` — SAM handshake (HELLO/SESSION/STREAM/NAMING).
+pub mod i2p;
 /// `ip_helpers.cpp` + `hash_address` — address classification.
 pub mod ip_helpers;
 /// `ip_voter.cpp` — external-IP majority voting.
