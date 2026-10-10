@@ -77,11 +77,19 @@ impl RateLimiter {
             return;
         }
         let grant = limit * dt_ms / 1000;
-        let _ = self.tokens.fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |t| Some((t + grant).min(limit)),
-        );
+        let mut cur = self.tokens.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            let next = (cur + grant).min(limit);
+            match self.tokens.compare_exchange_weak(
+                cur,
+                next,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(t) => cur = t,
+            }
+        }
         self.notify.notify_waiters();
     }
 
@@ -91,16 +99,21 @@ impl RateLimiter {
             return;
         }
         loop {
-            if self
-                .tokens
-                .fetch_update(
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                    |t| (t >= n).then_some(t - n),
-                )
-                .is_ok()
-            {
-                return;
+            let cur = self.tokens.load(std::sync::atomic::Ordering::Relaxed);
+            if cur >= n {
+                if self
+                    .tokens
+                    .compare_exchange_weak(
+                        cur,
+                        cur - n,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+                continue;
             }
             self.notify.notified().await;
         }
