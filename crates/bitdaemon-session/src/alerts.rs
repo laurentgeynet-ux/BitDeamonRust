@@ -118,6 +118,12 @@ pub enum Alert {
     Performance { warning: String },
     /// `save_resume_data_alert` — blob ready to persist.
     SaveResumeData { ih: Sha1Hash, data: Vec<u8> },
+    /// `state_update_alert` — `post_torrent_updates` payload:
+    /// a `torrent_status` snapshot per torrent.
+    StateUpdate {
+        /// statuses.
+        statuses: Vec<crate::status::TorrentStatus>,
+    },
     /// `session_error_alert`.
     SessionError(String),
 }
@@ -127,9 +133,10 @@ impl Alert {
     #[must_use]
     pub fn category(&self) -> AlertCategory {
         match self {
-            Self::TorrentAdded(_) | Self::TorrentRemoved(_) | Self::StateChanged { .. } => {
-                AlertCategory::STATUS
-            }
+            Self::TorrentAdded(_)
+            | Self::TorrentRemoved(_)
+            | Self::StateChanged { .. }
+            | Self::StateUpdate { .. } => AlertCategory::STATUS,
             Self::TorrentFinished(_) | Self::PieceFinished { .. } | Self::BlockFinished { .. } => {
                 AlertCategory::PROGRESS
             }

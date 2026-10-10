@@ -134,6 +134,25 @@ pub struct Torrent {
     pub queued: bool,
     /// last `ut_pex` broadcast (`m_last_pex` timing state).
     pub last_pex: Option<Instant>,
+    /// `m_added_time`.
+    pub added_time: std::time::SystemTime,
+    /// `m_save_path`.
+    pub save_path: String,
+    /// display name (`ti->name()` or `atp.name`).
+    pub name: String,
+    /// a `check_files` job is in flight (`m_checking_piece` coarse).
+    pub checking: bool,
+    /// payload rate samples for `torrent_status`
+    /// (`stat().download_payload_rate()` — sampled per tick).
+    pub down_rate: i64,
+    /// upload payload B/s.
+    pub up_rate: i64,
+    /// previous sample totals.
+    pub stat_prev_down: i64,
+    /// previous sample totals (upload).
+    pub stat_prev_up: i64,
+    /// last sample instant.
+    pub stat_sample: Option<std::time::Instant>,
 }
 
 impl Torrent {
@@ -179,6 +198,15 @@ impl Torrent {
             auto_managed: true,
             last_pex: None,
             queued: false,
+            added_time: std::time::SystemTime::now(),
+            save_path: String::new(),
+            name: String::new(),
+            checking: false,
+            down_rate: 0,
+            up_rate: 0,
+            stat_prev_down: 0,
+            stat_prev_up: 0,
+            stat_sample: None,
         }
     }
 
@@ -249,6 +277,12 @@ impl Torrent {
         t.paused = atp
             .flags
             .contains(bitdaemon_common::flags::TorrentFlags::PAUSED);
+        t.save_path = String::from_utf8_lossy(&atp.save_path).into_owned();
+        if !atp.name.is_empty() {
+            t.name = String::from_utf8_lossy(&atp.name).into_owned();
+        } else if let Some(ti) = &atp.ti {
+            t.name = String::from_utf8_lossy(ti.name()).into_owned();
+        }
         Some(t)
     }
 
@@ -275,6 +309,9 @@ impl Torrent {
         };
         self.num_pieces = info.num_pieces();
         self.piece_length = i64::from(info.piece_length());
+        if self.name.is_empty() {
+            self.name = String::from_utf8_lossy(info.name()).into_owned();
+        }
         self.have = Bitfield::with_size(info.num_pieces() as usize);
         self.piece_hashes = Some(
             (0..info.num_pieces())
@@ -702,6 +739,7 @@ impl Torrent {
     /// the resume-supplied bits are cleared; the caller reschedules
     /// per-piece `DiskHash` jobs for the real check.
     pub fn on_files_checked(&mut self, accepted: bool, out: &mut Vec<TorrentEffect>) {
+        self.checking = false;
         if !accepted {
             // the picker's have-tracking only knows pieces that
             // passed `piece_verified` — resume bits live solely in
@@ -1275,6 +1313,118 @@ impl Torrent {
             }
         }
         self.piece_verified(piece, passed, out);
+    }
+
+    /// `torrent_status()` — the snapshot upstream's `status()`
+    /// builds: state enum, counters, scrape bests, rates.
+    #[must_use]
+    pub fn status(&self) -> crate::status::TorrentStatus {
+        use crate::status::{TorrentState, TorrentStatus};
+        let state = if self.checking {
+            TorrentState::CheckingFiles
+        } else if self.magnet && self.picker.is_none() {
+            TorrentState::DownloadingMetadata
+        } else if self.finished {
+            if self.seeding {
+                TorrentState::Seeding
+            } else {
+                TorrentState::Finished
+            }
+        } else {
+            TorrentState::Downloading
+        };
+        let total_size = self.files.as_ref().map_or_else(
+            || i64::from(self.num_pieces) * self.piece_length,
+            |f| f.total_size(),
+        );
+        let wanted_pieces = self.picker.as_ref().map_or_else(
+            || self.num_pieces,
+            |p| {
+                (0..self.num_pieces)
+                    .filter(|&i| {
+                        p.piece_priority(PieceIndex(i))
+                            > bitdaemon_common::types::DownloadPriority::DONT_DOWNLOAD
+                    })
+                    .count() as i32
+            },
+        );
+        let (num_complete, num_incomplete, downloaded, last_scrape) = self
+            .trackers
+            .trackers
+            .iter()
+            .filter(|e| e.scrape_complete >= 0)
+            .max_by_key(|e| e.scrape_complete)
+            .map_or((-1, -1, -1, 0), |e| {
+                (
+                    e.scrape_complete,
+                    e.scrape_incomplete,
+                    e.scrape_downloaded,
+                    e.scrape_time.map_or(0, |t| t.elapsed().as_secs() as i64),
+                )
+            });
+        let total_download: i64 = self.peers.values().map(|c| c.stat_down_total).sum();
+        let total_upload: i64 = self.peers.values().map(|c| c.stat_up_total).sum();
+        let progress = if total_size > 0 {
+            (self.verified_bytes as f64 / total_size as f64).min(1.0)
+        } else {
+            0.0
+        };
+        TorrentStatus {
+            info_hash: self.info_hash,
+            state,
+            paused: self.paused,
+            auto_managed: self.auto_managed,
+            is_seed: self.is_seed(),
+            finished: self.finished,
+            name: self.name.clone(),
+            save_path: self.save_path.clone(),
+            error: String::new(),
+            num_peers: self.peers.len(),
+            num_seeds: self.num_seeds,
+            num_candidates: self.peer_list.num_peers(),
+            num_complete,
+            num_incomplete,
+            downloaded,
+            total_done: self.verified_bytes,
+            total_wanted: total_size.min(i64::from(wanted_pieces) * self.piece_length),
+            total_upload,
+            total_download,
+            download_rate: self.down_rate,
+            upload_rate: self.up_rate,
+            progress,
+            progress_ppm: (progress * 1e6) as i32,
+            pieces: self.have.clone(),
+            num_pieces: self.num_pieces,
+            piece_length: self.piece_length,
+            block_size: 0x4000,
+            distributed_copies: self.picker.as_ref().map_or(0.0, |p| {
+                let (min, frac) = p.distributed_copies();
+                f64::from(min) + f64::from(frac) / 1000.0
+            }),
+            added_time: self
+                .added_time
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64),
+            last_scrape,
+        }
+    }
+
+    /// `stat::second_tick` — refresh `down_rate`/`up_rate` from the
+    /// per-peer payload counters (upstream uses `stat` channel
+    /// sliding-window rates; a 1-tick delta is the same signal).
+    pub fn update_rates(&mut self, now: std::time::Instant) {
+        let down: i64 = self.peers.values().map(|c| c.stat_down_total).sum();
+        let up: i64 = self.peers.values().map(|c| c.stat_up_total).sum();
+        if let Some(prev_t) = self.stat_sample {
+            let dt = (now - prev_t).as_secs_f64();
+            if dt > 0.0 {
+                self.down_rate = ((down - self.stat_prev_down) as f64 / dt) as i64;
+                self.up_rate = ((up - self.stat_prev_up) as f64 / dt) as i64;
+            }
+        }
+        self.stat_prev_down = down;
+        self.stat_prev_up = up;
+        self.stat_sample = Some(now);
     }
 
     /// `want_more_peers` — downstream connect decisions.

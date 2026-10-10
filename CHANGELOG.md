@@ -9,6 +9,17 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **`torrent_status` enrichi + `state_update_alert`** — nouveau
+  module `session::status` : `TorrentState` (checking/metadata/
+  downloading/finished/seeding), compteurs (total_done/wanted/
+  upload/download, rates échantillonnés au tick), meilleurs scrape
+  (`num_complete`/`incomplete`/`downloaded`/`last_scrape`), bitfield
+  `pieces`, `distributed_copies`, `added_time`, `name`/`save_path`
+  (peuplés depuis `AddTorrentParams`/`set_metadata`).
+  `Session::post_torrent_updates` poste `Alert::StateUpdate`;
+  `SessionHandle::status`/`torrent_statuses`/`post_torrent_updates`
+  exposés. `Torrent::checking` marque `check_files` en vol.
+
 - **Tracker scrape bout-en-bout** — `Session::scrape_tracker` émet
   `SessionOut::TrackerScrape`, l'engine `spawn_scrape` fait l'échange
   (HTTP `scrape_url` + `scrape_http`, UDP BEP-15 action 2 via

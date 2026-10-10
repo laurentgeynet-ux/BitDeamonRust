@@ -124,6 +124,9 @@ pub struct AnnounceEntry {
     pub scrape_incomplete: i64,
     /// completed downloads from the last scrape.
     pub scrape_downloaded: i64,
+    /// `last_scrape` timestamp (upstream `torrent_status::last_scrape`
+    /// = now - this).
+    pub scrape_time: Option<Instant>,
 }
 
 impl AnnounceEntry {
@@ -143,6 +146,7 @@ impl AnnounceEntry {
             scrape_complete: -1,
             scrape_incomplete: -1,
             scrape_downloaded: -1,
+            scrape_time: None,
         }
     }
 

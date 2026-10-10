@@ -77,7 +77,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `add_torrent_params.cpp` (`add_torrent_params.hpp`) | `core::add_torrent_params` | **ported** | single canonical struct used by torrent/magnet/resume |
 | `path.cpp` (string helpers), `aux_/path.hpp` | `core::path` | **ported** (string half) | `directory.cpp`/`drive_info.cpp` (fs-dependent) → Phase 3 |
 | `entry`-adjacent `client_data.hpp`, `fwd.hpp`, `version.cpp` | misc | not started | |
-| `session_types.hpp`, `session_status.hpp`, `storage_defs.hpp`, `torrent_status.cpp`, `download_priority.hpp` | `core::types` | partial | `DownloadPriority` in common; status types later |
+| `session_types.hpp`, `session_status.hpp`, `storage_defs.hpp`, `torrent_status.cpp`, `download_priority.hpp` | `core::types` + `session::status` | **ported** (subset) | `DownloadPriority` in common; `TorrentStatus`/`TorrentState` snapshot (state, counters, scrape bests, rates, pieces, distributed_copies) + `post_torrent_updates`/`state_update_alert` |
 | `escape_string.cpp`, `utf8.cpp`, `parse_url.cpp` (subset) | `core::escape_string`, `core::utf8` | **ported** (subset) | `socket_io`/`string_util`/`ip_helpers` land with net |
 
 ## bitdaemon-disk

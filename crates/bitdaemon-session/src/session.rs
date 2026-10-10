@@ -451,16 +451,17 @@ impl Session {
     /// `async_check_files` on the injected `DiskIo`; the verdict
     /// arrives as `DiskCompleted::CheckFiles`.
     pub fn check_files(
-        &self,
+        &mut self,
         ih: Sha1Hash,
         resume_data: Option<Box<bitdaemon_core::add_torrent_params::AddTorrentParams>>,
     ) {
         let Some(disk) = self.disk.clone() else {
             return;
         };
-        let Some(t) = self.torrents.get(&ih) else {
+        let Some(t) = self.torrents.get_mut(&ih) else {
             return;
         };
+        t.checking = true;
         let storage = t.storage;
         let tx = self.disk_tx.clone();
         disk.async_check_files(
@@ -797,7 +798,11 @@ impl Session {
         while let Some((pkt, to)) = self.dht.poll() {
             out.push(SessionOut::UdpPacket(pkt, to));
         }
-        self.lsd_tick(Instant::now(), out);
+        let now = Instant::now();
+        for t in self.torrents.values_mut() {
+            t.update_rates(now);
+        }
+        self.lsd_tick(now, out);
         let ihs: Vec<Sha1Hash> = self
             .torrents
             .iter()
@@ -1114,6 +1119,7 @@ impl Session {
                     t.trackers.trackers[i].scrape_downloaded = r.downloaded;
                     t.trackers.trackers[i].scrape_incomplete = r.incomplete;
                     t.trackers.trackers[i].scrape_complete = r.complete;
+                    t.trackers.trackers[i].scrape_time = Some(Instant::now());
                 }
                 self.alerts.post(Alert::ScrapeReply {
                     ih: *ih,
@@ -1229,6 +1235,14 @@ impl Session {
                 });
             }
         }
+    }
+
+    /// `post_torrent_updates` — upstream posts a
+    /// `state_update_alert` with one `torrent_status` per torrent
+    /// (the `post_torrent_updates` call sites all want the full set).
+    pub fn post_torrent_updates(&mut self) {
+        let statuses = self.torrents.values().map(Torrent::status).collect();
+        self.alerts.post(Alert::StateUpdate { statuses });
     }
 
     /// `get_all` — drain posted alerts.

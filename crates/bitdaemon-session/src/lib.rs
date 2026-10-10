@@ -55,6 +55,7 @@ pub mod session_state;
 pub mod settings;
 /// `extensions/smart_ban` — corrupt-block peer banning.
 pub mod smart_ban;
+pub mod status;
 /// `torrent` — per-torrent state machine.
 pub mod torrent;
 /// `announce_entry`/`tracker_list` — retry & failover.

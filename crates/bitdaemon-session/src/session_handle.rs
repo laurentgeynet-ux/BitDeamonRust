@@ -18,26 +18,8 @@ use crate::session::{PeerPacket, Session, SessionOut};
 use crate::settings::SessionParams;
 use crate::torrent::Torrent;
 
-/// `torrent_status` — a snapshot of one swarm.
-#[derive(Clone, Debug)]
-pub struct TorrentStatus {
-    /// `handle`.
-    pub info_hash: Sha1Hash,
-    /// `state` — paused / downloading / seeding.
-    pub paused: bool,
-    /// `is_seed`.
-    pub is_seed: bool,
-    /// `is_finished`.
-    pub finished: bool,
-    /// `num_peers`.
-    pub num_peers: usize,
-    /// `num_pieces` verified.
-    pub num_have: usize,
-    /// `num_pieces` total.
-    pub num_pieces: i32,
-    /// `progress` 0..1.
-    pub progress: f64,
-}
+/// `torrent_status` — re-export of the ported status snapshot.
+pub use crate::status::TorrentStatus;
 
 fn lock(s: &Mutex<Session>) -> MutexGuard<'_, Session> {
     s.lock().unwrap_or_else(|e| e.into_inner())
@@ -130,21 +112,13 @@ impl SessionHandle {
         lock(&self.inner)
             .torrents
             .values()
-            .map(|t| TorrentStatus {
-                info_hash: t.info_hash,
-                paused: t.paused,
-                is_seed: t.is_seed(),
-                finished: t.finished,
-                num_peers: t.peers.len(),
-                num_have: t.have.count(),
-                num_pieces: t.num_pieces,
-                progress: if t.num_pieces > 0 {
-                    t.have.count() as f64 / f64::from(t.num_pieces)
-                } else {
-                    0.0
-                },
-            })
+            .map(Torrent::status)
             .collect()
+    }
+
+    /// `post_torrent_updates` — posts `state_update_alert`.
+    pub fn post_torrent_updates(&self) {
+        lock(&self.inner).post_torrent_updates();
     }
 
     /// `pop_alerts` / `wait_for_alert` — drain the alert queue.
@@ -206,20 +180,7 @@ impl TorrentHandle {
     #[must_use]
     pub fn status(&self) -> Option<TorrentStatus> {
         let g = lock(&self.session);
-        g.torrents.get(&self.info_hash).map(|t| TorrentStatus {
-            info_hash: t.info_hash,
-            paused: t.paused,
-            is_seed: t.is_seed(),
-            finished: t.finished,
-            num_peers: t.peers.len(),
-            num_have: t.have.count(),
-            num_pieces: t.num_pieces,
-            progress: if t.num_pieces > 0 {
-                t.have.count() as f64 / f64::from(t.num_pieces)
-            } else {
-                0.0
-            },
-        })
+        g.torrents.get(&self.info_hash).map(Torrent::status)
     }
 
     /// `have_piece`.
