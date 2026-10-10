@@ -910,6 +910,11 @@ impl Session {
                     conn.superseed_piece = Some(p);
                     PeerMessage::Have(p)
                 })
+            } else if conn.supports_fast && t.is_seed() {
+                // BEP-6: `have_all` replaces a full bitfield.
+                Some(PeerMessage::HaveAll)
+            } else if conn.supports_fast && t.have.count() == 0 {
+                Some(PeerMessage::HaveNone)
             } else {
                 let bits: Vec<u8> = t.have.bytes().into();
                 (!bits.is_empty() && t.have.count() > 0)
