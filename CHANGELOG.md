@@ -342,6 +342,13 @@ Until `1.0.0`, breaking changes may occur in any release.
   voter identity, 40-entry cap with upstream's stable-sort eviction,
   25-vote provisional / 50-vote or 5-min rotation, 2/3 majority
   rule).
+- `bitdaemon_session::ut_metadata` (BEP-9) — message codec +
+  `UtMetadataTracker` (download buffer, least-requested piece
+  selection, 3 s throttle, `max_metadata_size` validation,
+  hash-failure source penalties).
+- `bitdaemon_session::ut_pex` (BEP-11) — pex message build/parse:
+  `added`/`added.f`/`dropped` ×4 (v4/v6), flag constants,
+  `pex_lt_v2` stripping, `max_peer_entries`/`max_pex_peers` caps.
 - `bitdaemon_session::smart_ban` — `smart_ban` core ported: per-block
   CRC map keyed by `PieceBlock` (shared `common::types`), ban on
   differing digest from the same peer across failures and on stored

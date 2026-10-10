@@ -48,3 +48,5 @@ pub struct Session;
 /// TODO: implement — cheap `Clone`able handle sending commands into the
 /// session actor; mirrors the ~90 methods of `torrent_handle`.
 pub struct TorrentHandle;
+pub mod ut_metadata;
+pub mod ut_pex;
