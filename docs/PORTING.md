@@ -91,14 +91,14 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 
 | C++ source | Rust target | Status | Notes |
 |---|---|---|---|
-| `disk_interface.hpp`, `disk_job.cpp`, `disk_job_fence.cpp`, `disk_job_pool.cpp` | `disk::job` | not started | job model → async traits |
-| `disk_io_thread_pool.cpp`, `back_pressure.cpp` | `disk::pool` | not started | `spawn_blocking` pool |
+| `disk_job.hpp`, `disk_job_fence.cpp`, `disk_job_pool.cpp` | `disk::disk_job`, `disk::disk_job_fence`, `disk::disk_pool` | **ported** | boxed jobs (13 kinds), fence semantics verbatim (repost-under-lock, re-arm on stacked fences); pool slab → `Box` + counters |
+| `disk_io_thread_pool.cpp`, `back_pressure.cpp`, `disk_completed_queue.hpp` | `disk::disk_pool`, `disk::back_pressure`, `disk::disk_completed` | **ported** | on-demand spawn, condvar wait, `try_thread_exit` shrink, injected idle-reaper; watermarks `max*7/8`/`max*3/4` verbatim; completion queue posts single in-flight drain |
 | `storage_constructor` / `default_storage_constructor` (in `disk_interface.hpp`/`storage.hpp`) | `disk::StorageFactory` | not started | **injectable storage** (ADR-0008) — OnionBit `PrivateStorageFactory` parity |
-| `disk_buffer_pool.cpp`, `disk_buffer_holder.cpp`, `store_buffer.hpp`, `receive_buffer.cpp`, `chained_buffer.cpp`, `packet_pool.hpp` | `disk::buffer` | not started | `Bytes` slab + **bounded** memory caps (`max_queued_disk_bytes`, `send_buffer_watermark`) |
+| `disk_buffer_pool.cpp`, `disk_buffer_holder.cpp` | `disk::disk_buffer_pool` | **ported** | `Box<[u8]>` + RAII holder → allocator on drop; `in_use` + per-category histogram; `bulk_free_buffer` batch free |
 | `disabled_disk_io.cpp` | `disk::disabled` | not started | test backend |
 | `mmap.cpp`, `mmap_disk_io.cpp`, `mmap_storage.cpp`, `mmap_disk_job.hpp`, `file_view_pool.cpp` | `disk::mmap` | not started | `memmap2`, optional feature |
 | `posix_storage.cpp`, `posix_part_file.cpp` | `disk::storage` (shared) | merged | part file + storage identical to pread variant |
-| `pread_storage.cpp` (`pread_storage.hpp`), `aux_/readwrite.hpp` | `disk::storage`, `disk::readwrite` | **ported** (core I/O) | read/write/hash via `readwrite` walk; part-file redirection; `pread_disk_io` job layer pending |
+| `pread_disk_io.cpp` | `disk::disk_io` | **ported** (core) | `add_job`/`add_fence_job`/worker loop/`perform_job`/`add_completed_jobs`; `immediate_execute` 0-thread fallback; `abort_jobs`; storage registry + per-torrent fence |
 | `storage_utils.cpp` | `disk::storage_utils` | **ported** | `initialize_storage`, `move_storage`, `delete_files`, `rename_file`, `verify_resume_data`, `has_any_file` |
 | `part_file.cpp` (`part_file.hpp`) | `disk::part_file` | **ported** | header format + slot reuse + export frees full pieces |
 | `file.cpp`/`file.hpp`, `open_mode.hpp`, `file_pool_impl.cpp`/`file_pool.hpp` | `disk::file`, `disk::open_mode`, `disk::file_pool` | **ported** | `pread_all`/`pwrite_all`/`pwritev_all`; pool: LRU evict, open-waiter sharing, r/w upgrade race counter, ENOENT-mkdir retry, deferred close |

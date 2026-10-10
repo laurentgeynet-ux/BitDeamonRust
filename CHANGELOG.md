@@ -9,6 +9,29 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `bitdaemon_disk` Phase-3 wave 2+3 (job machinery + orchestrator):
+  `disk_job` (all 13 upstream `job_action_t` kinds, `fence`/
+  `in_progress`/`aborted` flag bits, per-job completion handlers),
+  `disk_job_fence` — verbatim `raise_fence`/`is_blocked`/`job_complete`
+  incl. repost-under-lock ordering, stacked-fence re-arming and the
+  TOCTOU-safe `blocked_disk_jobs` counter, `disk_pool`
+  (`disk_io_thread_pool`: demand-spawned workers, condvar wait,
+  `should_exit`/`try_thread_exit` shrink, injected idle-reap hook —
+  60 s deadline_timer deferred to session tick; `disk_job_pool`
+  counters), `disk_buffer_pool` + `DiskBufferHolder` RAII +
+  `BulkFreeBuffer` + per-category histogram, `back_pressure`
+  (`set_max_size` watermark math `max*7/8`/`max*3/4` verbatim,
+  observer coalescing, injected poster), `disk_completed_queue`
+  (single in-flight drain post, `call_job_handlers` on network
+  thread), `disk_io::PreadDiskIo` — `pread_disk_io` orchestrator:
+  `new_torrent`/`remove_torrent`, `add_job`/`add_fence_job`,
+  `perform_job` dispatch (read/partial_read/write/hash+block-hashes/
+  hash2/move/delete/rename/priority/check_fastresume), `immediate_execute`
+  0-thread fallback, `abort_jobs`. Fixed a non-reentrant-mutex
+  deadlock in `wait_for_job` caught by the threaded test.
+  Conformance: fence order/re-arm 3/3, back-pressure watermarks,
+  end-to-end write→read→hash through the pool (immediate + 4 threads).
+
 - Workspace scaffolding: 9 crates (`common`, `bencode`, `core`, `disk`,
   `net`, `dht`, `session`, facade `bitdaemon`, `bitdaemon-cli`).
 - Project governance docs: `AGENTS.md`, `ROADMAP.md`, `CONTRIBUTING.md`,

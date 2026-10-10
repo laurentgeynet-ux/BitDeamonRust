@@ -111,12 +111,19 @@ sharing + read→write upgrade race counter + ENOENT→mkdir retry** —
 the 349 s→ms fix, ADR-0009) ✅, `PartFile` ✅, `readwrite` piece→file
 walk ✅, `pread_storage` (read/write/hash/initialize/set_file_priority/
 move/delete/rename/verify_resume_data) ✅, `storage_utils` ✅.
-*(still to do)*: `DiskIo` job queue + per-torrent `disk_job_fence`,
-`disk_io_thread_pool` → blocking pool, **bounded** `disk_buffer_pool`,
-`back_pressure`, `FileProgress`, `HashPicker` (v2 piece layers),
+`disk_job` types + flags ✅, `disk_job_fence` (verbatim repost order,
+re-arming stacked fences) ✅, `disk_io_thread_pool` (on-demand spawn,
+condvar wait, `try_thread_exit`) ✅, `disk_buffer_pool` + RAII
+`DiskBufferHolder` + `BulkFreeBuffer` ✅, `back_pressure` (watermark
+formulas verbatim) ✅, `disk_completed_queue` (single in-flight drain
+post) ✅, `pread_disk_io` orchestrator (`perform_job` dispatch,
+`immediate_execute` 0-thread fallback, abort) ✅.
+*(still to do)*: `HashPicker` (v2 piece layers),
 `precomputed_block_hashes`, `file_view_pool`/`mmap` (memmap2 feature),
-`disk_completed_queue`, `disabled` backend, **`StorageFactory` trait**
-(ADR-0008 — downstream `PrivateStorageFactory`/OBD parity).
+`disabled` backend, `FileProgress`, **`StorageFactory` trait**
+(ADR-0008 — downstream `PrivateStorageFactory`/OBD parity), async
+`DiskIo` trait surface for the session, `store_buffer` watermarks
+(`max_queued_disk_bytes`/`send_buffer_watermark`).
 
 **Fastresume** (`core::resume` lands Phase 2, applied here):
 byte-compatible with upstream `read_resume_data`/`write_resume_data`

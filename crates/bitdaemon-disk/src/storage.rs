@@ -416,6 +416,12 @@ impl PreadStorage {
         )
     }
 
+    /// current per-file priorities (upstream `m_file_priority`).
+    #[must_use]
+    pub fn file_priorities(&self) -> &[DownloadPriority] {
+        &self.file_priority
+    }
+
     /// `has_any_file` — true if any non-pad file exists on disk.
     pub fn has_any_file(&self) -> StorageResult<bool> {
         let fs = &self.files;

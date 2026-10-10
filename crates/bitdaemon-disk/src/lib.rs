@@ -44,6 +44,20 @@ pub mod file_pool;
 /// `storage_error.hpp` — operation-scoped disk errors.
 pub mod storage_error;
 
+/// `aux_/back_pressure.hpp` — write-queue watermarks + observers.
+pub mod back_pressure;
+/// `aux_/disk_buffer_pool.hpp` + `disk_buffer_holder.hpp`.
+pub mod disk_buffer_pool;
+/// `aux_/disk_completed_queue.hpp` — network-thread completion drain.
+pub mod disk_completed;
+/// `pread_disk_io.cpp` — positioned-I/O orchestrator.
+pub mod disk_io;
+/// `aux_/disk_job.hpp` — job types, flags, completion.
+pub mod disk_job;
+/// `aux_/disk_job_fence.hpp` — per-torrent exclusive ordering.
+pub mod disk_job_fence;
+/// `aux_/disk_io_thread_pool.hpp` + `disk_job_pool` counters.
+pub mod disk_pool;
 /// `aux_/readwrite.hpp` — piece→file buffer walk.
 pub mod readwrite;
 /// `aux_/pread_storage.hpp` — positioned-I/O storage backend.

@@ -92,5 +92,16 @@ impl std::error::Error for StorageError {
     }
 }
 
+/// `storage_error` default — no error recorded yet.
+impl Default for StorageError {
+    fn default() -> Self {
+        Self {
+            io: io::Error::from(io::ErrorKind::Other),
+            file: FileIndex(-1),
+            operation: Operation::Unknown,
+        }
+    }
+}
+
 /// Convenience alias.
 pub type StorageResult<T> = Result<T, StorageError>;
