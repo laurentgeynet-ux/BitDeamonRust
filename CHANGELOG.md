@@ -320,6 +320,15 @@ Until `1.0.0`, breaking changes may occur in any release.
   `1..65535`, v1/v2-truncated infohashes — multicast loop/tick loop
   still pending `net::udp` interface enumeration). Tests: LSD
   render/parse vectors incl. self-announce rejection.
+- `bitdaemon_net` uTP stream: `utp_socket::UtpSocket` — full port of
+  `utp_socket_impl` (SYN handshake incl. the recv-id quirk, DATA/STATE/
+  FIN/RESET, cumulative+SACK acks, reorder buffer via `PacketBuffer`,
+  LEDBAT `do_ledbat` with fixed-point cwnd/ssthres/slow-start, MTU
+  floor/ceiling probing, dup-ack fast resend, nagle hold-off,
+  `packet_timeout` backoff, `tick` loss marking). Sends drain through
+  a queued `outbox` delivered by the injected `DatagramSocket`
+  (ADR-0008); upstream callbacks become pollable state. Tests:
+  two-socket handshake/data/FIN + out-of-order reorder, e2e green.
 - Tests: 67 conformance cases ported from `test_bdecode.cpp`, 16 from
   `test_bitfield.cpp`, 8 from `test_sliding_average.cpp`, 5 from
   `test_bloom_filter.cpp`, `test_crc32.cpp` vectors (RFC 3720 B.4),

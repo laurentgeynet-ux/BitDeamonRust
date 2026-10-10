@@ -80,3 +80,5 @@ pub mod socks;
 pub mod udp_tracker;
 /// uTP wire layer: `utp_header`, extension walk, conn-id demux.
 pub mod utp;
+/// `utp_socket_impl` — the uTP reliable-stream state machine.
+pub mod utp_socket;
