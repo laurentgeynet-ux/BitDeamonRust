@@ -7,6 +7,18 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — session wave 4: piece-hash verify, peer classes, counters
+
+- `Torrent::piece_hashes` + `expected_hash` — Hash job completion
+  compares SHA-1 like `torrent::piece_finished` (mismatch → fail).
+- `net::peer_class` — `PeerClass` bandwidth channels/priorities/
+  limits, `PeerClassPool` slot-stable registry, `PeerClassSet`
+  8-slot dedup (`peer_class.cpp` port).
+- `session::counters` — `Counters` atomic bank (`stats_counter_t`
+  subset) + `SessionStats::snapshot`; wired into `Session` for
+  incoming message classes and connected-peer gauge.
+
+
 ### Added — session wave 3: disk-job bridge
 
 - `session::Session::dispatch_disk` — `TorrentEffect::DiskRead`/

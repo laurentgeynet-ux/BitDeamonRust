@@ -41,6 +41,8 @@ pub mod request_blocks;
 pub mod alerts;
 /// `choker` — unchoke sort.
 pub mod choker;
+/// `performance_counters`/`session_stats`.
+pub mod counters;
 /// `session`/`session_impl` — orchestrator core.
 pub mod session;
 /// `session_handle`/`torrent_handle` — public API.

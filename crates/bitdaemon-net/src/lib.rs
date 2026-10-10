@@ -86,6 +86,8 @@ pub mod lsd;
 pub mod natpmp;
 /// `parse_url.cpp` — URL components/split/validation.
 pub mod parse_url;
+/// `peer_class`/`peer_class_pool`/`peer_class_set`.
+pub mod peer_class;
 /// `socks5_stream` — SOCKS4/5 handshake over any async stream.
 pub mod socks;
 /// `udp_socket::wrap`/`socks5_unwrap` — SOCKS5-UDP relay framing.

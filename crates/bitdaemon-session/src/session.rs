@@ -24,6 +24,7 @@ use bitdaemon_disk::storage_error::StorageError;
 use bitdaemon_net::peer_wire::PeerMessage;
 
 use crate::alerts::{Alert, AlertManager};
+use crate::counters::{Counter, Counters};
 use crate::torrent::{Torrent, TorrentEffect};
 
 /// A decoded wire message arriving for a torrent.
@@ -69,6 +70,8 @@ pub struct Session {
     pub disk: Option<Arc<dyn DiskIo>>,
     /// `m_alert_manager`.
     pub alerts: AlertManager,
+    /// `m_stats_counters`.
+    pub counters: Counters,
     /// completions pushed by disk-job callbacks (any thread).
     disk_tx: std::sync::mpsc::Sender<DiskCompleted>,
     disk_rx: std::sync::mpsc::Receiver<DiskCompleted>,
@@ -121,6 +124,7 @@ impl Default for Session {
             dht: DhtTracker::default(),
             disk: None,
             alerts: AlertManager::default(),
+            counters: Counters::default(),
             disk_tx,
             disk_rx,
         }
@@ -312,6 +316,19 @@ impl Session {
 
     /// feed one decoded peer message → effects.
     pub fn on_peer_message(&mut self, p: &PeerPacket, out: &mut Vec<SessionOut>) {
+        // `inc_stats_counter` per incoming message class
+        match p.msg {
+            PeerMessage::Bitfield(_) => self.counters.inc(Counter::IncomingBitfield),
+            PeerMessage::Have(_) => self.counters.inc(Counter::IncomingHave),
+            PeerMessage::Request(_) => self.counters.inc(Counter::IncomingRequest),
+            PeerMessage::Piece { .. } => self.counters.inc(Counter::IncomingPiece),
+            PeerMessage::Cancel(_) => self.counters.inc(Counter::IncomingCancel),
+            PeerMessage::Choke => self.counters.inc(Counter::IncomingChoke),
+            PeerMessage::Unchoke => self.counters.inc(Counter::IncomingUnchoke),
+            PeerMessage::Interested => self.counters.inc(Counter::IncomingInterested),
+            PeerMessage::NotInterested => self.counters.inc(Counter::IncomingNotInterested),
+            _ => {}
+        }
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(&p.info_hash) {
             t.on_peer_message(p.peer, &p.msg, &mut eff);
@@ -323,6 +340,10 @@ impl Session {
     pub fn peer_connected(&mut self, ih: &Sha1Hash, peer: u64, conn: crate::peer_conn::PeerConn) {
         if let Some(t) = self.torrents.get_mut(ih) {
             t.add_peer(peer, conn);
+            self.counters.set(
+                Counter::PeersConnected,
+                self.torrents.values().map(|t| t.peers.len() as i64).sum(),
+            );
         }
     }
 
