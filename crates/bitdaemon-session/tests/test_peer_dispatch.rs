@@ -10,7 +10,6 @@ use bitdaemon_common::{PeerRequest, PieceBlock};
 use bitdaemon_net::peer_wire::PeerMessage;
 use bitdaemon_session::peer_conn::{PeerConn, PeerEffect};
 use bitdaemon_session::peer_pipeline::PeerPipeline;
-use bitdaemon_session::piece_picker::PiecePicker;
 
 fn conn() -> PeerConn {
     PeerConn::new(10, PeerPipeline::new(1000, 30, 250), 0)
