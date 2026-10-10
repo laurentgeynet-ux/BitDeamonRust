@@ -249,3 +249,42 @@ fn piece_deadline_and_read_piece() {
         } if buffer.len() == 0x4000
     )));
 }
+
+#[test]
+fn flags_ban_and_tracker_ops() {
+    use bitdaemon_common::flags::TorrentFlags as F;
+    use bitdaemon_common::types::StorageIndex;
+    use bitdaemon_common::{Bitfield, Sha1Hash};
+    use bitdaemon_session::session_handle::SessionHandle;
+    use bitdaemon_session::settings::SessionParams;
+    use bitdaemon_session::torrent::Torrent;
+
+    let h = SessionHandle::new(SessionParams::default());
+    let ih = Sha1Hash::from_bytes(&[7u8; 20]).unwrap();
+    let t = Torrent::new(ih, 1, 128 * 1024, Bitfield::with_size(1), StorageIndex(0));
+    let th = h.add_torrent(t);
+
+    // flags
+    th.set_flags(
+        F::UPLOAD_MODE | F::AUTO_MANAGED,
+        F::UPLOAD_MODE | F::AUTO_MANAGED,
+    );
+    let f = th.flags();
+    assert!(f.contains(F::UPLOAD_MODE) && f.contains(F::AUTO_MANAGED));
+    th.unset_flags(F::UPLOAD_MODE);
+    assert!(!th.flags().contains(F::UPLOAD_MODE));
+
+    // trackers
+    th.add_tracker("http://t1/announce".into(), 1);
+    th.add_tracker("http://t0/announce".into(), 0);
+    th.replace_trackers(&[("http://x/announce".into(), 0)]);
+    assert_eq!(th.trackers(), vec![("http://x/announce".to_string(), 0)]);
+
+    // ban: peer not connected → just flagged, no disconnect effect
+    let mut out = Vec::new();
+    th.ban_peer("1.2.3.4:6881".parse().unwrap(), &mut out);
+    assert!(out.is_empty());
+
+    th.set_max_connections(10);
+    th.set_max_uploads(4);
+}

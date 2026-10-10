@@ -878,6 +878,30 @@ impl Session {
         self.route(*ih, eff, out);
     }
 
+    /// `torrent_handle::ban_peer` — ban the swarm entry and drop the
+    /// live connection if `remote` is connected right now (upstream
+    /// `torrent::set_ban` + `disconnect` semantics).
+    pub fn ban_peer(&mut self, ih: &Sha1Hash, remote: SocketAddr, out: &mut Vec<SessionOut>) {
+        let mut eff = Vec::new();
+        if let Some(t) = self.torrents.get_mut(ih) {
+            t.ban_peer(remote);
+            let conn_id = t
+                .peers
+                .iter()
+                .find(|(_, c)| c.remote == Some(remote))
+                .map(|(id, _)| *id);
+            if let Some(id) = conn_id {
+                t.peer_disconnected_addr(remote, self.session_time);
+                t.remove_peer(id, &mut eff);
+            }
+            self.alerts.post(Alert::PeerBan {
+                ih: *ih,
+                ip: remote,
+            });
+        }
+        self.route(*ih, eff, out);
+    }
+
     /// `peer_connect_failed` — an outbound dial never completed the
     /// handshake; report it so the swarm entry backs off.
     pub fn peer_connect_failed(&mut self, ih: &Sha1Hash, remote: SocketAddr) {

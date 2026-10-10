@@ -79,6 +79,14 @@ pub enum Alert {
     PeerDisconnected { ih: Sha1Hash, reason: String },
     /// `peer_connect_alert`.
     PeerConnect { ih: Sha1Hash, remote: String },
+    /// `peer_ban_alert` — `torrent_handle::ban_peer` /
+    /// `ip_filter` dropped a peer.
+    PeerBan {
+        /// `peer_ban_alert::ih`.
+        ih: Sha1Hash,
+        /// `peer_ban_alert::ip` — the banned endpoint.
+        ip: std::net::SocketAddr,
+    },
     /// `hash_failed_alert` — a piece failed verification.
     HashFailed { ih: Sha1Hash, piece: PieceIndex },
     /// `tracker_error_alert` / `tracker_reply_alert`.
@@ -180,6 +188,7 @@ impl Alert {
                 AlertCategory::PROGRESS
             }
             Self::PeerDisconnected { .. } | Self::PeerConnect { .. } => AlertCategory::PEER,
+            Self::PeerBan { .. } => AlertCategory::PEER,
             Self::HashFailed { .. }
             | Self::FileError { .. }
             | Self::StorageMovedFailed { .. }

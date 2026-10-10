@@ -8,6 +8,13 @@ Until `1.0.0`, breaking changes may occur in any release.
 ## [Unreleased]
 
 ### Added
+- `torrent_handle::flags`/`set_flags`/`unset_flags` (masked
+  `TorrentFlags` apply incl. `PAUSED`/`AUTO_MANAGED`/`SEQUENTIAL`/
+  `UPLOAD_MODE`/`SHARE_MODE`), `trackers`/`add_tracker`/
+  `replace_trackers`, `ban_peer` (+ `peer_ban_alert`, swarm ban +
+  live disconnect), `set_max_connections`/`set_max_uploads`.
+
+### Added
 
 - **Streaming — `set_piece_deadline`/`read_piece`** —
   `Torrent::time_critical` (deadline + `alert_when_available`),

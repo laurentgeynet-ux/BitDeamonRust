@@ -186,6 +186,14 @@ pub struct Torrent {
     /// by the session at `add_torrent`, rewritten by
     /// `queue_position_set`).
     pub queue_seq: i64,
+    /// `upload_mode` (flag) — never request pieces, upload only.
+    pub upload_mode: bool,
+    /// `share_mode` (flag) — ratio-keeping download throttle.
+    pub share_mode: bool,
+    /// `max_connections` per-torrent (-1 = use session limit).
+    pub max_connections: i32,
+    /// `max_uploads` per-torrent (-1 = use session limit).
+    pub max_uploads: i32,
     /// `m_time_critical_pieces` — `set_piece_deadline` entries:
     /// piece → (deadline, alert_when_available). Sorted list
     /// upstream; BTreeMap + deadline ordering when consumed.
@@ -254,6 +262,10 @@ impl Torrent {
             last_saved_resume: None,
             queue_seq: 0,
             time_critical: std::collections::BTreeMap::new(),
+            upload_mode: false,
+            share_mode: false,
+            max_connections: -1,
+            max_uploads: -1,
         }
     }
 
@@ -332,6 +344,12 @@ impl Torrent {
         t.sequential = atp
             .flags
             .contains(bitdaemon_common::flags::TorrentFlags::SEQUENTIAL_DOWNLOAD);
+        t.upload_mode = atp
+            .flags
+            .contains(bitdaemon_common::flags::TorrentFlags::UPLOAD_MODE);
+        t.share_mode = atp
+            .flags
+            .contains(bitdaemon_common::flags::TorrentFlags::SHARE_MODE);
         t.save_path = String::from_utf8_lossy(&atp.save_path).into_owned();
         if !atp.name.is_empty() {
             t.name = String::from_utf8_lossy(&atp.name).into_owned();
@@ -1108,7 +1126,7 @@ impl Torrent {
         let mut pc_stats = crate::piece_picker::NullPickerStats;
         let tctx = crate::request_blocks::TorrentRequestCtx {
             is_seed: self.is_seed(),
-            upload_mode: false,
+            upload_mode: self.upload_mode,
             valid_metadata: true,
             files_checked: true,
             graceful_pause: false,
@@ -1417,6 +1435,85 @@ impl Torrent {
             }
         }
         self.piece_verified(piece, passed, out);
+    }
+
+    /// `flags()` — assemble the `torrent_flags` bitset from the
+    /// scattered per-flag fields (upstream keeps one bitfield).
+    #[must_use]
+    pub fn flags(&self) -> bitdaemon_common::flags::TorrentFlags {
+        use bitdaemon_common::flags::TorrentFlags as F;
+        let mut f = F::NONE;
+        if self.paused {
+            f |= F::PAUSED;
+        }
+        if self.auto_managed {
+            f |= F::AUTO_MANAGED;
+        }
+        if self.sequential {
+            f |= F::SEQUENTIAL_DOWNLOAD;
+        }
+        if self.upload_mode {
+            f |= F::UPLOAD_MODE;
+        }
+        if self.share_mode {
+            f |= F::SHARE_MODE;
+        }
+        if self.need_save_resume {
+            f |= F::NEED_SAVE_RESUME;
+        }
+        f
+    }
+
+    /// `set_flags`/`unset_flags` — apply `flags` under `mask`
+    /// (upstream `torrent::set_flags`): only the masked bits are
+    /// touched. Returns whether `paused` changed (session decides
+    /// the announce side-effects).
+    pub fn set_flags(
+        &mut self,
+        flags: bitdaemon_common::flags::TorrentFlags,
+        mask: bitdaemon_common::flags::TorrentFlags,
+    ) -> bool {
+        use bitdaemon_common::flags::TorrentFlags as F;
+        let was_paused = self.paused;
+        if mask.contains(F::PAUSED) {
+            self.paused = flags.contains(F::PAUSED);
+        }
+        if mask.contains(F::AUTO_MANAGED) {
+            self.auto_managed = flags.contains(F::AUTO_MANAGED);
+        }
+        if mask.contains(F::SEQUENTIAL_DOWNLOAD) {
+            self.sequential = flags.contains(F::SEQUENTIAL_DOWNLOAD);
+        }
+        if mask.contains(F::UPLOAD_MODE) {
+            self.upload_mode = flags.contains(F::UPLOAD_MODE);
+        }
+        if mask.contains(F::SHARE_MODE) {
+            self.share_mode = flags.contains(F::SHARE_MODE);
+        }
+        if mask.contains(F::NEED_SAVE_RESUME) {
+            self.need_save_resume = flags.contains(F::NEED_SAVE_RESUME);
+        }
+        self.paused != was_paused
+    }
+
+    /// `replace_trackers` (upstream `torrent::replace_trackers`) —
+    /// swap the whole announce list.
+    pub fn replace_trackers(&mut self, trackers: &[(String, i32)]) {
+        self.trackers = crate::tracker_list::TrackerList::default();
+        for (url, tier) in trackers {
+            self.add_tracker(url.clone(), *tier);
+        }
+        self.need_save_resume = true;
+    }
+
+    /// `set_ban` (upstream `torrent::set_ban`) — ban the swarm entry
+    /// for `remote`; an already-connected peer is dropped by the
+    /// session's disconnect pump via `peer_disconnected_addr` —
+    /// callers pass the effect through as `SessionOut::Disconnect`.
+    pub fn ban_peer(&mut self, remote: std::net::SocketAddr) {
+        if let Some(i) = self.peer_index(remote) {
+            self.peer_list.ban_peer(i);
+        }
     }
 
     /// `prioritize_pieces` (upstream `torrent_handle::prioritize_pieces`

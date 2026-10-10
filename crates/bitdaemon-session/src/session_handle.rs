@@ -399,4 +399,103 @@ impl TorrentHandle {
     pub fn is_valid(&self) -> bool {
         lock(&self.session).torrents.contains_key(&self.info_hash)
     }
+
+    /// `torrent_handle::flags` — the `torrent_flags` bitset.
+    #[must_use]
+    pub fn flags(&self) -> bitdaemon_common::flags::TorrentFlags {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map(crate::torrent::Torrent::flags)
+            .unwrap_or_default()
+    }
+
+    /// `torrent_handle::set_flags(flags, mask)` — masked flag apply;
+    /// toggling `PAUSED` routes through `Session::set_paused` so the
+    /// announce side-effects run.
+    pub fn set_flags(
+        &self,
+        flags: bitdaemon_common::flags::TorrentFlags,
+        mask: bitdaemon_common::flags::TorrentFlags,
+    ) {
+        let mut s = lock(&self.session);
+        let mut out = Vec::new();
+        let changed = s
+            .torrents
+            .get_mut(&self.info_hash)
+            .map(|t| t.set_flags(flags, mask));
+        if changed == Some(true) {
+            let paused = flags.contains(bitdaemon_common::flags::TorrentFlags::PAUSED);
+            s.set_paused(&self.info_hash, paused, &mut out);
+        }
+    }
+
+    /// `torrent_handle::unset_flags(flags)` shorthand.
+    pub fn unset_flags(&self, flags: bitdaemon_common::flags::TorrentFlags) {
+        self.set_flags(bitdaemon_common::flags::TorrentFlags::NONE, flags);
+    }
+
+    /// `torrent_handle::trackers` — the announce list snapshot.
+    #[must_use]
+    pub fn trackers(&self) -> Vec<(String, i32)> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map(|t| {
+                t.trackers
+                    .trackers
+                    .iter()
+                    .map(|e| (e.url.clone(), e.tier))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `torrent_handle::replace_trackers`.
+    pub fn replace_trackers(&self, trackers: &[(String, i32)]) {
+        {
+            let mut s = lock(&self.session);
+            if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+                t.replace_trackers(trackers);
+            }
+        }
+    }
+
+    /// `torrent_handle::add_tracker(url, tier)`.
+    pub fn add_tracker(&self, url: String, tier: i32) {
+        {
+            let mut s = lock(&self.session);
+            if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+                t.add_tracker(url, tier);
+            }
+        }
+    }
+
+    /// `torrent_handle::ban_peer` — ban + drop the live connection.
+    pub fn ban_peer(&self, remote: std::net::SocketAddr, out: &mut Vec<SessionOut>) {
+        {
+            let mut s = lock(&self.session);
+            s.ban_peer(&self.info_hash, remote, out);
+        }
+    }
+
+    /// `torrent_handle::set_max_connections` (per-torrent).
+    pub fn set_max_connections(&self, max: i32) {
+        {
+            let mut s = lock(&self.session);
+            if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+                t.max_connections = max;
+            }
+        }
+    }
+
+    /// `torrent_handle::set_max_uploads` (per-torrent).
+    pub fn set_max_uploads(&self, max: i32) {
+        {
+            let mut s = lock(&self.session);
+            if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+                t.max_uploads = max;
+            }
+        }
+    }
 }
