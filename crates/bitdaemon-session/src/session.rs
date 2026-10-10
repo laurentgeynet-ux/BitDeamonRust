@@ -715,7 +715,13 @@ impl Session {
             self.announce_stopped(t, out);
         }
         let removed = self.torrents.remove(ih);
-        if removed.is_some() {
+        if let Some(t) = &removed {
+            // upstream `~torrent` → `m_disk_thread.remove_torrent` —
+            // drop the storage so queued jobs short-circuit behind
+            // the fence.
+            if let Some(disk) = &self.disk {
+                disk.remove_torrent(t.storage);
+            }
             self.alerts.post(Alert::TorrentRemoved(*ih));
         }
         removed
