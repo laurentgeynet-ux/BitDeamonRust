@@ -127,3 +127,76 @@ async fn accept_inbound_handshake() {
         .unwrap();
     assert!(eng.session.torrents[&ih].peers.contains_key(&peer));
 }
+
+#[derive(Debug)]
+struct MapResolver;
+
+impl bitdaemon_net::resolver::Resolver for MapResolver {
+    fn resolve(
+        &self,
+        host: &str,
+        _flags: bitdaemon_net::resolver::ResolveFlags,
+    ) -> Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<IpAddr>>> + Send + '_>> {
+        let host = host.to_string();
+        Box::pin(async move {
+            if host == "tracker.example" {
+                Ok(vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9))])
+            } else {
+                Err(std::io::Error::other("nxdomain"))
+            }
+        })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn http_announce_via_resolver() {
+    let ih = Sha1Hash::from_bytes(&[7; 20]).unwrap();
+    let (mine, theirs) = tokio::io::duplex(64 * 1024);
+    let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(Some(mine))));
+
+    let mut eng = Engine::new(conn, None);
+    eng.set_resolver(Arc::new(MapResolver));
+    eng.set_listen_port(6881);
+    let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
+    t.add_tracker("http://tracker.example:6969/announce".into(), 0);
+    eng.session.add_torrent(t);
+
+    // scripted HTTP tracker: read the GET, answer compact peers.
+    let mut srv: BoxedPeerStream = Box::new(theirs);
+    let responder = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 2048];
+        let n = srv.read(&mut buf).await.unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]);
+        assert!(req.starts_with("GET /announce?"));
+        assert!(req.contains("Host: tracker.example:6969"));
+        let peer = [10, 0, 0, 42, 26, 225]; // 10.0.0.42:6881
+        let body = format!("d8:completei1e10:incompletei0e5:peers6:{}e", {
+            let _ = &peer;
+            String::from_utf8_lossy(&peer).into_owned()
+        });
+        let _ = body; // peers is binary — build raw
+        let mut b = b"d8:completei1e10:incompletei0e5:peers6:".to_vec();
+        b.extend_from_slice(&peer);
+        b.push(b'e');
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", b.len());
+        srv.write_all(head.as_bytes()).await.unwrap();
+        srv.write_all(&b).await.unwrap();
+        // keep alive
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    });
+
+    // force the announce due + run engine tick
+    let now = std::time::Instant::now();
+    eng.tick(now).await;
+    // give the spawned announce task a slot to run
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+        eng.tick(now).await;
+        if eng.session.torrents[&ih].peer_list.num_peers() > 0 {
+            break;
+        }
+    }
+    responder.await.unwrap();
+    assert_eq!(eng.session.torrents[&ih].peer_list.num_peers(), 1);
+}

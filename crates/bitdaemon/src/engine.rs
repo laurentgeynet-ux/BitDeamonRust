@@ -20,6 +20,7 @@ use std::time::Instant;
 use bitdaemon_common::{PeerId, Sha1Hash};
 use bitdaemon_net::bt_peer_conn::{read_message, run_handshake, write_message};
 use bitdaemon_net::peer_wire::PeerMessage;
+use bitdaemon_net::resolver::{BoxedResolver, ResolveFlags, resolve_host};
 use bitdaemon_net::tracker_client::{AnnounceError, announce_http, announce_udp};
 use bitdaemon_net::transport::{BoxedPeerStream, DatagramSocket, PeerConnector};
 use bitdaemon_session::alerts::Alert;
@@ -51,6 +52,9 @@ pub struct Engine {
     connector: Arc<dyn PeerConnector>,
     /// datagram transport for DHT + UDP trackers.
     datagram: Option<Arc<dyn DatagramSocket>>,
+    /// hostname resolution (anonymous: inject a circuit resolver —
+    /// without one only IP-literal tracker hosts work).
+    resolver: Option<BoxedResolver>,
     /// next peer id (per-torrent in upstream; engine-unique here).
     next_peer: u64,
     /// peer writers: `(ih, peer)` → outbound message channel.
@@ -89,6 +93,7 @@ impl Engine {
             session: Session::new(),
             connector,
             datagram,
+            resolver: None,
             next_peer: 1,
             writers: HashMap::new(),
             inbound_rx,
@@ -112,6 +117,12 @@ impl Engine {
     /// `peer_id` passthrough.
     pub fn set_peer_id(&mut self, pid: PeerId) {
         self.session.peer_id = pid;
+    }
+
+    /// inject the hostname resolver (`resolver_interface` — use an
+    /// anonymous/circuit resolver under OnionBit).
+    pub fn set_resolver(&mut self, r: BoxedResolver) {
+        self.resolver = Some(r);
     }
 
     /// `on_tick` — pump inbound messages, announce completions,
@@ -188,18 +199,22 @@ impl Engine {
         let tx = self.announce_tx.clone();
         let connector = self.connector.clone();
         let datagram = self.datagram.clone();
+        let resolver = self.resolver.clone();
         self.tasks_forget();
         let handle = tokio::spawn(async move {
-            let result = match url.split("://").next() {
-                Some("udp") => {
-                    // udp://host:port/path — trackers ignore the path
-                    let host = url
-                        .trim_start_matches("udp://")
-                        .split('/')
-                        .next()
-                        .unwrap_or_default();
-                    match (datagram, host.parse::<SocketAddr>()) {
-                        (Some(dg), Ok(addr)) => announce_udp(
+            let result = match bitdaemon_net::parse_url::parse_url_components(&url) {
+                Ok(c) if c.protocol == "udp" => {
+                    let Some(dg) = datagram else {
+                        let _ = tx.send(AnnounceDone {
+                            ih,
+                            url,
+                            result: Err("no datagram transport injected".into()),
+                        });
+                        return;
+                    };
+                    let port = u16::try_from(c.port).unwrap_or(80);
+                    match resolve(&resolver, &c.hostname, port).await {
+                        Ok(addr) => announce_udp(
                             dg.as_ref(),
                             addr,
                             &params,
@@ -208,46 +223,43 @@ impl Engine {
                         )
                         .await
                         .map_err(|e: AnnounceError| e.to_string()),
-                        (None, _) => Err("no datagram transport injected".into()),
-                        (_, Err(_)) => Err(format!("bad udp tracker url {url}")),
+                        Err(e) => Err(e),
                     }
                 }
-                _ => {
+                Ok(c) => {
                     // http/https/ws — dial a stream and GET
-                    let host = url
-                        .split("://")
-                        .nth(1)
-                        .unwrap_or_default()
-                        .split('/')
-                        .next()
-                        .unwrap_or_default();
-                    let path = url
-                        .split("://")
-                        .nth(1)
-                        .and_then(|rest| rest.find('/').map(|i| &rest[i..]))
-                        .unwrap_or("/");
-                    match host.parse::<SocketAddr>() {
+                    let default_port = if c.protocol == "https" { 443 } else { 80 };
+                    let port = u16::try_from(c.port).unwrap_or(default_port);
+                    match resolve(&resolver, &c.hostname, port).await {
                         Ok(addr) => match connector.connect(addr).await {
-                            Ok(mut s) => announce_http(
-                                &mut s,
-                                host,
-                                path,
-                                &params,
-                                if tracker_id.is_empty() {
-                                    None
+                            Ok(mut s) => {
+                                let host = if c.port < 0 {
+                                    c.hostname.clone()
                                 } else {
-                                    Some(tracker_id.as_bytes())
-                                },
-                                &[],
-                                1024 * 1024,
-                            )
-                            .await
-                            .map_err(|e| e.to_string()),
+                                    format!("{}:{}", c.hostname, port)
+                                };
+                                announce_http(
+                                    &mut s,
+                                    &host,
+                                    &c.path,
+                                    &params,
+                                    if tracker_id.is_empty() {
+                                        None
+                                    } else {
+                                        Some(tracker_id.as_bytes())
+                                    },
+                                    &[],
+                                    1024 * 1024,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                            }
                             Err(e) => Err(format!("connect: {e}")),
                         },
-                        Err(_) => Err(format!("bad tracker url {url}")),
+                        Err(e) => Err(e),
                     }
                 }
+                Err(e) => Err(format!("bad tracker url {url}: {e}")),
             };
             let _ = tx.send(AnnounceDone { ih, url, result });
         });
@@ -446,6 +458,28 @@ impl Engine {
     #[must_use]
     pub fn num_peers(&self) -> usize {
         self.writers.len()
+    }
+}
+
+/// resolve `hostname:port` — IP literal short-circuit, else the
+/// injected `Resolver` (anonymous deployment MUST inject one; without
+/// it hostname trackers fail instead of leaking a DNS query).
+async fn resolve(
+    r: &Option<BoxedResolver>,
+    hostname: &str,
+    port: u16,
+) -> Result<SocketAddr, String> {
+    if let Ok(addr) = format!("{hostname}:{port}").parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    match r {
+        Some(r) => resolve_host(r.as_ref(), hostname, port, ResolveFlags::default())
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("no address for {hostname}")),
+        None => Err(format!("no resolver injected for {hostname}")),
     }
 }
 
