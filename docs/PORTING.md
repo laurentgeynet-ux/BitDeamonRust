@@ -77,19 +77,26 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 
 ## bitdaemon-disk
 
+> **Fidelity is the point here** (ADR-0009): this subsystem is the
+> primary motivation for the port. Do not simplify away the job queue,
+> fences, bounded buffer pool, lazy file pool or part-file — they are
+> the fixes for real production failures. Deferred-error semantics
+> (lazy open → error at first I/O, as alert) are upstream-specified
+> behavior, not a bug.
+
 | C++ source | Rust target | Status | Notes |
 |---|---|---|---|
 | `disk_interface.hpp`, `disk_job.cpp`, `disk_job_fence.cpp`, `disk_job_pool.cpp` | `disk::job` | not started | job model → async traits |
 | `disk_io_thread_pool.cpp`, `back_pressure.cpp` | `disk::pool` | not started | `spawn_blocking` pool |
 | `storage_constructor` / `default_storage_constructor` (in `disk_interface.hpp`/`storage.hpp`) | `disk::StorageFactory` | not started | **injectable storage** (ADR-0008) — OnionBit `PrivateStorageFactory` parity |
-| `disk_buffer_pool.cpp`, `disk_buffer_holder.cpp`, `store_buffer.hpp`, `receive_buffer.cpp`, `chained_buffer.cpp`, `packet_pool.hpp` | `disk::buffer` | not started | `Bytes` slab |
+| `disk_buffer_pool.cpp`, `disk_buffer_holder.cpp`, `store_buffer.hpp`, `receive_buffer.cpp`, `chained_buffer.cpp`, `packet_pool.hpp` | `disk::buffer` | not started | `Bytes` slab + **bounded** memory caps (`max_queued_disk_bytes`, `send_buffer_watermark`) |
 | `disabled_disk_io.cpp` | `disk::disabled` | not started | test backend |
 | `mmap.cpp`, `mmap_disk_io.cpp`, `mmap_storage.cpp`, `mmap_disk_job.hpp`, `file_view_pool.cpp` | `disk::mmap` | not started | `memmap2`, optional feature |
 | `posix_disk_io.cpp`, `posix_storage.cpp`, `posix_part_file.cpp` | `disk::fs` | not started | one `std::fs` backend |
 | `pread_disk_io.cpp`, `pread_storage.cpp` | merged into `disk::fs` | not started | positioned I/O |
 | `storage_utils.cpp`, `storage_array.hpp`, `storage_free_list.hpp` | `disk::storage` | not started | |
 | `part_file.cpp` (`part_file.hpp`) | `disk::part_file` | not started | |
-| `file.cpp`, `file.hpp`, `file_pool_impl.cpp`, `file_pool.hpp`, `file_descriptor.hpp`, `file_pointer.hpp`, `open_mode.hpp` | `disk::file` | not started | |
+| `file.cpp`, `file.hpp`, `file_pool_impl.cpp`, `file_pool.hpp`, `file_descriptor.hpp`, `file_pointer.hpp`, `open_mode.hpp` | `disk::file` | not started | lazy open + LRU handle cap — the 349 s→ms fix (ADR-0009) |
 | `file_progress.cpp`, `has_block.hpp` | `disk::progress` | not started | |
 | `hash_picker.cpp` (`hash_picker.hpp`), `precomputed_block_hashes.cpp` | `disk::hash_picker` | not started | v2 proofs |
 | `stat_cache.cpp` (disk side), `debug_disk_thread.hpp` | `disk::cache` | not started | |

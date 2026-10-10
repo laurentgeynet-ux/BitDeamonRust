@@ -196,6 +196,23 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and an MSRV
 - **Windows paths**: storage must sanitize `..`, drive letters, ADS
   (`file:`), reserved device names — `file_storage`/`path.cpp` logic is
   security-critical.
+- **Disk fidelity is the product** (ADR-0009): never "simplify" the
+  job queue, per-torrent `disk_job_fence` ordering, bounded
+  `disk_buffer_pool`, lazy `file_pool`, or `part_file` — those are the
+  fixes for real production failures downstream (349 s restores,
+  unbounded memory, per-piece-lock corruption on chunk-straddling
+  formats).
+- **Lazy open = deferred errors**: files open on first access; invalid
+  paths/permissions surface as alerts at first I/O, not at
+  `add_torrent`. Do not "fix" this back to eager init — upstream
+  behaves this way and OnionBit standardized on it.
+- **Resume round-trip both ways**: `.resume`/`.session` must load
+  upstream-written files *and* be readable by upstream. Test both
+  directions with golden vectors.
+- **Write coalescing + ordering**: piece-complete flush boundaries and
+  fence semantics (e.g. `clear_piece`, `move_storage`, `delete_files`
+  vs. in-flight writes) are correctness-critical — port
+  `disk_job_fence` before any perf tuning.
 
 ## 10. Session state & alerts (the model)
 

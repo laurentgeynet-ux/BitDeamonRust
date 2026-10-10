@@ -28,6 +28,7 @@ and its consequences.
 | [0006](0006-testing-and-conformance.md) | Testing and conformance strategy | accepted | 2026-10-10 |
 | [0007](0007-external-dependencies.md) | External dependency policy | accepted | 2026-10-10 |
 | [0008](0008-injectable-transports.md) | Injectable transports — no subsystem binds OS sockets | accepted | 2026-10-10 |
+| [0009](0009-disk-io-fidelity.md) | Disk I/O — port the full upstream machinery | accepted | 2026-10-10 |
 
 ## Template
 

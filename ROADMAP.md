@@ -82,19 +82,36 @@ pass; bencode round-trips every `.torrent` in upstream `test/` dir.
 
 ## Phase 3 — Disk I/O ⬜
 
-*~20k LOC C++.* Storage must be correct before any download exists.
+*~20k LOC C++.* Storage must be correct before any download exists —
+and this phase is a **primary motivation for the port** (ADR-0009):
+rqbit's I/O and memory behavior is what broke downstream. Port the
+full machinery, not a simplified subset.
 
-`bitdaemon-disk`: `DiskIo` trait (async job model), `Storage` (one
-positioned-I/O backend via `std::fs`/`tokio::fs` + optional `memmap2`),
-`PartFile`, `FilePool`, `disk_buffer_pool` → `Bytes`-based slab,
-`StatCache`, `FileProgress`, `storage_utils` (move/delete/rename,
-`apply_pad_files`, `free_space`/`drive_info`), `HashPicker` data path
-(v2 piece layers), `precomputed_block_hashes`, `copy_file`, `truncate`,
-`file`/`directory`/`file_view_pool`/`mmap` wrappers.
+`bitdaemon-disk`: `DiskIo` trait + async job queue with per-torrent
+`disk_job_fence` ordering, `disk_io_thread_pool` → blocking pool,
+**bounded** `disk_buffer_pool` (`Bytes` slab + `max_queued_disk_bytes`/
+`send_buffer_watermark` settings), `back_pressure`, `FilePool`
+(lazy-open + LRU handle cap — a 10k-file torrent restores in
+milliseconds, not minutes), `StatCache`, `FileProgress`, `PartFile`,
+`storage_utils` (move/delete/rename, `apply_pad_files`,
+`free_space`/`drive_info`), `HashPicker` (v2 piece layers),
+`precomputed_block_hashes`, `copy_file`, `truncate`,
+`file`/`directory`/`file_view_pool`/`mmap` wrappers, **`StorageFactory`
+trait** (ADR-0008 — downstream `PrivateStorageFactory`/OBD parity).
+Two backends: `std::fs` positioned I/O (default) + `memmap2` (feature),
+plus `disabled` for tests.
+
+**Fastresume** (`core::resume` lands Phase 2, applied here):
+byte-compatible with upstream `read_resume_data`/`write_resume_data`
+both directions — loads existing libtorrent/Tribler `.resume` files.
 
 **Exit criteria**: `test_storage.cpp`, `test_part_file.cpp`,
 `test_file_progress.cpp`, `test_stat_cache.cpp`, `test_mmap.cpp`
-equivalents pass; `CheckFiles` verifies a pre-seeded dataset byte-exact.
+equivalents pass; `check_files` verifies a pre-seeded multi-GB dataset
+byte-exact **under a bounded buffer pool**; lazy file pool restores an
+11 310-file torrent in milliseconds (OnionBit regression:
+349 s on eager init); deferred I/O errors surface as alerts at first
+access (upstream semantics).
 
 ---
 

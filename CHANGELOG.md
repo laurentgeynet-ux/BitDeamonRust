@@ -26,5 +26,12 @@ Until `1.0.0`, breaking changes may occur in any release.
 - ROADMAP: downstream driver section (OnionBit rqbit replacement),
   milestone ONIONBIT-1, uTP moved to Phase 5.
 - `bitdaemon_net::NetError`/`Result` foundation for transport errors.
+- ADR-0009 disk-I/O fidelity: Phase 3 ports the full upstream machinery
+  (job queue, per-torrent fences, bounded buffer pool, lazy file pool,
+  part files, stat cache, hash picker, back-pressure) — the subsystem
+  whose absence broke rqbit downstream (eager init = minutes-long
+  restore, unbounded memory, per-piece-lock RMW corruption).
+- `StorageFactory` injection point documented for downstream
+  encrypted/opaque-name storage (OBD parity).
 
 [Unreleased]: https://github.com/laurentgeynet-ux/BitDeamonRust/compare/main...HEAD
