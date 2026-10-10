@@ -308,8 +308,7 @@ impl RoutingTable {
             return;
         }
         // sort replacements by (verified, rtt) — `node_entry::operator<`
-        b.replacements
-            .sort_by_key(|a| (!a.verified, a.rtt));
+        b.replacements.sort_by_key(|a| (!a.verified, a.rtt));
         while b.live_nodes.len() < limit && !b.replacements.is_empty() {
             if let Some(j) = b.replacements.iter().position(|n| n.pinged()) {
                 let n = b.replacements.remove(j);
