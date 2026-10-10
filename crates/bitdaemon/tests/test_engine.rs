@@ -344,16 +344,7 @@ async fn acceptor_pump_registers_peer() {
     #[derive(Debug)]
     struct Acc(tokio::sync::Mutex<Option<DuplexStream>>);
     impl PeerAcceptor for Acc {
-        fn accept(
-            self: Arc<Self>,
-        ) -> Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = bitdaemon_net::Result<(BoxedPeerStream, Option<SocketAddr>)>,
-                    > + Send
-                    + Sync,
-            >,
-        > {
+        fn accept(self: Arc<Self>) -> bitdaemon_net::transport::AcceptFut {
             let me = self.clone();
             Box::pin(async move {
                 let s =

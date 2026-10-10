@@ -415,16 +415,7 @@ impl I2pAcceptor {
 }
 
 impl crate::transport::PeerAcceptor for I2pAcceptor {
-    fn accept(
-        self: std::sync::Arc<Self>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = crate::Result<(BoxedPeerStream, Option<std::net::SocketAddr>)>,
-                > + Send
-                + Sync,
-        >,
-    > {
+    fn accept(self: std::sync::Arc<Self>) -> crate::transport::AcceptFut {
         Box::pin(async move {
             let me = self.clone();
             let s: crate::Result<BoxedPeerStream> = tokio::spawn(async move {

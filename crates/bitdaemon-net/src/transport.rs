@@ -27,6 +27,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// `Pin<Box<dyn Future>>` shape so trait objects work).
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + Sync + 'a>>;
 
+/// Result of [`PeerAcceptor::accept`].
+pub type AcceptFut = Pin<
+    Box<dyn Future<Output = crate::Result<(BoxedPeerStream, Option<SocketAddr>)>> + Send + Sync>,
+>;
+
 /// Object-safe datagram transport — the subset of `tokio::net::UdpSocket`
 /// used by the DHT, UDP tracker clients, uTP socket manager and LSD.
 ///
@@ -101,11 +106,5 @@ pub trait PeerAcceptor: Send + Sync + Debug + 'static {
     /// Accept the next inbound peer stream, with its remote endpoint
     /// when the transport knows it (`None` e.g. for I2P — the SAM
     /// destination isn't an IP:port).
-    fn accept(
-        self: Arc<Self>,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = crate::Result<(BoxedPeerStream, Option<SocketAddr>)>> + Send + Sync,
-        >,
-    >;
+    fn accept(self: Arc<Self>) -> AcceptFut;
 }
