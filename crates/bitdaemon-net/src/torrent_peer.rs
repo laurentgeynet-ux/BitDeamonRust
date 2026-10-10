@@ -5,7 +5,7 @@
 //! kiB, and `peer_priority` (BEP 40 rank).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use bitdaemon_common::PeerSourceFlags;
 use bitdaemon_common::crc32c::crc32c;
@@ -59,7 +59,7 @@ pub enum ProtocolVersion {
 /// `peer_connection_interface` statistics access — the trait the live
 /// connection implements so `total_download`/`total_upload` read from
 /// it while connected (upstream dereferences `connection`).
-pub trait PeerStats {
+pub trait PeerStats: Send + Sync {
     /// `statistics().total_payload_download()`.
     fn total_payload_download(&self) -> i64;
     /// `statistics().total_payload_upload()`.
@@ -94,7 +94,7 @@ pub struct TorrentPeer {
     pub prev_amount_download: u32,
 
     /// `connection` — live connection stats while connected.
-    pub connection: Option<Rc<dyn PeerStats>>,
+    pub connection: Option<Arc<dyn PeerStats>>,
 
     /// `peer_rank` — lazily computed BEP-40 priority (0 = not set).
     pub peer_rank: u32,

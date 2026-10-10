@@ -70,6 +70,10 @@ pub struct Torrent {
     pub picker: Option<PiecePicker>,
     /// `m_connections` — peers keyed by caller-chosen id.
     pub peers: BTreeMap<u64, PeerConn>,
+    /// `m_peer_list` — known swarm members (tracker/PEX/DHT/LSD/
+    /// resume candidates). Upstream stores `torrent_peer`s owned by
+    /// the list; ours are `TorrentPeer`s in `PeerList`.
+    pub peer_list: bitdaemon_net::peer_list::PeerList,
     /// `m_storage` — disk job routing index.
     pub storage: StorageIndex,
     /// `m_seeds` / peers count for `state()`.
@@ -120,6 +124,7 @@ impl Torrent {
             have,
             picker: None,
             peers: BTreeMap::new(),
+            peer_list: bitdaemon_net::peer_list::PeerList::default(),
             storage,
             num_seeds: 0,
             paused: false,
@@ -407,6 +412,35 @@ impl Torrent {
     #[must_use]
     pub fn is_seed(&self) -> bool {
         self.seeding || self.finished
+    }
+
+    /// `add_peer` (swarm entry, not connection) — tracker/PEX/DHT/
+    /// LSD feed. Returns the `PeerList` index.
+    pub fn add_swarm_peer(
+        &mut self,
+        remote: std::net::SocketAddr,
+        src: bitdaemon_common::flags::PeerSourceFlags,
+        connectable: bool,
+    ) -> usize {
+        self.peer_list.add_peer(remote, src, connectable).0
+    }
+
+    /// `find_connect_candidates` — the session's connect pump asks
+    /// for the next endpoints to dial (`torrent::connect_to_peer`).
+    #[must_use]
+    pub fn connect_candidates(
+        &mut self,
+        session_time: i32,
+        state: &bitdaemon_net::peer_list::PeerListState,
+    ) -> Vec<std::net::SocketAddr> {
+        // keep `finished` in sync so seeds skip seeds/upload-only
+        let mut st = state.clone();
+        st.is_finished = self.is_seed();
+        self.peer_list
+            .find_connect_candidates(session_time, &st)
+            .into_iter()
+            .filter_map(|i| self.peer_list.peers().get(i).and_then(|p| p.ip()))
+            .collect()
     }
 
     /// `add_peer` — a new connection registered.

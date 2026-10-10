@@ -132,7 +132,7 @@ fn torrent_peer_flags_and_accounting() {
     }
     p.prev_amount_download = 0;
     p.prev_amount_upload = 0;
-    p.connection = Some(std::rc::Rc::new(FakeConn));
+    p.connection = Some(std::sync::Arc::new(FakeConn));
     assert_eq!(p.total_download(), 9999);
     assert_eq!(p.total_upload(), 777);
 }

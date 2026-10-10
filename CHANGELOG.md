@@ -7,6 +7,16 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — PeerList × Torrent
+
+- `Torrent.peer_list` + `add_swarm_peer` (feed tracker/PEX/DHT/LSD)
+  + `connect_candidates` (pompe de connexion session, `is_finished`
+  synchronisé).
+- `TorrentPeer.connection` passe en `Arc<dyn PeerStats + Send + Sync>`
+  — `Session` reste `Send`/`Sync` pour `SessionHandle`.
+- Fix `PeerList::default()` : `max_failcount = 3` (défaut upstream)
+  au lieu de 0 (aucun candidat).
+
 ### Added — peer_info
 
 - `peer_info.rs` — snapshot public `peer_info` (flags

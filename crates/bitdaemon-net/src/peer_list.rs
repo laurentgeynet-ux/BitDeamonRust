@@ -122,7 +122,6 @@ fn compare_peer(lhs: &TorrentPeer, rhs: &TorrentPeer, st: &PeerListState) -> boo
 /// stay `O(log n)`. Connections are tracked by index (`Some(usize)`
 /// marks "has a live connection" — the real `peer_connection` lives
 /// in the torrent's slab).
-#[derive(Default)]
 pub struct PeerList {
     peers: Vec<TorrentPeer>,
     /// `m_num_connect_candidates`.
@@ -141,14 +140,25 @@ pub struct PeerList {
     locked: Option<usize>,
 }
 
+impl Default for PeerList {
+    /// `torrent_state` defaults: `max_failcount = 3` (upstream).
+    fn default() -> Self {
+        Self::new(&PeerListState::default())
+    }
+}
+
 impl PeerList {
     /// `peer_list()` — `max_failcount` comes from `state`.
     #[must_use]
     pub fn new(state: &PeerListState) -> Self {
         Self {
+            peers: Vec::new(),
+            num_connect_candidates: 0,
+            num_seeds: 0,
             finished: state.is_finished,
             max_failcount: state.max_failcount,
-            ..Default::default()
+            round_robin: 0,
+            locked: None,
         }
     }
 
@@ -305,7 +315,7 @@ impl PeerList {
     /// stores the `peer_connection*`; we only need the flag.
     pub fn set_connected(&mut self, index: usize) {
         let was = self.is_connect_candidate(&self.peers[index]);
-        self.peers[index].connection = Some(std::rc::Rc::new(crate::torrent_peer::NullStats));
+        self.peers[index].connection = Some(std::sync::Arc::new(crate::torrent_peer::NullStats));
         let is = self.is_connect_candidate(&self.peers[index]);
         self.update_candidates(was, is);
     }
