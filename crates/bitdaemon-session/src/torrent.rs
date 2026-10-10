@@ -141,6 +141,69 @@ impl Torrent {
         }
     }
 
+    /// `torrent` ctor path — build a torrent from `AddTorrentParams`:
+    /// `ti` metadata → sizes/hashes/picker, `have`/`verified` and
+    /// `unfinished_pieces` via `apply_resume_data`, `peers`/`banned_peers`
+    /// into `peer_list`, `paused`/`magnet` flags. `None` when `ti` is
+    /// absent and `info_hash` can't be derived (upstream requires the
+    /// info-hash).
+    #[must_use]
+    pub fn from_params(
+        atp: &AddTorrentParams,
+        storage: StorageIndex,
+        out: &mut Vec<TorrentEffect>,
+    ) -> Option<Self> {
+        let ih = if atp.info_hashes.has_v1() {
+            atp.info_hashes.v1
+        } else {
+            atp.ti.as_ref().and_then(|ti| ti.info_hash_v1())?
+        };
+        let mut t = match &atp.ti {
+            Some(ti) => {
+                let mut t = Self::new(
+                    ih,
+                    ti.num_pieces(),
+                    i64::from(ti.piece_length()),
+                    Bitfield::with_size(ti.num_pieces() as usize),
+                    storage,
+                );
+                t.piece_hashes = Some(
+                    (0..ti.num_pieces())
+                        .map(|i| ti.hash_for_piece(PieceIndex(i)))
+                        .collect(),
+                );
+                t.init_picker(false);
+                t.apply_resume_data(atp, out);
+                t
+            }
+            None => {
+                // magnet add — metadata pending
+                let mut t = Self::new(ih, 0, 0, Bitfield::default(), storage);
+                t.magnet = true;
+                t
+            }
+        };
+        for &ep in &atp.peers {
+            t.add_swarm_peer(
+                ep,
+                bitdaemon_common::flags::PeerSourceFlags::RESUME_DATA,
+                true,
+            );
+        }
+        for &ep in &atp.banned_peers {
+            let (i, _) = t.peer_list.add_peer(
+                ep,
+                bitdaemon_common::flags::PeerSourceFlags::RESUME_DATA,
+                true,
+            );
+            t.peer_list.ban_peer(i);
+        }
+        t.paused = atp
+            .flags
+            .contains(bitdaemon_common::flags::TorrentFlags::PAUSED);
+        Some(t)
+    }
+
     /// `set_metadata` — a magnet just resolved: SHA-1 of the raw
     /// info section must equal `info_hash` (BEP-9). On match the
     /// torrent_info is parsed and picker+hashes initialized.

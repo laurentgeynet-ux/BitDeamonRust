@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bitdaemon_common::types::{PeerRequest, PieceIndex};
+use bitdaemon_common::types::{PeerRequest, PieceIndex, StorageIndex};
 use bitdaemon_common::{Bitfield, Sha1Hash};
 use bitdaemon_dht::dht_tracker::DhtTracker;
 use bitdaemon_disk::disk_buffer_pool::DiskBufferHolder;
@@ -323,6 +323,23 @@ impl Session {
         let ih = t.info_hash;
         self.torrents.insert(ih, t);
         ih
+    }
+
+    /// `add_torrent` — the real entry point: `AddTorrentParams` →
+    /// `Torrent::from_params`, resume effects are dispatched
+    /// (disk verify jobs for restored unfinished pieces).
+    pub fn add_torrent_params(
+        &mut self,
+        atp: &bitdaemon_core::add_torrent_params::AddTorrentParams,
+        storage: StorageIndex,
+        out: &mut Vec<SessionOut>,
+    ) -> Option<Sha1Hash> {
+        let mut eff = Vec::new();
+        let t = Torrent::from_params(atp, storage, &mut eff)?;
+        let ih = t.info_hash;
+        self.torrents.insert(ih, t);
+        self.route(ih, eff, out);
+        Some(ih)
     }
 
     /// `remove_torrent` — drop the swarm (peers + picker).

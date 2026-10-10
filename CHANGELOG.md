@@ -7,6 +7,14 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — add_torrent entry point
+
+- `Torrent::from_params` + `Session::add_torrent_params` — ctor
+  fidèle : `ti` → tailles/hashes/picker, resume appliqué
+  (`apply_resume_data`, jobs `DiskHash` dispatchés), `peers`→
+  RESUME_DATA dans `peer_list`, `banned_peers` bannis, `PAUSED`,
+  magnet sans `ti`.
+
 ### Added — PeerList × Torrent
 
 - `Torrent.peer_list` + `add_swarm_peer` (feed tracker/PEX/DHT/LSD)
