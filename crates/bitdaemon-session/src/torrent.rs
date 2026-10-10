@@ -1545,7 +1545,20 @@ impl Torrent {
     /// `is_seed`-side helper — all blocks of `piece` have been
     /// written (`picker` tracks open pieces; a piece leaves the
     /// open queue when every block is finished).
-    #[must_use]
+    /// `on_disk_write_complete` — the block landed on disk;
+    /// upstream `picker().mark_as_finished(block, nullptr)`.
+    pub fn mark_block_finished(&mut self, piece: PieceIndex, start: i32) {
+        if let Some(p) = self.picker.as_mut() {
+            p.mark_as_finished(
+                bitdaemon_common::types::PieceBlock {
+                    piece_index: piece,
+                    block_index: start / 16384,
+                },
+                None,
+            );
+        }
+    }
+
     pub fn piece_complete(&self, piece: PieceIndex) -> bool {
         // conservative: written when our have-bit set OR the picker
         // reports the piece fully downloaded; full fidelity needs

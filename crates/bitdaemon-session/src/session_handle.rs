@@ -542,6 +542,13 @@ impl TorrentHandle {
         s.force_lsd_announce(&self.info_hash, out);
     }
 
+    /// `torrent_handle::add_piece` — write + verify a user-supplied
+    /// piece (data must be the full piece length).
+    pub fn add_piece(&self, piece: PieceIndex, data: &[u8], flags: u8) {
+        let mut s = lock(&self.session);
+        s.add_piece(&self.info_hash, piece, data, flags);
+    }
+
     /// `torrent_handle::set_max_connections` (per-torrent).
     pub fn set_max_connections(&self, max: i32) {
         {

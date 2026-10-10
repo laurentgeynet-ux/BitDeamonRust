@@ -8,6 +8,11 @@ Until `1.0.0`, breaking changes may occur in any release.
 ## [Unreleased]
 
 ### Added
+- BitTorrent v2 session support: per-file merkle trees on `Torrent`,
+  `async_hash` returns per-block SHA-256s, `verify_v2_blocks` via
+  `HashPicker.set_block_hash`, `hash_request`/`hashes`/`hash_reject`
+  wire messages (serve + add + throttled `maybe_send_hash_request`),
+  sparse-tree fastresume round-trip, v2-only `add_torrent` fix.
 - `torrent_handle::flags`/`set_flags`/`unset_flags` (masked
   `TorrentFlags` apply incl. `PAUSED`/`AUTO_MANAGED`/`SEQUENTIAL`/
   `UPLOAD_MODE`/`SHARE_MODE`), `trackers`/`add_tracker`/

@@ -353,6 +353,10 @@ impl Session {
                         });
                         continue;
                     }
+                    // `on_disk_write_complete` → mark_as_finished
+                    if let Some(t) = self.torrents.get_mut(&ih) {
+                        t.mark_block_finished(req.piece, req.start);
+                    }
                     // whole piece complete? then hash it
                     if let (Some(disk), Some(t)) = (self.disk.clone(), self.torrents.get(&ih)) {
                         if t.piece_complete(req.piece) {
@@ -941,6 +945,56 @@ impl Session {
             };
             out.push(SessionOut::UdpPacket(pkt, to));
         }
+    }
+
+    /// `torrent_handle::add_piece` — inject user-supplied piece
+    /// data: split into blocks, queue one disk write per block; the
+    /// normal write→`piece_complete`→hash path verifies it
+    /// (upstream `torrent::add_piece` semantics).
+    pub fn add_piece(&mut self, ih: &Sha1Hash, piece: PieceIndex, data: &[u8], flags: u8) {
+        let _ = flags;
+        let Some(t) = self.torrents.get_mut(ih) else {
+            return;
+        };
+        // upstream `torrent::add_piece`: each block goes through
+        // mark_as_downloading + mark_as_writing so the picker tracks
+        // it; already-finished blocks are skipped without
+        // `overwrite_existing`.
+        const OVERWRITE: u8 = 1;
+        let mut eff = Vec::new();
+        if let Some(p) = t.picker.as_mut() {
+            let blocks = p.blocks_in_piece(piece);
+            for i in 0..blocks {
+                let b = bitdaemon_common::types::PieceBlock {
+                    piece_index: piece,
+                    block_index: i,
+                };
+                if flags & OVERWRITE == 0 && p.is_finished_block(b) {
+                    continue;
+                }
+                if p.is_downloaded(b) && !p.is_finished_block(b) {
+                    continue;
+                }
+                p.mark_as_downloading(b, None, crate::piece_picker::PickerOptions::NONE);
+                p.mark_as_writing(b, None);
+            }
+        }
+        let piece_len = t.piece_length;
+        let mut off = 0i32;
+        for chunk in data.chunks(16384) {
+            eff.push(TorrentEffect::DiskWrite {
+                req: bitdaemon_common::types::PeerRequest {
+                    piece,
+                    start: off,
+                    length: chunk.len() as i32,
+                },
+                data: chunk.to_vec(),
+            });
+            off += chunk.len() as i32;
+        }
+        let _ = piece_len;
+        let mut out = Vec::new();
+        self.route(*ih, eff, &mut out);
     }
 
     /// `peer_connect_failed` — an outbound dial never completed the
