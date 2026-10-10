@@ -219,6 +219,13 @@ pub struct Torrent {
 }
 
 impl Torrent {
+    /// `peer_connection::has_outstanding_block_requests` — true
+    /// while any peer still has blocks in flight (used to lift
+    /// `graceful_pause` once the last write lands).
+    pub fn requests_outstanding(&self) -> bool {
+        self.peers.values().any(|c| !c.outstanding().is_empty())
+    }
+
     /// `torrent` ctor — `have` from resume data (`verified_pieces`),
     /// `None` when checking is still needed.
     #[must_use]

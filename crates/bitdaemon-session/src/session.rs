@@ -356,6 +356,11 @@ impl Session {
                     // `on_disk_write_complete` → mark_as_finished
                     if let Some(t) = self.torrents.get_mut(&ih) {
                         t.mark_block_finished(req.piece, req.start);
+                        // upstream lifts graceful_pause once the last
+                        // in-flight block request has been consumed.
+                        if t.graceful_pause && !t.requests_outstanding() {
+                            t.graceful_pause = false;
+                        }
                     }
                     // whole piece complete? then hash it
                     if let (Some(disk), Some(t)) = (self.disk.clone(), self.torrents.get(&ih)) {
