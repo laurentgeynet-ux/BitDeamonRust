@@ -70,6 +70,8 @@ pub struct Torrent {
     pub picker: Option<PiecePicker>,
     /// `m_connections` — peers keyed by caller-chosen id.
     pub peers: BTreeMap<u64, PeerConn>,
+    /// `m_trackers` — tier-ordered announce entries.
+    pub trackers: crate::tracker_list::TrackerList,
     /// `m_peer_list` — known swarm members (tracker/PEX/DHT/LSD/
     /// resume candidates). Upstream stores `torrent_peer`s owned by
     /// the list; ours are `TorrentPeer`s in `PeerList`.
@@ -124,6 +126,7 @@ impl Torrent {
             have,
             picker: None,
             peers: BTreeMap::new(),
+            trackers: crate::tracker_list::TrackerList::default(),
             peer_list: bitdaemon_net::peer_list::PeerList::default(),
             storage,
             num_seeds: 0,
@@ -491,6 +494,40 @@ impl Torrent {
             self.finished = true;
             self.seeding = true;
             out.push(TorrentEffect::BecameSeed);
+        }
+    }
+
+    /// `add_tracker_url` — upstream `add_tracker_url`.
+    pub fn add_tracker(&mut self, url: String, tier: i32) {
+        if self.trackers.find(&url).is_none() {
+            self.trackers
+                .add(crate::tracker_list::AnnounceEntry::new(url, tier));
+        }
+    }
+
+    /// `announce_req` — the `AnnounceParams` for a due tracker
+    /// (`torrent::tracker_request`). `port`/`key`/`peer_id` come
+    /// from the session. `left` is approximated as
+    /// `num_pieces * piece_length - verified` (the tail-piece
+    /// delta needs `total_size` — close enough for `left=`).
+    #[must_use]
+    pub fn announce_params(
+        &self,
+        peer_id: bitdaemon_common::PeerId,
+        port: u16,
+        event: i32,
+        key: i32,
+    ) -> bitdaemon_net::tracker_client::AnnounceParams {
+        bitdaemon_net::tracker_client::AnnounceParams {
+            info_hash: self.info_hash.to_bytes(),
+            peer_id: *peer_id.as_bytes(),
+            port,
+            uploaded: 0,
+            downloaded: self.verified_bytes,
+            left: (i64::from(self.num_pieces) * self.piece_length - self.verified_bytes).max(0),
+            event,
+            num_want: -1,
+            key,
         }
     }
 

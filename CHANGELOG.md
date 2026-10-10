@@ -7,6 +7,17 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — tracker announce pump
+
+- `Torrent.trackers` (`TrackerList` tiers) alimenté par
+  `AddTorrentParams.trackers` + `add_tracker`.
+- `Torrent::announce_params` (info_hash/peer_id/left/event/key).
+- `Session.peer_id` (`generate_peer_id "-OB0001-"`), `listen_port`,
+  `key` ; `SessionOut::TrackerAnnounce` émis par
+  `tracker_announce_due` ; `on_announce_response` : pairs→
+  `peer_list` (TRACKER), `complete`→`num_seeds`, `trackerid`
+  perso, échec → backoff quadratique + `TrackerError`.
+
 ### Added — check_files wiring
 
 - `Session::check_files` → `DiskIo::async_check_files` →

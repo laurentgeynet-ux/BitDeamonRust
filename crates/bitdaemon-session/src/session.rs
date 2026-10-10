@@ -58,6 +58,19 @@ pub enum SessionOut {
     Torrent(TorrentEffect),
     /// `alert` — surfaced to the API.
     Alert(String),
+    /// announce to a tracker (the async driver performs the
+    /// HTTP/UDP/WebSocket exchange, then reports back via
+    /// `Session::on_announce_response`).
+    TrackerAnnounce {
+        /// torrent.
+        ih: Sha1Hash,
+        /// tracker URL.
+        url: String,
+        /// `trackerid` from the previous response, if any.
+        tracker_id: String,
+        /// announce parameters (event, counters, key).
+        params: bitdaemon_net::tracker_client::AnnounceParams,
+    },
 }
 
 /// `session_impl` — all state owned on one thread.
@@ -72,6 +85,13 @@ pub struct Session {
     pub alerts: AlertManager,
     /// `m_stats_counters`.
     pub counters: Counters,
+    /// `m_peer_id` — generated with the default fingerprint
+    /// (`generate_peer_id`); used in announces and handshakes.
+    pub peer_id: bitdaemon_common::PeerId,
+    /// `m_listen_port` — our listen port (`announce request.port`).
+    pub listen_port: u16,
+    /// `m_key` — announce key (per-session random, BEP-7).
+    pub key: i32,
     /// completions pushed by disk-job callbacks (any thread).
     disk_tx: std::sync::mpsc::Sender<DiskCompleted>,
     disk_rx: std::sync::mpsc::Receiver<DiskCompleted>,
@@ -135,6 +155,12 @@ impl Default for Session {
             disk: None,
             alerts: AlertManager::default(),
             counters: Counters::default(),
+            peer_id: bitdaemon_common::peer_id::generate_peer_id(b"-OB0001-"),
+            listen_port: 6881,
+            key: {
+                use rand::Rng as _;
+                rand::rng().random::<i32>()
+            },
             disk_tx,
             disk_rx,
         }
@@ -559,6 +585,86 @@ impl Session {
                     out.push(SessionOut::Torrent(TorrentEffect::PieceFailed(piece)));
                 }
                 other => out.push(SessionOut::Torrent(other)),
+            }
+        }
+    }
+
+    /// `tracker_announce_due` — `torrent::on_tracker_announce`
+    /// pump: collect due tracker entries (`tracker_list::due`) and
+    /// emit `TrackerAnnounce` effects. `event`: 0 none / 1
+    /// completed / 2 started / 3 stopped (BEP-3), caller chooses.
+    pub fn tracker_announce_due(
+        &mut self,
+        now: std::time::Instant,
+        event: i32,
+        out: &mut Vec<SessionOut>,
+    ) {
+        let (pid, port, key) = (self.peer_id, self.listen_port, self.key);
+        for (ih, t) in &mut self.torrents {
+            if t.paused {
+                continue;
+            }
+            let is_seed = t.is_seed();
+            for idx in t.trackers.due(now, is_seed) {
+                let e = &t.trackers.trackers[idx];
+                out.push(SessionOut::TrackerAnnounce {
+                    ih: *ih,
+                    url: e.url.clone(),
+                    tracker_id: e.tracker_id.clone(),
+                    params: t.announce_params(pid, port, event, key),
+                });
+            }
+        }
+    }
+
+    /// `on_announce_response` — a tracker exchange completed:
+    /// success → peers into `peer_list` (source TRACKER),
+    /// `trackerid` saved, `complete`→`num_seeds`; failure →
+    /// `announce_entry::failed` (quadratic backoff).
+    pub fn on_announce_response(
+        &mut self,
+        ih: &Sha1Hash,
+        url: &str,
+        resp: Result<bitdaemon_net::http_tracker::TrackerResponse, String>,
+    ) {
+        let Some(t) = self.torrents.get_mut(ih) else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        match resp {
+            Ok(r) => {
+                for ep in r.peers {
+                    t.add_swarm_peer(ep, bitdaemon_common::flags::PeerSourceFlags::TRACKER, true);
+                }
+                if r.complete >= 0 {
+                    t.num_seeds = r.complete as usize;
+                }
+                if let Some(i) = t.trackers.find(url) {
+                    let e = &mut t.trackers.trackers[i];
+                    e.verified = true;
+                    if let Some(tid) = r.tracker_id {
+                        e.tracker_id = String::from_utf8_lossy(&tid).into_owned();
+                    }
+                }
+                self.alerts.post(Alert::TrackerReply {
+                    ih: *ih,
+                    url: url.to_string(),
+                    num_peers: t.peer_list.num_peers(),
+                });
+            }
+            Err(_) => {
+                // settings: `tracker_backoff`/`retry_tracker_interval`
+                // live in the caller's settings — use the upstream
+                // defaults (250% backoff, base interval handled by
+                // the entry's own next_announce).
+                if let Some(i) = t.trackers.find(url) {
+                    t.trackers.trackers[i].failed(250, std::time::Duration::from_secs(60), now);
+                }
+                self.alerts.post(Alert::TrackerError {
+                    ih: *ih,
+                    url: url.to_string(),
+                    error: "announce failed".to_string(),
+                });
             }
         }
     }
