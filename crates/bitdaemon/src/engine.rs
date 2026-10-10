@@ -1421,7 +1421,17 @@ impl Engine {
                             Err(_) => break,
                         }
                     }
-                    w = rx.recv() => {
+                    w = tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        rx.recv(),
+                    ) => {
+                        // upstream sends a keepalive when the conn
+                        // has been silent ~2min; 60s keeps buffers
+                        // warm under NAT without wire chatter.
+                        let w = match w {
+                            Err(_) => Some(PeerMessage::Keepalive),
+                            Ok(v) => v,
+                        };
                         match w {
                             Some(msg) => {
                                 // throttle bulk payload (upstream
