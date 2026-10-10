@@ -15,6 +15,9 @@ use bitdaemon_common::types::PieceIndex;
 
 use crate::alerts::Alert;
 use crate::session::{PeerPacket, Session, SessionOut};
+
+/// effects vector alias for handle signatures.
+pub type SessionOutVec = Vec<SessionOut>;
 use crate::settings::SessionParams;
 use crate::torrent::Torrent;
 
@@ -197,6 +200,38 @@ impl TorrentHandle {
             .torrents
             .get(&self.info_hash)
             .map_or_else(Vec::new, |t| t.file_priorities.clone())
+    }
+
+    /// `prioritize_pieces` — direct per-piece overrides.
+    pub fn prioritize_pieces(&self, prios: &[bitdaemon_common::types::DownloadPriority]) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.prioritize_pieces(prios);
+        }
+    }
+
+    /// `piece_priority`.
+    #[must_use]
+    pub fn piece_priority(
+        &self,
+        index: PieceIndex,
+    ) -> Option<bitdaemon_common::types::DownloadPriority> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .and_then(|t| t.piece_priority(index))
+    }
+
+    /// `set_sequential_download`.
+    pub fn set_sequential_download(&self, yes: bool) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.set_sequential_download(yes);
+        }
+    }
+
+    /// `force_recheck` — effects (disk hash jobs) are returned for
+    /// the caller to route (a real engine drains `SessionOut`).
+    pub fn force_recheck(&self, out: &mut SessionOutVec) {
+        lock(&self.session).force_recheck(&self.info_hash, out);
     }
 
     /// `file_progress` — per-file downloaded bytes.

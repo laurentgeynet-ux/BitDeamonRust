@@ -9,6 +9,13 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **Ops `torrent_handle`** — `force_recheck` (re-hash par pièce
+  via `DiskHash`, `checking`/`checking_pieces` armé puis drainé par
+  `on_piece_verified`), `prioritize_pieces`/`piece_priority`
+  (overrides directs), `set_sequential_download` (flag +
+  `PickerOptions::SEQUENTIAL` dans `drive_peer`, `atp` flag
+  `SEQUENTIAL_DOWNLOAD` honoré).
+
 - **Priorités par fichier + `file_progress`** —
   `Torrent::prioritize_files` applique les `DownloadPriority` par
   fichier puis recalcule les priorités de pièces (max des fichiers

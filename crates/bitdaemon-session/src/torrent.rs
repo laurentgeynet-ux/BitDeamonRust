@@ -156,6 +156,11 @@ pub struct Torrent {
     /// `m_file_priority` — per-file `DownloadPriority` (empty =
     /// all default). Drives `piece_priority` upstream-style.
     pub file_priorities: Vec<bitdaemon_common::types::DownloadPriority>,
+    /// `m_sequential_download` — sequential pick order (streaming).
+    pub sequential: bool,
+    /// pieces left in an in-flight `force_recheck` pass
+    /// (`checking` clears when it reaches 0).
+    pub checking_pieces: i32,
 }
 
 impl Torrent {
@@ -211,6 +216,8 @@ impl Torrent {
             stat_prev_up: 0,
             stat_sample: None,
             file_priorities: Vec::new(),
+            sequential: false,
+            checking_pieces: 0,
         }
     }
 
@@ -286,6 +293,9 @@ impl Torrent {
         t.paused = atp
             .flags
             .contains(bitdaemon_common::flags::TorrentFlags::PAUSED);
+        t.sequential = atp
+            .flags
+            .contains(bitdaemon_common::flags::TorrentFlags::SEQUENTIAL_DOWNLOAD);
         t.save_path = String::from_utf8_lossy(&atp.save_path).into_owned();
         if !atp.name.is_empty() {
             t.name = String::from_utf8_lossy(&atp.name).into_owned();
@@ -1000,7 +1010,11 @@ impl Torrent {
         if self.picker.is_none() {
             return;
         }
-        let opts = PickerOptions::RAREST_FIRST;
+        let opts = if self.sequential {
+            PickerOptions::RAREST_FIRST | PickerOptions::SEQUENTIAL
+        } else {
+            PickerOptions::RAREST_FIRST
+        };
         // build peer ctx from an immutable snapshot first
         let (key, allowed_fast, suggested, peer_pieces, peer_choked, outstanding) = {
             let Some(c) = self.peers.get(&peer_id) else {
@@ -1322,6 +1336,60 @@ impl Torrent {
             }
         }
         self.piece_verified(piece, passed, out);
+    }
+
+    /// `prioritize_pieces` (upstream `torrent_handle::prioritize_pieces`
+    /// → `torrent::set_piece_priority` per index) — direct piece
+    /// overrides; they sit on top of the file-derived priorities.
+    pub fn prioritize_pieces(&mut self, prios: &[bitdaemon_common::types::DownloadPriority]) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        for (i, prio) in prios.iter().enumerate().take(self.num_pieces as usize) {
+            picker.set_piece_priority(PieceIndex(i as i32), *prio);
+        }
+    }
+
+    /// `piece_priority(index)` — current picker priority.
+    #[must_use]
+    pub fn piece_priority(
+        &self,
+        index: PieceIndex,
+    ) -> Option<bitdaemon_common::types::DownloadPriority> {
+        self.picker.as_ref().map(|p| p.piece_priority(index))
+    }
+
+    /// `set_sequential_download` (upstream `torrent::set_sequential_download`).
+    pub fn set_sequential_download(&mut self, yes: bool) {
+        self.sequential = yes;
+    }
+
+    /// `start_full_recheck` prep — clear `have`/seed state and arm
+    /// `checking_pieces`; the session then queues a `DiskHash`
+    /// per piece (`torrent::force_recheck` → per-piece hash jobs).
+    /// Returns how many pieces were queued (0 = nothing to check).
+    pub fn arm_full_recheck(&mut self) -> i32 {
+        if self.picker.is_none() || self.checking || self.num_pieces <= 0 {
+            return 0;
+        }
+        self.have.clear_all();
+        self.finished = false;
+        self.seeding = false;
+        self.checking = true;
+        self.checking_pieces = self.num_pieces;
+        self.num_pieces
+    }
+
+    /// one recheck hash came back — `checking` clears when the
+    /// armed count drains (upstream `torrent::on_piece_hashed`
+    /// ends the checking state at the last piece).
+    pub fn recheck_piece_done(&mut self) {
+        if self.checking_pieces > 0 {
+            self.checking_pieces -= 1;
+            if self.checking_pieces == 0 {
+                self.checking = false;
+            }
+        }
     }
 
     /// `prioritize_files` (upstream `torrent::prioritize_files`) —

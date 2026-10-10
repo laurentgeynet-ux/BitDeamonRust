@@ -657,6 +657,24 @@ impl Session {
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(ih) {
             t.piece_verified(piece, passed, &mut eff);
+            t.recheck_piece_done();
+        }
+        self.route(*ih, eff, out);
+    }
+
+    /// `force_recheck` — clear `have` and re-hash every piece
+    /// (upstream `torrent_handle::force_recheck` → per-piece
+    /// `disk_hash` jobs; `piece_verified` re-populates).
+    pub fn force_recheck(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
+        let mut eff = Vec::new();
+        if let Some(t) = self.torrents.get_mut(ih)
+            && t.arm_full_recheck() > 0
+        {
+            for p in 0..t.num_pieces {
+                eff.push(TorrentEffect::DiskHash {
+                    piece: bitdaemon_common::types::PieceIndex(p),
+                });
+            }
         }
         self.route(*ih, eff, out);
     }
