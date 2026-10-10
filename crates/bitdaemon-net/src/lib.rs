@@ -110,3 +110,5 @@ pub mod utp;
 pub mod utp_socket;
 /// `web_peer_connection`/`web_connection_base` — url-seed GETs.
 pub mod web_seed;
+/// `websocket_stream` — RFC 6455 upgrade + frame codec (wss trackers).
+pub mod websocket;
