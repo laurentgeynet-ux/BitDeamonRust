@@ -114,6 +114,8 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 
 | C++ source | Rust target | Status | Notes |
 |---|---|---|---|
+| `socket_io.cpp`/`socket_io.hpp` | `net::socket_io` | **ported** | BE int helpers, endpoint bytes (6/18 B), `read_endpoint_list` |
+| `bt_peer_connection` packet layer | `net::peer_wire` | partial | handshake (68 B, reserved bits verbatim) + all 24 message ids, tokio codec, max-len cap; conn state machine later |
 | `peer_connection.cpp` (`peer_connection.hpp`), `peer_connection_handle.cpp`, `peer_connection_interface.hpp` | `net::peer` | not started | base state machine |
 | `bt_peer_connection.cpp` (`bt_peer_connection.hpp`) | `net::peer::bt` | not started | BT handshake + BEP-10 |
 | `web_connection_base.cpp`, `web_peer_connection.cpp` | `net::peer::web` | not started | web seeds (Phase 8) |

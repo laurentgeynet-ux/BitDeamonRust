@@ -143,11 +143,12 @@ access (upstream semantics).
 
 ---
 
-## Phase 4 — Peer wire ⬜
+## Phase 4 — Peer wire 🟨
 
 *~25k LOC C++.* The core protocol, on tokio.
 
-`bitdaemon-net`: `PeerWireCodec` (framing + all message types),
+`bitdaemon-net`: `PeerWireCodec` (framing + all message types) ✅,
+`socket_io` (BE helpers + endpoint codec) ✅,
 `PeerConnection` state machine (choke/interest states, timeouts,
 keepalive, `receive_buffer`, `chained_buffer` → `BytesMut`),
 `BtPeerConnection` (BitTorrent handshake, extension protocol BEP-10),

@@ -9,6 +9,17 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `bitdaemon_net` Phase-4 wave 1 (peer wire codec):
+  `peer_wire` — 68-byte handshake (`write_handshake`/`parse_handshake`,
+  reserved bits verbatim: DHT r7|0x01, BEP-10 r5|0x10, FAST r7|0x04,
+  v2-upgrade r7|0x10), all 24 `message_type` ids encoded byte-exact
+  (choke..hash_reject, v2 hash messages keyed by merkle root),
+  `PeerWireCodec` (`tokio_util` Encoder/Decoder, length-prefixed
+  framing, keepalive, `max_len` cap), `decode` dispatch.
+  `socket_io` — BE u8/16/32/64 cursor, address/endpoint bytes (6/18 B),
+  `read_endpoint_list` (compact peer lists), `parse_endpoint`.
+  9/9 tests (byte-exact encodings, fragmented frames, round-trips).
+
 - `bitdaemon_disk` Phase-3 wave 5: `store_buffer` — `aux::store_buffer`
   read cache (`TorrentLocation`-keyed `Arc<[u8]>` buffers instead of raw
   pointers — `forbid(unsafe_code)`), `get`/`get2`/`insert`/`erase` with

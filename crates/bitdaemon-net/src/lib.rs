@@ -20,6 +20,10 @@
 
 #![forbid(unsafe_code)]
 
+/// Peer wire framing + message codec (`bt_peer_connection` packets).
+pub mod peer_wire;
+/// `aux_/socket_io.hpp` — BE wire helpers + endpoint codec.
+pub mod socket_io;
 pub mod transport;
 
 /// Networking errors (`boost::system::error_code` usages in
