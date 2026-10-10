@@ -220,16 +220,26 @@ impl PeerPipeline {
                 i64::from(self.queue_time) * download_payload_rate / i64::from(block_size);
             self.desired_queue_size = desired.clamp(0, i64::from(u16::MAX)) as u16;
         }
-        self.desired_queue_size = self
-            .desired_queue_size
-            .clamp(MIN_REQUEST_QUEUE as u16, self.max_out_request_queue);
+        // clamp can't invert when `max_out_request_queue` is set
+        // below `MIN_REQUEST_QUEUE` — the cap wins (upstream floors
+        // `max_out_request_queue` at MIN too).
+        self.desired_queue_size = self.desired_queue_size.clamp(
+            (MIN_REQUEST_QUEUE as u16).min(self.max_out_request_queue),
+            self.max_out_request_queue,
+        );
     }
 
-    /// Slow-start bump (`incoming_piece`: `m_slow_start` ⇒ +1).
+    /// Slow-start bump (`incoming_piece`: `m_slow_start` ⇒ +1) plus
+    /// the RTT sample (`m_request_time.add_sample`) and the snub
+    /// reset — data arrived, the peer isn't stalling.
     pub fn on_piece_received(&mut self, now_ms: i64) {
         if self.slow_start {
             self.desired_queue_size += 1;
         }
+        if self.last_request_ms != 0 && now_ms > self.last_request_ms {
+            self.request_time.add_sample(now_ms - self.last_request_ms);
+        }
+        self.snubbed = false;
         self.last_piece_ms = now_ms;
     }
 

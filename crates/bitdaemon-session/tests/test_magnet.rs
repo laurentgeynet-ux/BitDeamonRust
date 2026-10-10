@@ -86,12 +86,26 @@ fn auto_managed_queue_limits_downloads() {
     ses.manage_queue(2, -1);
     let queued: Vec<_> = ses.torrents.values().map(|t| t.queued).collect();
     assert_eq!(queued.iter().filter(|q| **q).count(), 2);
-    // a paused torrent frees a slot
+    // upstream `auto_manage_torrents`: pausing an auto-managed
+    // torrent does NOT free its slot — the queue unpauses it on the
+    // next pass (`set_paused(false)` within limits). A sticky pause
+    // requires clearing `auto_managed` first.
     let first = *ses.torrents.keys().next().unwrap();
     ses.set_paused(&first, true, &mut Vec::new());
     ses.manage_queue(2, -1);
     let queued2 = ses.torrents.values().filter(|t| t.queued).count();
+    assert_eq!(queued2, 2);
+    // clearing auto_managed makes the pause sticky → the torrent
+    // leaves the lists and frees its slot for the next one
+    {
+        let t = ses.torrents.get_mut(&first).unwrap();
+        t.auto_managed = false;
+        t.paused = true;
+    }
+    ses.manage_queue(2, -1);
+    let queued2 = ses.torrents.values().filter(|t| t.queued).count();
     assert_eq!(queued2, 1);
+    assert!(ses.torrents.get(&first).unwrap().paused);
 }
 
 #[test]

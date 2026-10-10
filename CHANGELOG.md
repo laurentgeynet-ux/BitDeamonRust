@@ -7,6 +7,57 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Fixed
+- **Real-swarm completion pipeline** (validated end-to-end on a
+  public Debian torrent: 100 % at ~12 MiB/s, hash-verified):
+  - `peer_list_state` deadlock — a `&slock(session)` borrow
+    lifetime-extended a `MutexGuard` across a second `slock` on the
+    same non-reentrant `Mutex`, freezing the engine at first tick;
+  - trackers never seeded from `add_torrent_params` — `from_params`
+    now tiers `atp.trackers` into `add_tracker` so announces fire;
+  - `manage_queue` was never called and skipped `paused` torrents —
+    upstream `auto_manage_torrents` unpauses auto-managed torrents
+    within the limits (auto-managed `paused` is scheduler state, not
+    a user pause); `auto_manage_scaler` now runs the pass every
+    `auto_manage_interval` (30 s) and `add_torrent` forces an
+    immediate pass;
+  - IPv6 swarm entries panicked `TorrentPeer::new_v4` — `add_peer`
+    now dispatches on `SocketAddr` family;
+  - disk write jobs were **dropped** once `back_pressure` tripped
+    (default limit was 9 buffers, reads counted instead of writes)
+    — `async_write` now always enqueues (upstream
+    `store_buffer.insert` semantics: the bool only signals the peer
+    to slow down), `write_blocks` tracks the real level
+    (`max_queued_disk_bytes` = 100 MiB → 6400 blocks) and
+    `job_done` releases the slot + re-checks watermarks at every
+    completion path;
+  - `drain_disk_completed` never ran completion callbacks —
+    `DiskIo::call_job_handlers` is invoked at the top of the drain;
+  - `piece_verified` never incremented `verified_bytes` (progress
+    pinned at 0.0 %) and never told the picker — `piece_passed`,
+    `hashing_done`/`hashing_started`, `is_hashing`/`have_piece`
+    guards wire the full `on_disk_write_complete` → `async_hash` →
+    `piece_finished` chain without re-hash storms;
+  - `piece_picker` bucket cascade could read `m_pieces` out of
+    bounds on a stale `elem_index`/stale priority hint —
+    `bucket_of` re-derives the bucket from the boundaries and
+    inconsistent entries mark `dirty` for a rebuild instead of
+    panicking;
+  - `check_request_timeouts` snubbed peers but never freed dead
+    requests — ported `snub_peer`: wipe the unsent queue, mark the
+    last eligible in-flight block `timed_out` + `abort_download` so
+    another peer re-picks it (the 99 % end-game stall);
+  - request bookkeeping: `requested_ms` re-armed per block
+    received, RTT samples on `incoming_piece`, `reqq` from the
+    extended handshake caps `max_out_request_queue`, AIMD
+    `desired_queue_size` + slow-start exit per `second_tick`,
+    endgame flag propagated to the peer pipeline;
+  - defaults aligned on `settings_pack.cpp`: `connections_limit`
+    200, `active_limit` 500, `max_allowed_in_request_queue` 2000,
+    `max_peerlist_size` 3000, `alert_queue_size` 2000,
+    `max_queued_disk_bytes` 100 MiB, `connection_speed` 30;
+  - CLI: injects `SystemResolver` + DHT bootstrap routers.
+
 ### Added
 - Peer wire niceties: engine sends keepalives after 60 s of idle
   upstream ~2 min `inactivity_timeout`, `graceful_pause` flag +

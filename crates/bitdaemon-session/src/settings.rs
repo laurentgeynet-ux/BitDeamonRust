@@ -71,6 +71,9 @@ pub struct SessionSettings {
     pub max_failcount: i32,
     /// `allow_multiple_connections_per_ip`.
     pub allow_multiple_connections_per_ip: bool,
+    /// `auto_manage_interval` — seconds between auto-manage queue
+    /// passes (upstream default 30; adds also trigger a pass).
+    pub auto_manage_interval: i32,
     /// `anonymous_mode` — hide identity on the wire; **also**
     /// suppresses LSD multicasts (OnionBit deviation: upstream only
     /// strips announce `ip`/user-agent — announcing info-hashes to
@@ -82,8 +85,8 @@ impl Default for SessionSettings {
     /// `default_settings()`.
     fn default() -> Self {
         Self {
-            connections_limit: 500,
-            active_limit: 15,
+            connections_limit: 200,
+            active_limit: 500,
             active_downloads: 3,
             active_seeds: 5,
             unchoke_slots: 8,
@@ -91,13 +94,13 @@ impl Default for SessionSettings {
             request_timeout: Duration::from_secs(60),
             peer_timeout: Duration::from_secs(120),
             request_queue_time: Duration::from_secs(3),
-            max_allowed_in_queue: 500,
+            max_allowed_in_queue: 2000,
             upload_rate_limit: 0,
             download_rate_limit: 0,
             piece_timeout: Duration::from_secs(20),
-            max_disk_write_queue: 32 << 20,
+            max_disk_write_queue: 100 << 20,
             send_buffer_watermark: 500 << 10,
-            alert_queue_size: 100,
+            alert_queue_size: 2000,
             dht_enabled: true,
             prefer_rc4: false,
             connection_speed: 30,
@@ -105,9 +108,10 @@ impl Default for SessionSettings {
             save_resume_interval: Duration::from_secs(60),
             web_seed_blocks_per_tick: 4,
             min_reconnect_time: 60,
-            max_peerlist_size: 4000,
+            max_peerlist_size: 3000,
             max_failcount: 3,
             allow_multiple_connections_per_ip: false,
+            auto_manage_interval: 30,
             anonymous_mode: false,
         }
     }

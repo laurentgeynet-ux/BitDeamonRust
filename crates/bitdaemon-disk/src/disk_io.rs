@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use bitdaemon_common::types::{FileIndex, PieceIndex, StorageIndex};
 use bitdaemon_common::{Sha1Hash, Sha256Hash};
@@ -41,7 +41,12 @@ use crate::storage_error::{Operation, StorageError};
 /// Per-torrent state owned by the disk io — upstream the fence hangs
 /// off `storage_interface`; here both live behind one entry.
 struct StorageEntry {
-    storage: Mutex<Box<dyn DiskStorage>>,
+    /// `RwLock`: read/write/hash jobs only need `&self` access — a
+    /// plain `Mutex` would serialize all disk I/O for a torrent onto
+    /// one logical thread regardless of pool size. `&mut self` ops
+    /// (`rename_file`, `set_file_priority`) take the write side; they
+    /// are fence jobs so exclusive access is already guaranteed.
+    storage: RwLock<Box<dyn DiskStorage>>,
     fence: DiskJobFence,
 }
 
@@ -59,6 +64,9 @@ pub struct PreadDiskIo {
     file_pool: Arc<crate::file_pool::FilePool>,
     /// `m_back_pressure`.
     back_pressure: crate::back_pressure::BackPressure,
+    /// `m_blocks` — write blocks queued/in flight; the back-pressure
+    /// level (upstream `disk_cache::m_blocks`).
+    write_blocks: std::sync::atomic::AtomicI64,
 }
 
 impl PreadDiskIo {
@@ -105,10 +113,21 @@ impl PreadDiskIo {
             factory,
             file_pool: Arc::new(crate::file_pool::FilePool::new(40)),
             back_pressure: crate::back_pressure::BackPressure::new(),
+            write_blocks: std::sync::atomic::AtomicI64::new(0),
         });
+        // upstream `pread_disk_io` ctor:
+        // `m_cache.set_max_size(max_queued_disk_bytes / 0x4000)` with
+        // the setting default 100 MiB → 6400 blocks.
+        io.back_pressure.set_max_size(100 * 1024 * 1024 / 0x4000);
         *io_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&io));
         io.pool.set_max_threads(max_threads);
         io
+    }
+
+    /// `settings_updated` — apply `max_queued_disk_bytes` (upstream
+    /// divides by `default_block_size` = 16 KiB).
+    pub fn set_max_queued_bytes(&self, bytes: i64) {
+        self.back_pressure.set_max_size(bytes / 0x4000);
     }
 
     /// the buffer pool (jobs' `disk_buffer_holder`s come from here).
@@ -137,7 +156,7 @@ impl PreadDiskIo {
         g.insert(
             idx,
             Arc::new(StorageEntry {
-                storage: Mutex::new(storage),
+                storage: RwLock::new(storage),
                 fence: DiskJobFence::new(),
             }),
         );
@@ -153,7 +172,7 @@ impl PreadDiskIo {
             .insert(
                 idx,
                 Arc::new(StorageEntry {
-                    storage: Mutex::new(storage),
+                    storage: RwLock::new(storage),
                     fence: DiskJobFence::new(),
                 }),
             );
@@ -174,9 +193,21 @@ impl PreadDiskIo {
         let mut drained = self.pool.drain_jobs();
         for j in &mut drained {
             crate::disk_completed::abort(j);
+            self.job_done(j);
         }
         self.pool.abort(wait);
         self.completed.append(drained);
+    }
+
+    /// A job reached the completed queue — release its write-block
+    /// slot and release observers when the level drains below the
+    /// low watermark (upstream `disk_cache::check_buffer_level` on
+    /// every erase).
+    fn job_done(&self, j: &DiskJob) {
+        if matches!(j.action, JobKind::Write(_)) {
+            let level = self.write_blocks.fetch_sub(1, Ordering::Relaxed) - 1;
+            self.back_pressure.check_buffer_level(level);
+        }
     }
 
     fn storage(&self, idx: StorageIndex) -> Option<Arc<StorageEntry>> {
@@ -192,6 +223,7 @@ impl PreadDiskIo {
         if self.abort.load(Ordering::Relaxed) {
             let mut j = j;
             crate::disk_completed::abort(&mut j);
+            self.job_done(&j);
             self.completed.push(j);
             return;
         }
@@ -205,6 +237,7 @@ impl PreadDiskIo {
             // no storage — job is stale; complete it aborted
             let mut j = j;
             crate::disk_completed::abort(&mut j);
+            self.job_done(&j);
             self.completed.push(j);
         }
     }
@@ -214,6 +247,7 @@ impl PreadDiskIo {
         if self.abort.load(Ordering::Relaxed) {
             let mut j = j;
             crate::disk_completed::abort(&mut j);
+            self.job_done(&j);
             self.completed.push(j);
             return;
         }
@@ -231,6 +265,7 @@ impl PreadDiskIo {
             None => {
                 let mut j = j;
                 crate::disk_completed::abort(&mut j);
+                self.job_done(&j);
                 self.completed.push(j);
             }
         }
@@ -302,6 +337,7 @@ impl PreadDiskIo {
                     self.pool.submit_jobs();
                 }
             }
+            self.job_done(&j);
             done.push_back(j);
         }
         self.completed.append(done);
@@ -332,8 +368,39 @@ impl PreadDiskIo {
             }
             return;
         };
-        let mut st_guard = e.storage.lock().unwrap_or_else(|p| p.into_inner());
-        let st: &mut dyn DiskStorage = &mut **st_guard;
+        // `&mut self` ops (rename, file priorities) are exclusive
+        // fence jobs — they take the write side. Everything else is
+        // `&self` and runs concurrently across pool threads on the
+        // read side; upstream `mmap_disk_io` likewise does not hold a
+        // per-storage mutex around positioned I/O.
+        if matches!(j.action, JobKind::RenameFile(_) | JobKind::FilePriority(_)) {
+            let mut st_guard = e.storage.write().unwrap_or_else(|p| p.into_inner());
+            let st: &mut dyn DiskStorage = &mut **st_guard;
+            j.error = match &mut j.action {
+                JobKind::RenameFile(r) => {
+                    match st.rename_file(r.file_index, r.name.as_os_str().as_encoded_bytes()) {
+                        Ok(()) => StorageError::default(),
+                        Err(e) => e,
+                    }
+                }
+                JobKind::FilePriority(f) => {
+                    // exclusive job — the fence guarantees sole access;
+                    // upstream writes the adjusted priorities back into
+                    // the job for the handler
+                    match st.set_file_priority(&f.prio) {
+                        Ok(()) => {
+                            f.prio = st.file_priorities().to_vec();
+                            StorageError::default()
+                        }
+                        Err(e) => e,
+                    }
+                }
+                _ => StorageError::default(),
+            };
+            return;
+        }
+        let st_guard = e.storage.read().unwrap_or_else(|p| p.into_inner());
+        let st: &dyn DiskStorage = &**st_guard;
         j.error = match &mut j.action {
             JobKind::Read(r) => read_job(st, r),
             JobKind::PartialRead(r) => partial_read_job(st, r),
@@ -377,29 +444,10 @@ impl PreadDiskIo {
                     Err(e) => e,
                 }
             }
-            JobKind::RenameFile(r) => {
-                match st.rename_file(r.file_index, r.name.as_os_str().as_encoded_bytes()) {
-                    Ok(()) => StorageError::default(),
-                    Err(e) => e,
-                }
-            }
-            JobKind::StopTorrent(_) => StorageError::default(),
-            JobKind::FilePriority(f) => {
-                // exclusive job — the fence guarantees sole access;
-                // upstream writes the adjusted priorities back into
-                // the job for the handler
-                match st.set_file_priority(&f.prio) {
-                    Ok(()) => {
-                        f.prio = st.file_priorities().to_vec();
-                        StorageError::default()
-                    }
-                    Err(e) => e,
-                }
-            }
-            JobKind::ClearPiece(c) => {
-                let _ = c;
-                StorageError::default()
-            }
+            JobKind::StopTorrent(_)
+            | JobKind::ClearPiece(_)
+            | JobKind::RenameFile(_)
+            | JobKind::FilePriority(_) => StorageError::default(),
         };
     }
 
@@ -610,14 +658,14 @@ impl DiskIo for PreadDiskIo {
         handler: Box<dyn FnOnce(StorageError) + Send>,
         _flags: u8,
     ) -> bool {
-        // `async_write` returns true when the queue is full — the peer
-        // stops and waits on the observer (upstream contract)
-        if self
-            .back_pressure
-            .has_back_pressure(self.buffer_pool.in_use(), o)
-        {
-            return true;
-        }
+        // upstream `pread_disk_io::async_write` / `mmap_disk_io`:
+        // the block is **inserted regardless** (`store_buffer.insert`)
+        // — the bool return only signals the peer to stop requesting
+        // until the queue drains below the low watermark. Dropping
+        // the job would wedge the block in picker `writing` forever.
+        let level = self.write_blocks.load(Ordering::Relaxed);
+        let pressure = self.back_pressure.has_back_pressure(level, o);
+        self.write_blocks.fetch_add(1, Ordering::Relaxed);
         let j = self.mk_job(JobKind::Write(WriteJob {
             handler,
             buf,
@@ -626,7 +674,7 @@ impl DiskIo for PreadDiskIo {
             buffer_size: u16::try_from(r.length).unwrap_or(u16::MAX),
         }));
         self.add_job(storage, j);
-        false
+        pressure
     }
 
     fn async_hash(
@@ -785,6 +833,18 @@ impl DiskIo for PreadDiskIo {
 
     fn abort(&self, wait: bool) {
         self.abort_jobs(wait);
+    }
+
+    fn call_job_handlers(&self) -> usize {
+        self.completed.call_job_handlers()
+    }
+
+    fn set_max_queued_bytes(&self, bytes: i64) {
+        PreadDiskIo::set_max_queued_bytes(self, bytes);
+    }
+
+    fn write_queue_exceeded(&self) -> bool {
+        self.back_pressure.exceeded()
     }
 
     fn submit_jobs(&self) {

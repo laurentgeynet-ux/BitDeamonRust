@@ -112,8 +112,14 @@ pub struct PeerConn {
     pub stat_up_round: i64,
     /// download payload bytes since the last unchoke round.
     pub stat_down_round: i64,
+    /// download bytes at the previous tick (drives the upstream
+    /// slow-start exit: stalled growth ⇒ AIMD takes over).
+    pub down_delta_prev: i64,
     /// `time_of_last_unchoke` (round-robin quota bookkeeping).
     pub last_unchoke: std::time::Instant,
+    /// monotonic ms clock refreshed each `second_tick` — drives the
+    /// pipeline's RTT samples and request-timeout bookkeeping.
+    pub now_ms: i64,
 }
 
 impl PeerConn {
@@ -157,11 +163,13 @@ impl PeerConn {
             last_down_total: 0,
             stat_up_round: 0,
             stat_down_round: 0,
+            down_delta_prev: -1,
             supports_fast: false,
             supports_dht: false,
             local_dont_have: 3,
             we_sent_interested: false,
             last_unchoke: std::time::Instant::now(),
+            now_ms,
         }
     }
 
@@ -297,8 +305,14 @@ impl PeerConn {
             piece_index: r.piece,
             block_index: r.start / 0x4000,
         };
-        self.pipeline.on_piece_received(0);
+        self.pipeline.on_piece_received(self.now_ms);
         let _ = self.cancel_request(block);
+        // upstream `incoming_piece`: while requests remain, the next
+        // expected block gets a fresh timeout window — `m_requested`
+        // is the last-receive watermark, not the queue's age.
+        if !self.pipeline.request_queue.is_empty() || !self.pipeline.download_queue.is_empty() {
+            self.pipeline.requested_ms = self.now_ms;
+        }
         block
     }
 
@@ -417,6 +431,13 @@ impl PeerConn {
                         self.ext_ut_pex = hs.messages.get("ut_pex").copied().unwrap_or(0) as u8;
                         self.metadata_size = hs.metadata_size;
                         self.remote_upload_only = hs.upload_only;
+                        // `reqq` — the peer's max tolerated request
+                        // queue (upstream `max_out_request_queue(reqq)`);
+                        // exceeding it floods the peer → disconnect.
+                        if hs.reqq > 0 {
+                            self.pipeline.max_out_request_queue =
+                                hs.reqq.min(i64::from(u16::MAX)) as u16;
+                        }
                         if let Some(v) = hs.client_version {
                             self.client_version = v;
                         }
@@ -455,8 +476,14 @@ impl PeerConn {
         }
     }
 
-    /// `add_request(pb, flags)` — queue a picked block.
-    pub fn add_request(&mut self, block: PieceBlock, busy: bool, time_critical: bool) {
+    /// `add_request(pb, flags)` — queue a picked block. `now_ms`
+    /// stamps `m_requested` when the wire queue goes empty→non-empty
+    /// (request timeout) and `m_last_request` (RTT sampling).
+    pub fn add_request(&mut self, block: PieceBlock, busy: bool, time_critical: bool, now_ms: i64) {
+        if self.pipeline.request_queue.is_empty() && self.pipeline.download_queue.is_empty() {
+            self.pipeline.requested_ms = now_ms;
+        }
+        self.pipeline.last_request_ms = now_ms;
         let mut pb = PendingBlock::new(block);
         pb.busy = busy;
         pb.time_critical = time_critical;
@@ -476,18 +503,21 @@ impl PeerConn {
             .position(|b| b.block == block)
         {
             self.pipeline.download_queue.remove(pos);
-            return true;
-        }
-        if let Some(pos) = self
+        } else if let Some(pos) = self
             .pipeline
             .request_queue
             .iter()
             .position(|b| b.block == block)
         {
             self.pipeline.request_queue.remove(pos);
-            return true;
+        } else {
+            return false;
         }
-        false
+        // `m_requested` — re-arm the timeout on the remaining head.
+        if self.pipeline.download_queue.is_empty() && self.pipeline.request_queue.is_empty() {
+            self.pipeline.requested_ms = 0;
+        }
+        true
     }
 
     /// Build the `PeerRequestCtx` the picker glue needs from this
@@ -566,7 +596,7 @@ impl PeerConn {
             });
         for (b, busy) in picked {
             if picker.mark_as_downloading(b, peer_key, opts) {
-                self.add_request(b, busy, false);
+                self.add_request(b, busy, false, now_ms);
             }
         }
         if let Some(e) = endgame {

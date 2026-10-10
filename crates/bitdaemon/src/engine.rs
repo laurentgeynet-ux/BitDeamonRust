@@ -227,6 +227,10 @@ pub struct Engine {
     pub request_timeout: i32,
     /// `settings_pack::max_out_request_queue`.
     pub max_out_request_queue: u16,
+    /// `settings_pack::connection_speed` — dial attempts per tick
+    /// (upstream `m_connect_speed`). `run` uses it when the caller
+    /// doesn't pass an explicit per-tick budget.
+    pub connection_speed: i32,
     /// `settings_pack::upload_rate_limit` — shared upload token
     /// bucket for every peer writer (payload bytes only, like
     /// upstream's channel-0 data accounting).
@@ -285,7 +289,8 @@ impl Engine {
             known_ihs: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
             queue_time: 3,
             request_timeout: 60,
-            max_out_request_queue: 500,
+            max_out_request_queue: 2000,
+            connection_speed: 30,
             upload_limiter: Arc::new(RateLimiter::new(0)),
             download_limiter: Arc::new(RateLimiter::new(0)),
             torrent_up_limiters: std::collections::HashMap::new(),
@@ -1135,6 +1140,7 @@ impl Engine {
         self.queue_time = s.request_queue_time.as_secs() as i32;
         self.request_timeout = s.request_timeout.as_secs() as i32;
         self.max_out_request_queue = s.max_allowed_in_queue.clamp(0, i32::from(u16::MAX)) as u16;
+        self.connection_speed = s.connection_speed;
         slock(&self.session).apply_settings(s);
     }
 
@@ -1307,11 +1313,12 @@ impl Engine {
     /// builds the same from `settings_pack`).
     #[must_use]
     pub fn peer_list_state(&self) -> bitdaemon_net::peer_list::PeerListState {
-        let s = &slock(&self.session).settings;
+        let guard = slock(&self.session);
+        let s = &guard.settings;
         bitdaemon_net::peer_list::PeerListState {
             is_finished: false,
             external_ip: None,
-            external_port: slock(&self.session).listen_port,
+            external_port: guard.listen_port,
             min_reconnect_time: s.min_reconnect_time,
             max_peerlist_size: s.max_peerlist_size,
             max_failcount: s.max_failcount,
@@ -1321,8 +1328,9 @@ impl Engine {
 
     /// `session_impl::run` — the canonical driver: 1 Hz tick
     /// (announces, peer drive, disk completions, DHT, LSD) plus the
-    /// connect pump dialing up to `settings.connections_limit`
-    /// candidates. Runs until `stop` resolves.
+    /// connect pump dialing up to `settings.connection_speed`
+    /// candidates per tick. `max_dials_per_tick = 0` → the setting.
+    /// Runs until `stop` resolves.
     pub async fn run<F: std::future::Future<Output = ()>>(
         &mut self,
         stop: F,
@@ -1338,7 +1346,12 @@ impl Engine {
             self.tick(Instant::now()).await;
             let st = self.peer_list_state();
             let stime = slock(&self.session).session_time;
-            let candidates = self.connect_pump(stime, &st, max_dials_per_tick);
+            let budget = if max_dials_per_tick == 0 {
+                self.connection_speed.max(0) as usize
+            } else {
+                max_dials_per_tick
+            };
+            let candidates = self.connect_pump(stime, &st, budget);
             for (ih, ep) in candidates {
                 self.spawn_dial(ih, ep, false);
             }

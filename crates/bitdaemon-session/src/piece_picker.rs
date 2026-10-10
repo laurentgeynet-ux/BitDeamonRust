@@ -920,6 +920,16 @@ impl PiecePicker {
 
     // ---------- priority buckets ----------
 
+    /// bucket containing `elem_index` — boundaries hold exclusive
+    /// end indices, so it's the first bucket whose end is past it.
+    /// Callers' `priority` hints can go stale (seeds/priority
+    /// shifts); deriving it here keeps the cascades in-bounds.
+    fn bucket_of(&self, elem_index: i32) -> Option<usize> {
+        self.priority_boundaries
+            .iter()
+            .position(|&end| elem_index < end)
+    }
+
     fn priority_begin(&self, prio: usize) -> i32 {
         if prio == 0 {
             0
@@ -993,7 +1003,11 @@ impl PiecePicker {
     /// `m_pieces`, cascading the last element of each lower bucket up.
     fn remove(&mut self, priority: usize, elem_index: i32) {
         debug_assert!(!self.dirty);
-        let mut priority = priority;
+        if elem_index < 0 || elem_index as usize >= self.pieces.len() {
+            self.dirty = true;
+            return;
+        }
+        let mut priority = self.bucket_of(elem_index).unwrap_or(priority);
         let mut elem_index = elem_index;
         let mut next_index = elem_index;
         loop {
@@ -1025,11 +1039,28 @@ impl PiecePicker {
 
     /// `update(priority, elem_index)` — `piece_map[pieces[elem_index]]`
     /// changed priority; relocate it (remove if it became -1).
-    fn update(&mut self, priority: usize, elem_index: i32) {
+    fn update(&mut self, _priority: usize, elem_index: i32) {
         debug_assert!(!self.dirty);
+        // upstream asserts `p.index == elem_index` and
+        // `priority_begin <= elem_index < priority_end`; a stale
+        // index (e.g. a flushed piece's reclaimed slot) would
+        // corrupt the boundary cascade — mark dirty and let the
+        // next pick rebuild `m_pieces` instead of panicking.
+        if elem_index < 0 || elem_index as usize >= self.pieces.len() {
+            self.dirty = true;
+            return;
+        }
         let index = self.pieces[elem_index as usize];
+        if self.piece_map[index.0 as usize].index != elem_index {
+            self.dirty = true;
+            return;
+        }
         let new_priority = self.piece_map[index.0 as usize].priority(self.seeds);
-        let mut priority = priority as i32;
+        let Some(bucket) = self.bucket_of(elem_index) else {
+            self.dirty = true;
+            return;
+        };
+        let mut priority = bucket as i32;
 
         if new_priority == priority {
             return;

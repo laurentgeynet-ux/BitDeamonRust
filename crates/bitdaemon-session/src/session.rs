@@ -161,6 +161,9 @@ pub struct Session {
     /// last `session_time` a DHT announce ran per torrent
     /// (`m_dht_announce_timer` upstream).
     dht_last_announce: std::collections::BTreeMap<Sha1Hash, i32>,
+    /// `m_auto_manage_time_scaler` — ticks until the next
+    /// auto-manage pass; `add_torrent` forces 0 (immediate).
+    auto_manage_scaler: i32,
 }
 
 /// A disk job's result, delivered back onto the session thread.
@@ -295,6 +298,7 @@ impl Default for Session {
             dht_lookup_map: std::collections::BTreeMap::new(),
             dht_port: None,
             dht_last_announce: std::collections::BTreeMap::new(),
+            auto_manage_scaler: 0,
             disk_tx,
             disk_rx,
         }
@@ -319,6 +323,13 @@ impl Session {
     /// Hash → `piece_verified` (passed = no error; hash comparison
     /// lands with `TorrentInfo` on `Torrent`).
     pub fn drain_disk_completed(&mut self, out: &mut Vec<SessionOut>) {
+        // `disk_completed_queue::call_job_handlers` — upstream posts
+        // this on the io_context on each 0→1 queue transition. Our
+        // handlers push `DiskCompleted` into `disk_rx`, so run them
+        // first or nothing below ever fires (writes/hashes wedged).
+        if let Some(d) = &self.disk {
+            d.call_job_handlers();
+        }
         while let Ok(c) = self.disk_rx.try_recv() {
             match c {
                 DiskCompleted::Read {
@@ -366,9 +377,14 @@ impl Session {
                             t.graceful_pause = false;
                         }
                     }
-                    // whole piece complete? then hash it
-                    if let (Some(disk), Some(t)) = (self.disk.clone(), self.torrents.get(&ih)) {
-                        if t.piece_complete(req.piece) {
+                    // whole piece complete and no hash in flight?
+                    // (`picker.started_hash_job` upstream)
+                    if let (Some(disk), Some(t)) = (self.disk.clone(), self.torrents.get_mut(&ih)) {
+                        if !t.have_piece(req.piece)
+                            && t.piece_complete(req.piece)
+                            && !t.is_hashing(req.piece)
+                        {
+                            t.hashing_started(req.piece);
                             let tx = self.disk_tx.clone();
                             let storage = t.storage;
                             let v2 = t.hash_job_v2_span(req.piece);
@@ -634,6 +650,7 @@ impl Session {
 
     /// attach the disk backend (`session_params` wiring).
     pub fn set_disk(&mut self, io: Arc<dyn DiskIo>) {
+        io.set_max_queued_bytes(self.settings.max_disk_write_queue);
         self.disk = Some(io);
     }
 
@@ -692,6 +709,10 @@ impl Session {
         let t = Torrent::from_params(atp, storage, &mut eff)?;
         let ih = t.info_hash;
         self.torrents.insert(ih, t);
+        // upstream `trigger_auto_manage` — an add forces the next
+        // tick into a queue pass (newly added default-flagged
+        // torrents start paused+auto-managed).
+        self.auto_manage_scaler = 0;
         self.alerts.post(Alert::TorrentAdded(ih));
         self.route(ih, eff, out);
         // `.torrent` `nodes` — `dht->m_add_node` upstream: seed
@@ -782,12 +803,21 @@ impl Session {
     /// `active_downloads`. Non-auto-managed and user-paused
     /// torrents are left alone (upstream `auto_managed` flag).
     /// `-1` limits mean unlimited.
+    ///
+    /// Upstream `auto_manage_torrents` iterates the
+    /// `*_auto_managed` lists — which contain *all* auto-managed
+    /// torrents, paused included — and calls `set_paused(false)`
+    /// within the limits / `set_paused(true)` beyond. `paused` on
+    /// an auto-managed torrent is scheduler state, not a user
+    /// request (user pause on an auto-managed torrent is
+    /// overridden by the queue — `flags::auto_managed` must be
+    /// cleared for a sticky pause).
     pub fn manage_queue(&mut self, active_downloads: i32, active_seeds: i32) {
         let mut dl_active = 0i32;
         let mut seed_active = 0i32;
         // BTreeMap order → deterministic promotion, oldest-ih first
         for t in self.torrents.values_mut() {
-            if !t.auto_managed || t.paused {
+            if !t.auto_managed {
                 t.queued = false;
                 continue;
             }
@@ -797,8 +827,16 @@ impl Session {
             } else {
                 dl_active >= active_downloads && active_downloads >= 0
             };
-            t.queued = over;
-            if !over {
+            if over {
+                // upstream `set_paused(true, graceful_pause)` —
+                // queued beyond the slot limit.
+                t.paused = true;
+                t.queued = true;
+            } else {
+                // upstream `set_paused(false)` — promote into a
+                // free slot, unpausing scheduler-paused torrents.
+                t.paused = false;
+                t.queued = false;
                 if seed {
                     seed_active += 1;
                 } else {
@@ -1270,6 +1308,13 @@ impl Session {
     /// re-reads everything lazily; we mirror that by replacing the
     /// struct (all reads go through `self.settings`).
     pub fn apply_settings(&mut self, s: crate::settings::SessionSettings) {
+        // hot-applied knobs upstream pushes eagerly
+        // (`update_alert_queue_size`, `update_disk_cache_limit`):
+        // the rest is read lazily through `self.settings`.
+        if let Some(d) = &self.disk {
+            d.set_max_queued_bytes(s.max_disk_write_queue);
+        }
+        self.alerts.set_queue_limit(s.alert_queue_size);
         self.settings = s;
     }
 
@@ -1368,6 +1413,15 @@ impl Session {
     /// `tick` — drive every torrent's peers + dht timeouts.
     pub fn tick(&mut self, out: &mut Vec<SessionOut>) -> std::time::Duration {
         self.session_time += 1;
+        // `session_impl::on_tick` — `m_auto_manage_time_scaler--`;
+        // when it hits 0 the queue runs and the scaler re-arms to
+        // `auto_manage_interval` (upstream 30 s default).
+        self.auto_manage_scaler -= 1;
+        if self.auto_manage_scaler <= 0 {
+            self.auto_manage_scaler = self.settings.auto_manage_interval;
+            let (dl, sd) = (self.settings.active_downloads, self.settings.active_seeds);
+            self.manage_queue(dl, sd);
+        }
         self.drain_disk_completed(out);
         let wait = self.dht.tick();
         self.dht_announce_tick();
@@ -1388,14 +1442,21 @@ impl Session {
             .collect();
         let peer_timeout = self.settings.peer_timeout.as_secs() as i32;
         let web_seed_blocks = self.settings.web_seed_blocks_per_tick;
+        // `disk_observer` gate — stop issuing block requests while
+        // the write queue sits above `max_queued_disk_bytes`.
+        let disk_bp = self.disk.as_ref().is_some_and(|d| d.write_queue_exceeded());
         for ih in ihs {
             let mut eff = Vec::new();
             if let Some(t) = self.torrents.get_mut(&ih) {
+                t.disk_back_pressure = disk_bp;
                 t.metadata_tick(&mut eff);
                 t.pex_tick(Instant::now(), &mut eff);
                 for id in t.peers.keys().copied().collect::<Vec<_>>() {
                     t.drive_peer(id, &mut eff);
                 }
+                // `peer_connection::second_tick` — snub + refund
+                // blocks stuck past `request_timeout`.
+                t.check_request_timeouts(&mut eff);
                 // `web_connection_base` — feed url seeds too
                 if let Some((url, reqs)) = t.next_web_seed_blocks(web_seed_blocks)
                     && let Some(fs) = t.files.clone()

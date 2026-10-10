@@ -558,5 +558,5 @@ fn session_state_roundtrip_settings() {
     let set = st2.settings.unwrap();
     assert_eq!(set.unchoke_slots, 42);
     assert!(set.anonymous_mode);
-    assert_eq!(set.connections_limit, 500); // defaults preserved
+    assert_eq!(set.connections_limit, 200); // defaults preserved
 }

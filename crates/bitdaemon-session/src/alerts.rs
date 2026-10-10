@@ -246,11 +246,11 @@ pub struct AlertManager {
 
 impl Default for AlertManager {
     /// Upstream defaults: `m_alert_mask = all_categories`,
-    /// `alert_queue_size = 1000`.
+    /// `alert_queue_size = 2000`.
     fn default() -> Self {
         Self {
             mask: AlertCategory::ALL,
-            queue_limit: 1000,
+            queue_limit: 2000,
             pending: Vec::new(),
             notify: None,
             dropped: 0,
@@ -267,6 +267,12 @@ impl AlertManager {
             queue_limit,
             ..Default::default()
         }
+    }
+
+    /// `settings_pack::alert_queue_size` — hot-applied by
+    /// `apply_settings` (upstream `update_alert_queue_size`).
+    pub fn set_queue_limit(&mut self, limit: usize) {
+        self.queue_limit = limit;
     }
 
     /// `set_notify_callback`.

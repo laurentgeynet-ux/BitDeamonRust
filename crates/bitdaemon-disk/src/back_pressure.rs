@@ -114,6 +114,17 @@ impl BackPressure {
         }
     }
 
+    /// `m_exceeded_max_size` — sticky flag; the session stops issuing
+    /// block requests while set (upstream marks the peer waiting on
+    /// its `disk_observer`).
+    #[must_use]
+    pub fn exceeded(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .exceeded
+    }
+
     /// `has_back_pressure(level, observer)` — registers `o` and returns
     /// true when `level >= max_size`.
     pub fn has_back_pressure(&self, level: i64, o: Option<Arc<dyn DiskObserver>>) -> bool {

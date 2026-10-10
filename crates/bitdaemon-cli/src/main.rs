@@ -94,6 +94,9 @@ async fn main() -> anyhow::Result<()> {
     let udp_port = bitdaemon::net::transport::DatagramSocket::local_addr(&udp).port();
 
     let mut eng = Engine::new(connector, Some(Arc::new(udp)));
+    // OS resolver — the default transports' DNS companion (anonymous
+    // deployments inject a circuit resolver instead; ADR-0008).
+    eng.set_resolver(Arc::new(bitdaemon::net::resolver::SystemResolver));
     slock(&eng.session).set_disk(disk);
     slock(&eng.session).listen_port = args.port;
     slock(&eng.session).set_dht_port(udp_port);
@@ -124,12 +127,22 @@ async fn main() -> anyhow::Result<()> {
     eng.start_acceptor(Arc::new(acceptor));
     eng.start_udp_pump();
 
+    // upstream `dht_bootstrap_nodes` setting — seed the routing
+    // table from the well-known public routers.
+    for host in ["router.bittorrent.com", "dht.transmissionbt.com"] {
+        eng.dispatch_out(bitdaemon::session::session::SessionOut::DhtAddNode {
+            host: host.into(),
+            port: 6881,
+        });
+    }
+
     // status printer + ctrl-c stop
     let ses = eng.session.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            for (ih, t) in &slock(&ses).torrents {
+            let guard = slock(&ses);
+            for (ih, t) in &guard.torrents {
                 let st = t.status();
                 println!(
                     "{}: {:.1}% | {} peers | {} down {} up B/s | {:?}",
@@ -148,7 +161,8 @@ async fn main() -> anyhow::Result<()> {
         async {
             let _ = tokio::signal::ctrl_c().await;
         },
-        8,
+        // 0 → `settings.connection_speed` (upstream default 30/s).
+        0,
     )
     .await;
     Ok(())

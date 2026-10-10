@@ -158,6 +158,29 @@ pub trait DiskIo: Send + Sync {
     /// `submit_jobs` — batch wake-up.
     fn submit_jobs(&self);
 
+    /// `disk_completed_queue::call_job_handlers` — run pending
+    /// completion callbacks on the caller's thread; returns how many
+    /// ran. The session's disk drain must call this or completions
+    /// never reach their handlers (upstream posts this on the
+    /// io_context via the `DrainPoster`; sessions that drive `tick`
+    /// may call it directly instead). Default: no completions.
+    fn call_job_handlers(&self) -> usize {
+        0
+    }
+
+    /// `settings_pack::max_queued_disk_bytes` — resize the write
+    /// back-pressure limit (upstream `m_cache.set_max_size`). No-op
+    /// on backends without a buffer limit.
+    fn set_max_queued_bytes(&self, _bytes: i64) {}
+
+    /// `m_cache.exceeded_max_size()` — true while the write queue is
+    /// above `max_queued_disk_bytes`. The session gates new block
+    /// requests on this so incoming payloads can't grow the job queue
+    /// (and its buffers) without bound.
+    fn write_queue_exceeded(&self) -> bool {
+        false
+    }
+
     /// `settings_updated`.
     fn settings_updated(&self);
 }

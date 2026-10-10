@@ -45,6 +45,7 @@ fn choke_aborts_unsent_requests() {
         },
         false,
         false,
+        0,
     );
     c.add_request(
         PieceBlock {
@@ -53,6 +54,7 @@ fn choke_aborts_unsent_requests() {
         },
         false,
         false,
+        0,
     );
     let mut eff = Vec::new();
     c.dispatch(&PeerMessage::Choke, 10, &mut eff);
@@ -67,7 +69,7 @@ fn piece_marks_download_and_requests_more() {
         piece_index: PieceIndex(3),
         block_index: 0,
     };
-    c.add_request(b, false, false);
+    c.add_request(b, false, false, 0);
     // simulate the block was sent (moved to download queue by
     // send_block_requests) — push it directly
     c.pipeline

@@ -214,7 +214,10 @@ impl PeerList {
             self.update_candidates(was, is);
             return (i, false);
         }
-        let p = TorrentPeer::new_v4(remote, connectable, src);
+        let p = match remote {
+            SocketAddr::V4(_) => TorrentPeer::new_v4(remote, connectable, src),
+            SocketAddr::V6(_) => TorrentPeer::new_v6(remote, connectable, src),
+        };
         let is = self.is_connect_candidate(&p);
         self.peers.push(p);
         self.update_candidates(false, is);
