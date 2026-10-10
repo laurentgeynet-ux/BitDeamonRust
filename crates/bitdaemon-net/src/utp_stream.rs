@@ -45,6 +45,9 @@ pub struct UtpManager {
 struct ManagerInner {
     /// `(remote, conn_id)` → socket's inbound channel.
     sockets: HashMap<(SocketAddr, u16), mpsc::Sender<Inbound>>,
+    /// unmatched SYNs go here (the acceptor's queue) — upstream's
+    /// `utp_socket_manager` hands unknown SYNs to the listen socket.
+    listener: Option<mpsc::Sender<Inbound>>,
     /// tasks we spawned (kept alive; aborted with the manager).
     tasks: Vec<JoinHandle<()>>,
 }
@@ -81,6 +84,71 @@ impl UtpManager {
                 return;
             }
         }
+        // unmatched ST_SYN (type nibble 4) → the listen queue
+        if buf[0] >> 4 == 4 {
+            if let Some(tx) = &inner.listener {
+                let _ = tx.send((buf.to_vec(), from)).await;
+            }
+        }
+    }
+
+    /// register the SYN listener — returns the acceptor's queue
+    /// (one listener per manager; replacing drops the old queue).
+    pub async fn set_listener(&self) -> mpsc::Receiver<Inbound> {
+        let (tx, rx) = mpsc::channel(64);
+        self.inner.lock().await.listener = Some(tx);
+        rx
+    }
+
+    /// accept one inbound SYN — build the responder socket
+    /// (`send_id = SYN conn_id`, `recv_id = +1` upstream), register
+    /// its pump, feed the SYN in, and return the stream.
+    pub async fn accept_syn(
+        self: &Arc<Self>,
+        dg: Arc<dyn DatagramSocket>,
+        from: SocketAddr,
+        syn: &[u8],
+        cfg: UtpConfig,
+    ) -> io::Result<UtpStream> {
+        if syn.len() < 20 || syn[0] >> 4 != 4 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a syn"));
+        }
+        let id = u16::from_be_bytes([syn[2], syn[3]]);
+        // upstream `utp_socket_manager::incoming_packet`: responder
+        // send_id = the SYN's connection id, recv_id = send_id + 1
+        let sock = UtpSocket::new(id.wrapping_add(1), id, cfg);
+        let recv_id = sock.recv_id();
+        let rx = self.register((from, recv_id)).await;
+        let (rd_tx, rd_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (wr_tx, wr_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (st_tx, st_rx) = mpsc::channel::<UtpState>(1);
+
+        let dg2 = dg.clone();
+        let pump = tokio::spawn(socket_pump(
+            sock,
+            dg2,
+            rx,
+            wr_rx,
+            rd_tx,
+            st_tx,
+            (from, recv_id),
+            self.clone(),
+        ));
+        // feed the SYN — the pump transitions to Connected and emits
+        // the deferred STATE ack on its first loop turn
+        {
+            let inner = self.inner.lock().await;
+            if let Some(tx) = inner.sockets.get(&(from, recv_id)) {
+                let _ = tx.send((syn.to_vec(), from)).await;
+            }
+        }
+        self.inner.lock().await.tasks.push(pump);
+        Ok(UtpStream {
+            rd_rx,
+            wr_tx,
+            st_rx: Arc::new(Mutex::new(st_rx)),
+            read_buf: std::collections::VecDeque::new(),
+        })
     }
 
     /// `pump_in` — convenience loop routing every datagram from
@@ -291,6 +359,60 @@ pub struct UtpConnector {
     pub datagram: Arc<dyn DatagramSocket>,
     /// socket config.
     pub cfg: UtpConfig,
+}
+
+/// `UtpAcceptor` — `PeerAcceptor` impl: unmatched SYNs on the
+/// manager's listener queue become responder `UtpStream`s.
+#[derive(Debug)]
+pub struct UtpAcceptor {
+    /// demux manager (must be the same instance routing datagrams).
+    pub manager: Arc<UtpManager>,
+    /// datagram transport replies go out on.
+    pub datagram: Arc<dyn DatagramSocket>,
+    /// socket config.
+    pub cfg: UtpConfig,
+    /// SYN queue (from `UtpManager::set_listener`).
+    rx: Mutex<mpsc::Receiver<Inbound>>,
+}
+
+impl UtpAcceptor {
+    /// install the listener on `manager`.
+    pub async fn new(
+        manager: Arc<UtpManager>,
+        datagram: Arc<dyn DatagramSocket>,
+        cfg: UtpConfig,
+    ) -> Self {
+        let rx = Mutex::new(manager.set_listener().await);
+        Self {
+            manager,
+            datagram,
+            cfg,
+            rx,
+        }
+    }
+}
+
+impl crate::transport::PeerAcceptor for UtpAcceptor {
+    fn accept(
+        self: Arc<Self>,
+    ) -> Pin<Box<dyn std::future::Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>>
+    {
+        let me = self.clone();
+        Box::pin(async move {
+            let (syn, from) = me
+                .rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or(crate::NetError::NoTransport("utp listener closed"))?;
+            let s = me
+                .manager
+                .accept_syn(me.datagram.clone(), from, &syn, me.cfg.clone())
+                .await?;
+            Ok(Box::new(s) as BoxedPeerStream)
+        })
+    }
 }
 
 impl PeerConnector for UtpConnector {

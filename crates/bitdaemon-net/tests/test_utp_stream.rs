@@ -130,3 +130,102 @@ async fn connect_handshake_and_echo() {
     assert_eq!(&out, b"pong");
     responder.await.unwrap();
 }
+
+#[tokio::test]
+async fn acceptor_handshake_and_echo() {
+    use bitdaemon_net::transport::PeerAcceptor;
+    use bitdaemon_net::utp_stream::{UtpAcceptor, UtpConnector};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // two channel-linked datagram sockets
+    let (a_tx, a_rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, std::net::SocketAddr)>();
+    let (b_tx, b_rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, std::net::SocketAddr)>();
+    let a_ep = std::net::SocketAddr::from(([10, 0, 0, 1], 5000));
+    let b_ep = std::net::SocketAddr::from(([10, 0, 0, 2], 6000));
+
+    #[derive(Debug)]
+    struct C {
+        rx: tokio::sync::Mutex<
+            tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, std::net::SocketAddr)>,
+        >,
+        tx: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, std::net::SocketAddr)>,
+        local: std::net::SocketAddr,
+    }
+    impl bitdaemon_net::transport::DatagramSocket for C {
+        fn send_to<'a>(
+            &'a self,
+            buf: &'a [u8],
+            target: std::net::SocketAddr,
+        ) -> bitdaemon_net::transport::BoxFut<'a, usize> {
+            Box::pin(async move {
+                let n = buf.len();
+                let _ = self.tx.send((buf.to_vec(), target));
+                Ok(n)
+            })
+        }
+        fn recv_from<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> bitdaemon_net::transport::BoxFut<'a, (usize, std::net::SocketAddr)> {
+            Box::pin(async move {
+                let mut rx = self.rx.lock().await;
+                match rx.recv().await {
+                    Some((data, from)) => {
+                        let n = data.len().min(buf.len());
+                        buf[..n].copy_from_slice(&data[..n]);
+                        Ok((n, from))
+                    }
+                    None => Err(std::io::Error::other("closed")),
+                }
+            })
+        }
+        fn local_addr(&self) -> std::net::SocketAddr {
+            self.local
+        }
+    }
+
+    let dg_a = Arc::new(C {
+        rx: tokio::sync::Mutex::new(a_rx),
+        tx: b_tx.clone(),
+        local: a_ep,
+    });
+    let dg_b = Arc::new(C {
+        rx: tokio::sync::Mutex::new(b_rx),
+        tx: a_tx.clone(),
+        local: b_ep,
+    });
+
+    // responder side: one manager routes dg_b, acceptor yields streams
+    let mgr_b = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
+    let _pump = mgr_b.pump_in(dg_b.clone());
+    let acceptor = Arc::new(
+        UtpAcceptor::new(mgr_b, dg_b, bitdaemon_net::utp_socket::UtpConfig::default()).await,
+    );
+
+    // initiator side
+    let mgr_a = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
+    let _pump2 = mgr_a.pump_in(dg_a.clone());
+    let connector = Arc::new(UtpConnector {
+        manager: mgr_a,
+        datagram: dg_a,
+        cfg: bitdaemon_net::utp_socket::UtpConfig::default(),
+    });
+
+    let acc = acceptor.clone();
+    let responder = tokio::spawn(async move {
+        let mut s = acc.accept().await.unwrap();
+        // echo back whatever arrives
+        let mut b = [0u8; 64];
+        let n = s.read(&mut b).await.unwrap();
+        s.write_all(&b[..n]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    });
+
+    let mut s = connector.connect(b_ep).await.unwrap();
+    s.write_all(b"ping").await.unwrap();
+    let mut b = [0u8; 64];
+    let n = s.read(&mut b).await.unwrap();
+    assert_eq!(&b[..n], b"ping");
+    responder.await.unwrap();
+}

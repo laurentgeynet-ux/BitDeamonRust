@@ -8,6 +8,7 @@ Until `1.0.0`, breaking changes may occur in any release.
 ## [Unreleased]
 
 ### Ajouté
+- `UtpAcceptor` : `PeerAcceptor` uTP — `UtpManager` route les ST_SYN orphelins vers une file d'écoute (`set_listener`), `accept_syn` crée le socket répondeur (`send_id` = conn-id du SYN, `recv_id` +1 — sémantique upstream), pompe dédiée, handshake+echo testés en duplex complet sur datagrammes injectés.
 - `Engine::start_udp_pump` : pompe datagramme → `session.on_udp` (DHT, réponses tracker UDP) ; `Session::enable_dht` (`start_dht` upstream) — round-trip ping DHT testé de bout en bout via socket injectée.
 - `PeerConnector::connect_dest` : connexion par destination texte (`host:port` par défaut ; surchargeable pour les adresses non-IP).
 - `I2pConnector`/`I2pAcceptor` : `PeerConnector`/`PeerAcceptor` sur le bridge SAM — `open_session` (`SESSION CREATE` STREAM), `connect_dest` fait `NAMING LOOKUP` (socket dédiée) puis `STREAM CONNECT` (socket dédiée), accept via `STREAM ACCEPT`.
