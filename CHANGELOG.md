@@ -9,6 +9,14 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `session::peer_conn::dispatch` — incoming wire message router
+  (`peer_connection::incoming_*`): choke drains unsent requests with
+  picker aborts, bitfield size validation, have/dont-have refcount
+  effects, request validation (`validate_piece_request`), upload
+  queue, piece → mark+write+re-pick, reject frees the block
+
+### Added
+
 - `dht`: write phase — `announce_peer`/`put` (immutable+mutable
   BEP-44 signed, verified on receipt) issued to write-token nodes
 - `dht::dht_tracker` — per-family node mux (v4/v6), shared tick,

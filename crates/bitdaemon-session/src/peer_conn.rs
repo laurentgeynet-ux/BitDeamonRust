@@ -10,7 +10,7 @@
 //! transport-agnostic — the anonymous OnionBit path plugs in at the
 //! stream layer.
 
-use bitdaemon_common::{Bitfield, PeerId, PieceBlock, PieceIndex};
+use bitdaemon_common::{Bitfield, PeerId, PeerRequest, PieceBlock, PieceIndex};
 use bitdaemon_net::peer_wire::PeerMessage;
 
 use crate::peer_pipeline::{PeerPipeline, PendingBlock};
@@ -50,6 +50,10 @@ pub struct PeerConn {
     pub remote_upload_only: bool,
     /// `m_client_version` — remote's `v` string.
     pub client_version: Vec<u8>,
+    /// `m_upload_queue` — peer's requests to us.
+    pub upload_queue: Vec<PeerRequest>,
+    /// `m_num_invalid_requests`.
+    pub num_invalid_requests: i32,
     /// `m_num_pieces` — total pieces the peer announced.
     pub num_pieces: i32,
     /// ms timestamp the connection was established (`m_connect`).
@@ -76,6 +80,8 @@ impl PeerConn {
             ext_dont_have: 0,
             remote_upload_only: false,
             client_version: Vec::new(),
+            upload_queue: Vec::new(),
+            num_invalid_requests: 0,
             num_pieces: 0,
             connect_ms: now_ms,
         }
@@ -153,6 +159,154 @@ impl PeerConn {
     /// `incoming_allowed_fast` — BEP-6 allowed-fast.
     pub fn on_allowed_fast(&mut self, index: PieceIndex) {
         self.allowed_fast.push(index);
+    }
+
+    /// `incoming_dont_have`.
+    pub fn on_dont_have(&mut self, index: PieceIndex) -> bool {
+        if (index.0 as usize) >= self.peer_pieces.size()
+            || !self.peer_pieces.get_bit(index.0 as usize)
+        {
+            return false;
+        }
+        self.peer_pieces.clear_bit(index.0 as usize);
+        self.num_pieces -= 1;
+        true
+    }
+
+    /// `incoming_choke` — also abandons unsent requests
+    /// (`clear_request_queue`); the blocks are returned so the
+    /// picker can `abort_download` them.
+    pub fn on_choke_with_aborts(&mut self) -> Vec<PieceBlock> {
+        self.peer_choked = true;
+        self.pipeline.endgame = false;
+        self.pipeline
+            .request_queue
+            .drain(..)
+            .map(|b| b.block)
+            .collect()
+    }
+
+    /// `incoming_request` — `validate_piece_request` then enqueue
+    /// for the upload path. `num_pieces` is the torrent's piece
+    /// count (0 when metadata unknown → reject).
+    pub fn validate_request(&mut self, r: &PeerRequest, num_pieces: i32) -> bool {
+        let ok = r.length > 0
+            && r.length <= 0x20000
+            && r.start >= 0
+            && r.piece.0 >= 0
+            && r.piece.0 < num_pieces;
+        if !ok {
+            self.num_invalid_requests += 1;
+        }
+        ok
+    }
+
+    /// `incoming_reject_request` — the block is freed; the caller
+    /// `abort_download`s it in the picker and re-picks.
+    pub fn on_reject(&mut self, r: &PeerRequest) -> PieceBlock {
+        let block = PieceBlock {
+            piece_index: r.piece,
+            block_index: r.start / 0x4000,
+        };
+        let _ = self.cancel_request(block);
+        block
+    }
+
+    /// `incoming_piece` bookkeeping — slow-start growth, pipeline
+    /// counters, queue removal. Returns the block.
+    pub fn on_piece(&mut self, r: &PeerRequest) -> PieceBlock {
+        let block = PieceBlock {
+            piece_index: r.piece,
+            block_index: r.start / 0x4000,
+        };
+        self.pipeline.on_piece_received(0);
+        let _ = self.cancel_request(block);
+        block
+    }
+
+    /// `dispatch` — route a decoded wire message. Returns the
+    /// side-effects the torrent layer must run (picker updates,
+    /// disk writes, uploads).
+    pub fn dispatch(
+        &mut self,
+        msg: &bitdaemon_net::peer_wire::PeerMessage,
+        num_pieces: i32,
+        eff: &mut Vec<PeerEffect>,
+    ) {
+        use bitdaemon_net::peer_wire::PeerMessage as M;
+        match *msg {
+            M::Keepalive => {}
+            M::Choke => {
+                for b in self.on_choke_with_aborts() {
+                    eff.push(PeerEffect::AbortDownload(b));
+                }
+            }
+            M::Unchoke => {
+                self.on_unchoke();
+                eff.push(PeerEffect::MaybePick);
+            }
+            M::Interested => self.on_interested(),
+            M::NotInterested => self.on_not_interested(),
+            M::Have(i) => {
+                if self.on_have(i, |_| false) {
+                    eff.push(PeerEffect::MaybePick);
+                }
+                eff.push(PeerEffect::RefcountInc(i));
+            }
+            M::HaveAll => self.on_have_all(),
+            M::HaveNone => self.on_have_none(),
+            M::Bitfield(ref bits) => {
+                match bitdaemon_common::Bitfield::from_bytes(bits, num_pieces.max(0) as usize) {
+                    Some(bf) => {
+                        self.on_bitfield(&bf);
+                        eff.push(PeerEffect::RefcountBulk(bf, true));
+                    }
+                    None => eff.push(PeerEffect::Disconnect("invalid bitfield size")),
+                }
+            }
+            M::Request(r) => {
+                if self.validate_request(&r, num_pieces) {
+                    self.upload_queue.push(r);
+                    eff.push(PeerEffect::ReadRequest(r));
+                } else {
+                    eff.push(PeerEffect::Disconnect("invalid request"));
+                }
+            }
+            M::Cancel(r) => {
+                if let Some(pos) = self
+                    .upload_queue
+                    .iter()
+                    .position(|u| u.piece == r.piece && u.start == r.start && u.length == r.length)
+                {
+                    self.upload_queue.remove(pos);
+                    eff.push(PeerEffect::CancelRequest(r));
+                }
+            }
+            M::Piece {
+                piece,
+                offset,
+                ref data,
+            } => {
+                let r = bitdaemon_common::PeerRequest {
+                    piece,
+                    start: offset,
+                    length: data.len() as i32,
+                };
+                let block = self.on_piece(&r);
+                eff.push(PeerEffect::MarkDownloaded(block));
+                eff.push(PeerEffect::DiskWrite(r, data.to_vec()));
+                eff.push(PeerEffect::MaybePick);
+            }
+            M::RejectRequest(r) => {
+                let b = self.on_reject(&r);
+                eff.push(PeerEffect::AbortDownload(b));
+                eff.push(PeerEffect::MaybePick);
+            }
+            M::AllowedFast(i) => self.on_allowed_fast(i),
+            M::SuggestPiece(i) => self.on_suggest(i),
+            M::DhtPort(p) => eff.push(PeerEffect::DhtPort(p)),
+            _ => {}
+        }
     }
 
     /// `add_request(pb, flags)` — queue a picked block.
@@ -307,4 +461,32 @@ impl PeerConn {
     pub fn interested_msg() -> PeerMessage {
         PeerMessage::Interested
     }
+}
+
+/// `peer_connection` incoming-side effects — the session runs
+/// these (picker/disk/wire/alerts).
+#[derive(Debug)]
+pub enum PeerEffect {
+    /// `picker.inc_refcount(index)`.
+    RefcountInc(PieceIndex),
+    /// `picker.dec_refcount(index)`.
+    RefcountDec(PieceIndex),
+    /// bulk refcount from a bitfield (`true` = inc).
+    RefcountBulk(bitdaemon_common::Bitfield, bool),
+    /// write a received block to disk.
+    DiskWrite(bitdaemon_common::PeerRequest, Vec<u8>),
+    /// serve a peer's request (upload path).
+    ReadRequest(bitdaemon_common::PeerRequest),
+    /// peer cancelled a request.
+    CancelRequest(bitdaemon_common::PeerRequest),
+    /// `picker.mark_as_downloaded`.
+    MarkDownloaded(PieceBlock),
+    /// `picker.abort_download` (reject/choke clearing).
+    AbortDownload(PieceBlock),
+    /// drive `request_a_block` again.
+    MaybePick,
+    /// BEP-5 port announcement.
+    DhtPort(u16),
+    /// protocol violation — drop the connection.
+    Disconnect(&'static str),
 }
