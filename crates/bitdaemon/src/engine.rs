@@ -1326,6 +1326,7 @@ impl Engine {
         };
         hs.messages.insert("ut_metadata".into(), 1);
         hs.messages.insert("ut_pex".into(), 2);
+        hs.messages.insert("lt_donthave".into(), 3);
         if let Some(t) = self.session.torrents.get(ih) {
             if let Some(md) = &t.metadata_raw {
                 hs.metadata_size = Some(md.len() as i64);

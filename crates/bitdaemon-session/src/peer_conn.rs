@@ -60,6 +60,9 @@ pub struct PeerConn {
     pub local_ut_metadata: u8,
     /// our local `ut_pex` id.
     pub local_ut_pex: u8,
+    /// our local `lt_donthave` id — remote sends extended messages
+    /// on this id to retract a piece.
+    pub local_dont_have: u8,
     /// `m_superseed_piece` — the piece we're currently
     /// super-seeding to this peer (BEP initial-seed).
     pub superseed_piece: Option<PieceIndex>,
@@ -143,6 +146,7 @@ impl PeerConn {
             stat_down_round: 0,
             supports_fast: false,
             supports_dht: false,
+            local_dont_have: 3,
             we_sent_interested: false,
             last_unchoke: std::time::Instant::now(),
         }
@@ -425,6 +429,13 @@ impl PeerConn {
                     eff.push(PeerEffect::MetadataPacket(data.to_vec()));
                 } else if id == self.local_ut_pex {
                     eff.push(PeerEffect::PexPacket(data.to_vec()));
+                } else if id == self.local_dont_have && data.len() == 4 {
+                    // `incoming_dont_have` — peer retracted a piece.
+                    let i = PieceIndex(i32::from_be_bytes([data[0], data[1], data[2], data[3]]));
+                    if self.on_dont_have(i) {
+                        eff.push(PeerEffect::RefcountDec(i));
+                        eff.push(PeerEffect::MaybePick);
+                    }
                 }
             }
             _ => {}
