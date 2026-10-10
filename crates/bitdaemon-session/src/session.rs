@@ -466,6 +466,7 @@ impl Session {
                     }
                 }
                 DiskCompleted::CheckFiles { ih, accepted, err } => {
+                    self.alerts.post(Alert::TorrentChecked(ih));
                     // `torrent::files_checked`: resume accepted → the
                     // optimistic `have` bits stand; rejected → drop
                     // them (upstream `need_full_check` → per-piece
@@ -1072,7 +1073,10 @@ impl Session {
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(ih) {
             t.piece_verified(piece, passed, &mut eff);
-            t.recheck_piece_done();
+            if t.recheck_piece_done() {
+                // `torrent_checked_alert` — last check piece landed.
+                self.alerts.post(Alert::TorrentChecked(*ih));
+            }
         }
         self.route(*ih, eff, out);
     }

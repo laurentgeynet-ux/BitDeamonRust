@@ -2154,13 +2154,16 @@ impl Torrent {
     /// one recheck hash came back — `checking` clears when the
     /// armed count drains (upstream `torrent::on_piece_hashed`
     /// ends the checking state at the last piece).
-    pub fn recheck_piece_done(&mut self) {
+    /// returns `true` on the last checked piece (checking ended).
+    pub fn recheck_piece_done(&mut self) -> bool {
         if self.checking_pieces > 0 {
             self.checking_pieces -= 1;
             if self.checking_pieces == 0 {
                 self.checking = false;
+                return true;
             }
         }
+        false
     }
 
     /// `prioritize_files` (upstream `torrent::prioritize_files`) —

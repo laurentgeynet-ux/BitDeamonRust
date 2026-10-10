@@ -61,6 +61,8 @@ pub enum Alert {
     TorrentRemoved(Sha1Hash),
     /// `torrent_finished_alert`.
     TorrentFinished(Sha1Hash),
+    /// `torrent_checked_alert` — files_checked/recheck done.
+    TorrentChecked(Sha1Hash),
     /// `state_changed_alert` — paused→downloading etc.
     StateChanged {
         ih: Sha1Hash,
@@ -187,6 +189,7 @@ impl Alert {
             Self::TorrentFinished(_) | Self::PieceFinished { .. } | Self::BlockFinished { .. } => {
                 AlertCategory::PROGRESS
             }
+            Self::TorrentChecked(_) => AlertCategory::STATUS, // upstream: status_notification
             Self::PeerDisconnected { .. } | Self::PeerConnect { .. } => AlertCategory::PEER,
             Self::PeerBan { .. } => AlertCategory::PEER,
             Self::HashFailed { .. }
