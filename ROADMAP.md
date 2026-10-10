@@ -49,21 +49,25 @@ Project skeleton that lets parallel work happen safely.
 Everything else depends on these. *~15k LOC C++.*
 
 `bitdaemon-common` *(done)*: `Sha1Hash`, `Sha256Hash`, `InfoHash`
-(v1/v2/hybrid), `Bitfield`, `PeerId`, `PieceBlock`, `DownloadPriority`,
-`error`/`Result`, `hex`. *(still to do)*: `PeerRequest`, `TorrentFlags`,
-`AnnounceFlags`, `time` helpers, `sliding_average`, `stat`,
-`bloom_filter`, `random`, `crc32c`, `cpuid`-free paths.
+(v1/v2/hybrid), `Bitfield`, `PeerId`, `PieceBlock`, `PeerRequest`,
+`DownloadPriority`, `TorrentFlags`/`PexFlags`/`AnnounceFlags`
+(`bitfield_flag!`), `time` helpers, `SlidingAverage`, `Stat`/`StatChannel`,
+`BloomFilter`, `random`/`crypto_random_bytes`, `crc32c`, `error`/`Result`,
+`hex`. *(still to do)*: `index_range`, `stat_cache`,
+`timestamp_history`.
 
 `bitdaemon-bencode` *(done)*: `Entry` (owned, sorted-dict invariant),
 `BdecodeNode` (lazy zero-copy, packed 8-byte tokens, soft errors,
 back-patched partial trees), encoder, `bdecode_errors` mapping,
 depth limits, pretty-printer.
 
-**Exit criteria**: all ported `test/test_bdecode.cpp` ✅ (67 cases),
-`test_bitfield.cpp` ✅ (16 cases); still needed:
-`test_sha1.cpp` full vector set, `test_bloom_filter.cpp`,
-`test_sliding_average.cpp`; bencode round-trips every `.torrent` in
-upstream `test/` dir.
+**Exit criteria**: `test_bdecode.cpp` ✅ (67 cases),
+`test_bitfield.cpp` ✅ (16), `test_sha1_hash.cpp` ✅ (bit ops, shifts,
+`count_leading_zeroes` vectors), `test_bloom_filter.cpp` ✅ (5),
+`test_sliding_average.cpp` ✅ (8), `test_crc32.cpp` ✅; bencode
+round-trips every `.torrent` in upstream `test/` dir ✅ (107 parsed,
+99 byte-identical). Still needed: `stat_cache`, `index_range`,
+`timestamp_history`.
 
 ---
 

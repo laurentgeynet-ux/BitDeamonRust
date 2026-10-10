@@ -46,8 +46,20 @@ Until `1.0.0`, breaking changes may occur in any release.
   detection (unsorted/duplicate keys, leading zeros), upstream error
   kinds + positions; owned `Entry`, canonical `bencode` encoder,
   `print_node`/`print_entry` pretty-printer.
+- `bitdaemon_common` Phase-1 remainder: `flags` (`bitfield_flag!` macro,
+  `TorrentFlags` u64 bits 0-25 incl. `DEFAULT_FLAGS`, `PexFlags` u8,
+  `AnnounceFlags` u8), `time` (`Clock`/`TimePoint`/`Milliseconds32`
+  aliases), `SlidingAverage<G>` (fixed-point ×64, clamped samples,
+  deviation estimator), `Stat`/`StatChannel` (6 channels, `second_tick`
+  4/5+1/5 average, SYN costs, IP-overhead MTU formula), `BloomFilter<N>`
+  (SHA-1-derived dual indices, `size()` estimator), `random`/`random_bytes`/
+  `crypto_random_bytes`/`random_shuffle` (`random(m)` inclusive),
+  `crc32c_32`/`crc32c_words` (Castagnoli, LE memory order).
 - Tests: 67 conformance cases ported from `test_bdecode.cpp`, 16 from
-  `test_bitfield.cpp`, plus hash/hex/peer-id unit coverage — all green;
-  `clippy -D warnings` clean, `cargo doc` clean.
+  `test_bitfield.cpp`, 8 from `test_sliding_average.cpp`, 5 from
+  `test_bloom_filter.cpp`, `test_crc32.cpp` vectors (RFC 3720 B.4),
+  `test_sha1_hash.cpp` shift/bitops/leading-zero vectors, `stat` formula
+  checks — all green; `clippy -D warnings` clean, `cargo fmt --check`
+  clean.
 
 [Unreleased]: https://github.com/laurentgeynet-ux/BitDeamonRust/compare/main...HEAD

@@ -4,8 +4,6 @@
 
 use std::fmt;
 
-use rand::Rng;
-
 /// `libtorrent::peer_id` — fixed 20-byte peer identifier sent in the
 /// BitTorrent handshake.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
@@ -27,9 +25,8 @@ const PRINTABLE: &[u8; 70] =
 /// inclusive range `[0, 69]`, i.e. all 70 characters (`sizeof` includes the
 /// NUL terminator and `random(m)` is inclusive).
 pub fn url_random(dest: &mut [u8]) {
-    let mut rng = rand::rng();
     for b in dest.iter_mut() {
-        *b = PRINTABLE[rng.random_range(0..PRINTABLE.len())];
+        *b = PRINTABLE[crate::random::random((PRINTABLE.len() - 1) as u32) as usize];
     }
 }
 

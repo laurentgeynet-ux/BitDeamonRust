@@ -33,13 +33,13 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `peer_id.hpp` / `generate_peer_id.cpp` | `common::peer_id` | ported | 70-char printable set, `random(69)` inclusive quirk reproduced |
 | `peer_request.hpp`, `piece_block.cpp` | `common::types` | ported | `PieceIndex`/`BlockIndex`…, `PieceBlock::INVALID` = `(max, i32::MAX)` |
 | `error_code.cpp`, `error.hpp`, `close_reason.cpp` | `common::error` | in progress | `bdecode` category done (`bencode::BdecodeErrorKind`); other `lt::errors` categories pending |
-| `time.cpp`, `timestamp_history.cpp` | `common::time` | not started | monotonic clock semantics |
-| `download_priority.hpp`, `operations.hpp`, `torrent_flags.hpp`, `pex_flags.hpp`, `announce_flags.hpp`, `flags.hpp`, `index_range.hpp` | `common::types`/`common::flags` | in progress | `DownloadPriority` strong type done; flags enums pending |
-| `random.cpp`, `dev_random.hpp` | `common::random` | not started | `rand` crate (already used by `peer_id`) |
+| `time.cpp`, `timestamp_history.cpp` | `common::time` | ported | `Clock`/`TimePoint` aliases on `Instant`, `Milliseconds32` i32 ticks; `timestamp_history` still pending (lands with session stats) |
+| `download_priority.hpp`, `operations.hpp`, `torrent_flags.hpp`, `pex_flags.hpp`, `announce_flags.hpp`, `flags.hpp`, `index_range.hpp` | `common::types`/`common::flags` | ported | `bitfield_flag!` macro + `TorrentFlags` (u64, bits 0-25, `DEFAULT_FLAGS`), `PexFlags` (u8), `AnnounceFlags` (u8); `index_range` pending |
+| `random.cpp`, `dev_random.hpp` | `common::random` | ported | `random(m)` inclusive `[0,m]`, `random_bytes`, `crypto_random_bytes`, `random_shuffle` on `rand` |
 | `hex.cpp` | `common::hex` | ported | to/from hex, validation; upstream messages |
-| `crc32c.cpp`, `cpuid.cpp` | `common::crc32c` | not started | `crc32c` crate, no CPUID needed |
-| `sliding_average.hpp`, `stat.cpp`, `stat_cache.cpp` | `common::stat` | not started | counters + averages |
-| `bloom_filter.cpp` | `common::bloom_filter` | not started | used by DHT routing |
+| `crc32c.cpp`, `cpuid.cpp` | `common::crc32c` | ported | `crc32c` crate, no CPUID needed; `crc32c_32`/`crc32c_words` (LE memory order); RFC 3720 B.4 vectors pass |
+| `sliding_average.hpp`, `stat.cpp`, `stat_cache.cpp` | `common::sliding_average`/`common::stat` | ported | `SlidingAverage<G>` (fixed-point ×64, clamped, deviation) — all 8 `test_sliding_average.cpp` cases pass; `StatChannel`+`Stat` (6 channels, SYN/IP-overhead formulas); `stat_cache` still pending |
+| `bloom_filter.cpp` | `common::bloom_filter` | ported | `BloomFilter<N>` + free `set_bits`/`has_bits`/`count_zero_bits`; `test_bloom_filter.cpp` cases pass |
 | `assert.cpp`, `invariant_check.hpp` | — | won't port | → `debug_assert!` |
 | `numeric_cast.hpp`, `noexcept_movable.hpp`, `copy_ptr.hpp`, `unique_ptr.hpp`, `alloca.hpp`, `array.hpp`, `container_wrapper.hpp`, `deque.hpp`, `vector.hpp`, `vector_utils.hpp`, `heterogeneous_queue.hpp`, `tailqueue.hpp`, `link.hpp`, `pool.hpp`, `stack_allocator.hpp`, `string_ptr.hpp`, `strview_less.hpp`, `byteswap.hpp`, `range.hpp`, `scope_end.hpp`, `throw.hpp`, `set_socket_buffer.hpp`, `keepalive.hpp`, `io.hpp`, `io_bytes.hpp`, `visit_block_iovecs.hpp` | idiomatic Rust | won't port | STL/boost shims — use std equivalents |
 
