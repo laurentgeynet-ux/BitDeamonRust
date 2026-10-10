@@ -26,6 +26,7 @@ pub mod bandwidth;
 pub mod chained_buffer;
 /// `ip_filter.hpp` — IPv4/IPv6 + port range access rules.
 pub mod ip_filter;
+pub mod os_transports;
 /// `aux_/packet_buffer` — 16-bit-wrapping circular packet store (uTP).
 pub mod packet_buffer;
 /// `pe_crypto` — MSE/PE: DH-768 key exchange + RC4 (`libTomCrypt`).

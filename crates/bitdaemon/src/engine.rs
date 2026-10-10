@@ -420,6 +420,13 @@ impl Engine {
 
     /// `ToPeer`-only fan-out for sync call sites (connect paths —
     /// bitfield/first-have emission after `attach_stream`).
+    /// `session_impl` effect fan-out — public so callers that
+    /// mutate `Session` directly (e.g. `add_torrent_params`) can
+    /// push the produced `SessionOut`s through the transport layer.
+    pub fn dispatch_out(&mut self, o: SessionOut) {
+        self.send_msgs_to_peers(vec![o]);
+    }
+
     fn send_msgs_to_peers(&mut self, out: Vec<SessionOut>) {
         for e in out {
             if let SessionOut::ToPeer { ih, peer, msg } = e {
