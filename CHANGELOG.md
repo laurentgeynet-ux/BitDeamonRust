@@ -9,6 +9,15 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **Streaming — `set_piece_deadline`/`read_piece`** —
+  `Torrent::time_critical` (deadline + `alert_when_available`),
+  bump `top_priority`, premier critique → `cancel_non_critical`
+  (`Cancel` wire + `abort_download` sur requêtes hors-critiques),
+  `PickerOptions::TIME_CRITICAL` dans `drive_peer`, à la vérif →
+  `ReadPiece` → `async_read` pièce entière → `read_piece_alert`
+  avec le payload (`ReadPieceFailed` sur erreur). API
+  `TorrentHandle::{set_piece_deadline,reset_piece_deadline,read_piece}`.
+
 - **File d'attente auto-managed** — `Torrent::queue_seq`
   (`m_sequence_number`, assigné à l'ajout), `Session::queue_position`
   (rang dans sa classe download/seed, -1 si pause/non-auto-managed),

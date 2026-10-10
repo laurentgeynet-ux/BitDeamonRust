@@ -187,3 +187,67 @@ fn queue_position_moves() {
     s.torrents.get_mut(&ihs[1]).unwrap().paused = true;
     assert_eq!(s.queue_position(&ihs[1]), -1);
 }
+
+#[test]
+fn piece_deadline_and_read_piece() {
+    use bitdaemon_common::types::{PeerRequest, PieceBlock};
+    use bitdaemon_net::peer_wire::PeerMessage;
+    use bitdaemon_session::alerts::Alert;
+    use bitdaemon_session::session::DiskCompleted;
+    use bitdaemon_session::torrent::TorrentEffect;
+
+    let ih = Sha1Hash::from_bytes(&[11; 20]).unwrap();
+    let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
+    t.piece_hashes = Some(vec![Sha1Hash::from_bytes(&[0; 20]).unwrap(); 4]);
+    t.init_picker(false);
+
+    // already-haved piece + alert_when_available → ReadPiece now
+    t.have.set_bit(1);
+    let mut eff = Vec::new();
+    t.set_piece_deadline(PieceIndex(1), 5000, true, &mut eff);
+    assert!(matches!(
+        eff[0],
+        TorrentEffect::ReadPiece {
+            piece: PieceIndex(1)
+        }
+    ));
+
+    // missing piece → top priority + time_critical + cancel non-critical
+    let mut eff = Vec::new();
+    t.set_piece_deadline(PieceIndex(2), 5000, true, &mut eff);
+    assert_eq!(t.piece_priority(PieceIndex(2)), Some(DownloadPriority::TOP));
+    assert!(t.time_critical.contains_key(&PieceIndex(2)));
+
+    // verify piece 2 → removed from critical + ReadPiece effect
+    let mut eff = Vec::new();
+    t.piece_verified(PieceIndex(2), true, &mut eff);
+    assert!(!t.time_critical.contains_key(&PieceIndex(2)));
+    assert!(eff.iter().any(|e| matches!(
+        e,
+        TorrentEffect::ReadPiece {
+            piece: PieceIndex(2)
+        }
+    )));
+
+    // disk readback → read_piece_alert with payload
+    let mut s = Session::new();
+    s.add_torrent(t);
+    s.pop_alerts();
+    s.disk_completions()
+        .send(DiskCompleted::ReadPiece {
+            ih,
+            piece: PieceIndex(2),
+            data: vec![0xAB; 0x4000],
+            err: bitdaemon_disk::storage_error::StorageError::default(),
+        })
+        .unwrap();
+    s.drain_disk_completed(&mut Vec::new());
+    assert!(s.pop_alerts().iter().any(|a| matches!(
+        a,
+        Alert::ReadPiece {
+            piece: 2,
+            buffer,
+            ..
+        } if buffer.len() == 0x4000
+    )));
+}

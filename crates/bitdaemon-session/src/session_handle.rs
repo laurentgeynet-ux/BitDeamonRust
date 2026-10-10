@@ -263,6 +263,38 @@ impl TorrentHandle {
             .map_or_else(Vec::new, Torrent::file_progress)
     }
 
+    /// `set_piece_deadline` — time-critical pick + optional
+    /// `read_piece_alert` readback (`alert_when_available`).
+    /// Deadline effects are routed via `out` (engine drains it).
+    pub fn set_piece_deadline(
+        &self,
+        piece: PieceIndex,
+        deadline_ms: i64,
+        alert_when_available: bool,
+        out: &mut SessionOutVec,
+    ) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            let mut eff = Vec::new();
+            t.set_piece_deadline(piece, deadline_ms, alert_when_available, &mut eff);
+            out.extend(eff.into_iter().map(crate::session::SessionOut::Torrent));
+        }
+    }
+
+    /// `reset_piece_deadline`.
+    pub fn reset_piece_deadline(&self, piece: PieceIndex) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.reset_piece_deadline(piece);
+        }
+    }
+
+    /// `read_piece` — read a verified piece back (posts
+    /// `read_piece_alert` via the disk pipeline).
+    pub fn read_piece(&self, piece: PieceIndex, out: &mut SessionOutVec) {
+        out.push(crate::session::SessionOut::Torrent(
+            crate::torrent::TorrentEffect::ReadPiece { piece },
+        ));
+    }
+
     /// `queue_position` — index within the auto-managed queue.
     #[must_use]
     pub fn queue_position(&self) -> i32 {

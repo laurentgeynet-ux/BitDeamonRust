@@ -228,6 +228,17 @@ pub enum DiskCompleted {
         /// job result.
         err: StorageError,
     },
+    /// `read_piece` — whole-piece read for `read_piece_alert`.
+    ReadPiece {
+        /// torrent.
+        ih: Sha1Hash,
+        /// the piece.
+        piece: PieceIndex,
+        /// payload (empty on error).
+        data: Vec<u8>,
+        /// job result.
+        err: StorageError,
+    },
     /// `async_release_files` done (upstream `cache_flushed`).
     ReleaseFiles {
         /// torrent.
@@ -401,6 +412,27 @@ impl Session {
                         });
                     }
                 }
+                DiskCompleted::ReadPiece {
+                    ih,
+                    piece,
+                    data,
+                    err,
+                } => {
+                    // `read_piece_alert` — payload or the error
+                    if err.is_ok() {
+                        self.alerts.post(Alert::ReadPiece {
+                            ih,
+                            piece: piece.0,
+                            buffer: data,
+                        });
+                    } else {
+                        self.alerts.post(Alert::ReadPieceFailed {
+                            ih,
+                            piece: piece.0,
+                            error: err.to_string(),
+                        });
+                    }
+                }
                 DiskCompleted::ReleaseFiles { ih } => {
                     // `cache_flushed_alert`
                     self.alerts.post(Alert::CacheFlushed(ih));
@@ -507,6 +539,37 @@ impl Session {
                         None,
                         Box::new(move |err| {
                             let _ = tx.send(DiskCompleted::Write { ih, req, err });
+                        }),
+                        0,
+                    );
+                }
+                TorrentEffect::ReadPiece { piece } => {
+                    // `torrent::read_piece` — whole piece buffer
+                    let Some(t) = self.torrents.get(&ih) else {
+                        continue;
+                    };
+                    let storage = t.storage;
+                    let size = t
+                        .files
+                        .as_ref()
+                        .map_or(t.piece_length, |f| i64::from(f.piece_size(*piece)));
+                    let req = PeerRequest {
+                        piece: *piece,
+                        start: 0,
+                        length: size as i32,
+                    };
+                    let piece = *piece;
+                    let tx = self.disk_tx.clone();
+                    disk.async_read(
+                        storage,
+                        req,
+                        Box::new(move |buf, err| {
+                            let _ = tx.send(DiskCompleted::ReadPiece {
+                                ih,
+                                piece,
+                                data: buf.data().map_or_else(Vec::new, |d| d.to_vec()),
+                                err,
+                            });
                         }),
                         0,
                     );
@@ -1400,6 +1463,13 @@ impl Session {
                         bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_PEER,
                         &ip,
                     );
+                }
+                TorrentEffect::ReadPieceFailed { piece, error } => {
+                    self.alerts.post(Alert::ReadPieceFailed {
+                        ih,
+                        piece: piece.0,
+                        error,
+                    });
                 }
                 other => out.push(SessionOut::Torrent(other)),
             }

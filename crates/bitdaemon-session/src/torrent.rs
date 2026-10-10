@@ -43,6 +43,12 @@ pub enum TorrentEffect {
     /// verify a piece's hash (`verify_piece` — resume restore and
     /// post-write verification).
     DiskHash { piece: PieceIndex },
+    /// `read_piece` — read the whole piece back from disk and
+    /// post `read_piece_alert` (`alert_when_available` path).
+    ReadPiece { piece: PieceIndex },
+    /// failed read-piece request (`alert_when_available` on an
+    /// invalid/dead torrent).
+    ReadPieceFailed { piece: PieceIndex, error: String },
     /// piece passed verification → `have` broadcast pending.
     PiecePassed(PieceIndex),
     /// piece failed verification → re-download.
@@ -180,6 +186,10 @@ pub struct Torrent {
     /// by the session at `add_torrent`, rewritten by
     /// `queue_position_set`).
     pub queue_seq: i64,
+    /// `m_time_critical_pieces` — `set_piece_deadline` entries:
+    /// piece → (deadline, alert_when_available). Sorted list
+    /// upstream; BTreeMap + deadline ordering when consumed.
+    pub time_critical: std::collections::BTreeMap<PieceIndex, (std::time::Instant, bool)>,
 }
 
 impl Torrent {
@@ -243,6 +253,7 @@ impl Torrent {
             need_save_resume: false,
             last_saved_resume: None,
             queue_seq: 0,
+            time_critical: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1067,11 +1078,14 @@ impl Torrent {
         if self.picker.is_none() {
             return;
         }
-        let opts = if self.sequential {
+        let mut opts = if self.sequential {
             PickerOptions::RAREST_FIRST | PickerOptions::SEQUENTIAL
         } else {
             PickerOptions::RAREST_FIRST
         };
+        if !self.time_critical.is_empty() {
+            opts = opts | PickerOptions::TIME_CRITICAL;
+        }
         // build peer ctx from an immutable snapshot first
         let (key, allowed_fast, suggested, peer_pieces, peer_choked, outstanding) = {
             let Some(c) = self.peers.get(&peer_id) else {
@@ -1336,6 +1350,15 @@ impl Torrent {
                 self.finished = true;
                 out.push(TorrentEffect::BecameSeed);
             }
+            // `remove_time_critical_piece` — the piece just
+            // verified; `alert_when_available` → read it back
+            if self
+                .time_critical
+                .remove(&piece)
+                .is_some_and(|(_, alert)| alert)
+            {
+                out.push(TorrentEffect::ReadPiece { piece });
+            }
         } else {
             if let Some(p) = self.picker.as_mut() {
                 p.restore_piece(piece, &[]);
@@ -1535,6 +1558,95 @@ impl Torrent {
             }
         }
         out
+    }
+
+    /// `set_piece_deadline` (upstream `torrent::set_piece_deadline`):
+    /// mark `piece` time-critical — bumped to `top_priority`,
+    /// and the first critical piece cancels outstanding
+    /// non-critical requests (`cancel_non_critical`).
+    /// `alert_when_available` = upstream flag: when the piece
+    /// completes, `ReadPiece` reads it back and posts
+    /// `read_piece_alert`. Already-haved pieces read back now.
+    pub fn set_piece_deadline(
+        &mut self,
+        piece: PieceIndex,
+        deadline_ms: i64,
+        alert_when_available: bool,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        if self.picker.is_none() || piece.0 < 0 || piece.0 >= self.num_pieces {
+            if alert_when_available {
+                out.push(TorrentEffect::ReadPieceFailed {
+                    piece,
+                    error: "piece deadline on invalid/missing metadata".into(),
+                });
+            }
+            return;
+        }
+        if self.is_seed() || self.have.get_bit(piece.0 as usize) {
+            if alert_when_available {
+                out.push(TorrentEffect::ReadPiece { piece });
+            }
+            return;
+        }
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(
+                u64::try_from(deadline_ms.max(0)).unwrap_or(u64::MAX),
+            );
+        let first = self.time_critical.is_empty();
+        self.time_critical
+            .insert(piece, (deadline, alert_when_available));
+        // upstream bumps to `top_priority` unconditionally
+        if let Some(p) = self.picker.as_mut() {
+            p.set_piece_priority(piece, bitdaemon_common::types::DownloadPriority::TOP);
+        }
+        if first {
+            self.cancel_non_critical(out);
+        }
+    }
+
+    /// `reset_piece_deadline`.
+    pub fn reset_piece_deadline(&mut self, piece: PieceIndex) {
+        self.time_critical.remove(&piece);
+    }
+
+    /// `cancel_non_critical` — first time-critical piece cancels
+    /// every outstanding request not on a critical piece:
+    /// `Cancel` wire message + `abort_download` so the picker can
+    /// re-pick the block for a fast peer.
+    fn cancel_non_critical(&mut self, out: &mut Vec<TorrentEffect>) {
+        let critical: std::collections::BTreeSet<PieceIndex> =
+            self.time_critical.keys().copied().collect();
+        for (id, c) in self.peers.iter_mut() {
+            let mut removed = Vec::new();
+            for q in [
+                &mut c.pipeline.request_queue,
+                &mut c.pipeline.download_queue,
+            ] {
+                let mut i = 0;
+                while i < q.len() {
+                    if !critical.contains(&q[i].block.piece_index) {
+                        removed.push(q.remove(i).block);
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            let key = c.peer_key();
+            for b in removed {
+                out.push(TorrentEffect::SendTo {
+                    peer: *id,
+                    msg: PeerMessage::Cancel(PeerRequest {
+                        piece: b.piece_index,
+                        start: b.block_index * 0x4000,
+                        length: 0x4000,
+                    }),
+                });
+                if let Some(p) = self.picker.as_mut() {
+                    p.abort_download(b, key);
+                }
+            }
+        }
     }
 
     /// `torrent_status()` — the snapshot upstream's `status()`
