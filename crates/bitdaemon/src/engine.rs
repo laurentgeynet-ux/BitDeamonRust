@@ -46,8 +46,12 @@ struct InboundPeerMsg {
 /// result of an async dial job (`session_impl::on_connection_attempt`).
 struct DialDone {
     ih: Sha1Hash,
-    remote: SocketAddr,
+    /// `None` for inbound streams on non-IP transports (I2P).
+    remote: Option<SocketAddr>,
     stream: Result<BoxedPeerStream, String>,
+    /// `false` — an outbound dial failure feeds the reconnect
+    /// backoff; an inbound accept failure is just dropped.
+    outbound: bool,
 }
 
 /// `Engine` — everything outside `Session` that upstream does in
@@ -83,6 +87,9 @@ pub struct Engine {
     connect_tx: mpsc::UnboundedSender<DialDone>,
     /// spawned task handles (kept for abort on drop).
     tasks: Vec<JoinHandle<()>>,
+    /// info-hash set shared with acceptor tasks (`m_torrents` check
+    /// in upstream's listen_socket on_accept).
+    known_ihs: Arc<std::sync::Mutex<std::collections::BTreeSet<Sha1Hash>>>,
     /// pipeline settings handed to every new `PeerConn`
     /// (`queue_time`, `request_timeout`, `max_out_request_queue` —
     /// `settings_pack` values upstream).
@@ -122,6 +129,7 @@ impl Engine {
             connect_rx,
             connect_tx,
             tasks: Vec::new(),
+            known_ihs: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
             queue_time: 3,
             request_timeout: 60,
             max_out_request_queue: 500,
@@ -187,6 +195,9 @@ impl Engine {
             self.on_dial_done(d);
         }
 
+        // refresh the acceptor's known info-hash set
+        *self.known_ihs.lock().unwrap_or_else(|e| e.into_inner()) =
+            self.session.torrents.keys().copied().collect();
         self.session.tick(&mut out);
         self.session.tracker_announce_due(now, 0, &mut out);
         self.dispatch(out).await;
@@ -432,8 +443,12 @@ impl Engine {
         let s = match d.stream {
             Ok(s) => s,
             Err(e) => {
-                warn!(remote = %d.remote, err = e, "dial failed");
-                self.session.peer_connect_failed(&d.ih, d.remote);
+                warn!(remote = ?d.remote, err = e, "dial failed");
+                if d.outbound {
+                    if let Some(r) = d.remote {
+                        self.session.peer_connect_failed(&d.ih, r);
+                    }
+                }
                 return;
             }
         };
@@ -453,8 +468,11 @@ impl Engine {
             ),
             0,
         );
-        self.session.peer_connected(&d.ih, peer, conn, d.remote);
-        self.attach_stream(d.ih, peer, d.remote, s);
+        let remote = d
+            .remote
+            .unwrap_or_else(|| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
+        self.session.peer_connected(&d.ih, peer, conn, remote);
+        self.attach_stream(d.ih, peer, remote, s);
     }
 
     /// `torrent::connect_to_peer` (async form) — spawn the dial +
@@ -470,8 +488,9 @@ impl Engine {
             let send_err = |e: String| {
                 let _ = tx.send(DialDone {
                     ih,
-                    remote,
+                    remote: Some(remote),
                     stream: Err(e),
+                    outbound: true,
                 });
             };
             let mut s = match connector.connect(remote).await {
@@ -507,9 +526,54 @@ impl Engine {
             }
             let _ = tx.send(DialDone {
                 ih,
-                remote,
+                remote: Some(remote),
                 stream: Ok(s),
+                outbound: true,
             });
+        });
+        self.tasks.push(h);
+    }
+
+    /// `listen_sockets` accept pump — one task per acceptor: each
+    /// inbound stream runs the responder handshake (info-hash gated
+    /// by `known`, refreshed every tick) and lands in `connect_rx`
+    /// like an outbound dial.
+    pub fn start_acceptor(&mut self, acceptor: Arc<dyn bitdaemon_net::transport::PeerAcceptor>) {
+        let tx = self.connect_tx.clone();
+        let known = self.known_ihs.clone();
+        let pid = self.session.peer_id;
+        let h = tokio::spawn(async move {
+            loop {
+                let acc = acceptor.clone().accept().await;
+                let mut s = match acc {
+                    Ok((s, _remote)) => s,
+                    Err(e) => {
+                        warn!(err = %e, "accept failed");
+                        return;
+                    }
+                };
+                let hs = bitdaemon_net::bt_peer_conn::run_handshake_responder(
+                    &mut s,
+                    &pid,
+                    false,
+                    false,
+                    |ih| known.lock().unwrap_or_else(|e| e.into_inner()).contains(ih),
+                )
+                .await;
+                match hs {
+                    Ok(hs) => {
+                        let _ = tx.send(DialDone {
+                            ih: hs.info_hash,
+                            remote: None,
+                            stream: Ok(s),
+                            outbound: false,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(err = %e, "inbound handshake failed");
+                    }
+                }
+            }
         });
         self.tasks.push(h);
     }

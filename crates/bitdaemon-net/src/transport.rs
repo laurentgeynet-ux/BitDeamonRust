@@ -98,8 +98,14 @@ pub trait PeerConnector: Send + Sync + Debug + 'static {
 ///
 /// Equivalent of the `UtpAcceptor` trait patched into vendored rqbit.
 pub trait PeerAcceptor: Send + Sync + Debug + 'static {
-    /// Accept the next inbound peer stream.
+    /// Accept the next inbound peer stream, with its remote endpoint
+    /// when the transport knows it (`None` e.g. for I2P — the SAM
+    /// destination isn't an IP:port).
     fn accept(
         self: Arc<Self>,
-    ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>>;
+    ) -> Pin<
+        Box<
+            dyn Future<Output = crate::Result<(BoxedPeerStream, Option<SocketAddr>)>> + Send + Sync,
+        >,
+    >;
 }

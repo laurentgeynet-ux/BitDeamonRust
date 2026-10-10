@@ -418,21 +418,28 @@ impl crate::transport::PeerAcceptor for I2pAcceptor {
     fn accept(
         self: std::sync::Arc<Self>,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>,
+        Box<
+            dyn std::future::Future<
+                    Output = crate::Result<(BoxedPeerStream, Option<std::net::SocketAddr>)>,
+                > + Send
+                + Sync,
+        >,
     > {
         Box::pin(async move {
             let me = self.clone();
-            tokio::spawn(async move {
+            let s: crate::Result<BoxedPeerStream> = tokio::spawn(async move {
                 let mut s = me.conn.dial_sam().await.map_err(|e| {
                     crate::NetError::Transport(std::io::Error::other(e.to_string()))
                 })?;
                 i2p_accept(&mut s, &me.conn.session_id).await.map_err(|e| {
                     crate::NetError::Transport(std::io::Error::other(e.to_string()))
                 })?;
-                Ok(s)
+                Ok(Box::new(s) as BoxedPeerStream)
             })
             .await
-            .map_err(|e| crate::NetError::Transport(std::io::Error::other(e.to_string())))?
+            .map_err(|e| crate::NetError::Transport(std::io::Error::other(e.to_string())))?;
+            // I2P peers are destinations, not IP endpoints
+            s.map(|s| (s, None))
         })
     }
 }

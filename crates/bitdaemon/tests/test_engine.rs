@@ -336,3 +336,66 @@ async fn spawn_dial_connects_peer() {
     assert_eq!(eng.session.torrents[&ih].peers.len(), 1);
     remote.abort();
 }
+
+#[tokio::test]
+async fn acceptor_pump_registers_peer() {
+    use bitdaemon_net::transport::PeerAcceptor;
+
+    #[derive(Debug)]
+    struct Acc(tokio::sync::Mutex<Option<DuplexStream>>);
+    impl PeerAcceptor for Acc {
+        fn accept(
+            self: Arc<Self>,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = bitdaemon_net::Result<(BoxedPeerStream, Option<SocketAddr>)>,
+                    > + Send
+                    + Sync,
+            >,
+        > {
+            let me = self.clone();
+            Box::pin(async move {
+                let s =
+                    me.0.lock()
+                        .await
+                        .take()
+                        .ok_or(bitdaemon_net::NetError::NoTransport("done"))?;
+                Ok((Box::new(s) as BoxedPeerStream, None))
+            })
+        }
+    }
+
+    let ih = Sha1Hash::from_bytes(&[77; 20]).unwrap();
+    let (mine, theirs) = tokio::io::duplex(64 * 1024);
+    let mut eng = Engine::new(
+        Arc::new(DuplexConnector(tokio::sync::Mutex::new(None))),
+        None,
+    );
+    eng.session.add_torrent(Torrent::new(
+        ih,
+        1,
+        16384,
+        Bitfield::with_size(1),
+        StorageIndex(0),
+    ));
+    eng.start_acceptor(Arc::new(Acc(tokio::sync::Mutex::new(Some(mine)))));
+
+    // remote dials: initiator handshake
+    let remote = tokio::spawn(async move {
+        let mut b: BoxedPeerStream = Box::new(theirs);
+        let pid = bitdaemon_common::PeerId::default();
+        let _ = bitdaemon_net::bt_peer_conn::run_handshake(&mut b, &ih, &pid, false, false).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        b
+    });
+    for _ in 0..100 {
+        eng.tick(std::time::Instant::now()).await;
+        if !eng.session.torrents[&ih].peers.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(eng.session.torrents[&ih].peers.len(), 1);
+    remote.abort();
+}

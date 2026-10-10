@@ -214,7 +214,7 @@ async fn acceptor_handshake_and_echo() {
 
     let acc = acceptor.clone();
     let responder = tokio::spawn(async move {
-        let mut s = acc.accept().await.unwrap();
+        let (mut s, _from) = acc.accept().await.unwrap();
         // echo back whatever arrives
         let mut b = [0u8; 64];
         let n = s.read(&mut b).await.unwrap();

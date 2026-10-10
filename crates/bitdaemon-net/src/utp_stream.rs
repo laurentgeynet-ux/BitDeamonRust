@@ -395,8 +395,13 @@ impl UtpAcceptor {
 impl crate::transport::PeerAcceptor for UtpAcceptor {
     fn accept(
         self: Arc<Self>,
-    ) -> Pin<Box<dyn std::future::Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>>
-    {
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = crate::Result<(BoxedPeerStream, Option<SocketAddr>)>>
+                + Send
+                + Sync,
+        >,
+    > {
         let me = self.clone();
         Box::pin(async move {
             let (syn, from) = me
@@ -410,7 +415,7 @@ impl crate::transport::PeerAcceptor for UtpAcceptor {
                 .manager
                 .accept_syn(me.datagram.clone(), from, &syn, me.cfg.clone())
                 .await?;
-            Ok(Box::new(s) as BoxedPeerStream)
+            Ok((Box::new(s) as BoxedPeerStream, Some(from)))
         })
     }
 }

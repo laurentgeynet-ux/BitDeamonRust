@@ -9,6 +9,15 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `Engine::start_acceptor` (`listen_socket` accept pump) : une tâche
+  par accepteur — chaque stream inbound fait le handshake répondeur
+  (info-hash filtré par le set partagé `known_ihs`, rafraîchi au tick)
+  puis rejoint `connect_rx` comme un dial. `PeerAcceptor::accept`
+  retourne `(stream, Option<SocketAddr>)` — `None` pour les
+  transports non-IP (I2P/SAM).
+
+### Added
+
 - `settings_pack::anonymous_mode` : coupe l'émission LSD (déviation
   OnionBit documentée — upstream ne masque que `ip`/user-agent des
   announces ; broadcaster les info-hashes sur le LAN trahirait
