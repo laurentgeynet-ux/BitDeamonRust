@@ -176,7 +176,7 @@ pub struct PeerInfo {
     pub download_rate_peak: i32,
     /// upload peak.
     pub upload_rate_peak: i32,
-    /// `progress_ppm` [0,1_000_000].
+    /// `progress_ppm` \[0, 1_000_000\].
     pub progress_ppm: i32,
     /// `ip` — remote endpoint (`None` for i2p).
     pub remote_endpoint: Option<SocketAddr>,

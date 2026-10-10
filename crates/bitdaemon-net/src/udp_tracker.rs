@@ -1,6 +1,6 @@
 //! Port of `udp_tracker_connection.cpp` — the UDP tracker protocol
 //! (BEP-15): connect (64-bit `connection_id` handshake), announce and
-//! scrape exchanges, over the injectable [`DatagramSocket`].
+//! scrape exchanges, over the injectable `DatagramSocket`.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;

@@ -156,7 +156,7 @@ pub struct DeleteFilesJob {
 pub struct CheckFastresumeJob {
     /// handler — `(status, error)`.
     pub handler: Box<dyn FnOnce(Status, StorageError) + Send>,
-    /// `links` — hard-link targets per file (upstream vector<string>*).
+    /// `links` — hard-link targets per file (upstream `vector<string>*`).
     pub links: Vec<String>,
     /// `resume_data`.
     pub resume_data: Option<Box<AddTorrentParams>>,

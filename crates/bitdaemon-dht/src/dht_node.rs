@@ -8,7 +8,7 @@
 //! Upstream `node.cpp` owns sockets and posts through
 //! `udp_socket`; here the wire side is injected: [`DhtNode::poll`]
 //! drains outgoing datagrams the caller forwards to a
-//! [`DatagramSocket`](bitdaemon_net::udp::DatagramSocket), and
+//! `DatagramSocket`(bitdaemon_net::udp::DatagramSocket), and
 //! [`DhtNode::incoming`] feeds received datagrams back. This is the
 //! seam OnionBit uses to run DHT over anonymous circuits.
 
@@ -155,7 +155,7 @@ impl DhtNode {
         })
     }
 
-    /// `rotate_secrets()` — promote secret[0] → secret[1].
+    /// `rotate_secrets()` — promote secret\[0\] → secret\[1\].
     pub fn rotate_secrets(&mut self) {
         self.secret[1] = self.secret[0];
         bitdaemon_common::random_bytes(&mut self.secret[0]);

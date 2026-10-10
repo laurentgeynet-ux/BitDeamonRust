@@ -4,7 +4,7 @@
 
 //! `i2p_stream` — the SAM (Simple Anonymous Messaging) handshake,
 //! verbatim command lines and response grammar from
-//! `i2p_stream.hpp`, driven over any injected [`BoxedPeerStream`].
+//! `i2p_stream.hpp`, driven over any injected `BoxedPeerStream`.
 //!
 //! Flow (`cmd` sequence): `HELLO VERSION` → `SESSION CREATE` /
 //! `STREAM CONNECT` / `STREAM ACCEPT` / `NAMING LOOKUP` → the
@@ -267,7 +267,7 @@ pub async fn i2p_name_lookup(s: &mut BoxedPeerStream, name: &str) -> Result<Stri
     }
 }
 
-/// `i2p_stream` as a [`PeerConnector`]/[`PeerAcceptor`]: each
+/// `i2p_stream` as a `PeerConnector`/`PeerAcceptor`: each
 /// outbound dial is `STREAM CONNECT` on a fresh SAM control socket,
 /// each accept `STREAM ACCEPT` likewise (upstream multiplexes per
 /// socket exactly this way). The SAM bridge itself is reached via

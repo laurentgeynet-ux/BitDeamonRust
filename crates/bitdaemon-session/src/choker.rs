@@ -5,7 +5,7 @@
 //! `choker` — the unchoke sort. `unchoke_sort` upstream returns
 //! the number of upload slots after reordering `peers` so the top
 //! `slots` should be unchoked. Peers are described by
-//! [`ChokePeer`] — a value snapshot, so the sort is pure and
+//! `ChokePeer` — a value snapshot, so the sort is pure and
 //! testable (upstream sorts `peer_connection*`).
 
 use std::time::{Duration, Instant};

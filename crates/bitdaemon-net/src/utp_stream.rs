@@ -2,9 +2,9 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `utp_stream` bridge — adapt the poll-style [`UtpSocket`] to
-//! `AsyncRead + AsyncWrite` ([`PeerStream`]) plus a
-//! [`PeerConnector`] dialing over any injected [`DatagramSocket`].
+//! `utp_stream` bridge — adapt the poll-style `UtpSocket` to
+//! `AsyncRead + AsyncWrite` (`PeerStream`) plus a
+//! `PeerConnector` dialing over any injected `DatagramSocket`.
 //!
 //! Architecture: a `UtpManager` demuxes inbound datagrams by
 //! `(remote, conn-id)` into per-socket channels; each socket gets a

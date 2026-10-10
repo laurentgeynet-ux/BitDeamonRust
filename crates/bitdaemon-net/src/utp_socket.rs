@@ -9,11 +9,11 @@
 //!   which delivers them through the injected `DatagramSocket`
 //!   (ADR-0008 — anonymous circuits). A `None` send error is assumed;
 //!   a transport that cannot send reports `WouldBlock` via
-//!   [`UtpSocket::stalled`]-equivalent flow is handled by re-queueing.
+//!   `UtpSocket::stalled`-equivalent flow is handled by re-queueing.
 //! - upstream user-provided iovec buffers become a byte-queue write
 //!   buffer and a `read(&mut [u8])` pull API.
 //! - upstream callbacks (`on_read`/`on_write`/`on_connect`) become
-//!   pollable state: [`UtpSocket::state`], [`UtpSocket::error`].
+//!   pollable state: `UtpSocket::state`, `UtpSocket::error`.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;

@@ -62,12 +62,12 @@ pub trait PeerStream: AsyncRead + AsyncWrite + Unpin + Send + Debug + 'static {}
 
 impl<T> PeerStream for T where T: AsyncRead + AsyncWrite + Unpin + Send + Debug + 'static {}
 
-/// Boxed peer stream returned by [`PeerConnector`] / [`PeerAcceptor`].
+/// Boxed peer stream returned by `PeerConnector` / `PeerAcceptor`.
 pub type BoxedPeerStream = Box<dyn PeerStream>;
 
 /// Outbound peer connector — the injection point for "how do I reach a
 /// peer". Default impls: TCP connect, uTP `connect` over a
-/// [`DatagramSocket`], SOCKS5. Custom impls route through tunnels.
+/// `DatagramSocket`, SOCKS5. Custom impls route through tunnels.
 ///
 /// Equivalent of the `UtpConnector` trait patched into vendored rqbit.
 pub trait PeerConnector: Send + Sync + Debug + 'static {
@@ -98,7 +98,7 @@ pub trait PeerConnector: Send + Sync + Debug + 'static {
     }
 }
 
-/// Inbound peer acceptor — symmetric counterpart of [`PeerConnector`]
+/// Inbound peer acceptor — symmetric counterpart of `PeerConnector`
 /// on the listen path (uTP `accept`, TCP listener, tunnel acceptor).
 ///
 /// Equivalent of the `UtpAcceptor` trait patched into vendored rqbit.

@@ -1,9 +1,9 @@
 //! Port of `extensions/smart_ban.cpp` — per-block CRC bookkeeping
 //! used to ban peers that send corrupt data. The disk reads upstream
 //! triggers are caller-driven here: the owner feeds block digests via
-//! [`SmartBan::record_failed_block`] / [`SmartBan::check_ok_block`]
+//! `SmartBan::record_failed_block` / `SmartBan::check_ok_block`
 //! after its async reads complete. Decisions are returned as
-//! [`BanDecision`] events instead of calling `torrent::ban_peer`
+//! `BanDecision` events instead of calling `torrent::ban_peer`
 //! directly.
 
 use std::collections::BTreeMap;

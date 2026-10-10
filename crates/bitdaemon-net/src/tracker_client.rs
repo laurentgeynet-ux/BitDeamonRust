@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! `tracker_connection` — one full announce exchange per call:
-//! HTTP via [`http_get`] + `parse_response`, UDP via the BEP-15
+//! HTTP via `http_get` + `parse_response`, UDP via the BEP-15
 //! connect→announce handshake over the injected `DatagramSocket`.
 //! Retries/failover live in `session::tracker_list`; this module is
 //! the wire half of `http_tracker_connection`/`udp_tracker_connection`'s

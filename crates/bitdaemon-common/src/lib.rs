@@ -16,9 +16,9 @@
 //! | [`sliding_average`] | `aux_/sliding_average.hpp`                   |
 //! | [`stat`]      | `aux_/stat.hpp`, `src/stat.cpp`                    |
 //! | [`bloom_filter`] | `aux_/bloom_filter.hpp`, `src/bloom_filter.cpp` |
-//! | [`random`]    | `random.hpp`, `src/random.cpp`                     |
+//! | [`mod@random`]    | `random.hpp`, `src/random.cpp`                     |
 //! | [`crc32c`]    | `aux_/crc32c.hpp`, `src/crc32c.cpp`                |
-//! | [`index_range`] | `index_range.hpp`                                |
+//! | [`mod@index_range`] | `index_range.hpp`                                |
 //! | [`timestamp_history`] | `aux_/timestamp_history.hpp`, `compare_less_wrap` (`utp_stream.cpp`) |
 //!
 //! Still TODO here: `span.hpp`, `disk_buffer` (land with the disk layer),

@@ -15,7 +15,7 @@ enum State {
     Error,
 }
 
-/// `http_parser` — feed growing receive buffers via [`incoming`];
+/// `http_parser` — feed growing receive buffers via `incoming`;
 /// the parser keeps absolute positions (`m_recv_pos`,
 /// `m_body_start_pos`) like upstream's `span`-based design.
 #[derive(Debug)]

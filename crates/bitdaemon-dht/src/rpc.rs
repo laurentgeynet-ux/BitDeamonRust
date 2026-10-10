@@ -7,7 +7,7 @@
 //!
 //! Upstream keeps `observer` shared_ptrs in `m_transactions`; here
 //! each pending request carries an opaque `tag` and a
-//! [`RpcHandler`] the caller supplies per request — the wiring to
+//! `RpcHandler` the caller supplies per request — the wiring to
 //! `Traversal`/observer state lives in the session layer, keeping
 //! this manager free of borrow cycles.
 
@@ -45,7 +45,7 @@ struct Pending {
 /// `rpc_manager` — transaction-id → pending request map.
 ///
 /// Generic over the per-request dispatch tag (`u64` — e.g. a
-/// traversal index) chosen by the caller at [`Self::add`].
+/// traversal index) chosen by the caller at `Self::add`.
 #[derive(Default)]
 pub struct RpcManager {
     /// `m_transactions` (multimap tid → pending).

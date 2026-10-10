@@ -5,7 +5,7 @@
 //! `torrent` — per-torrent state machine. Owns the piece picker,
 //! the peer set (`PeerConn`s keyed by an opaque id), the have-set,
 //! and the disk-storage index. Wire and disk stay outside: the
-//! session feeds decoded messages and drains [`TorrentEffect`]s
+//! session feeds decoded messages and drains `TorrentEffect`s
 //! (send, write, read, announce, alerts).
 //!
 //! Port of `torrent.cpp`'s core: `peer_has`/`peer_lost` refcount

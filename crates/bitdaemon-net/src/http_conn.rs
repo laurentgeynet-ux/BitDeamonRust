@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! `http_connection` — the request/response pump on top of
-//! [`HttpParser`], over any injected [`BoxedPeerStream`] (ADR-0008:
+//! `HttpParser`, over any injected `BoxedPeerStream` (ADR-0008:
 //! tunnels/proxies carry trackers and web seeds verbatim).
 //! Upstream's class owns socket+resolver+rate-limiter; here each
 //! phase is composed by the caller — resolve/connect/proxy first,
@@ -70,7 +70,7 @@ pub async fn send_request(
     Ok(())
 }
 
-/// the parsed response — thin view over [`HttpParser`]'s state.
+/// the parsed response — thin view over `HttpParser`'s state.
 pub struct HttpResponse {
     /// the parser — status/headers/chunks all queryable.
     pub parser: HttpParser,

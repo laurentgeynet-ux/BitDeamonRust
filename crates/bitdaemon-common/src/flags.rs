@@ -3,7 +3,7 @@
 //!
 //! Upstream wraps an unsigned integer in a strongly-typed struct with
 //! `|`/`&`/`^`/`~`, `operator bool`, `all()` and a `N_bit` literal
-//! constructor. The [`bitfield_flag!`] macro below reproduces that surface
+//! constructor. The `bitfield_flag!` macro below reproduces that surface
 //! for a concrete flag type; constants keep upstream's bit positions.
 
 /// Generates a `bitfield_flag` newtype: `bitfield_flag!(Name, u64)` then

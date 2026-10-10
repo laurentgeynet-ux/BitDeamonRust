@@ -51,7 +51,7 @@ pub struct WebSeedHeaders {
     pub proxy_authorization: String,
     /// `m_extra_headers`.
     pub extra: Vec<(String, String)>,
-    /// `format_host_header` result host[:port].
+    /// `format_host_header` result host\[:port\].
     pub host: String,
 }
 

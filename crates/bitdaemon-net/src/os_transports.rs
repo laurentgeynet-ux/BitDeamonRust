@@ -35,7 +35,7 @@ impl PeerConnector for TokioTcpConnector {
     }
 }
 
-/// `TokioTcpAcceptor` — `TcpListener` as a [`PeerAcceptor`].
+/// `TokioTcpAcceptor` — `TcpListener` as a `PeerAcceptor`.
 #[derive(Debug)]
 pub struct TokioTcpAcceptor {
     listener: TcpListener,
@@ -67,7 +67,7 @@ impl PeerAcceptor for TokioTcpAcceptor {
     }
 }
 
-/// `TokioUdpSocket` — the default [`DatagramSocket`] (DHT, UDP
+/// `TokioUdpSocket` — the default `DatagramSocket` (DHT, UDP
 /// trackers, uTP, LSD all run on top of this).
 #[derive(Debug)]
 pub struct TokioUdpSocket {

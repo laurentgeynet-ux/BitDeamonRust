@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Port of `kademlia/item.cpp` — BEP-44 items: `canonical_string`
-//! ("4:salt<len>:<salt>3:seqi<seq>e1:v<v>"), `item_target_id`,
+//! `4:salt<len>:<salt>3:seqi<seq>e1:v<v>`, `item_target_id`,
 //! `sign_mutable_item`/`verify_mutable_item` via `ed25519-dalek`
 //! (ADR-0007 — the bundled C implementation is not ported).
 
