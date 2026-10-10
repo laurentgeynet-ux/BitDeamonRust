@@ -27,16 +27,16 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 
 | C++ source | Rust target | Status | Notes |
 |---|---|---|---|
-| `sha1_hash.cpp` / `sha256.cpp` | `common::hash` | not started | wraps `sha1`/`sha2` crates |
-| `info_hash.hpp` | `common::info_hash` | not started | v1/v2/hybrid info_hash_t |
-| `bitfield.cpp` | `common::bitfield` | not started | |
-| `peer_id.hpp` / `generate_peer_id.cpp` | `common::peer_id` | not started | Azureus-style fingerprint |
-| `peer_request.hpp`, `piece_block.cpp` | `common::piece` | not started | |
-| `error_code.cpp`, `error.hpp`, `close_reason.cpp` | `common::error` | not started | map `lt::errors` categories |
+| `sha1_hash.cpp` / `sha256.cpp` (`digest32.hpp`) | `common::hash` | ported | `Digest<N>` + `Sha1Hash`/`Sha256Hash`; big-endian shifts, bitwise ops, `count_leading_zeros` — upstream test vectors pass |
+| `info_hash.hpp` | `common::info_hash` | ported | v1/v2/hybrid `InfoHash`: `has_v1`/`has_v2`/`get`/`get_best` |
+| `bitfield.cpp` | `common::bitfield` | ported | MSB-first wire order, `resize_with` fill semantics, trailing-bit clearing; 16 cases from `test_bitfield.cpp` pass |
+| `peer_id.hpp` / `generate_peer_id.cpp` | `common::peer_id` | ported | 70-char printable set, `random(69)` inclusive quirk reproduced |
+| `peer_request.hpp`, `piece_block.cpp` | `common::types` | ported | `PieceIndex`/`BlockIndex`…, `PieceBlock::INVALID` = `(max, i32::MAX)` |
+| `error_code.cpp`, `error.hpp`, `close_reason.cpp` | `common::error` | in progress | `bdecode` category done (`bencode::BdecodeErrorKind`); other `lt::errors` categories pending |
 | `time.cpp`, `timestamp_history.cpp` | `common::time` | not started | monotonic clock semantics |
-| `download_priority.hpp`, `operations.hpp`, `torrent_flags.hpp`, `pex_flags.hpp`, `announce_flags.hpp`, `flags.hpp`, `index_range.hpp` | `common::flags` | not started | bitflags newtypes |
-| `random.cpp`, `dev_random.hpp` | `common::random` | not started | `rand` crate |
-| `hex.cpp` | `common::hex` | not started | |
+| `download_priority.hpp`, `operations.hpp`, `torrent_flags.hpp`, `pex_flags.hpp`, `announce_flags.hpp`, `flags.hpp`, `index_range.hpp` | `common::types`/`common::flags` | in progress | `DownloadPriority` strong type done; flags enums pending |
+| `random.cpp`, `dev_random.hpp` | `common::random` | not started | `rand` crate (already used by `peer_id`) |
+| `hex.cpp` | `common::hex` | ported | to/from hex, validation; upstream messages |
 | `crc32c.cpp`, `cpuid.cpp` | `common::crc32c` | not started | `crc32c` crate, no CPUID needed |
 | `sliding_average.hpp`, `stat.cpp`, `stat_cache.cpp` | `common::stat` | not started | counters + averages |
 | `bloom_filter.cpp` | `common::bloom_filter` | not started | used by DHT routing |
@@ -47,9 +47,10 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 
 | C++ source | Rust target | Status | Notes |
 |---|---|---|---|
-| `bdecode.cpp` (`bdecode.hpp`) | `bencode::decode` | not started | lazy zero-copy; `data_section` must be byte-exact |
-| `entry.cpp` (`entry.hpp`) | `bencode::entry` | not started | sorted unique dict keys |
-| `bencode.hpp`, `aux_::bencoder.hpp` | `bencode::encode` | not started | |
+| `bdecode.cpp` (`bdecode.hpp`) | `bencode::decode` + `bencode::node` | ported | 8-byte packed tokens (`offset:29|kind:3`/`next:29|hdr:3`), lazy `int_value`, back-patched partial trees, soft errors, error positions — 60+ cases from `test_bdecode.cpp` pass |
+| `entry.cpp` (`entry.hpp`) | `bencode::entry` | ported | `Entry` owned enum; dict = `BTreeMap<Vec<u8>,_>` = upstream sorted `map` |
+| `bencode.hpp`, `aux_::bencoder.hpp` | `bencode::encode` | ported | canonical dict order; `Preformatted` verbatim; `Undefined`→`0:` |
+| `print_entry` (in `bdecode.cpp`/`entry.cpp`) | `bencode::print` | ported | `print_node`/`print_entry`, upstream separators + 200-char one-liner rule |
 | `gzip.cpp`, `puff.cpp` | `bencode::gzip` (or net) | not started | `flate2` crate; puff is C zlib-inflate — don't port |
 | `xml_parse.cpp`, `xml_parse.hpp` | `core::rss`? | not started | RSS support — low priority |
 

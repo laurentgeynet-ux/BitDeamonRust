@@ -1,45 +1,34 @@
 //! Shared primitives used across all BitDaemon crates.
 //!
 //! Ported from the foundational headers of libtorrent:
-//! `sha1_hash.hpp`, `info_hash.hpp`, `bitfield.hpp`, `peer_id.hpp`,
-//! `peer_request.hpp`, `piece_block.hpp`, `error_code.hpp`, `time.hpp`,
-//! `download_priority.hpp`, `flags.hpp`, `span.hpp`, `units.hpp`.
 //!
-//! Status: **not ported yet** — see `docs/PORTING.md` for the module map.
+//! | module        | upstream file(s)                                   |
+//! |---------------|----------------------------------------------------|
+//! | [`hex`]       | `hex.hpp`, `src/hex.cpp`                           |
+//! | [`hash`]      | `sha1_hash.hpp`, `src/sha1_hash.cpp` (`digest32`)  |
+//! | [`info_hash`] | `info_hash.hpp` (`info_hash_t`, `protocol_version`)|
+//! | [`bitfield`]  | `bitfield.hpp`, `src/bitfield.cpp`                 |
+//! | [`peer_id`]   | `peer_id.hpp`, `src/generate_peer_id.cpp`          |
+//! | [`types`]     | `units.hpp`, `peer_request.hpp`, `piece_block.hpp`, `download_priority.hpp` |
+//! | [`error`]     | `error_code.hpp` usage patterns                    |
+//!
+//! Still TODO here: `time.hpp` (clock types land with the session layer),
+//! `flags.hpp`/`span.hpp` (subsumed by Rust idioms where needed).
 
 #![forbid(unsafe_code)]
 
-/// 20-byte SHA-1 digest (`libtorrent::sha1_hash`).
-///
-/// TODO: implement — wraps a `[u8; 20]`, `FromStr`/`Display` for hex,
-/// `count_bits`, ordering, XOR-distance helpers (needed by the DHT).
-pub struct Sha1Hash;
+pub mod bitfield;
+pub mod error;
+pub mod hash;
+pub mod hex;
+pub mod info_hash;
+pub mod peer_id;
+pub mod types;
 
-/// 32-byte SHA-256 digest (`libtorrent::sha256_hash`).
-///
-/// TODO: implement — used by BitTorrent v2 piece layers and merkle trees.
-pub struct Sha256Hash;
-
-/// Bitfield over pieces or blocks (`libtorrent::bitfield`).
-///
-/// TODO: implement — back onto `bitvec` or a hand-rolled `Vec<u32>`
-/// matching `aux::bitfield` semantics.
-pub struct Bitfield;
-
-/// 20-byte peer identifier (`libtorrent::peer_id`).
-///
-/// TODO: implement — Azureus-style client fingerprinting lives in
-/// `fingerprint` / `identify_client` (bitdaemon-core).
-pub struct PeerId;
-
-/// Common error type for foundation-level failures
-/// (`libtorrent::error_code` / `boost::system::error_code` usage).
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// A value failed a fixed-length or format constraint.
-    #[error("invalid value: {0}")]
-    InvalidValue(String),
-}
-
-/// Convenience alias mirroring libtorrent's `error_code`-returning APIs.
-pub type Result<T> = std::result::Result<T, Error>;
+pub use bitfield::Bitfield;
+pub use error::{Error, Result};
+pub use hash::{Digest, Sha1Hash, Sha256Hash};
+pub use hex::{HexError, from_hex, is_hex, to_hex, to_hex_into};
+pub use info_hash::{ALL_VERSIONS, InfoHash, ProtocolVersion};
+pub use peer_id::{PEER_ID_LEN, PeerId, generate_peer_id, url_random};
+pub use types::{DownloadPriority, FileIndex, PeerRequest, PieceBlock, PieceIndex};

@@ -33,5 +33,21 @@ Until `1.0.0`, breaking changes may occur in any release.
   restore, unbounded memory, per-piece-lock RMW corruption).
 - `StorageFactory` injection point documented for downstream
   encrypted/opaque-name storage (OBD parity).
+- `bitdaemon_common`: `hex`, `Digest<N>`/`Sha1Hash`/`Sha256Hash`
+  (big-endian ordering/shifts/bitops, `count_leading_zeros`),
+  `InfoHash` (v1/v2/hybrid), `Bitfield` (MSB-first, `resize_with`
+  fill semantics, trailing-bit clearing), `PeerId` (70-char printable
+  set), `types` (`PieceIndex`, `PieceBlock::INVALID`,
+  `DownloadPriority`, …), `Error`/`Result`.
+- `bitdaemon_bencode`: faithful port of `bdecode` — flat packed-token
+  tree (`offset:29|kind:3` + `next_item:29|header:3`), lazy zero-copy
+  `BdecodeNode` (`list_at`/`dict_at`/`dict_find*`, `data_section`,
+  `string_offset`), back-patched partial trees on error, soft-error
+  detection (unsorted/duplicate keys, leading zeros), upstream error
+  kinds + positions; owned `Entry`, canonical `bencode` encoder,
+  `print_node`/`print_entry` pretty-printer.
+- Tests: 67 conformance cases ported from `test_bdecode.cpp`, 16 from
+  `test_bitfield.cpp`, plus hash/hex/peer-id unit coverage — all green;
+  `clippy -D warnings` clean, `cargo doc` clean.
 
 [Unreleased]: https://github.com/laurentgeynet-ux/BitDeamonRust/compare/main...HEAD
