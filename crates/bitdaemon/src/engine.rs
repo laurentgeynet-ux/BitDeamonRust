@@ -389,7 +389,7 @@ impl Engine {
             ),
             0,
         );
-        self.session.peer_connected(ih, peer, conn);
+        self.session.peer_connected(ih, peer, conn, remote);
         self.attach_stream(*ih, peer, remote, s);
         Ok(peer)
     }
@@ -432,6 +432,7 @@ impl Engine {
                 ),
                 0,
             ),
+            remote,
         );
         self.attach_stream(hs.info_hash, peer, remote, s);
         Ok(Some(peer))

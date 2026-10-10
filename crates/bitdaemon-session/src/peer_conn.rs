@@ -53,6 +53,13 @@ pub struct PeerConn {
     pub ext_ut_pex: u8,
     /// `metadata_size` the remote advertised (its info dict size).
     pub metadata_size: Option<i64>,
+    /// OUR local ext ids — the ids we advertise in our own BEP-10
+    /// handshake; inbound messages carry these (the remote's ids
+    /// above are for our sends). Session sets both to whatever it
+    /// advertises.
+    pub local_ut_metadata: u8,
+    /// our local `ut_pex` id.
+    pub local_ut_pex: u8,
     /// `m_upload_only` — remote told us it's upload-only.
     pub remote_upload_only: bool,
     /// `m_client_version` — remote's `v` string.
@@ -65,6 +72,10 @@ pub struct PeerConn {
     pub num_pieces: i32,
     /// ms timestamp the connection was established (`m_connect`).
     pub connect_ms: i64,
+    /// remote endpoint (`m_remote`) — needed for `ut_pex` diffs.
+    pub remote: Option<std::net::SocketAddr>,
+    /// pex update bookkeeping — the set we last sent this peer.
+    pub pex_sent: std::collections::BTreeSet<std::net::SocketAddr>,
 }
 
 impl PeerConn {
@@ -88,12 +99,16 @@ impl PeerConn {
             ext_ut_metadata: 0,
             ext_ut_pex: 0,
             metadata_size: None,
+            local_ut_metadata: 1,
+            local_ut_pex: 2,
             remote_upload_only: false,
             client_version: Vec::new(),
             upload_queue: Vec::new(),
             num_invalid_requests: 0,
             num_pieces: 0,
             connect_ms: now_ms,
+            remote: None,
+            pex_sent: std::collections::BTreeSet::new(),
         }
     }
 
@@ -333,9 +348,9 @@ impl PeerConn {
                         }
                         eff.push(PeerEffect::ExtHandshake);
                     }
-                } else if id == self.ext_ut_metadata && self.ext_ut_metadata != 0 {
+                } else if id == self.local_ut_metadata {
                     eff.push(PeerEffect::MetadataPacket(data.to_vec()));
-                } else if id == self.ext_ut_pex && self.ext_ut_pex != 0 {
+                } else if id == self.local_ut_pex {
                     eff.push(PeerEffect::PexPacket(data.to_vec()));
                 }
             }

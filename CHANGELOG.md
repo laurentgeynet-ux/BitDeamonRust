@@ -8,6 +8,7 @@ Until `1.0.0`, breaking changes may occur in any release.
 ## [Unreleased]
 
 ### Ajouté
+- `ut_pex` câblé : `PeerConn.remote`/`pex_sent`, `Session::peer_connected` prend l'endpoint, dispatch entrant sur `local_ut_pex`/`local_ut_metadata` (ids qu'on annonce vs ids du remote), `Torrent::on_pex_packet` → `peer_list`, `pex_tick` (diff 60 s vers les pairs ut_pex).
 - Dispatch BEP-10/9/11 dans `PeerConn` : handshake étendu parsé (`ext_ut_metadata`, `ext_ut_pex`, `metadata_size`, `upload_only`, `v`), effets `ExtHandshake`/`MetadataPacket`/`PexPacket`.
 - `Torrent` : `on_metadata_packet` (sert notre info dict via `metadata_raw`, rejette sans métadonnées), `metadata_tick`/`metadata_tick_peer` (demande la prochaine pièce aux pairs ayant `ut_metadata`), `set_metadata` conserve le dict brut ; `Session::tick` appelle `metadata_tick`. Magnet résolu e2e (handshake → request → piece → `set_metadata`).
 - `UtpAcceptor` : `PeerAcceptor` uTP — `UtpManager` route les ST_SYN orphelins vers une file d'écoute (`set_listener`), `accept_syn` crée le socket répondeur (`send_id` = conn-id du SYN, `recv_id` +1 — sémantique upstream), pompe dédiée, handshake+echo testés en duplex complet sur datagrammes injectés.

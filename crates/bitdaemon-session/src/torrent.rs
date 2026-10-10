@@ -13,6 +13,8 @@
 //! transitions — minus upstream's io_service entanglement.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use bitdaemon_common::types::PieceBlock;
 use bitdaemon_common::types::{FileIndex, PieceIndex, StorageIndex};
@@ -111,6 +113,8 @@ pub struct Torrent {
     /// (distinct from user `paused`, like upstream
     /// `graceful_pause` vs the queue state).
     pub queued: bool,
+    /// last `ut_pex` broadcast (`m_last_pex` timing state).
+    pub last_pex: Option<Instant>,
 }
 
 impl Torrent {
@@ -148,6 +152,7 @@ impl Torrent {
             magnet: false,
             smart_ban: SmartBan::new(),
             auto_managed: true,
+            last_pex: None,
             queued: false,
         }
     }
@@ -367,6 +372,68 @@ impl Torrent {
                 data: body.into(),
             },
         });
+    }
+
+    /// `ut_pex` receive — parse the diff and feed the swarm list
+    /// (upstream `on_pex_message` → `peer_list.add_peer` per added).
+    /// `max_pex_peers` mirrors `settings_pack::max_pex_peers` (50).
+    pub fn on_pex_packet(&mut self, body: &[u8]) {
+        let Some((added, _dropped)) = crate::ut_pex::parse_pex_message(
+            body,
+            crate::ut_pex::MAX_PEER_ENTRIES / 2,
+            self.peer_list.num_peers(),
+        ) else {
+            return;
+        };
+        for p in added {
+            // upstream skips local addresses unless the sender is
+            // local — our peers are anonymous endpoints, keep all
+            self.peer_list
+                .add_peer(p.addr, bitdaemon_common::flags::PeerSourceFlags::PEX, true);
+        }
+    }
+
+    /// `second_tick`'s pex section — every `PEX_INTERVAL` send each
+    /// `ut_pex`-capable peer a diff of our connected endpoints.
+    pub fn pex_tick(&mut self, now: Instant, out: &mut Vec<TorrentEffect>) {
+        const PEX_INTERVAL: Duration = Duration::from_secs(60);
+        if self
+            .last_pex
+            .is_some_and(|t| now.duration_since(t) < PEX_INTERVAL)
+        {
+            return;
+        }
+        self.last_pex = Some(now);
+        // the connected set we advertise (endpoints we dialed or
+        // accepted — pex excludes peers without a listen address,
+        // which `remote` approximates)
+        let connected: Vec<(SocketAddr, u8)> = self
+            .peers
+            .values()
+            .filter_map(|c| c.remote)
+            .map(|ep| (ep, 0u8))
+            .collect();
+        let ids: Vec<(u64, u8)> = self
+            .peers
+            .iter()
+            .filter(|(_, c)| c.ext_ut_pex != 0)
+            .map(|(id, c)| (*id, c.ext_ut_pex))
+            .collect();
+        for (id, ext) in ids {
+            let c = match self.peers.get_mut(&id) {
+                Some(c) => c,
+                None => continue,
+            };
+            let (body, sent) = crate::ut_pex::build_pex_message(&connected, &c.pex_sent);
+            c.pex_sent = sent;
+            out.push(TorrentEffect::SendTo {
+                peer: id,
+                msg: PeerMessage::Extended {
+                    id: ext,
+                    data: body.into(),
+                },
+            });
+        }
     }
 
     /// `metadata_request` — which ut_metadata piece to ask for next
@@ -750,7 +817,9 @@ impl Torrent {
                 PeerEffect::MetadataPacket(body) => {
                     self.on_metadata_packet(peer_id, &body, out);
                 }
-                PeerEffect::PexPacket(_body) => {}
+                PeerEffect::PexPacket(body) => {
+                    self.on_pex_packet(&body);
+                }
                 PeerEffect::DhtPort(_) => {}
                 PeerEffect::Disconnect(r) => {
                     out.push(TorrentEffect::DisconnectPeer {

@@ -33,6 +33,7 @@ fn add_peer_and_dispatch() {
         &ih,
         1,
         PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 6881),
     );
     assert_eq!(s.num_peers(), 1);
 
@@ -65,6 +66,7 @@ fn disconnect_cleans_up() {
         &ih,
         9,
         PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 6881),
     );
     // apply refcount via the normal Have path
     let p = PeerPacket {
@@ -89,11 +91,13 @@ fn verified_piece_emits_have_to_peers() {
         &ih,
         1,
         PeerConn::new(2, PeerPipeline::new(1000, 30, 250), 0),
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 6881),
     );
     s.peer_connected(
         &ih,
         2,
         PeerConn::new(2, PeerPipeline::new(1000, 30, 250), 0),
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 6881),
     );
 
     let mut out = Vec::new();

@@ -119,3 +119,62 @@ fn smart_ban_disconnects_corrupt_peer() {
             .any(|e| matches!(e, TorrentEffect::DisconnectPeer { .. }))
     );
 }
+
+#[test]
+fn pex_feeds_swarm_and_broadcasts() {
+    use bitdaemon_net::bep10::ExtendedHandshake;
+    use bitdaemon_net::peer_wire::PeerMessage;
+    use bitdaemon_session::peer_conn::PeerConn;
+    use bitdaemon_session::peer_pipeline::PeerPipeline;
+    use bitdaemon_session::torrent::TorrentEffect;
+    use bitdaemon_session::ut_pex::build_pex_message;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let ih = Sha1Hash::from_bytes(&[3; 20]).unwrap();
+    let mut t = Torrent::new(ih, 4, 16384, Bitfield::with_size(4), StorageIndex(0));
+    t.add_peer(7, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
+    let mut out = Vec::new();
+
+    // peer advertises ut_pex id 2
+    let mut m = BTreeMap::new();
+    m.insert("ut_pex".to_string(), 2);
+    let hs = ExtendedHandshake {
+        messages: m,
+        ..Default::default()
+    };
+    t.on_peer_message(
+        7,
+        &PeerMessage::Extended {
+            id: 0,
+            data: bitdaemon_bencode::bencode(&hs.build()).into(),
+        },
+        &mut out,
+    );
+
+    // remote sends a pex message adding 10.1.2.3:6881
+    let added_ep = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 6881);
+    let (body, _sent) = build_pex_message(&[(added_ep, 0)], &BTreeSet::new());
+    t.on_peer_message(
+        7,
+        &PeerMessage::Extended {
+            id: 2, // our local pex id (PeerConn::local_ut_pex)
+            data: body.into(),
+        },
+        &mut out,
+    );
+    assert_eq!(t.peer_list.num_peers(), 1);
+
+    // tick → we emit a pex diff to the peer (contains peer 7? we
+    // advertise remote endpoints of our connections — none have
+    // remote set here, so the diff is empty but still sent)
+    let mut out2 = Vec::new();
+    t.pex_tick(std::time::Instant::now(), &mut out2);
+    assert!(out2.iter().any(|e| matches!(
+        e,
+        TorrentEffect::SendTo {
+            msg: PeerMessage::Extended { id: 2, .. },
+            ..
+        }
+    )));
+}

@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bitdaemon_common::types::{PeerRequest, PieceIndex, StorageIndex};
 use bitdaemon_common::{Bitfield, Sha1Hash};
@@ -495,8 +496,16 @@ impl Session {
     }
 
     /// a peer connected — register it on the torrent.
-    pub fn peer_connected(&mut self, ih: &Sha1Hash, peer: u64, conn: crate::peer_conn::PeerConn) {
+    pub fn peer_connected(
+        &mut self,
+        ih: &Sha1Hash,
+        peer: u64,
+        conn: crate::peer_conn::PeerConn,
+        remote: SocketAddr,
+    ) {
         if let Some(t) = self.torrents.get_mut(ih) {
+            let mut conn = conn;
+            conn.remote = Some(remote);
             t.add_peer(peer, conn);
             self.counters.set(
                 Counter::PeersConnected,
@@ -565,6 +574,7 @@ impl Session {
             let mut eff = Vec::new();
             if let Some(t) = self.torrents.get_mut(&ih) {
                 t.metadata_tick(&mut eff);
+                t.pex_tick(Instant::now(), &mut eff);
                 for id in t.peers.keys().copied().collect::<Vec<_>>() {
                     t.drive_peer(id, &mut eff);
                 }
