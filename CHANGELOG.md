@@ -342,6 +342,13 @@ Until `1.0.0`, breaking changes may occur in any release.
   voter identity, 40-entry cap with upstream's stable-sort eviction,
   25-vote provisional / 50-vote or 5-min rotation, 2/3 majority
   rule).
+- `bitdaemon_dht` — first DHT modules: `node_id` (BEP-42
+  generate/verify + secret ids + distance/prefix masks),
+  `node_entry` (rtt EMA, fail-count, confirmed semantics),
+  `dht_settings` (22-field struct + session-file dict),
+  `dht_state` (nids/nodes save-load), `routing_table` (k-buckets
+  with split, prefix-spread replacement, CIDR dedup, find_node
+  k-closest, next_refresh).
 - `bitdaemon_session::ut_metadata` (BEP-9) — message codec +
   `UtMetadataTracker` (download buffer, least-requested piece
   selection, 3 s throttle, `max_metadata_size` validation,

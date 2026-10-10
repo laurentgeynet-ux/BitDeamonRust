@@ -151,14 +151,14 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | C++ source | Rust target | Status | Notes |
 |---|---|---|---|
 | `node.cpp` (`node.hpp`) | `dht::node` | not started | main state machine; UDP socket injected via `DatagramSocket` (ADR-0008) |
-| `routing_table.cpp` | `dht::routing_table` | not started | |
+| `routing_table.cpp` (+`node_entry.cpp`, `node_id.cpp`) | `dht::routing_table`, `dht::node_entry`, `dht::node_id` | **ported** | BEP-42 vectors verbatim (5/5); k-bucket split (extended `{16,8,4,2}`× limits), `compare_ip_cidr` /24+//64 dedup, `restrict_routing_ips`, `classify_prefix` spread-replacement, `find_node` k-closest, `next_refresh`, `update_node_id` |
 | `rpc_manager.cpp` | `dht::rpc` | not started | transaction/timeouts |
 | `traversal_algorithm.cpp` | `dht::traversal` | not started | base algo |
 | `find_data.cpp`, `get_peers.cpp`, `get_item.cpp`, `put_data.cpp`, `refresh.cpp`, `sample_infohashes.cpp` | `dht::ops::*` | not started | traversal specializations |
-| `dht_storage.cpp`, `dht_settings.cpp`, `dht_state.cpp` | `dht::storage` | not started | |
+| `dht_settings.cpp`, `dht_state.cpp` | `dht::dht_settings`, `dht::dht_state` | **ported** | all 22 fields + `dht_load/save_state` dict; `node-id`/`nodes`/`nodes6` save/load incl. old-style 20-byte nid; `dht_storage` pending |
 | `dht_tracker.cpp` | `dht::tracker` | not started | session glue |
 | `dos_blocker.cpp` | `dht::dos` | not started | rate limiting |
-| `node_id.cpp`, `node_entry.cpp` | `dht::id` | not started | BEP-42 verify |
+| `node_id.cpp`, `node_entry.cpp` | `dht::node_id`, `dht::node_entry` | **ported** | BEP-42 verify/generate, secret-id signature, distance/compare_ref/prefix masks; rtt EMA (2/3+1/3), fail-count semantics |
 | `msg.cpp`, `item.cpp`, `io.hpp`, `direct_request.hpp`, `observer.hpp` | `dht::msg` | not started | bencode schemas |
 | `ed25519.cpp` + `src/ed25519/*` (20 files) | `ed25519-dalek` | won't port | RustCrypto crate (ADR-0007) |
 | `types.hpp`, `announce_flags.hpp` | `dht::types` | not started | |
@@ -178,7 +178,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `request_blocks.cpp` (`request_a_block`) | `session::request_blocks` | **ported** | torrent/peer_conn inputs → `TorrentRequestCtx`/`PeerRequestCtx` snapshots, `add_request` closure, fast-set mask, strict-end-game + busy-block path verbatim |
 | `piece_picker.cpp` (`piece_picker.hpp`) | `session::piece_picker` | **ported** | `PiecePos` buckets 0..7 w/ `prio_factor=3`, 4 download queues (partial/full/finished/zero-prio) incl. reverse variants, `BlockInfo` w/ `num_peers` end-game refcount, `pick_pieces` all paths (partials-heap, suggested, sequential/reverse, rarest-first forward+reverse, random, extent affinity, end-game busy-block re-request), `restore_piece`/`write_failed`/`lock_piece` hash-job lifecycle, `distributed_copies`, pad bytes; `torrent_peer*` → `Option<u64>` peer key, `counters` → `PickerStats` trait; `test_piece_picker` 18 cases (pick, whole, priorities, partials, block states, abort, write_failed+restore, sequential, reverse, suggested, end-game, clear_peer, cursor, rarest-first, distributed_copies, accounting, seeds, queue) — all green |
 | `smart_ban.cpp` (`extensions/smart_ban.hpp`) | `session::smart_ban` | **ported (core)** | `m_block_hashes` map + ban rules verbatim (differing CRC on repeat failure, stored-CRC vs passing-piece mismatch); disk reads injected as `read_digest` closures, bans returned as `BanDecision` events instead of calling `torrent::ban_peer` |
-| `ut_metadata.cpp`, `ut_pex.cpp`, `i2p_pex.cpp` (ext side), `extensions.hpp` | `session::ext::*` | not started | BEP-9/11, i2p |
+| `ut_metadata.cpp`, `ut_pex.cpp`, `i2p_pex.cpp` (ext side), `extensions.hpp` | `session::ut_metadata`, `session::ut_pex` | **ported (cores)** | BEP-9 codec+`UtMetadataTracker` & BEP-11 message build/parse landed; i2p_pex + `extensions.hpp` registry + peer-plugin wiring pending |
 | `read_resume_data`/`write_resume_data` (session glue), `session_state` | `session::state` | not started | `.session` file compat |
 | `ip_filter` application, `portmap` glue, `natpmp`/`upnp` session glue | `session::nat` | not started | |
 | `stat.cpp` (session side), `session_stats.hpp` | `session::stats` | not started | |

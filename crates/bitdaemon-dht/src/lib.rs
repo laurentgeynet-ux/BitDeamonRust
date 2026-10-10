@@ -9,13 +9,14 @@
 //! Ed25519 signing uses the `ed25519-dalek` crate instead of porting
 //! the bundled C implementation — see ADR-0007.
 //!
-//! Status: **not ported yet** — see `docs/PORTING.md`.
+//! Status: `node_id` (BEP-42) ported — see `docs/PORTING.md`.
 
 #![forbid(unsafe_code)]
 
-/// DHT node id, 160-bit Kademlia distance space
-/// (`libtorrent::dht::node_id` ≡ `sha1_hash`).
-///
-/// TODO: implement — `distance()` XOR metric, `generate` with
-/// BEP-42 node-id verification for security.
-pub struct NodeId;
+pub mod dht_settings;
+pub mod dht_state;
+pub mod node_entry;
+pub mod node_id;
+pub mod routing_table;
+
+pub use node_id::NodeId;
