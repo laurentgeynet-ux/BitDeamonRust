@@ -816,10 +816,10 @@ impl Torrent {
         Some(PeerInfo {
             flags,
             source: bitdaemon_common::flags::PeerSourceFlags::INCOMING,
-            up_speed: 0,
-            down_speed: 0,
-            payload_up_speed: 0,
-            payload_down_speed: 0,
+            up_speed: c.rate_up_speed,
+            down_speed: c.rate_down_speed,
+            payload_up_speed: c.rate_up_speed,
+            payload_down_speed: c.rate_down_speed,
             pid: c.peer_id.unwrap_or_default(),
             pieces: c.peer_pieces.clone(),
             queue_bytes: c.pipeline.outstanding_bytes.min(i64::from(i32::MAX)) as i32,
@@ -2343,7 +2343,20 @@ impl Torrent {
             if dt > 0.0 {
                 self.down_rate = ((down - self.stat_prev_down) as f64 / dt) as i64;
                 self.up_rate = ((up - self.stat_prev_up) as f64 / dt) as i64;
+                // per-peer `stat::rate()` — bytes/sec over the tick.
+                for c in self.peers.values_mut() {
+                    c.rate_down_speed = ((c.stat_down_total - c.last_down_total) as f64 / dt)
+                        .clamp(0.0, f64::from(i32::MAX))
+                        as i32;
+                    c.rate_up_speed = ((c.stat_up_total - c.last_up_total) as f64 / dt)
+                        .clamp(0.0, f64::from(i32::MAX))
+                        as i32;
+                }
             }
+        }
+        for c in self.peers.values_mut() {
+            c.last_down_total = c.stat_down_total;
+            c.last_up_total = c.stat_up_total;
         }
         self.stat_prev_down = down;
         self.stat_prev_up = up;

@@ -76,6 +76,15 @@ pub struct PeerConn {
     pub num_invalid_requests: i32,
     /// `m_num_pieces` — total pieces the peer announced.
     pub num_pieces: i32,
+    /// `stat` rate sampling — last totals at the previous tick and
+    /// the resulting bytes/sec the `peer_info` snapshot reports.
+    pub rate_up_speed: i32,
+    /// `stat` rate sampling — payload download bytes/sec.
+    pub rate_down_speed: i32,
+    /// last sampled `stat_up_total` for rate computation.
+    pub last_up_total: i64,
+    /// last sampled `stat_down_total` for rate computation.
+    pub last_down_total: i64,
     /// ms timestamp the connection was established (`m_connect`).
     pub connect_ms: i64,
     /// `m_supports_fast` — remote negotiated the FAST extension
@@ -142,6 +151,10 @@ impl PeerConn {
             pex_sent: std::collections::BTreeSet::new(),
             stat_up_total: 0,
             stat_down_total: 0,
+            rate_up_speed: 0,
+            rate_down_speed: 0,
+            last_up_total: 0,
+            last_down_total: 0,
             stat_up_round: 0,
             stat_down_round: 0,
             supports_fast: false,
