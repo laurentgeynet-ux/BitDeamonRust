@@ -1506,6 +1506,28 @@ impl Torrent {
         self.need_save_resume = true;
     }
 
+    /// `torrent_handle::add_url_seed` / `add_http_seed`.
+    pub fn add_url_seed(&mut self, url: String) {
+        if !self.web_seeds.contains(&url) {
+            self.web_seeds.push(url);
+            self.need_save_resume = true;
+        }
+    }
+
+    /// `torrent_handle::remove_url_seed` / `remove_http_seed`.
+    pub fn remove_url_seed(&mut self, url: &str) {
+        if self.web_seeds.iter().any(|u| u == url) {
+            self.web_seeds.retain(|u| u != url);
+            self.need_save_resume = true;
+        }
+    }
+
+    /// `torrent_handle::url_seeds` snapshot.
+    #[must_use]
+    pub fn url_seeds(&self) -> &[String] {
+        &self.web_seeds
+    }
+
     /// `set_ban` (upstream `torrent::set_ban`) — ban the swarm entry
     /// for `remote`; an already-connected peer is dropped by the
     /// session's disconnect pump via `peer_disconnected_addr` —
@@ -1861,6 +1883,9 @@ impl Torrent {
     /// `want_more_peers` — downstream connect decisions.
     #[must_use]
     pub fn want_peers(&self) -> bool {
-        self.want_peers && !self.paused && !self.queued && !self.is_seed()
+        // upstream `torrent::want_peers_download` also checks the
+        // per-torrent connection cap (`m_max_connections`, -1 = inf).
+        let conn_ok = self.max_connections < 0 || (self.peers.len() as i32) < self.max_connections;
+        self.want_peers && !self.paused && !self.queued && !self.is_seed() && conn_ok
     }
 }

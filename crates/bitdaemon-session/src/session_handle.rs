@@ -489,6 +489,32 @@ impl TorrentHandle {
         }
     }
 
+    /// `torrent_handle::add_url_seed` — BEP-17 web seed endpoint.
+    pub fn add_url_seed(&self, url: String) {
+        let mut s = lock(&self.session);
+        if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+            t.add_url_seed(url);
+        }
+    }
+
+    /// `torrent_handle::remove_url_seed`.
+    pub fn remove_url_seed(&self, url: &str) {
+        let mut s = lock(&self.session);
+        if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+            t.remove_url_seed(url);
+        }
+    }
+
+    /// `torrent_handle::url_seeds` snapshot.
+    #[must_use]
+    pub fn url_seeds(&self) -> Vec<String> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map(|t| t.url_seeds().to_vec())
+            .unwrap_or_default()
+    }
+
     /// `torrent_handle::set_max_uploads` (per-torrent).
     pub fn set_max_uploads(&self, max: i32) {
         {
