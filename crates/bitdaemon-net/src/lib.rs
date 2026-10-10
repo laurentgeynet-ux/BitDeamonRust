@@ -76,6 +76,8 @@ pub mod http_tracker;
 pub mod lsd;
 /// `socks5_stream` — SOCKS4/5 handshake over any async stream.
 pub mod socks;
+/// `udp_socket::wrap`/`socks5_unwrap` — SOCKS5-UDP relay framing.
+pub mod socks_udp;
 /// `udp_tracker_connection` — BEP-15 announce/scrape over `DatagramSocket`.
 pub mod udp_tracker;
 /// uTP wire layer: `utp_header`, extension walk, conn-id demux.

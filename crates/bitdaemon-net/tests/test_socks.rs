@@ -533,3 +533,47 @@ fn lsd_parse() {
     // not BT-SEARCH → ignored
     assert!(process_packet(b"GET / HTTP/1.1\r\n\r\n", from, 0x99).is_none());
 }
+
+// ---------- socks_udp (SOCKS5 datagram framing) ----------
+
+use bitdaemon_net::socks_udp::*;
+
+#[test]
+fn socks5_udp_v4_roundtrip() {
+    let ep: std::net::SocketAddr = "1.2.3.4:6881".parse().unwrap();
+    let pkt = socks5_wrap(ep, b"payload");
+    // [0,0][0][1][1.2.3.4][6881] + payload
+    assert_eq!(&pkt[..4], &[0, 0, 0, 1]);
+    assert_eq!(&pkt[4..8], &[1, 2, 3, 4]);
+    assert_eq!(&pkt[8..10], &6881u16.to_be_bytes());
+    let (from, body) = socks5_unwrap(&pkt).unwrap();
+    match from {
+        Socks5From::Addr(a) => assert_eq!(a, ep),
+        _ => panic!(),
+    }
+    assert_eq!(body, b"payload");
+}
+
+#[test]
+fn socks5_udp_v6_hostname_frag() {
+    let ep: std::net::SocketAddr = "[::1]:443".parse().unwrap();
+    let pkt = socks5_wrap(ep, b"x");
+    assert_eq!(pkt[3], 4);
+    let (from, body) = socks5_unwrap(&pkt).unwrap();
+    assert!(matches!(from, Socks5From::Addr(a) if a == ep));
+    assert_eq!(body, b"x");
+
+    // hostname
+    let pkt = socks5_wrap_hostname("example.com", 80, b"p");
+    match socks5_unwrap(&pkt).unwrap().0 {
+        Socks5From::Hostname(h) => assert_eq!(h, "example.com"),
+        _ => panic!(),
+    }
+
+    // FRAG != 0 rejected
+    let mut pkt = socks5_wrap(ep, b"x");
+    pkt[2] = 1;
+    assert!(socks5_unwrap(&pkt).is_none());
+    // too short
+    assert!(socks5_unwrap(&[0u8; 10]).is_none());
+}
