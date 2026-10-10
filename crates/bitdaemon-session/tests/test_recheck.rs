@@ -190,8 +190,6 @@ fn queue_position_moves() {
 
 #[test]
 fn piece_deadline_and_read_piece() {
-    use bitdaemon_common::types::{PeerRequest, PieceBlock};
-    use bitdaemon_net::peer_wire::PeerMessage;
     use bitdaemon_session::alerts::Alert;
     use bitdaemon_session::session::DiskCompleted;
     use bitdaemon_session::torrent::TorrentEffect;
