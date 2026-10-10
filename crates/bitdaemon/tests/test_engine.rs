@@ -82,3 +82,48 @@ async fn connect_and_receive_bitfield() {
     let c = t.peers.get(&peer).unwrap();
     assert!(c.peer_pieces.get_bit(0) && c.peer_pieces.get_bit(2));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_pump_lists_candidates() {
+    let ih = Sha1Hash::from_bytes(&[8; 20]).unwrap();
+    let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(None)));
+    let mut eng = Engine::new(conn, None);
+    let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
+    t.add_swarm_peer(
+        ep(),
+        bitdaemon_common::flags::PeerSourceFlags::TRACKER,
+        true,
+    );
+    eng.session.add_torrent(t);
+    let st = bitdaemon_net::peer_list::PeerListState::default();
+    let dialing = eng.connect_pump(0, &st, 10);
+    assert_eq!(dialing, vec![(ih, ep())]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn accept_inbound_handshake() {
+    let ih = Sha1Hash::from_bytes(&[2; 20]).unwrap();
+    let (mine, theirs) = tokio::io::duplex(64 * 1024);
+    let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(None)));
+    let mut eng = Engine::new(conn, None);
+    eng.session.add_torrent(Torrent::new(
+        ih,
+        4,
+        128 * 1024,
+        Bitfield::with_size(4),
+        StorageIndex(0),
+    ));
+
+    let pid = eng.session.peer_id;
+    let mut boxed: BoxedPeerStream = Box::new(theirs);
+    let hs = write_handshake(&ih, &pid, false, false, false, false);
+    let accept = eng.accept_stream(ep(), Box::new(mine));
+    let (peer, _) = tokio::join!(accept, boxed.write_all(&hs));
+    let peer = peer.unwrap().expect("known ih");
+    // our reply handshake went out
+    let mut buf = [0u8; 68];
+    tokio::io::AsyncReadExt::read_exact(&mut boxed, &mut buf)
+        .await
+        .unwrap();
+    assert!(eng.session.torrents[&ih].peers.contains_key(&peer));
+}

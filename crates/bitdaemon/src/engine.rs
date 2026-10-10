@@ -317,6 +317,49 @@ impl Engine {
         Ok(peer)
     }
 
+    /// `on_incoming` — register an accepted stream: responder
+    /// handshake (needs `their` first 68 bytes to learn `info_hash`),
+    /// then attach. Returns the peer id, or `None` for unknown ih.
+    pub async fn accept_stream(
+        &mut self,
+        remote: SocketAddr,
+        mut s: BoxedPeerStream,
+    ) -> std::io::Result<Option<u64>> {
+        let pid = self.session.peer_id;
+        let ih_known = {
+            // snapshot of known info-hashes for the callback
+            let set: Vec<Sha1Hash> = self.session.torrents.keys().copied().collect();
+            move |ih: &Sha1Hash| set.contains(ih)
+        };
+        let hs = bitdaemon_net::bt_peer_conn::run_handshake_responder(
+            &mut s, &pid, false, false, ih_known,
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        let num_pieces = self
+            .session
+            .torrents
+            .get(&hs.info_hash)
+            .map_or(0, |t| t.num_pieces as usize);
+        let peer = self.next_peer;
+        self.next_peer += 1;
+        self.session.peer_connected(
+            &hs.info_hash,
+            peer,
+            PeerConn::new(
+                num_pieces,
+                PeerPipeline::new(
+                    self.queue_time,
+                    self.request_timeout,
+                    self.max_out_request_queue,
+                ),
+                0,
+            ),
+        );
+        self.attach_stream(hs.info_hash, peer, remote, s);
+        Ok(Some(peer))
+    }
+
     /// split a live peer stream into reader/writer tasks feeding the
     /// engine queues.
     fn attach_stream(
@@ -371,6 +414,32 @@ impl Engine {
             let _ = gone_tx.send((ih, peer));
         });
         self.tasks.push(h);
+    }
+
+    /// `torrent::connect_to_peer` pump — ask every torrent for
+    /// connect candidates (`want_peers` gate like upstream) and
+    /// spawn dial tasks; each success registers via
+    /// [`Engine::connect_peer`]. `max_peers` caps new dials.
+    /// Returns endpoints being dialed (for tests/metrics).
+    pub fn connect_pump(
+        &mut self,
+        session_time: i32,
+        state: &bitdaemon_net::peer_list::PeerListState,
+        max_peers: usize,
+    ) -> Vec<(Sha1Hash, SocketAddr)> {
+        let mut dialing = Vec::new();
+        for (ih, t) in &mut self.session.torrents {
+            if dialing.len() >= max_peers || !t.want_peers() {
+                continue;
+            }
+            for ep in t.connect_candidates(session_time, state) {
+                if dialing.len() >= max_peers {
+                    break;
+                }
+                dialing.push((*ih, ep));
+            }
+        }
+        dialing
     }
 
     /// number of live peer writers.

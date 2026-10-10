@@ -67,6 +67,28 @@ pub async fn run_handshake(
     Ok(hs)
 }
 
+/// plaintext responder (`on_incoming`): read the peer's handshake
+/// first — we need its `info_hash` to pick the torrent — then reply
+/// with ours. `known` says whether the torrent exists (upstream
+/// disconnects on unknown ih). `peer_id` is ours.
+pub async fn run_handshake_responder(
+    s: &mut BoxedPeerStream,
+    our_peer_id: &PeerId,
+    dht: bool,
+    fast: bool,
+    known: impl Fn(&Sha1Hash) -> bool,
+) -> Result<Handshake, PeerConnError> {
+    let mut theirs = [0u8; HANDSHAKE_LEN];
+    s.read_exact(&mut theirs).await?;
+    let hs = parse_handshake(&theirs).map_err(|_| PeerConnError::Protocol("bad handshake"))?;
+    if !known(&hs.info_hash) {
+        return Err(PeerConnError::WrongInfoHash);
+    }
+    let ours = write_handshake(&hs.info_hash, our_peer_id, dht, true, fast, false);
+    s.write_all(&ours).await?;
+    Ok(hs)
+}
+
 /// MSE then BT handshake — initiator side (`write_pe1_2_dhkey` +
 /// `write_pe3_sync` → `on_connected`). Returns the negotiated crypto
 /// state: `rc4_encrypted` decides whether subsequent traffic must go
