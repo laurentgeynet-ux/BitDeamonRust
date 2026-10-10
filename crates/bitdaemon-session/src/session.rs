@@ -205,8 +205,29 @@ impl Session {
                         }
                     }
                 }
-                DiskCompleted::Hash { ih, piece, err, .. } => {
-                    self.on_piece_verified(&ih, piece, err.is_ok(), out);
+                DiskCompleted::Hash {
+                    ih,
+                    piece,
+                    hash,
+                    err,
+                } => {
+                    // upstream `torrent::piece_finished` compares
+                    // `j.d.h.hash` vs `hash_for_piece` — mismatch is
+                    // a `hash_failed_alert` + re-download.
+                    let passed = err.is_ok()
+                        && self
+                            .torrents
+                            .get(&ih)
+                            .and_then(|t| t.expected_hash(piece))
+                            .is_none_or(|want| want == hash);
+                    if err.is_err() {
+                        self.alerts.post(Alert::FileError {
+                            ih,
+                            path: String::new(),
+                            error: err.to_string(),
+                        });
+                    }
+                    self.on_piece_verified(&ih, piece, passed, out);
                 }
             }
         }

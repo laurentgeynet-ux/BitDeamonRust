@@ -112,3 +112,28 @@ fn verified_piece_emits_have_to_peers() {
         .count();
     assert_eq!(haves, 2);
 }
+
+#[test]
+fn hash_mismatch_fails_piece() {
+    use bitdaemon_session::session::DiskCompleted;
+    let mut s = Session::new();
+    let mut t = mk_torrent(2);
+    t.init_picker(true);
+    let good = Sha1Hash::from_bytes(&[0xAA; 20]).unwrap();
+    t.piece_hashes = Some(vec![good, good]);
+    let ih = s.add_torrent(t);
+
+    // mismatched hash → piece failed, not verified
+    let mut out = Vec::new();
+    let bad = Sha1Hash::from_bytes(&[0xBB; 20]).unwrap();
+    s.disk_completions()
+        .send(DiskCompleted::Hash {
+            ih,
+            piece: PieceIndex(0),
+            hash: bad,
+            err: Default::default(),
+        })
+        .unwrap();
+    s.drain_disk_completed(&mut out);
+    assert!(!s.torrents[&ih].have.get_bit(0));
+}

@@ -53,6 +53,9 @@ pub struct Torrent {
     pub piece_length: i64,
     /// `m_have_piece` — our verified bitfield.
     pub have: Bitfield,
+    /// `m_torrent_file` piece hashes — `hash_for_piece` table
+    /// (v1). `None` until metadata arrives (`ut_metadata`).
+    pub piece_hashes: Option<Vec<Sha1Hash>>,
     /// `m_picker` — `None` until `init_picker` (no metadata yet).
     pub picker: Option<PiecePicker>,
     /// `m_connections` — peers keyed by caller-chosen id.
@@ -90,6 +93,7 @@ impl Torrent {
             info_hash,
             num_pieces,
             piece_length,
+            piece_hashes: None,
             have,
             picker: None,
             peers: BTreeMap::new(),
@@ -324,6 +328,14 @@ impl Torrent {
         self.picker
             .as_ref()
             .is_some_and(|p| p.is_piece_finished(piece))
+    }
+
+    /// `hash_for_piece` — the expected SHA-1, if metadata held.
+    #[must_use]
+    pub fn expected_hash(&self, piece: PieceIndex) -> Option<Sha1Hash> {
+        self.piece_hashes
+            .as_ref()
+            .and_then(|h| h.get(piece.0 as usize).copied())
     }
 
     /// `piece_finished` — verification result. `passed` → have-bit
