@@ -60,6 +60,9 @@ pub struct PeerConn {
     pub local_ut_metadata: u8,
     /// our local `ut_pex` id.
     pub local_ut_pex: u8,
+    /// `m_superseed_piece` — the piece we're currently
+    /// super-seeding to this peer (BEP initial-seed).
+    pub superseed_piece: Option<PieceIndex>,
     /// `m_upload_only` — remote told us it's upload-only.
     pub remote_upload_only: bool,
     /// `m_client_version` — remote's `v` string.
@@ -115,6 +118,7 @@ impl PeerConn {
             metadata_size: None,
             local_ut_metadata: 1,
             local_ut_pex: 2,
+            superseed_piece: None,
             remote_upload_only: false,
             client_version: Vec::new(),
             upload_queue: Vec::new(),

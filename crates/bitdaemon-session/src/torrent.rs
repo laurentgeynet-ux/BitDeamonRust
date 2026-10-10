@@ -197,6 +197,9 @@ pub struct Torrent {
     /// by the session at `add_torrent`, rewritten by
     /// `queue_position_set`).
     pub queue_seq: i64,
+    /// `m_super_seeding` (flag) — initial-seed: leak one piece at
+    /// a time per peer (`super_seeding()` upstream).
+    pub super_seeding: bool,
     /// `upload_mode` (flag) — never request pieces, upload only.
     pub upload_mode: bool,
     /// `share_mode` (flag) — ratio-keeping download throttle.
@@ -276,6 +279,7 @@ impl Torrent {
             last_saved_resume: None,
             queue_seq: 0,
             time_critical: std::collections::BTreeMap::new(),
+            super_seeding: false,
             upload_mode: false,
             share_mode: false,
             max_connections: -1,
@@ -1152,6 +1156,15 @@ impl Torrent {
             _ => {}
         }
         let mut effects = Vec::new();
+        // super-seeding: a `have` for the piece we leaked triggers
+        // the next superseed pick (upstream `incoming_have`).
+        if self.super_seeding {
+            if let PeerMessage::Have(p) = msg {
+                if self.peers.get(&peer_id).and_then(|c| c.superseed_piece) == Some(*p) {
+                    self.on_superseeded_have(peer_id, *p, out);
+                }
+            }
+        }
         if let Some(c) = self.peers.get_mut(&peer_id) {
             c.last_active = now;
             if let PeerMessage::Piece { data, .. } = msg {
@@ -1305,6 +1318,63 @@ impl Torrent {
         picker.hashes_rejected(&hp_req);
         drop(picker);
         self.hash_requests_sent.remove(&(f.0, req.index));
+    }
+
+    /// `torrent::get_piece_to_super_seed` — pick the lowest-
+    /// availability piece the remote lacks, preferring pieces no
+    /// other peer is already super-seeded on.
+    #[must_use]
+    pub fn get_piece_to_super_seed(&self, remote_bits: &Bitfield) -> Option<PieceIndex> {
+        let mut min_avail = 9999i32;
+        let mut avail: Vec<PieceIndex> = Vec::new();
+        for i in 0..self.num_pieces {
+            if (i as usize) < remote_bits.size() && remote_bits.get_bit(i as usize) {
+                continue;
+            }
+            let mut availability = 0i32;
+            for c in self.peers.values() {
+                if c.superseed_piece == Some(PieceIndex(i)) {
+                    availability = 999;
+                    break;
+                }
+                if (i as usize) < c.peer_pieces.size() && c.peer_pieces.get_bit(i as usize) {
+                    availability += 1;
+                }
+            }
+            if availability > min_avail {
+                continue;
+            }
+            if availability < min_avail {
+                min_avail = availability;
+                avail.clear();
+            }
+            avail.push(PieceIndex(i));
+        }
+        if avail.is_empty() {
+            return None;
+        }
+        Some(avail[(rand::random::<u32>() as usize) % avail.len()])
+    }
+
+    /// `peer_connection::incoming_have` super-seed hook: when the
+    /// remote completed the piece we super-seeded it, pick the next
+    /// one and `have`-announce it.
+    fn on_superseeded_have(&mut self, peer: u64, _piece: PieceIndex, out: &mut Vec<TorrentEffect>) {
+        let bits = self
+            .peers
+            .get(&peer)
+            .map(|c| c.peer_pieces.clone())
+            .unwrap_or_default();
+        let next = self.get_piece_to_super_seed(&bits);
+        if let Some(c) = self.peers.get_mut(&peer) {
+            c.superseed_piece = next;
+        }
+        if let Some(p) = next {
+            out.push(TorrentEffect::SendTo {
+                peer,
+                msg: PeerMessage::Have(p),
+            });
+        }
     }
 
     /// `request_a_block` for one peer — `drive_requests` emits the
@@ -1769,6 +1839,9 @@ impl Torrent {
         if self.share_mode {
             f |= F::SHARE_MODE;
         }
+        if self.super_seeding {
+            f |= F::SUPER_SEEDING;
+        }
         if self.need_save_resume {
             f |= F::NEED_SAVE_RESUME;
         }
@@ -1800,6 +1873,9 @@ impl Torrent {
         }
         if mask.contains(F::SHARE_MODE) {
             self.share_mode = flags.contains(F::SHARE_MODE);
+        }
+        if mask.contains(F::SUPER_SEEDING) {
+            self.super_seeding = flags.contains(F::SUPER_SEEDING);
         }
         if mask.contains(F::NEED_SAVE_RESUME) {
             self.need_save_resume = flags.contains(F::NEED_SAVE_RESUME);

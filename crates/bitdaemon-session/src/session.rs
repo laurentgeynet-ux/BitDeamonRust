@@ -873,16 +873,31 @@ impl Session {
         peer: u64,
         conn: crate::peer_conn::PeerConn,
         remote: SocketAddr,
+        out: &mut Vec<SessionOut>,
     ) {
         if let Some(t) = self.torrents.get_mut(ih) {
             let mut conn = conn;
             conn.remote = Some(remote);
             t.peer_connected_addr(remote);
+            // upstream `send_bitfield` on connect — super-seeding
+            // hides the real bitfield and `have`s only the leaked
+            // piece instead.
+            let msg = if t.super_seeding {
+                t.get_piece_to_super_seed(&conn.peer_pieces).map(|p| {
+                    conn.superseed_piece = Some(p);
+                    PeerMessage::Have(p)
+                })
+            } else {
+                let bits: Vec<u8> = t.have.bytes().into();
+                (!bits.is_empty() && t.have.count() > 0)
+                    .then_some(PeerMessage::Bitfield(bits.into()))
+            };
+            if let Some(msg) = msg {
+                out.push(SessionOut::ToPeer { ih: *ih, peer, msg });
+            }
             t.add_peer(peer, conn);
-            self.counters.set(
-                Counter::PeersConnected,
-                self.torrents.values().map(|t| t.peers.len() as i64).sum(),
-            );
+            let n = self.torrents.values().map(|t| t.peers.len() as i64).sum();
+            self.counters.set(Counter::PeersConnected, n);
         }
     }
 

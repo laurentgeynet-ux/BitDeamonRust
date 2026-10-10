@@ -29,11 +29,13 @@ fn add_peer_and_dispatch() {
     let mut t = mk_torrent(4);
     t.init_picker(true);
     let ih = s.add_torrent(t);
+    let mut out = Vec::new();
     s.peer_connected(
         &ih,
         1,
         PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
         std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 6881),
+        &mut out,
     );
     assert_eq!(s.num_peers(), 1);
 
@@ -62,11 +64,13 @@ fn disconnect_cleans_up() {
     let mut t = mk_torrent(4);
     t.init_picker(true);
     let ih = s.add_torrent(t);
+    let mut out = Vec::new();
     s.peer_connected(
         &ih,
         9,
         PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
         std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 6881),
+        &mut out,
     );
     // apply refcount via the normal Have path
     let p = PeerPacket {
@@ -87,17 +91,20 @@ fn verified_piece_emits_have_to_peers() {
     let mut t = mk_torrent(2);
     t.init_picker(true);
     let ih = s.add_torrent(t);
+    let mut out = Vec::new();
     s.peer_connected(
         &ih,
         1,
         PeerConn::new(2, PeerPipeline::new(1000, 30, 250), 0),
         std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 6881),
+        &mut out,
     );
     s.peer_connected(
         &ih,
         2,
         PeerConn::new(2, PeerPipeline::new(1000, 30, 250), 0),
         std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 6881),
+        &mut out,
     );
 
     let mut out = Vec::new();
@@ -473,7 +480,6 @@ fn dht_ip_key_votes_external_ip() {
 
 #[test]
 fn unchoke_tick_unchokes_top_peer() {
-    use bitdaemon_session::peer_pipeline::PeerPipeline;
     use bitdaemon_session::session::SessionOut;
 
     let mut s = Session::new();
@@ -481,12 +487,14 @@ fn unchoke_tick_unchokes_top_peer() {
     let mut t = mk_torrent(4);
     t.init_picker(true);
     let ih = s.add_torrent(t);
+    let mut out = Vec::new();
     for pid in 1u64..=3 {
         s.peer_connected(
             &ih,
             pid,
             PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
             "127.0.0.1:6881".parse().unwrap(),
+            &mut out,
         );
         // mark them interested + give pid 1 the best upload rate
         let t = s.torrents.get_mut(&ih).unwrap();

@@ -405,6 +405,20 @@ impl Engine {
         self.session.pop_alerts()
     }
 
+    /// `ToPeer`-only fan-out for sync call sites (connect paths —
+    /// bitfield/first-have emission after `attach_stream`).
+    fn send_msgs_to_peers(&mut self, out: Vec<SessionOut>) {
+        for e in out {
+            if let SessionOut::ToPeer { ih, peer, msg } = e {
+                if let Some(tx) = self.writers.get(&(ih, peer)) {
+                    if tx.send(msg).is_err() {
+                        self.writers.remove(&(ih, peer));
+                    }
+                }
+            }
+        }
+    }
+
     /// fan `SessionOut` effects to transports/peers.
     async fn dispatch(&mut self, out: Vec<SessionOut>) {
         for e in out {
@@ -1087,8 +1101,11 @@ impl Engine {
             ),
             0,
         );
-        self.session.peer_connected(ih, peer, conn, remote);
+        let mut out = Vec::new();
+        self.session
+            .peer_connected(ih, peer, conn, remote, &mut out);
         self.attach_stream(*ih, peer, remote, s);
+        self.send_msgs_to_peers(out);
         Ok(peer)
     }
 
@@ -1127,8 +1144,11 @@ impl Engine {
         let remote = d
             .remote
             .unwrap_or_else(|| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
-        self.session.peer_connected(&d.ih, peer, conn, remote);
+        let mut out = Vec::new();
+        self.session
+            .peer_connected(&d.ih, peer, conn, remote, &mut out);
         self.attach_stream(d.ih, peer, remote, s);
+        self.send_msgs_to_peers(out);
     }
 
     /// `torrent::connect_to_peer` (async form) — spawn the dial +
@@ -1321,6 +1341,7 @@ impl Engine {
             .map_or(0, |t| t.num_pieces as usize);
         let peer = self.next_peer;
         self.next_peer += 1;
+        let mut out = Vec::new();
         self.session.peer_connected(
             &hs.info_hash,
             peer,
@@ -1334,8 +1355,10 @@ impl Engine {
                 0,
             ),
             remote,
+            &mut out,
         );
         self.attach_stream(hs.info_hash, peer, remote, s);
+        self.send_msgs_to_peers(out);
         Ok(Some(peer))
     }
 
