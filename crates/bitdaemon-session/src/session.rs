@@ -211,6 +211,11 @@ pub enum DiskCompleted {
         /// job result.
         err: StorageError,
     },
+    /// `async_release_files` done (upstream `cache_flushed`).
+    ReleaseFiles {
+        /// torrent.
+        ih: Sha1Hash,
+    },
     /// `async_delete_files` verdict.
     DeleteFiles {
         /// torrent.
@@ -377,6 +382,10 @@ impl Session {
                             error: err.to_string(),
                         });
                     }
+                }
+                DiskCompleted::ReleaseFiles { ih } => {
+                    // `cache_flushed_alert`
+                    self.alerts.post(Alert::CacheFlushed(ih));
                 }
                 DiskCompleted::DeleteFiles { ih, err } => {
                     // `torrent_deleted{,_failed}_alert`
@@ -832,6 +841,24 @@ impl Session {
         );
     }
 
+    /// `flush_cache` — upstream `torrent_handle::flush_cache`
+    /// → `async_release_files` (handles released; the OS page
+    /// cache writeback is the storage layer's job).
+    pub fn flush_cache(&mut self, ih: &Sha1Hash) {
+        let (Some(disk), Some(t)) = (self.disk.clone(), self.torrents.get(ih)) else {
+            return;
+        };
+        let storage = t.storage;
+        let tx = self.disk_tx.clone();
+        let ih = *ih;
+        disk.async_release_files(
+            storage,
+            Box::new(move || {
+                let _ = tx.send(DiskCompleted::ReleaseFiles { ih });
+            }),
+        );
+    }
+
     /// `force_recheck` — clear `have` and re-hash every piece
     /// (upstream `torrent_handle::force_recheck` → per-piece
     /// `disk_hash` jobs; `piece_verified` re-populates).
@@ -1066,13 +1093,60 @@ impl Session {
             .map(|(ih, _)| *ih)
             .collect();
         for ih in ihs {
-            self.dht_last_announce.insert(ih, self.session_time);
-            for v6 in [false, true] {
-                if let Some(n) = self.dht.get_node_mut(v6) {
-                    let li = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetPeers, ih);
-                    self.dht_lookup_map.insert((v6, li), ih);
-                }
+            self.dht_announce_one(ih);
+        }
+    }
+
+    /// `dht::announce` for one torrent — starts the `get_peers`
+    /// traversal on every bound node family and registers the
+    /// lookup id for reply routing.
+    fn dht_announce_one(&mut self, ih: Sha1Hash) {
+        self.dht_last_announce.insert(ih, self.session_time);
+        for v6 in [false, true] {
+            if let Some(n) = self.dht.get_node_mut(v6) {
+                let li = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetPeers, ih);
+                self.dht_lookup_map.insert((v6, li), ih);
             }
+        }
+    }
+
+    /// `force_dht_announce` — user-triggered, ignores the interval
+    /// (private torrents still never touch the DHT).
+    pub fn force_dht_announce(&mut self, ih: &Sha1Hash) {
+        if !self.settings.dht_enabled
+            || self.settings.anonymous_mode
+            || self.torrents.get(ih).is_none_or(|t| t.private)
+        {
+            return;
+        }
+        self.dht_announce_one(*ih);
+    }
+
+    /// `force_reannounce` — emit `TrackerAnnounce` now (event
+    /// `none` = periodic refresh, like upstream's reannounce).
+    /// `tracker_idx` selects one entry; `None` = all trackers.
+    pub fn force_announce(
+        &mut self,
+        ih: &Sha1Hash,
+        tracker_idx: Option<usize>,
+        out: &mut Vec<SessionOut>,
+    ) {
+        let (pid, port, key) = (self.peer_id, self.listen_port, self.key);
+        let Some(t) = self.torrents.get_mut(ih) else {
+            return;
+        };
+        let idxs: Vec<usize> =
+            tracker_idx.map_or_else(|| (0..t.trackers.trackers.len()).collect(), |i| vec![i]);
+        for i in idxs {
+            let Some(e) = t.trackers.trackers.get(i) else {
+                continue;
+            };
+            out.push(SessionOut::TrackerAnnounce {
+                ih: *ih,
+                url: e.url.clone(),
+                tracker_id: e.tracker_id.clone(),
+                params: t.announce_params(pid, port, 0, key),
+            });
         }
     }
 

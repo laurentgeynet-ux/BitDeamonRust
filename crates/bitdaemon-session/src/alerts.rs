@@ -148,6 +148,8 @@ pub enum Alert {
     TorrentDeleted(Sha1Hash),
     /// `torrent_delete_failed_alert`.
     TorrentDeleteFailed { ih: Sha1Hash, error: String },
+    /// `cache_flushed_alert`.
+    CacheFlushed(Sha1Hash),
     /// `session_error_alert`.
     SessionError(String),
 }
@@ -171,7 +173,9 @@ impl Alert {
             | Self::FileRenameFailed { .. }
             | Self::TorrentDeleteFailed { .. } => AlertCategory::ERROR.or(AlertCategory::STORAGE),
             Self::StorageMoved { .. } | Self::FileRenamed { .. } => AlertCategory::STORAGE,
-            Self::TorrentDeleted(_) => AlertCategory::STATUS.or(AlertCategory::STORAGE),
+            Self::TorrentDeleted(_) | Self::CacheFlushed(_) => {
+                AlertCategory::STATUS.or(AlertCategory::STORAGE)
+            }
             Self::TrackerError { .. }
             | Self::TrackerReply { .. }
             | Self::ScrapeReply { .. }

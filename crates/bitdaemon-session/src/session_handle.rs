@@ -263,6 +263,22 @@ impl TorrentHandle {
             .map_or_else(Vec::new, Torrent::file_progress)
     }
 
+    /// `force_reannounce` — announce now (all trackers or one).
+    pub fn force_announce(&self, tracker_idx: Option<usize>, out: &mut SessionOutVec) {
+        lock(&self.session).force_announce(&self.info_hash, tracker_idx, out);
+    }
+
+    /// `force_dht_announce` — `get_peers` traversal now.
+    pub fn force_dht_announce(&self) {
+        lock(&self.session).force_dht_announce(&self.info_hash);
+    }
+
+    /// `flush_cache` — `async_release_files`; `cache_flushed`
+    /// arrives via alerts.
+    pub fn flush_cache(&self) {
+        lock(&self.session).flush_cache(&self.info_hash);
+    }
+
     /// `save_resume_data` — posts `save_resume_data_alert` with
     /// the bencoded resume blob (`only_if_modified` gate).
     pub fn save_resume_data(&self, only_if_modified: bool) {

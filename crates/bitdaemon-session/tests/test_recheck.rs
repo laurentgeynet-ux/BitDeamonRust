@@ -104,3 +104,50 @@ fn save_resume_data_alert_and_interval() {
     s.save_resume_data(&ih, true);
     assert!(s.pop_alerts().is_empty());
 }
+
+#[test]
+fn force_announce_emits_effects() {
+    use bitdaemon_session::session::SessionOut;
+    let ih = Sha1Hash::from_bytes(&[4; 20]).unwrap();
+    let mut t = Torrent::new(ih, 2, 128 * 1024, Bitfield::with_size(2), StorageIndex(0));
+    t.add_tracker("http://a/announce".into(), 0);
+    t.add_tracker("http://b/announce".into(), 1);
+    let mut s = Session::new();
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.force_announce(&ih, None, &mut out);
+    let urls: Vec<_> = out
+        .iter()
+        .filter_map(|e| {
+            if let SessionOut::TrackerAnnounce { url, .. } = e {
+                Some(url.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(urls, vec!["http://a/announce", "http://b/announce"]);
+
+    // single index
+    out.clear();
+    s.force_announce(&ih, Some(1), &mut out);
+    assert!(matches!(
+        &out[0],
+        SessionOut::TrackerAnnounce { url, .. } if url == "http://b/announce"
+    ));
+
+    // flush_cache posts cache_flushed once the job completes
+    use bitdaemon_session::alerts::Alert;
+    use bitdaemon_session::session::DiskCompleted;
+    s.pop_alerts();
+    s.disk_completions()
+        .send(DiskCompleted::ReleaseFiles { ih })
+        .unwrap();
+    s.drain_disk_completed(&mut Vec::new());
+    assert!(
+        s.pop_alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::CacheFlushed(i) if *i == ih))
+    );
+}

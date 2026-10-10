@@ -9,6 +9,14 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **Force-ops + flush** — `Session::force_announce(ih, idx)`
+  (effets `TrackerAnnounce` immédiats, un ou tous trackers),
+  `force_dht_announce` (`dht_announce_one` factorisé — respecte
+  `private`/anonymat, ignore l'intervalle), `flush_cache` →
+  `async_release_files` → `DiskCompleted::ReleaseFiles` →
+  `cache_flushed_alert`. API `TorrentHandle::{force_announce,
+  force_dht_announce,flush_cache}`.
+
 - **`save_resume_data` pipeline** — `Torrent::need_save_resume`
   (marqué par pièce vérifiée, priorités, métadonnées, verdict de
   check), `Session::save_resume_data(ih, only_if_modified)` poste
