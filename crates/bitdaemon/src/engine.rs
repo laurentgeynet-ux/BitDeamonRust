@@ -225,6 +225,9 @@ pub struct Engine {
     /// bucket for every peer writer (payload bytes only, like
     /// upstream's channel-0 data accounting).
     pub upload_limiter: Arc<RateLimiter>,
+    /// `settings_pack::download_rate_limit` — shared download
+    /// bucket (upstream throttles incoming payload the same way).
+    pub download_limiter: Arc<RateLimiter>,
     /// per-torrent limiters (`torrent::set_upload_limit`/
     /// `set_download_limit` → `peer_class` channels upstream).
     /// Created lazily in `attach_stream`, re-throttled each tick.
@@ -278,6 +281,7 @@ impl Engine {
             request_timeout: 60,
             max_out_request_queue: 500,
             upload_limiter: Arc::new(RateLimiter::new(0)),
+            download_limiter: Arc::new(RateLimiter::new(0)),
             torrent_up_limiters: std::collections::HashMap::new(),
             torrent_down_limiters: std::collections::HashMap::new(),
         }
@@ -373,6 +377,9 @@ impl Engine {
         self.upload_limiter
             .set_limit(self.session.settings.upload_rate_limit);
         self.upload_limiter.refill(1000);
+        self.download_limiter
+            .set_limit(self.session.settings.download_rate_limit);
+        self.download_limiter.refill(1000);
         // per-torrent channels — `torrent::set_{up,down}load_limit`
         for (ih, t) in &self.session.torrents {
             self.torrent_up_limiters
@@ -1377,6 +1384,7 @@ impl Engine {
         let inbound_tx = self.inbound_tx.clone();
         let gone_tx = self.gone_tx.clone();
         let ul = self.upload_limiter.clone();
+        let dl = self.download_limiter.clone();
         let tul = self.torrent_up_limiters.get(&ih).cloned();
         let tdl = self.torrent_down_limiters.get(&ih).cloned();
         // one task owns the stream: select between inbound decode and
@@ -1390,10 +1398,11 @@ impl Engine {
                                 // download throttle — hold the
                                 // pump, TCP back-pressure does the
                                 // rest (upstream rate-limits reads)
-                                if let PeerMessage::Piece { data, .. } = &msg
-                                    && let Some(l) = &tdl
-                                {
-                                    l.acquire(data.len() as i64).await;
+                                if let PeerMessage::Piece { data, .. } = &msg {
+                                    dl.acquire(data.len() as i64).await;
+                                    if let Some(l) = &tdl {
+                                        l.acquire(data.len() as i64).await;
+                                    }
                                 }
                                 if inbound_tx
                                     .send(InboundPeerMsg {
