@@ -83,6 +83,9 @@ pub struct Torrent {
     pub peers: BTreeMap<u64, PeerConn>,
     /// `m_trackers` — tier-ordered announce entries.
     pub trackers: crate::tracker_list::TrackerList,
+    /// `m_torrent_file` upstream — the parsed metainfo once we have
+    /// it (None for unresolved magnets).
+    pub ti: Option<std::sync::Arc<TorrentInfo>>,
     /// `m_web_seeds` — BEP-17/19 url-seed endpoints.
     pub web_seeds: Vec<String>,
     /// `m_torrent_file->files()` — file layout for web-seed
@@ -220,6 +223,7 @@ impl Torrent {
             picker: None,
             peers: BTreeMap::new(),
             trackers: crate::tracker_list::TrackerList::default(),
+            ti: None,
             web_seeds: Vec::new(),
             files: None,
             web_seed_idx: 0,
@@ -300,6 +304,7 @@ impl Torrent {
                         .map(|i| ti.hash_for_piece(PieceIndex(i)))
                         .collect(),
                 );
+                t.ti = Some(ti.clone());
                 t.metadata_raw = Some(ti.info_section().to_vec());
                 t.files = Some(std::sync::Arc::new(ti.files().clone()));
                 t.init_picker(false);
@@ -391,6 +396,7 @@ impl Torrent {
                 .map(|i| info.hash_for_piece(PieceIndex(i)))
                 .collect(),
         );
+        self.ti = Some(std::sync::Arc::new(info));
         self.metadata_raw = Some(metadata.to_vec());
         self.magnet = false;
         self.init_picker(true);
@@ -1341,6 +1347,10 @@ impl Torrent {
         self.piece_hashes
             .as_ref()
             .and_then(|h| h.get(piece.0 as usize).copied())
+            // v2-only torrents have no v1 piece layer — upstream
+            // `hash_for_piece` yields the zero hash there, and the
+            // block-level SHA-256 merkle path verifies instead.
+            .filter(|h| *h != Sha1Hash::default())
     }
 
     /// `piece_finished` — verification result. `passed` → have-bit
