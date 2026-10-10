@@ -149,9 +149,7 @@ pub async fn ws_write_frame(
 
 /// read one frame — returns `(opcode, payload)`. Server→client
 /// frames are unmasked; masked input is unmasked transparently.
-pub async fn ws_read_frame(
-    s: &mut BoxedPeerStream,
-) -> Result<(WsOpcode, Vec<u8>), WsError> {
+pub async fn ws_read_frame(s: &mut BoxedPeerStream) -> Result<(WsOpcode, Vec<u8>), WsError> {
     let mut hdr = [0u8; 2];
     s.read_exact(&mut hdr).await?;
     let fin = hdr[0] & 0x80 != 0;

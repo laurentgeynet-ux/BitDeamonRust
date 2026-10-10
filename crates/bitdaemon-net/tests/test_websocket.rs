@@ -5,8 +5,9 @@
 //! `websocket` — upgrade handshake + RFC 6455 framing.
 
 use bitdaemon_net::transport::BoxedPeerStream;
-use bitdaemon_net::websocket::{WsOpcode, validate_handshake, ws_accept_key,
-    ws_read_frame, ws_upgrade, ws_write_frame};
+use bitdaemon_net::websocket::{
+    WsOpcode, validate_handshake, ws_accept_key, ws_read_frame, ws_upgrade, ws_write_frame,
+};
 use tokio::io::AsyncReadExt;
 
 // RFC 6455 §1.3 vector: key "dGhlIHNhbXBsZSBub25jZQ==" →
@@ -21,8 +22,22 @@ fn accept_key_rfc_vector() {
 
 #[test]
 fn handshake_validation() {
-    assert!(validate_handshake(101, Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "dGhlIHNhbXBsZSBub25jZQ==").is_ok());
-    assert!(validate_handshake(200, Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "dGhlIHNhbXBsZSBub25jZQ==").is_err());
+    assert!(
+        validate_handshake(
+            101,
+            Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            "dGhlIHNhbXBsZSBub25jZQ=="
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_handshake(
+            200,
+            Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            "dGhlIHNhbXBsZSBub25jZQ=="
+        )
+        .is_err()
+    );
     assert!(validate_handshake(101, Some("bogus"), "k").is_err());
 }
 
@@ -60,9 +75,15 @@ async fn upgrade_request_verbatim() {
         let n = b.read(&mut buf).await.unwrap();
         String::from_utf8(buf[..n].to_vec()).unwrap()
     });
-    ws_upgrade(&mut a, "tracker.example", "/announce", "bitdaemon/1.0", "dGhlIHNhbXBsZSBub25jZQ==")
-        .await
-        .unwrap();
+    ws_upgrade(
+        &mut a,
+        "tracker.example",
+        "/announce",
+        "bitdaemon/1.0",
+        "dGhlIHNhbXBsZSBub25jZQ==",
+    )
+    .await
+    .unwrap();
     drop(a);
     let req = reader.await.unwrap();
     assert!(req.starts_with("GET /announce HTTP/1.1\r\nHost: tracker.example\r\n"));

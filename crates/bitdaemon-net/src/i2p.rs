@@ -256,10 +256,7 @@ pub async fn i2p_accept(s: &mut BoxedPeerStream, session_id: &str) -> Result<Str
 
 /// `send_name_lookup` — `NAMING LOOKUP` → the `.b32.i2p`/base64
 /// destination in `VALUE`.
-pub async fn i2p_name_lookup(
-    s: &mut BoxedPeerStream,
-    name: &str,
-) -> Result<String, I2pError> {
+pub async fn i2p_name_lookup(s: &mut BoxedPeerStream, name: &str) -> Result<String, I2pError> {
     sam_hello(s).await?;
     s.write_all(format!("NAMING LOOKUP NAME={name}\n").as_bytes())
         .await?;

@@ -38,6 +38,8 @@ pub mod receive_buffer;
 pub mod socket_io;
 /// `aux_/torrent_peer` — per-peer record + BEP-40 `peer_priority`.
 pub mod torrent_peer;
+/// `tracker_connection` announce exchanges (HTTP + BEP-15 UDP).
+pub mod tracker_client;
 pub mod transport;
 
 /// Networking errors (`boost::system::error_code` usages in
