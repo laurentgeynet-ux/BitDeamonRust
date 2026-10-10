@@ -1692,8 +1692,30 @@ impl Session {
                     // upstream `torrent::finished()` →
                     // `torrent_finished_alert` + `upload_only`
                     // re-announce to every peer that negotiated
-                    // BEP-21.
+                    // BEP-21, plus a `completed` announce to
+                    // trackers that saw `started`.
                     self.alerts.post(Alert::TorrentFinished(ih));
+                    if let Some(t) = self.torrents.get(&ih) {
+                        for e in &t.trackers.trackers {
+                            let started = e
+                                .endpoints
+                                .iter()
+                                .any(|ep| ep.v1.start_sent || ep.v2.start_sent);
+                            if started {
+                                out.push(SessionOut::TrackerAnnounce {
+                                    ih,
+                                    url: e.url.clone(),
+                                    tracker_id: e.tracker_id.clone(),
+                                    params: t.announce_params(
+                                        self.peer_id,
+                                        self.listen_port,
+                                        1, // completed
+                                        self.key,
+                                    ),
+                                });
+                            }
+                        }
+                    }
                     if let Some(t) = self.torrents.get(&ih) {
                         for (pid, c) in &t.peers {
                             if c.ext_upload_only != 0 {
