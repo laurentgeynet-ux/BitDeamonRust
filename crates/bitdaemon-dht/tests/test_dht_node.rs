@@ -23,19 +23,20 @@ fn node(ip: &str) -> (DhtNode, SocketAddr) {
 }
 
 /// pump datagrams between two nodes until quiescent.
-fn pump(a: &mut DhtNode, b: &mut DhtNode) {
+fn pump(a: &mut DhtNode, b: &mut DhtNode, pa: SocketAddr, pb: SocketAddr) {
     for _ in 0..50 {
         let mut moved = false;
         while let Some((pkt, to)) = a.poll() {
             moved = true;
-            if let Some((rsp, back)) = b.incoming(&pkt, to) {
-                let _ = a.incoming(&rsp, back);
+            let _ = to;
+            if let Some((rsp, _)) = b.incoming(&pkt, pa) {
+                let _ = a.incoming(&rsp, pb);
             }
         }
-        while let Some((pkt, to)) = b.poll() {
+        while let Some((pkt, _)) = b.poll() {
             moved = true;
-            if let Some((rsp, back)) = a.incoming(&pkt, to) {
-                let _ = b.incoming(&rsp, back);
+            if let Some((rsp, _)) = a.incoming(&pkt, pb) {
+                let _ = b.incoming(&rsp, pa);
             }
         }
         if !moved {
@@ -84,7 +85,7 @@ fn get_peers_round_trip() {
     let _ = pa;
 
     // b should receive a get_peers query; pump the exchange
-    pump(&mut a, &mut b);
+    pump(&mut a, &mut b, pa, pb);
 
     let events = a.drain_events();
     let saw_data = events
@@ -142,4 +143,24 @@ fn announce_requires_token() {
     let rsp = bdecode_checked(&pkt).unwrap();
     assert_eq!(rsp.dict_find_string_value(b"y", b""), b"r");
     let _ = pa;
+}
+
+#[test]
+fn announce_write_phase() {
+    let (mut a, pa) = node("1.2.3.4");
+    let (mut b, pb) = node("5.6.7.8");
+    let ih = bitdaemon_common::Sha1Hash::from_bytes(&[0x77u8; 20]).unwrap();
+
+    // a announces to b using the token b would have issued
+    let mut targets = std::collections::BTreeMap::new();
+    targets.insert(b.id, pb);
+    let token = b.generate_token(&pa, &ih);
+    a.announce(&ih, 6881, false, false, &targets, |_| Some(token.to_vec()));
+
+    pump(&mut a, &mut b, pa, pb);
+
+    // b stored a as a peer on ih
+    let r = b.storage.get_peers(&ih, false, false, &pa.ip());
+    assert_eq!(r.peers.len(), 6, "expected one compact v4 peer");
+    let _ = pb;
 }

@@ -17,6 +17,7 @@ pub mod dht_node;
 pub mod dht_settings;
 pub mod dht_state;
 pub mod dht_storage;
+pub mod dht_tracker;
 pub mod dos_blocker;
 pub mod ed25519;
 pub mod item;

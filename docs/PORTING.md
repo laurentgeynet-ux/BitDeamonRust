@@ -156,7 +156,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `traversal_algorithm.cpp` + `observer.hpp` | `dht::traversal` | ported | sorted results, dedup, /24 diversity, branch factor, short-timeout |
 | `find_data.cpp`, `get_peers.cpp`, `get_item.cpp`, `put_data.cpp`, `refresh.cpp`, `sample_infohashes.cpp` | `dht::ops::*` | not started | traversal specializations |
 | `dht_settings.cpp`, `dht_state.cpp`, `dht_storage.cpp`, `msg.cpp`, `item.cpp`, `ed25519.cpp`, `dos_blocker.cpp` | `dht::{dht_settings, dht_state, dht_storage, msg, item, ed25519, dos_blocker}` | **ported** | storage: announce/get_peers (scrape blooms, write-token gate), BEP-44 items (canonical_string verbatim, ed25519-dalek per ADR-0007, seq/sig/k/salt), BEP-51 sample_infohashes, tick expiry; `verify_message` schema walker; dos_blocker 10s-window ban; `dht_tracker` pending |
-| `dht_tracker.cpp` | `dht::tracker` | not started | session glue |
+| `dht_tracker.cpp` | `dht::dht_tracker` | ported | v4/v6 mux, secret rotation, injected transport | session glue |
 | (see `dht_storage` row) | — | merged | |
 | `node_id.cpp`, `node_entry.cpp` | `dht::node_id`, `dht::node_entry` | **ported** | BEP-42 verify/generate, secret-id signature, distance/compare_ref/prefix masks; rtt EMA (2/3+1/3), fail-count semantics |
 | `msg.cpp`, `item.cpp`, `ed25519.cpp` | `dht::msg`, `dht::item`, `dht::ed25519` | **ported** | schema-driven `verify_message` (key_desc_t flags verbatim); canonical_string + ed25519 sign/verify (dalek, ADR-0007); observer/direct_request pending |

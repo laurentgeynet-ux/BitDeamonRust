@@ -9,6 +9,13 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `dht`: write phase — `announce_peer`/`put` (immutable+mutable
+  BEP-44 signed, verified on receipt) issued to write-token nodes
+- `dht::dht_tracker` — per-family node mux (v4/v6), shared tick,
+  5-min write-token secret rotation, injected transport
+
+### Added
+
 - `dht::lookups` — specialized traversals (`find_node`, `get_peers`,
   obfuscated `get_peers`, `get`, `sample_infohashes`, `put`) with
   reply extraction (token/values/nodes/samples/BEP-44 fields)

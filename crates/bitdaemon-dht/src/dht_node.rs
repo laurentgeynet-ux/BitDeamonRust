@@ -12,6 +12,7 @@
 //! [`DhtNode::incoming`] feeds received datagrams back. This is the
 //! seam OnionBit uses to run DHT over anonymous circuits.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -619,6 +620,89 @@ impl DhtNode {
         (bitdaemon_bencode::bencode(&e), from)
     }
 
+    /// `node::announce` second phase — send `announce_peer` to
+    /// every node that gave us a write token (typically the
+    /// `write_tokens` of a completed `GetPeers` lookup).
+    /// `announce::seed`/`implied_port` flags upstream.
+    pub fn announce(
+        &mut self,
+        info_hash: &Sha1Hash,
+        port: u16,
+        seed: bool,
+        implied_port: bool,
+        tokens: &BTreeMap<NodeId, SocketAddr>,
+        write_tokens: impl Fn(&NodeId) -> Option<Vec<u8>>,
+    ) {
+        for (nid, ep) in tokens {
+            let Some(token) = write_tokens(nid) else {
+                continue;
+            };
+            let mut e = Entry::Dict(Default::default());
+            let d = e.dict_mut().expect("dict");
+            d.insert("q".into(), Entry::String(b"announce_peer".to_vec()));
+            let mut a = Entry::Dict(Default::default());
+            {
+                let am = a.dict_mut().expect("dict");
+                am.insert(
+                    "info_hash".into(),
+                    Entry::String(info_hash.as_bytes().to_vec()),
+                );
+                am.insert("port".into(), Entry::Int(i64::from(port)));
+                am.insert("token".into(), Entry::String(token));
+                am.insert("seed".into(), Entry::Int(i64::from(seed)));
+                if implied_port {
+                    am.insert("implied_port".into(), Entry::Int(1));
+                }
+            }
+            d.insert("a".into(), a);
+            self.send_query(e, *ep, u64::MAX);
+        }
+    }
+
+    /// `put_data::invoke` — send `put` to nodes holding tokens.
+    /// `mutable` carries (pk, seq, sig, salt) for BEP-44 items.
+    pub fn put(
+        &mut self,
+        value: &[u8],
+        mutable: Option<MutableFields<'_>>,
+        targets: Vec<(SocketAddr, Vec<u8>)>,
+    ) {
+        for (ep, token) in targets {
+            let mut e = Entry::Dict(Default::default());
+            let d = e.dict_mut().expect("dict");
+            d.insert("q".into(), Entry::String(b"put".to_vec()));
+            let mut a = Entry::Dict(Default::default());
+            {
+                let am = a.dict_mut().expect("dict");
+                am.insert("v".into(), Entry::Preformatted(value.to_vec()));
+                am.insert("token".into(), Entry::String(token));
+                if let Some((pk, seq, sig, salt)) = mutable {
+                    am.insert("k".into(), Entry::String(pk.to_vec()));
+                    am.insert("seq".into(), Entry::Int(seq));
+                    am.insert("sig".into(), Entry::String(sig.to_vec()));
+                    if !salt.is_empty() {
+                        am.insert("salt".into(), Entry::String(salt.to_vec()));
+                    }
+                }
+            }
+            d.insert("a".into(), a);
+            self.send_query(e, ep, u64::MAX);
+        }
+    }
+
+    /// push one pre-built query through rpc → outbox.
+    fn send_query(&mut self, e: Entry, ep: SocketAddr, tag: u64) {
+        let our_id = self.id;
+        let ro = self.settings.read_only;
+        let v6 = self.v6;
+        let rpc = &mut self.rpc;
+        let outbox = &mut self.outbox;
+        rpc.invoke(e, ep, tag, our_id, ro, !v6, |e2, t| {
+            outbox.push((bitdaemon_bencode::bencode(&e2), t));
+            true
+        });
+    }
+
     /// `tick()` — rpc timeouts → traversal failures; storage tick.
     pub fn tick(&mut self) -> Duration {
         let mut expirations = Vec::new();
@@ -636,6 +720,9 @@ impl DhtNode {
         wait
     }
 }
+
+/// `(pk, seq, sig, salt)` for a mutable `put` (BEP-44).
+pub type MutableFields<'a> = (&'a [u8; 32], i64, &'a [u8; 64], &'a [u8]);
 
 fn pack_tag(lookup: usize, entry: usize) -> u64 {
     ((lookup as u64) << 32) | entry as u64
