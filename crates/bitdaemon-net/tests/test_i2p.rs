@@ -107,3 +107,86 @@ async fn sam_errors() {
     bridge.await.unwrap();
     assert!(matches!(e, I2pError::CantReachPeer));
 }
+
+// ---------- I2pConnector / I2pAcceptor over a scripted SAM ----------
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+
+use bitdaemon_net::transport::PeerConnector;
+use tokio::io::{AsyncBufReadExt, BufReader};
+
+struct SamFactory(tokio::sync::Mutex<Vec<tokio::io::DuplexStream>>);
+
+impl std::fmt::Debug for SamFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SamFactory").finish()
+    }
+}
+
+impl PeerConnector for SamFactory {
+    fn connect(
+        self: Arc<Self>,
+        _addr: SocketAddr,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = bitdaemon_net::Result<BoxedPeerStream>> + Send + Sync>,
+    > {
+        let me = self.clone();
+        Box::pin(async move {
+            me.0.lock()
+                .await
+                .pop()
+                .map(|s| -> BoxedPeerStream { Box::new(s) })
+                .ok_or_else(|| std::io::Error::other("no sam socket queued").into())
+        })
+    }
+}
+
+#[tokio::test]
+async fn i2p_connector_connect_dest() {
+    use bitdaemon_net::i2p::I2pConnector;
+
+    // two scripted SAM sockets: NAMING then CONNECT (each gets HELLO)
+    let (m1, t1) = tokio::io::duplex(64 * 1024);
+    let (m2, t2) = tokio::io::duplex(64 * 1024);
+    let factory = Arc::new(SamFactory(tokio::sync::Mutex::new(vec![m2, m1]))); // pop order
+    tokio::spawn(async move {
+        let mut r = BufReader::new(t1);
+        let mut line = String::new();
+        r.read_line(&mut line).await.unwrap(); // HELLO
+        r.write_all(b"HELLO REPLY RESULT=OK VERSION=3.1\n")
+            .await
+            .unwrap();
+        line.clear();
+        r.read_line(&mut line).await.unwrap(); // NAMING LOOKUP
+        assert!(line.contains("NAMING LOOKUP NAME=peerdest"));
+        r.write_all(b"NAMING REPLY RESULT=OK NAME=peerdest VALUE=resolveddest\n")
+            .await
+            .unwrap();
+    });
+    tokio::spawn(async move {
+        let mut r = BufReader::new(t2);
+        let mut line = String::new();
+        r.read_line(&mut line).await.unwrap(); // HELLO
+        r.write_all(b"HELLO REPLY RESULT=OK VERSION=3.1\n")
+            .await
+            .unwrap();
+        line.clear();
+        r.read_line(&mut line).await.unwrap(); // STREAM CONNECT
+        assert!(
+            line.contains("STREAM CONNECT ID=sess DESTINATION=resolveddest"),
+            "got: {line:?}"
+        );
+        r.write_all(b"STREAM STATUS RESULT=OK\n").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    });
+
+    let conn = Arc::new(I2pConnector::new(
+        factory,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7656),
+        "sess".into(),
+    ));
+    let mut s = conn.connect_dest("peerdest").await.unwrap();
+    s.write_all(b"x").await.unwrap();
+}

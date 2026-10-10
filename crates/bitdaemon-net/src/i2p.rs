@@ -266,3 +266,173 @@ pub async fn i2p_name_lookup(s: &mut BoxedPeerStream, name: &str) -> Result<Stri
         Some(e) => Err(e),
     }
 }
+
+/// `i2p_stream` as a [`PeerConnector`]/[`PeerAcceptor`]: each
+/// outbound dial is `STREAM CONNECT` on a fresh SAM control socket,
+/// each accept `STREAM ACCEPT` likewise (upstream multiplexes per
+/// socket exactly this way). The SAM bridge itself is reached via
+/// `sam_connector` — typically plain TCP to 127.0.0.1:7656.
+///
+/// The session (`SESSION CREATE`) is owned by the caller:
+/// [`I2pConnector::open_session`] runs it once and returns our
+/// destination; the returned connector uses that `session_id` for
+/// every connect/accept.
+#[derive(Debug)]
+pub struct I2pConnector {
+    /// connector used to reach the SAM bridge.
+    sam: std::sync::Arc<PeerConnectorDyn>,
+    /// SAM bridge endpoint.
+    sam_addr: std::net::SocketAddr,
+    /// `ID=` of our STREAM session.
+    session_id: String,
+}
+
+/// alias — the trait-object connector to the SAM bridge.
+pub(crate) type PeerConnectorDyn = dyn crate::transport::PeerConnector;
+
+impl I2pConnector {
+    /// connector bound to an existing `session_id`.
+    pub fn new(
+        sam: std::sync::Arc<PeerConnectorDyn>,
+        sam_addr: std::net::SocketAddr,
+        session_id: String,
+    ) -> Self {
+        Self {
+            sam,
+            sam_addr,
+            session_id,
+        }
+    }
+
+    /// `SESSION CREATE` — open our STREAM session on the bridge and
+    /// return `(connector, our_destination)`.
+    pub async fn open_session(
+        sam: std::sync::Arc<PeerConnectorDyn>,
+        sam_addr: std::net::SocketAddr,
+        session_id: String,
+        opts: I2pSessionOptions,
+    ) -> Result<(Self, String), I2pError> {
+        let mut s = sam
+            .clone()
+            .connect(sam_addr)
+            .await
+            .map_err(|e| I2pError::Io(std::io::Error::other(e.to_string())))?;
+        let dest = i2p_session_create(&mut s, &session_id, &opts).await?;
+        Ok((
+            Self {
+                sam,
+                sam_addr,
+                session_id,
+            },
+            dest,
+        ))
+    }
+
+    /// our session id.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    async fn dial_sam(&self) -> Result<BoxedPeerStream, I2pError> {
+        self.sam
+            .clone()
+            .connect(self.sam_addr)
+            .await
+            .map_err(|e| I2pError::Io(std::io::Error::other(e.to_string())))
+    }
+}
+
+impl crate::transport::PeerConnector for I2pConnector {
+    fn connect(
+        self: std::sync::Arc<Self>,
+        _addr: std::net::SocketAddr,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>,
+    > {
+        Box::pin(async move {
+            Err(crate::NetError::NoTransport(
+                "i2p destinations are not ip addresses — use connect_dest",
+            ))
+        })
+    }
+
+    fn connect_dest(
+        self: std::sync::Arc<Self>,
+        dest: &str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync + '_>,
+    > {
+        // the trait wants a Sync future; the SAM exchange holds
+        // `&mut stream` across awaits (Send, not Sync) — run it in a
+        // task and await the handle, which is Sync.
+        let dest = dest.to_string();
+        Box::pin(async move {
+            let me = self.clone();
+            tokio::spawn(async move {
+                // `NAMING LOOKUP` runs on its own SAM socket — each
+                // command does a fresh HELLO upstream.
+                let destination = if dest.contains('=') || dest.len() > 60 {
+                    dest
+                } else {
+                    let mut ns = me.dial_sam().await.map_err(|e| {
+                        crate::NetError::Transport(std::io::Error::other(e.to_string()))
+                    })?;
+                    i2p_name_lookup(&mut ns, &dest).await.map_err(|e| {
+                        crate::NetError::Transport(std::io::Error::other(e.to_string()))
+                    })?
+                };
+                let mut s = me.dial_sam().await.map_err(|e| {
+                    crate::NetError::Transport(std::io::Error::other(e.to_string()))
+                })?;
+                i2p_connect(&mut s, &me.session_id, &destination)
+                    .await
+                    .map_err(|e| {
+                        crate::NetError::Transport(std::io::Error::other(e.to_string()))
+                    })?;
+                Ok(s)
+            })
+            .await
+            .map_err(|e| crate::NetError::Transport(std::io::Error::other(e.to_string())))?
+        })
+    }
+}
+
+/// `PeerAcceptor` counterpart — `STREAM ACCEPT` per call; the
+/// returned stream is the peer's tunnel.
+#[derive(Debug)]
+pub struct I2pAcceptor {
+    /// shared connector state (sam dial params + session id).
+    conn: std::sync::Arc<I2pConnector>,
+}
+
+impl I2pAcceptor {
+    /// wrap an open connector.
+    #[must_use]
+    pub fn new(conn: std::sync::Arc<I2pConnector>) -> Self {
+        Self { conn }
+    }
+}
+
+impl crate::transport::PeerAcceptor for I2pAcceptor {
+    fn accept(
+        self: std::sync::Arc<Self>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>,
+    > {
+        Box::pin(async move {
+            let me = self.clone();
+            tokio::spawn(async move {
+                let mut s = me.conn.dial_sam().await.map_err(|e| {
+                    crate::NetError::Transport(std::io::Error::other(e.to_string()))
+                })?;
+                i2p_accept(&mut s, &me.conn.session_id).await.map_err(|e| {
+                    crate::NetError::Transport(std::io::Error::other(e.to_string()))
+                })?;
+                Ok(s)
+            })
+            .await
+            .map_err(|e| crate::NetError::Transport(std::io::Error::other(e.to_string())))?
+        })
+    }
+}

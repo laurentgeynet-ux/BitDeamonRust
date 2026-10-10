@@ -71,6 +71,26 @@ pub trait PeerConnector: Send + Sync + Debug + 'static {
         self: Arc<Self>,
         addr: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>>;
+
+    /// Connect by destination string — `"host:port"`, an I2P base64/
+    /// `.b32.i2p` destination, an onion service name… Default parses
+    /// `host:port` into [`PeerConnector::connect`]; transports whose
+    /// addressing isn't IP-based (I2P/SAM, onion) override this.
+    fn connect_dest(
+        self: Arc<Self>,
+        dest: &str,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync + '_>> {
+        let parsed = dest.parse::<SocketAddr>();
+        Box::pin(async move {
+            match parsed {
+                Ok(a) => self.connect(a).await,
+                Err(e) => Err(crate::NetError::Transport(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("bad destination {dest}: {e}"),
+                ))),
+            }
+        })
+    }
 }
 
 /// Inbound peer acceptor — symmetric counterpart of [`PeerConnector`]

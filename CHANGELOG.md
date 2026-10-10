@@ -8,6 +8,8 @@ Until `1.0.0`, breaking changes may occur in any release.
 ## [Unreleased]
 
 ### Ajouté
+- `PeerConnector::connect_dest` : connexion par destination texte (`host:port` par défaut ; surchargeable pour les adresses non-IP).
+- `I2pConnector`/`I2pAcceptor` : `PeerConnector`/`PeerAcceptor` sur le bridge SAM — `open_session` (`SESSION CREATE` STREAM), `connect_dest` fait `NAMING LOOKUP` (socket dédiée) puis `STREAM CONNECT` (socket dédiée), accept via `STREAM ACCEPT`.
 - `bitdaemon-net::ws_tracker` : annonces `ws://`/`wss://` WebTorrent (JSON `announce` sur frames WS) — `build_announce`/`build_answer`/`parse_response` verbatim (latin-1↔UTF-8, `key` %08X, events completed/started/stopped/paused), `announce_ws` (upgrade + validation `Sec-WebSocket-Accept` + un frame aller-retour, Pong auto). Câblé dans `Engine` pour les URLs `ws`/`wss`.
 - `web_seed::fetch_block` : driver async — écrit les GET `Range` de `build_piece_request` et lit une réponse HTTP par fichier non-pad (`got_get`), vérifie statut 2xx et longueur.
 - `Engine` : résolution des hostnames de trackers via `Resolver` injecté (`set_resolver` — jamais de DNS direct ; les littéraux IP passent sans résolveur), URLs parsées via `parse_url_components`, ports par défaut http/https, annonces UDP résolues aussi.
