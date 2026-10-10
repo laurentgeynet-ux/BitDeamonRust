@@ -263,6 +263,49 @@ impl TorrentHandle {
             .map_or_else(Vec::new, Torrent::file_progress)
     }
 
+    /// `scrape_tracker` — immediate scrape of tracker entry `idx`.
+    pub fn scrape_tracker(&self, tracker_idx: usize, out: &mut SessionOutVec) {
+        lock(&self.session).scrape_tracker(&self.info_hash, tracker_idx, out);
+    }
+
+    /// `get_peer_info` — `peer_info` snapshot of one connection.
+    #[must_use]
+    pub fn get_peer_info(
+        &self,
+        peer: u64,
+        remote: Option<std::net::SocketAddr>,
+    ) -> Option<crate::peer_info::PeerInfo> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .and_then(|t| t.peer_info(peer, remote))
+    }
+
+    /// `piece_availability` — swarm availability per piece.
+    #[must_use]
+    pub fn piece_availability(&self) -> Vec<i32> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or_else(Vec::new, Torrent::piece_availability)
+    }
+
+    /// `get_download_queue` — partial pieces in flight.
+    #[must_use]
+    pub fn get_download_queue(&self) -> Vec<crate::piece_picker::DownloadingPiece> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or_else(Vec::new, Torrent::get_download_queue)
+    }
+
+    /// `connect_peer` — add `remote` as an immediate dial candidate.
+    pub fn connect_peer(&self, remote: std::net::SocketAddr) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.connect_peer(remote);
+        }
+    }
+
     /// `have_piece`.
     #[must_use]
     pub fn have_piece(&self, p: PieceIndex) -> bool {

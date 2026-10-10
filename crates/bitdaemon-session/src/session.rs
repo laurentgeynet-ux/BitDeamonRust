@@ -1380,6 +1380,7 @@ impl Session {
         let now = std::time::Instant::now();
         match resp {
             Ok(r) => {
+                t.last_error.clear();
                 // `tracker response "external ip"` → ip_voter
                 // (`source_tracker` — upstream `on_announce`).
                 if let Some(ip) = r.external_ip {
@@ -1408,7 +1409,7 @@ impl Session {
                     num_peers: t.peer_list.num_peers(),
                 });
             }
-            Err(_) => {
+            Err(e) => {
                 // settings: `tracker_backoff`/`retry_tracker_interval`
                 // live in the caller's settings — use the upstream
                 // defaults (250% backoff, base interval handled by
@@ -1416,10 +1417,13 @@ impl Session {
                 if let Some(i) = t.trackers.find(url) {
                     t.trackers.trackers[i].failed(250, std::time::Duration::from_secs(60), now);
                 }
+                // `torrent_status::error` — the tracker failure
+                // message is upstream's `m_error` source
+                t.last_error = e.clone();
                 self.alerts.post(Alert::TrackerError {
                     ih: *ih,
                     url: url.to_string(),
-                    error: "announce failed".to_string(),
+                    error: e,
                 });
             }
         }

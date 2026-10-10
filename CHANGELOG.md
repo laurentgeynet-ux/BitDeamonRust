@@ -9,6 +9,12 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **API `torrent_handle` complétée** — `scrape_tracker`,
+  `get_peer_info`, `piece_availability`, `get_download_queue`
+  (partial pieces upstream `partial_piece_info`), `connect_peer`
+  (candidat de dial immédiat). `TorrentStatus.error` alimenté par
+  `Torrent::last_error` (échecs d'annonce tracker, vidé au succès).
+
 - **Ops stockage (`move_storage`/`rename_file`/`delete_files`)** —
   entrées `Session` + nouvelles variantes `DiskCompleted`
   (`MoveStorage`/`RenameFile`/`DeleteFiles`) routées via

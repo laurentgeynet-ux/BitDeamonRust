@@ -161,6 +161,9 @@ pub struct Torrent {
     /// pieces left in an in-flight `force_recheck` pass
     /// (`checking` clears when it reaches 0).
     pub checking_pieces: i32,
+    /// `m_error` — last tracker/disk error string for
+    /// `torrent_status::error` ("" = no error).
+    pub last_error: String,
 }
 
 impl Torrent {
@@ -218,6 +221,7 @@ impl Torrent {
             file_priorities: Vec::new(),
             sequential: false,
             checking_pieces: 0,
+            last_error: String::new(),
         }
     }
 
@@ -824,6 +828,35 @@ impl Torrent {
         connectable: bool,
     ) -> usize {
         self.peer_list.add_peer(remote, src, connectable).0
+    }
+
+    /// `connect_to_peer` (upstream `torrent_handle::connect_peer`)
+    /// — insert `remote` in the peer list as an immediate
+    /// connect candidate (failcount untouched → next pump picks it).
+    pub fn connect_peer(&mut self, remote: std::net::SocketAddr) -> usize {
+        self.add_swarm_peer(remote, bitdaemon_common::flags::PeerSourceFlags::NONE, true)
+    }
+
+    /// `piece_availability` — swarm availability vector
+    /// (`torrent::piece_availability` → picker availability).
+    #[must_use]
+    pub fn piece_availability(&self) -> Vec<i32> {
+        let mut v = Vec::new();
+        if let Some(p) = &self.picker {
+            p.get_availability_vec(&mut v);
+        }
+        v
+    }
+
+    /// `get_download_queue` — in-flight partial pieces
+    /// (`partial_piece_info` upstream: finished/writing/requested
+    /// counts per downloading piece).
+    #[must_use]
+    pub fn get_download_queue(&self) -> Vec<crate::piece_picker::DownloadingPiece> {
+        self.picker.as_ref().map_or_else(
+            Vec::new,
+            crate::piece_picker::PiecePicker::get_download_queue,
+        )
     }
 
     /// `find_connect_candidates` — the session's connect pump asks
@@ -1529,7 +1562,7 @@ impl Torrent {
             finished: self.finished,
             name: self.name.clone(),
             save_path: self.save_path.clone(),
-            error: String::new(),
+            error: self.last_error.clone(),
             num_peers: self.peers.len(),
             num_seeds: self.num_seeds,
             num_candidates: self.peer_list.num_peers(),
