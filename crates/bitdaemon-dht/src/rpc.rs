@@ -73,12 +73,14 @@ impl RpcManager {
         Self::default()
     }
 
-    /// `invoke()` — build the query dict (`y:"q"`, `a.id`,
-    /// `t: tid`, `ro`, `want`) and register the transaction.
-    /// `send` pushes the encoded packet out (injected transport).
-    /// Returns `Some(tid)` when the send succeeded.
+    /// `invoke()` — take a caller-built query dict (with `q` and
+    /// the `a` arguments), add `y:"q"`, `a.id`, `t: tid`, `ro`,
+    /// `want`, register the transaction and push it through `send`
+    /// (injected transport). Returns `Some(tid)` on success.
+    #[allow(clippy::too_many_arguments)]
     pub fn invoke(
         &mut self,
+        mut q: Entry,
         ep: SocketAddr,
         tag: u64,
         our_id: NodeId,
@@ -87,12 +89,13 @@ impl RpcManager {
         send: impl FnOnce(Entry, SocketAddr) -> bool,
     ) -> Option<u16> {
         let tid: u16 = rand::random();
-        let mut q = Entry::Dict(Default::default());
-        let e = q.dict_mut().expect("fresh dict");
-        e.insert("y".into(), Entry::String(b"q".to_vec()));
+        let e = q.dict_mut().ok()?;
+        e.entry("y".into()).or_insert(Entry::String(b"q".to_vec()));
         e.insert("t".into(), Entry::String(tid.to_be_bytes().to_vec()));
-        let mut a = Entry::Dict(Default::default());
-        let am = a.dict_mut().expect("fresh dict");
+        let a = e
+            .entry("a".into())
+            .or_insert_with(|| Entry::Dict(Default::default()));
+        let am = a.dict_mut().ok()?;
         am.insert("id".into(), Entry::String(our_id.as_bytes().to_vec()));
         if want_v6 {
             am.insert(
@@ -100,7 +103,6 @@ impl RpcManager {
                 Entry::List(vec![Entry::String(b"n6".to_vec())]),
             );
         }
-        e.insert("a".into(), a);
         if read_only {
             e.insert("ro".into(), Entry::Int(1));
         }

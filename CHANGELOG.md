@@ -9,6 +9,16 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `dht::lookups` — specialized traversals (`find_node`, `get_peers`,
+  obfuscated `get_peers`, `get`, `sample_infohashes`, `put`) with
+  reply extraction (token/values/nodes/samples/BEP-44 fields)
+- `dht::dht_node` — full node orchestrator: query dispatch
+  (ping/find_node/get_peers/announce_peer/get/put/sample_infohashes),
+  BEP-42 id + write-token generation/verification, lookup pump,
+  event surface — all I/O through an injected outbox, no sockets
+
+### Added
+
 - `dht`: iterative Kademlia `traversal` (port of `traversal_algorithm` +
   `observer`) — distance-sorted results, id dedup, /24 diversity
   (`restrict_search_ips`), router seeding, branch-factor growth on

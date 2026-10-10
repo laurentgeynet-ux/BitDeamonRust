@@ -162,6 +162,11 @@ impl Traversal {
     pub fn results(&self) -> &[ObserverEntry] {
         &self.results
     }
+    /// `target()`.
+    #[must_use]
+    pub fn target(&self) -> &NodeId {
+        &self.target
+    }
     /// `invoke_count()`.
     #[must_use]
     pub fn invoke_count(&self) -> i16 {

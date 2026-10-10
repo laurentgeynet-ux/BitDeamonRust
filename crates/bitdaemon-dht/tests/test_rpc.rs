@@ -14,6 +14,13 @@ fn our_id() -> NodeId {
     generate_id_impl(&"124.31.75.21".parse().unwrap(), 1)
 }
 
+fn query() -> Entry {
+    let mut e = Entry::Dict(Default::default());
+    let d = e.dict_mut().unwrap();
+    d.insert("q".into(), Entry::String(b"ping".to_vec()));
+    e
+}
+
 fn send_capture() -> (
     impl FnMut(Entry, SocketAddr) -> bool,
     std::sync::Arc<std::sync::Mutex<Vec<u16>>>,
@@ -33,7 +40,7 @@ fn invoke_builds_query_and_registers() {
     let mut rpc = RpcManager::new();
     let ep: SocketAddr = "8.8.8.8:6881".parse().unwrap();
     let (send, tids) = send_capture();
-    let tid = rpc.invoke(ep, 7, our_id(), false, false, send);
+    let tid = rpc.invoke(query(), ep, 7, our_id(), false, false, send);
     assert!(tid.is_some());
     assert_eq!(tids.lock().unwrap()[0], tid.unwrap());
     assert_eq!(rpc.outstanding(), 1);
@@ -45,7 +52,7 @@ fn incoming_dispatch_and_errors() {
     let ep: SocketAddr = "8.8.8.8:6881".parse().unwrap();
     let nid = generate_id_impl(&"8.8.8.8".parse().unwrap(), 1);
     let tid = rpc
-        .invoke(ep, 42, our_id(), false, false, |_, _| true)
+        .invoke(query(), ep, 42, our_id(), false, false, |_, _| true)
         .unwrap();
 
     // wrong endpoint → ignored
@@ -65,7 +72,7 @@ fn incoming_dispatch_and_errors() {
 
     // re-register and get a real reply
     let tid = rpc
-        .invoke(ep, 9, our_id(), false, false, |_, _| true)
+        .invoke(query(), ep, 9, our_id(), false, false, |_, _| true)
         .unwrap();
     match rpc.incoming(ep, &tid.to_be_bytes(), false, Some(nid), false) {
         Incoming::Reply { tag, id } => {
@@ -81,7 +88,7 @@ fn enforce_node_id() {
     let mut rpc = RpcManager::new();
     let ep: SocketAddr = "8.8.8.8:6881".parse().unwrap();
     let tid = rpc
-        .invoke(ep, 5, our_id(), false, false, |_, _| true)
+        .invoke(query(), ep, 5, our_id(), false, false, |_, _| true)
         .unwrap();
     // random (non-BEP-42) id + enforce → Error
     let bad = NodeId::from_bytes(&[0u8; 20]).unwrap();
@@ -97,7 +104,7 @@ fn error_message_is_timeout() {
     let ep: SocketAddr = "8.8.8.8:6881".parse().unwrap();
     let nid = generate_id_impl(&"8.8.8.8".parse().unwrap(), 1);
     let tid = rpc
-        .invoke(ep, 3, our_id(), false, false, |_, _| true)
+        .invoke(query(), ep, 3, our_id(), false, false, |_, _| true)
         .unwrap();
     assert_eq!(
         rpc.incoming(ep, &tid.to_be_bytes(), true, Some(nid), false),
@@ -109,7 +116,7 @@ fn error_message_is_timeout() {
 fn tick_fires_short_then_final() {
     let mut rpc = RpcManager::new();
     let ep: SocketAddr = "8.8.8.8:6881".parse().unwrap();
-    rpc.invoke(ep, 11, our_id(), false, false, |_, _| true);
+    rpc.invoke(query(), ep, 11, our_id(), false, false, |_, _| true);
     // not yet expired
     let mut fired = Vec::new();
     rpc.tick(|t, e, x| fired.push((t, e, x)));
