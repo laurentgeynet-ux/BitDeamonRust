@@ -74,6 +74,20 @@ pub struct Torrent {
     pub peers: BTreeMap<u64, PeerConn>,
     /// `m_trackers` — tier-ordered announce entries.
     pub trackers: crate::tracker_list::TrackerList,
+    /// `m_web_seeds` — BEP-17/19 url-seed endpoints.
+    pub web_seeds: Vec<String>,
+    /// `m_torrent_file->files()` — file layout for web-seed
+    /// range mapping.
+    pub files: Option<std::sync::Arc<bitdaemon_core::FileStorage>>,
+    /// round-robin cursor over `web_seeds`.
+    pub web_seed_idx: usize,
+    /// blocks in flight toward web seeds (`m_requests` of the
+    /// virtual web peer).
+    pub web_seed_outstanding: std::collections::BTreeSet<bitdaemon_common::types::PieceBlock>,
+    /// the virtual web peer's bitfield was refcounted once
+    /// (`web_peer_connection` bumps availability for every piece
+    /// on connect — the seed serves the full payload).
+    web_seed_refcounted: bool,
     /// `m_peer_list` — known swarm members (tracker/PEX/DHT/LSD/
     /// resume candidates). Upstream stores `torrent_peer`s owned by
     /// the list; ours are `TorrentPeer`s in `PeerList`.
@@ -139,6 +153,11 @@ impl Torrent {
             picker: None,
             peers: BTreeMap::new(),
             trackers: crate::tracker_list::TrackerList::default(),
+            web_seeds: Vec::new(),
+            files: None,
+            web_seed_idx: 0,
+            web_seed_outstanding: std::collections::BTreeSet::new(),
+            web_seed_refcounted: false,
             peer_list: bitdaemon_net::peer_list::PeerList::default(),
             storage,
             num_seeds: 0,
@@ -192,6 +211,7 @@ impl Torrent {
                         .collect(),
                 );
                 t.metadata_raw = Some(ti.info_section().to_vec());
+                t.files = Some(std::sync::Arc::new(ti.files().clone()));
                 t.init_picker(false);
                 t.apply_resume_data(atp, out);
                 t
@@ -203,6 +223,11 @@ impl Torrent {
                 t
             }
         };
+        t.web_seeds = atp
+            .url_seeds
+            .iter()
+            .map(|u| String::from_utf8_lossy(u).into_owned())
+            .collect();
         for &ep in &atp.peers {
             t.add_swarm_peer(
                 ep,
@@ -993,6 +1018,141 @@ impl Torrent {
                         length: 0x4000,
                     }),
                 });
+            }
+        }
+    }
+
+    /// `web_seed_peer` pseudo-identity in the picker — a web seed
+    /// counts as a virtual peer upstream (`web_peer_connection`
+    /// derives `peer_connection`); blocks it serves are tracked
+    /// under this key so real peers never double-request them.
+    pub const WEB_SEED_PEER: u64 = u64::MAX;
+
+    /// `web_peer_connection::write_request` drive — pick up to
+    /// `max_blocks` blocks the web seed can serve (it has every
+    /// piece) and mark them `requested` under [`Self::WEB_SEED_PEER`].
+    /// Returns the url (round-robin over `web_seeds`) and the
+    /// picked block requests, or `None` when nothing applies.
+    pub fn next_web_seed_blocks(&mut self, max_blocks: i32) -> Option<(String, Vec<PeerRequest>)> {
+        if self.web_seeds.is_empty()
+            || self.is_seed()
+            || self.picker.is_none()
+            || self.files.is_none()
+        {
+            return None;
+        }
+        if !self.web_seed_refcounted {
+            // virtual `peer_has` — the seed has every piece
+            self.picker.as_mut().expect("checked").inc_refcount_all();
+            self.web_seed_refcounted = true;
+        }
+        let all = Bitfield::with_value(self.num_pieces as usize, true);
+        let tctx = crate::request_blocks::TorrentRequestCtx {
+            is_seed: false,
+            upload_mode: false,
+            valid_metadata: true,
+            files_checked: true,
+            graceful_pause: false,
+            time_critical_mode: false,
+            num_peers: (self.peers.len() + 1) as i32,
+            whole_pieces_threshold: 0,
+            strict_end_game_mode: false,
+            piece_length: self.piece_length,
+            block_size: 0x4000,
+        };
+        let allowed_fast = Vec::new();
+        let suggested = Vec::new();
+        let outstanding: Vec<_> = self.web_seed_outstanding.iter().copied().collect();
+        let pctx = crate::request_blocks::PeerRequestCtx {
+            no_download: false,
+            disconnecting: false,
+            desired_queue_size: max_blocks,
+            outstanding: &outstanding,
+            prefer_contiguous_blocks: 0,
+            download_payload_rate: 0,
+            peer_choked: false,
+            allowed_fast: &allowed_fast,
+            peer_pieces: &all,
+            peer_key: Some(Self::WEB_SEED_PEER),
+            picker_options: PickerOptions::RAREST_FIRST,
+            suggested_pieces: &suggested,
+        };
+        let mut picked = Vec::new();
+        let mut pc_stats = crate::piece_picker::NullPickerStats;
+        let (got, _) = crate::request_blocks::request_a_block_out(
+            self.picker.as_mut().expect("checked"),
+            &tctx,
+            &pctx,
+            &mut pc_stats,
+            |b, busy| {
+                picked.push((b, busy));
+                picked.len() < max_blocks as usize
+            },
+        );
+        if !got || picked.is_empty() {
+            return None;
+        }
+        let mut reqs = Vec::with_capacity(picked.len());
+        for (b, _busy) in picked {
+            if !self.picker.as_mut().is_some_and(|p| {
+                p.mark_as_downloading(b, Some(Self::WEB_SEED_PEER), PickerOptions::RAREST_FIRST)
+            }) {
+                continue;
+            }
+            self.web_seed_outstanding.insert(b);
+            if !(0..self.num_pieces).contains(&b.piece_index.0) {
+                continue;
+            }
+            let start = b.block_index * 0x4000;
+            let piece_size = self.files.as_ref().map_or(self.piece_length, |f| {
+                i64::from(f.piece_size(b.piece_index))
+            });
+            let length = (piece_size - i64::from(start)).min(0x4000) as i32;
+            reqs.push(PeerRequest {
+                piece: b.piece_index,
+                start,
+                length,
+            });
+        }
+        if reqs.is_empty() {
+            return None;
+        }
+        let url = self.web_seeds[self.web_seed_idx % self.web_seeds.len()].clone();
+        self.web_seed_idx += 1;
+        Some((url, reqs))
+    }
+
+    /// one web-seed block arrived — `mark_as_writing` + emit the
+    /// disk write (the same path a wire `Piece` takes).
+    pub fn on_web_seed_block(
+        &mut self,
+        req: PeerRequest,
+        data: Vec<u8>,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        let b = bitdaemon_common::types::PieceBlock {
+            piece_index: req.piece,
+            block_index: req.start / 0x4000,
+        };
+        self.web_seed_outstanding.remove(&b);
+        if let Some(p) = self.picker.as_mut() {
+            p.mark_as_writing(b, Some(Self::WEB_SEED_PEER));
+        }
+        out.push(TorrentEffect::DiskWrite { req, data });
+    }
+
+    /// a web-seed fetch failed — release the blocks so they can be
+    /// re-requested from a real peer or another seed (`web_seed`
+    /// `fail_count`→`abort_download` upstream path).
+    pub fn on_web_seed_error(&mut self, reqs: &[PeerRequest]) {
+        for r in reqs {
+            let b = bitdaemon_common::types::PieceBlock {
+                piece_index: r.piece,
+                block_index: r.start / 0x4000,
+            };
+            self.web_seed_outstanding.remove(&b);
+            if let Some(p) = self.picker.as_mut() {
+                p.abort_download(b, Some(Self::WEB_SEED_PEER));
             }
         }
     }

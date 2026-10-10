@@ -9,6 +9,18 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **Web seeds bout-en-bout** : `Torrent.web_seeds` (BEP-17/19
+  `url-list`/`ws=`) alimente un pair virtuel `WEB_SEED_PEER` —
+  `inc_refcount_all` (le seed a tout), `next_web_seed_blocks`
+  pioche via le picker (mark `downloading`), `Session::tick` émet
+  `SessionOut::WebSeedFetch` (`web_seed_blocks_per_tick`),
+  `Engine::spawn_web_seed` fait `build_piece_request`/`fetch_block`
+  via le connecteur+résolveur injectés, `on_web_seed_block` repasse
+  par le chemin `DiskWrite`→hash, `on_web_seed_error` libère les
+  blocs (`abort_download`).
+
+### Added
+
 - `Session::save_state`/`load_state` — le fichier `.session` :
   resume data par torrent (`to_resume_data` embarque le blob `info`
   via `metadata_raw`), état DHT v4+v6 fusionné ; `load_state`

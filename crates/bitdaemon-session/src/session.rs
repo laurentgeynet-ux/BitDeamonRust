@@ -72,6 +72,24 @@ pub enum SessionOut {
         /// announce parameters (event, counters, key).
         params: bitdaemon_net::tracker_client::AnnounceParams,
     },
+    /// fetch one batch of blocks from a url seed — the async
+    /// driver dials the host via the injected connector and
+    /// reports through `Session::on_web_seed_block` /
+    /// `Session::on_web_seed_error`.
+    WebSeedFetch {
+        /// torrent.
+        ih: Sha1Hash,
+        /// seed base url.
+        url: String,
+        /// file layout for range mapping.
+        files: std::sync::Arc<bitdaemon_core::FileStorage>,
+        /// piece size for request building.
+        piece_length: i64,
+        /// single-file torrent → BEP-19 absolute path.
+        single_file: bool,
+        /// blocks to fetch.
+        reqs: Vec<bitdaemon_common::types::PeerRequest>,
+    },
 }
 
 /// `session_impl` — all state owned on one thread.
@@ -731,6 +749,7 @@ impl Session {
             .map(|(ih, _)| *ih)
             .collect();
         let peer_timeout = self.settings.peer_timeout.as_secs() as i32;
+        let web_seed_blocks = self.settings.web_seed_blocks_per_tick;
         for ih in ihs {
             let mut eff = Vec::new();
             if let Some(t) = self.torrents.get_mut(&ih) {
@@ -738,6 +757,20 @@ impl Session {
                 t.pex_tick(Instant::now(), &mut eff);
                 for id in t.peers.keys().copied().collect::<Vec<_>>() {
                     t.drive_peer(id, &mut eff);
+                }
+                // `web_connection_base` — feed url seeds too
+                if let Some((url, reqs)) = t.next_web_seed_blocks(web_seed_blocks)
+                    && let Some(fs) = t.files.clone()
+                {
+                    let single_file = fs.num_files() == 1;
+                    out.push(SessionOut::WebSeedFetch {
+                        ih,
+                        url,
+                        files: fs,
+                        piece_length: t.piece_length,
+                        single_file,
+                        reqs,
+                    });
                 }
                 // `peer_timeout` — disconnect peers silent for
                 // `peer_timeout` seconds (upstream second_tick)
@@ -812,6 +845,34 @@ impl Session {
                     params: t.announce_params(pid, port, event, key),
                 });
             }
+        }
+    }
+
+    /// `web_peer_connection::on_body_data` — one web-seed block
+    /// arrived; routes to the disk-write path (marks the picker
+    /// block `writing` under `Torrent::WEB_SEED_PEER`).
+    pub fn on_web_seed_block(
+        &mut self,
+        ih: &Sha1Hash,
+        req: bitdaemon_common::types::PeerRequest,
+        data: Vec<u8>,
+        out: &mut Vec<SessionOut>,
+    ) {
+        let mut eff = Vec::new();
+        if let Some(t) = self.torrents.get_mut(ih) {
+            t.on_web_seed_block(req, data, &mut eff);
+        }
+        self.route(*ih, eff, out);
+    }
+
+    /// `web_peer_connection` failure — release the picked blocks.
+    pub fn on_web_seed_error(
+        &mut self,
+        ih: &Sha1Hash,
+        reqs: &[bitdaemon_common::types::PeerRequest],
+    ) {
+        if let Some(t) = self.torrents.get_mut(ih) {
+            t.on_web_seed_error(reqs);
         }
     }
 

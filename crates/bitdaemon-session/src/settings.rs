@@ -57,6 +57,9 @@ pub struct SessionSettings {
     pub connection_speed: i32,
     /// `tick_interval` — session tick cadence.
     pub tick_interval: Duration,
+    /// `web_seed_request_blocks`-equivalent — max blocks picked
+    /// from url seeds per tick.
+    pub web_seed_blocks_per_tick: i32,
     /// `min_reconnect_time` — peer re-dial backoff (s).
     pub min_reconnect_time: i32,
     /// `max_peerlist_size` — swarm entries per torrent (0 = ∞).
@@ -96,6 +99,7 @@ impl Default for SessionSettings {
             prefer_rc4: false,
             connection_speed: 30,
             tick_interval: Duration::from_secs(1),
+            web_seed_blocks_per_tick: 4,
             min_reconnect_time: 60,
             max_peerlist_size: 4000,
             max_failcount: 3,

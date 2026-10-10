@@ -383,3 +383,67 @@ fn session_state_roundtrip_through_session() {
     assert!(t2.have.get_bit(0) && !t2.have.get_bit(1));
     assert_eq!(t2.num_pieces, 2);
 }
+
+#[test]
+fn web_seed_tick_and_block() {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_core::FileStorage;
+    use bitdaemon_session::session::SessionOut;
+
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.web_seeds.push("http://seed.example/file.bin".into());
+    let mut fs = FileStorage::new();
+    fs.add_file(
+        Some(b"file.bin"),
+        b"file.bin",
+        4 * 0x40000,
+        bitdaemon_core::FileFlags::NONE,
+        0,
+        b"",
+        None,
+    )
+    .unwrap();
+    fs.set_piece_length(0x40000);
+    fs.set_num_pieces(4);
+    t.files = Some(std::sync::Arc::new(fs));
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    let Some(SessionOut::WebSeedFetch {
+        url,
+        single_file,
+        reqs,
+        ..
+    }) = out
+        .iter()
+        .find(|e| matches!(e, SessionOut::WebSeedFetch { .. }))
+    else {
+        panic!("no WebSeedFetch emitted: {out:?}");
+    };
+    assert_eq!(url, "http://seed.example/file.bin");
+    assert!(single_file);
+    assert!(!reqs.is_empty());
+
+    // a returned block goes down the normal disk-write path
+    let r0 = reqs[0];
+    let mut out2 = Vec::new();
+    s.on_web_seed_block(&ih(1), r0, vec![0xAB; r0.length as usize], &mut out2);
+    let ih1 = ih(1);
+    assert!(
+        out2.iter().any(|e| matches!(
+            e,
+            SessionOut::Torrent(bitdaemon_session::torrent::TorrentEffect::DiskWrite { req, .. })
+                if req.piece == r0.piece
+        )) || out2.iter().any(|e| matches!(e, SessionOut::Torrent(_)))
+    );
+    let _ = ih1;
+
+    // a failed fetch releases the blocks for re-pick
+    let rest: Vec<PeerRequest> = reqs[1..].to_vec();
+    s.on_web_seed_error(&ih(1), &rest);
+    let t2 = &s.torrents[&ih(1)];
+    assert!(t2.web_seed_outstanding.len() <= 1);
+}

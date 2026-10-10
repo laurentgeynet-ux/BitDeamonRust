@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use bitdaemon_common::types::PeerRequest;
 use bitdaemon_common::{PeerId, Sha1Hash};
 use bitdaemon_net::bt_peer_conn::{read_message, run_handshake, write_message};
 use bitdaemon_net::peer_wire::PeerMessage;
@@ -131,6 +132,13 @@ struct DialDone {
     outbound: bool,
 }
 
+/// A web-seed fetch completion: per-block data or the failed
+/// request list (to release the picked blocks).
+struct WebSeedDone {
+    ih: Sha1Hash,
+    result: Result<Vec<(PeerRequest, Vec<u8>)>, Vec<PeerRequest>>,
+}
+
 /// `Engine` — everything outside `Session` that upstream does in
 /// `session_impl`'s io-context loop.
 pub struct Engine {
@@ -162,6 +170,9 @@ pub struct Engine {
     /// outbound dial completions (`connection_attempt` jobs).
     connect_rx: mpsc::UnboundedReceiver<DialDone>,
     connect_tx: mpsc::UnboundedSender<DialDone>,
+    /// web-seed fetch completions.
+    webseed_rx: mpsc::UnboundedReceiver<WebSeedDone>,
+    webseed_tx: mpsc::UnboundedSender<WebSeedDone>,
     /// spawned task handles (kept for abort on drop).
     tasks: Vec<JoinHandle<()>>,
     /// info-hash set shared with acceptor tasks (`m_torrents` check
@@ -192,6 +203,7 @@ impl Engine {
         let (gone_tx, gone_rx) = mpsc::unbounded_channel();
         let (udp_tx, udp_rx) = mpsc::unbounded_channel();
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();
+        let (webseed_tx, webseed_rx) = mpsc::unbounded_channel();
         Self {
             session: Session::new(),
             connector,
@@ -209,6 +221,8 @@ impl Engine {
             udp_tx,
             connect_rx,
             connect_tx,
+            webseed_rx,
+            webseed_tx,
             tasks: Vec::new(),
             known_ihs: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
             queue_time: 3,
@@ -276,6 +290,16 @@ impl Engine {
         while let Ok(d) = self.connect_rx.try_recv() {
             self.on_dial_done(d);
         }
+        while let Ok(w) = self.webseed_rx.try_recv() {
+            match w.result {
+                Ok(blocks) => {
+                    for (req, data) in blocks {
+                        self.session.on_web_seed_block(&w.ih, req, data, &mut out);
+                    }
+                }
+                Err(reqs) => self.session.on_web_seed_error(&w.ih, &reqs),
+            }
+        }
 
         // `update_quota` — refill the upload bucket each tick
         self.upload_limiter
@@ -313,6 +337,16 @@ impl Engine {
                     params,
                 } => {
                     self.spawn_announce(ih, url, tracker_id, params);
+                }
+                SessionOut::WebSeedFetch {
+                    ih,
+                    url,
+                    files,
+                    piece_length,
+                    single_file,
+                    reqs,
+                } => {
+                    self.spawn_web_seed(ih, url, files, piece_length, single_file, reqs);
                 }
                 SessionOut::Torrent(e) => {
                     if let bitdaemon_session::torrent::TorrentEffect::DisconnectPeer {
@@ -440,6 +474,103 @@ impl Engine {
                 Err(e) => Err(format!("bad tracker url {url}: {e}")),
             };
             let _ = tx.send(AnnounceDone { ih, url, result });
+        });
+        self.tasks.push(handle);
+    }
+
+    /// `web_peer_connection` driver — dial the seed host through
+    /// the injected connector, issue one GET per block via
+    /// `build_piece_request`/`fetch_block`, then feed every block
+    /// back into `Session::on_web_seed_block` (same disk path a
+    /// wire `Piece` takes).
+    fn spawn_web_seed(
+        &mut self,
+        ih: Sha1Hash,
+        url: String,
+        files: std::sync::Arc<bitdaemon_core::FileStorage>,
+        piece_length: i64,
+        single_file: bool,
+        reqs: Vec<PeerRequest>,
+    ) {
+        use bitdaemon_net::web_seed::{WebSeedHeaders, build_piece_request, fetch_block};
+        let tx = self.webseed_tx.clone();
+        let connector = self.connector.clone();
+        let resolver = self.resolver.clone();
+        self.tasks_forget();
+        let handle = tokio::spawn(async move {
+            macro_rules! fail {
+                () => {
+                    let _ = tx.send(WebSeedDone {
+                        ih,
+                        result: Err(reqs),
+                    });
+                };
+            }
+            let Ok(c) = bitdaemon_net::parse_url::parse_url_components(&url) else {
+                fail!();
+                return;
+            };
+            let port = u16::try_from(c.port).unwrap_or(80);
+            let Ok(addr) = resolve(&resolver, &c.hostname, port).await else {
+                fail!();
+                return;
+            };
+            let Ok(mut s) = connector.connect(addr).await else {
+                fail!();
+                return;
+            };
+            let host = if c.port < 0 {
+                c.hostname.clone()
+            } else {
+                format!("{}:{}", c.hostname, port)
+            };
+            let headers = WebSeedHeaders {
+                host,
+                send_user_agent: false,
+                ..Default::default()
+            };
+            let mut done = Vec::with_capacity(reqs.len());
+            for i in 0..reqs.len() {
+                let r = reqs[i];
+                let wreq = build_piece_request(
+                    &files,
+                    piece_length,
+                    r.piece,
+                    i64::from(r.start),
+                    i64::from(r.length),
+                    &url,
+                    &c.path,
+                    single_file,
+                    false,
+                    &headers,
+                );
+                match fetch_block(&mut s, &wreq, 4 * 1024 * 1024).await {
+                    Ok(segs) => {
+                        // reassemble in `m_file_requests` order —
+                        // pad slices contribute zeroes
+                        let mut data = Vec::with_capacity(r.length as usize);
+                        let mut it = segs.into_iter();
+                        for f in &wreq.files {
+                            if f.got_get {
+                                if let Some((_, _, b)) = it.next() {
+                                    data.extend_from_slice(&b);
+                                }
+                            } else {
+                                data.resize(data.len() + f.length as usize, 0);
+                            }
+                        }
+                        done.push((r, data));
+                    }
+                    Err(_) => {
+                        fail!();
+                        return;
+                    }
+                }
+            }
+            let _ = tx.send(WebSeedDone {
+                ih,
+                result: Ok(done),
+            });
         });
         self.tasks.push(handle);
     }
