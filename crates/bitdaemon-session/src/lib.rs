@@ -37,8 +37,20 @@ pub mod piece_picker;
 /// `aux_/request_blocks` — `request_a_block` glue picker↔peer.
 pub mod request_blocks;
 
+/// `alert`/`alert_manager` — event bus.
+pub mod alerts;
+/// `choker` — unchoke sort.
+pub mod choker;
+/// `session`/`session_impl` — orchestrator core.
+pub mod session;
+/// `settings_pack`/`session_params`.
+pub mod settings;
 /// `extensions/smart_ban` — corrupt-block peer banning.
 pub mod smart_ban;
+/// `torrent` — per-torrent state machine.
+pub mod torrent;
+/// `announce_entry`/`tracker_list` — retry & failover.
+pub mod tracker_list;
 
 /// Client session (`libtorrent::session` / `session_handle`).
 pub struct Session;

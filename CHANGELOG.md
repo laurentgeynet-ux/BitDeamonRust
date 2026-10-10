@@ -7,6 +7,35 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — session & torrent glue (Phase 6 wave 1)
+
+- `session::torrent` — `Torrent` per-swarm state machine: peer registry,
+  picker refcount glue (bitfield/have/have-all/peer-lost), `piece_verified`
+  → have broadcast + seed transition + failed-piece restore,
+  `drive_peer` → `request_a_block` scheduling (`torrent.cpp` subset).
+- `session::session` — `Session` synchronous core: torrent map keyed by
+  info_hash, `on_peer_message`/`peer_connected`/`peer_disconnected`/
+  `on_piece_verified`, `tick` driving all peers + DhtTracker outbox
+  (injected UDP), `SessionOut` effect routing (`session_impl` subset).
+- `session::alerts` — `Alert` payload enum + `AlertCategory` bitmask
+  verbatim + `AlertManager` (mask, queue limit, drop counter, notify
+  hook), `SessionPlugin` extension trait (`alert_manager` subset).
+- `session::settings` — `SessionSettings` typed struct with upstream
+  `default_settings()` values; `SessionParams` with injected
+  `Arc<dyn DiskIo>` (the OnionBit `StorageFactory` seam).
+- `session::tracker_list` — `AnnounceEntry`/`TrackerList` with
+  upstream quadratic retry backoff (`5s + fails²·5s·ratio/100`, capped
+  60 min), `can_announce` (due/min_announce/fail_limit), tier-ordered
+  failover + URL dedup (`announce_entry.cpp`/`tracker_list.cpp`).
+- `session::choker` — `unchoke_sort` verbatim: fixed-slots and
+  rate-based slot calculation, round-robin (quota-complete at
+  `piece_length·quota` after 60 s) / fastest-upload / anti-leech
+  comparators, `nth_element` top-slots partition on `ChokePeer`
+  snapshots (`choker.cpp`).
+- `piece_picker::NullPickerStats` — no-op `PickerStats` for sessions
+  without a stats sink.
+
+
 ### Added
 
 - `session::peer_conn::dispatch` — incoming wire message router

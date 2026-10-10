@@ -373,6 +373,13 @@ pub trait PickerStats {
     fn inc(&mut self, c: PickerCounter);
 }
 
+/// No-op counters — sessions without a stats sink.
+#[derive(Debug, Default)]
+pub struct NullPickerStats;
+impl PickerStats for NullPickerStats {
+    fn inc(&mut self, _c: PickerCounter) {}
+}
+
 /// The counters `pick_pieces` bumps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerCounter {

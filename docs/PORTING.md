@@ -67,7 +67,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `merkle.cpp` (`merkle.hpp`), `aux_/merkle_tree.hpp` + `merkle_tree.cpp` | `core::merkle`, `core::merkle_tree` | **ported** | full sparse/piece-layer tree, proofs, verified-bitfield; `test_merkle_tree.cpp` 22/22 |
 | `magnet_uri.cpp` (`magnet_uri.hpp`) | `core::magnet_uri` | **ported** | `test_magnet.cpp` parse vectors 24/24 |
 | `load_torrent.cpp` (`load_torrent.hpp`) | `core::torrent_info` (`load_torrent*`) | **ported** | `parse_torrent_file`/`load_torrent_buffer` |
-| `announce_entry.cpp`, `tracker_list.cpp` | `core::tracker` | not started | tier + failover semantics |
+| `announce_entry.cpp`, `tracker_list.cpp` | `session::tracker_list` | **ported** | `AnnounceInfohash`/`Endpoint`/`Entry`/`TrackerList` — quadratic backoff `5+f²·5·ratio/100` ≤ 60 min verbatim, `can_announce` (due/min/fail_limit), tier-order insert + dedup, `due()` failover |
 | `web_seed_entry.cpp` (`web_seed_entry.hpp`) | `core::web_seed` | partial | `WebSeedEntry` data struct; endpoint/scrape logic is Phase 5 |
 | `fingerprint.cpp`, `identify_client.cpp` | `core::fingerprint` | **ported** | az/shadow/mainline/TR-legacy styles + name map; `test_identify_client.cpp` 2/2 |
 | `read_resume_data.cpp`, `write_resume_data.cpp` | `core::resume_data` | **ported** | file-version 1+2 read, v2 write; `test_read_resume.cpp` vectors + round-trip |
@@ -118,7 +118,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `ip_filter.cpp` | `net::ip_filter` | **ported** | `BTreeMap` set-surgery verbatim; `test_ip_filter.cpp` 9/9 incl. overlap joins + v6 + port_filter |
 | `pe_crypto.cpp` | `net::pe_crypto` | **ported** | DH-768 (`num-bigint` powmod, degenerate-key guard), RC4 RFC 6229 vectors exact, `keyA/keyB` longkey derivation, 1024-byte discard |
 | `bt_peer_connection` packet layer | `net::peer_wire` | partial | handshake (68 B, reserved bits verbatim) + all 24 message ids, tokio codec, max-len cap; conn state machine later |
-| `peer_connection.cpp` (`peer_connection.hpp`), `peer_connection_handle.cpp`, `peer_connection_interface.hpp` | `net::peer` | not started | base state machine |
+| `peer_connection.cpp` (`peer_connection.hpp`), `peer_connection_handle.cpp`, `peer_connection_interface.hpp` | `net::peer` (`session::peer_conn`) | **started** | `PeerConn` full incoming dispatch → `PeerEffect`s (bitfield/have/choke/request/cancel/reject/piece/dht-port), upload-queue validation, picker drive; stream lifecycle/`bt` handshake layer pending |
 | `bt_peer_connection.cpp` (`bt_peer_connection.hpp`) | `net::peer::bt` | not started | BT handshake + BEP-10 |
 | `web_connection_base.cpp`, `web_peer_connection.cpp` | `net::peer::web` | not started | web seeds (Phase 8) |
 | `request_blocks.cpp`, `merge_block_requests.hpp`, `suggest_piece.hpp`, `peer_list.cpp`, `peer_info.cpp`, `peer.cpp`, `peer.hpp` | `net::peer::*` | not started | |
@@ -167,12 +167,12 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 
 | C++ source | Rust target | Status | Notes |
 |---|---|---|---|
-| `session.cpp`, `session_impl.cpp` (`session_impl.hpp`), `session_call.cpp`, `session_handle.cpp` (`session_handle.hpp`), `session_interface.hpp`, `session_params.cpp`, `session_types.hpp` | `session::session` | not started | actor + handle (ADR-0001); `SessionParams` carries injected transports + anonymous-lane flags (ADR-0008) |
-| `torrent.cpp` (`torrent.hpp`, `torrent_impl.hpp`), `torrent_handle.cpp`, `torrent_status.cpp`, `torrent_list.hpp`, `torrent_peer.cpp`, `torrent_peer_allocator.cpp` | `session::torrent` | not started | per-torrent state machine |
-| `alert.cpp`, `alert_manager.cpp`, `alert_types.hpp`, `alert.hpp` | `session::alert` | not started | enum-based alerts |
-| `settings_pack.cpp`, `session_settings.cpp`, `session_stats.cpp`, `performance_counters.cpp` | `session::settings` | not started | typed struct + defaults = spec |
+| `session.cpp`, `session_impl.cpp` (`session_impl.hpp`), `session_call.cpp`, `session_handle.cpp` (`session_handle.hpp`), `session_interface.hpp`, `session_params.cpp`, `session_types.hpp` | `session::session` | **started** | `Session` synchronous core: torrent map, peer dispatch, `on_peer_message`/`on_piece_verified`/`tick`/`on_udp`, DhtTracker + injected `DiskIo`; async actor wrapper + `session_handle` pending |
+| `torrent.cpp` (`torrent.hpp`, `torrent_impl.hpp`), `torrent_handle.cpp`, `torrent_status.cpp`, `torrent_list.hpp`, `torrent_peer.cpp`, `torrent_peer_allocator.cpp` | `session::torrent` | **started** | `Torrent` per-swarm state: peer registry, picker refcount glue (bitfield/have/lost), `piece_verified` → have broadcast + seed transition, `drive_peer` → request scheduling; handle/status/list pending |
+| `alert.cpp`, `alert_manager.cpp`, `alert_types.hpp`, `alert.hpp` | `session::alert` | **ported** | `Alert` enum (essential payload variants), `AlertCategory` bitmask verbatim, `AlertManager` (mask filter, queue limit + drop counter, notify hook on empty→non-empty), `SessionPlugin` extension trait |
+| `settings_pack.cpp`, `session_settings.cpp`, `session_stats.cpp`, `performance_counters.cpp` | `session::settings` | **started** | `SessionSettings` typed struct (upstream defaults), `SessionParams` with injected `Arc<dyn DiskIo>` + `SessionPlugin`s; `session_stats`/counters pending |
 | `add_torrent_params.cpp` (session side) | `session::add` | not started | |
-| `choker.cpp`, `peer_class.cpp`, `peer_class_set.cpp`, `peer_class_type_filter.hpp` | `session::choker` | not started | upload slots |
+| `choker.cpp`, `peer_class.cpp`, `peer_class_set.cpp`, `peer_class_type_filter.hpp` | `session::choker` | **ported** | `unchoke_sort` verbatim (fixed-slots + rate-based + RR/fastest/anti-leech comparators, quota `piece_length·quota` + 60s, `nth_element` top-slots), `ChokePeer` value snapshot; `peer_class*` pending |
 | `peer_connection.hpp` (machine d'état) | `session::peer_conn` | **partial** | bitfield/have/dont-have/suggest/allowed-fast, choke/intérêt bilatéral, `drive_requests` assemble picker→queue→wire; sockets/extensions/alerts restent côté appelant (transport-agnostique) |
 | `merge_block_requests.hpp` + pipeline de `peer_connection.cpp` | `session::peer_pipeline` | **ported** | `pending_block`, request/download queues, `RequestMerger` coalescing (bornes tronquées fidèles), `send_block_requests_impl`, AIMD `desired_queue_size` (slow-start/snub), `request_timeout` RTT `sliding_average<20>` mean+4σ |
 | `request_blocks.cpp` (`request_a_block`) | `session::request_blocks` | **ported** | torrent/peer_conn inputs → `TorrentRequestCtx`/`PeerRequestCtx` snapshots, `add_request` closure, fast-set mask, strict-end-game + busy-block path verbatim |
