@@ -22,6 +22,8 @@
 
 #![forbid(unsafe_code)]
 
+/// `peer_connection` request pipeline + `merge_block_requests`.
+pub mod peer_pipeline;
 /// Client session (`libtorrent::session` / `session_handle`).
 ///
 /// TODO: implement — spawn the actor, `add_torrent`, `pause`/`resume`,

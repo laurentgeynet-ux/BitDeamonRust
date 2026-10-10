@@ -9,6 +9,12 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added — `bitdaemon-session` (piece picking)
 
+- `peer_pipeline` — the request-pipeline half of
+  `aux_/peer_connection.cpp`: `pending_block`, request/download
+  queues, `RequestMerger` block coalescing (byte-range merge with
+  truncated-piece boundary handling), `send_block_requests_impl`,
+  `update_desired_queue_size` (slow-start AIMD + snub collapse),
+  adaptive `request_timeout` (RTT mean + 4σ, floor 2 s).
 - `request_blocks` — port of `aux_/request_blocks.cpp`
   (`request_a_block`, `source_rank`): torrent/peer state is passed in
   as `TorrentRequestCtx`/`PeerRequestCtx` snapshots; `add_request` is

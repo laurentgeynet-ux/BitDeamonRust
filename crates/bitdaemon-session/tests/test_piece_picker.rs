@@ -579,3 +579,116 @@ fn request_block_endgame() {
         assert!(picker.is_requested(b));
     }
 }
+
+// ---------- peer_pipeline (peer_connection request pipeline) ----------
+
+use bitdaemon_common::PeerRequest;
+use bitdaemon_session::peer_pipeline::{
+    PeerPipeline, PendingBlock, PipelineTorrent, RequestMerger,
+};
+
+struct FakeTorrent;
+impl PipelineTorrent for FakeTorrent {
+    fn block_size(&self) -> i32 {
+        0x4000
+    }
+    fn piece_length(&self) -> i64 {
+        i64::from(PIECE_SIZE)
+    }
+    fn piece_size_for_req(&self, _piece: PieceIndex) -> i32 {
+        PIECE_SIZE
+    }
+    fn to_req(&self, block: PieceBlock, _piece_size: i32) -> PeerRequest {
+        PeerRequest {
+            piece: block.piece_index,
+            start: block.block_index * 0x4000,
+            length: 0x4000,
+        }
+    }
+}
+
+#[test]
+fn merger_contiguous() {
+    // blocks 0..3 of piece 0 then block 0 of piece 1 all merge
+    let mut m = RequestMerger::new(pb(0, 0), PIECE_SIZE, i64::from(PIECE_SIZE), 0x4000);
+    assert!(m.continues(pb(0, 1)));
+    assert_eq!(m.merge(pb(0, 1), PIECE_SIZE), 0x4000);
+    assert!(m.continues(pb(0, 2)));
+    assert_eq!(m.merge(pb(0, 2), PIECE_SIZE), 0x4000);
+    assert!(m.continues(pb(0, 3)));
+    assert_eq!(m.merge(pb(0, 3), PIECE_SIZE), 0x4000);
+    // crosses the piece boundary
+    assert!(m.continues(pb(1, 0)));
+    assert_eq!(m.merge(pb(1, 0), PIECE_SIZE), 0x4000);
+    // gap → not contiguous
+    assert!(!m.continues(pb(1, 2)));
+}
+
+#[test]
+fn pipeline_drains_queue() {
+    let t = FakeTorrent;
+    let mut pl = PeerPipeline::new(3, 10, 250);
+    for i in 0..4 {
+        pl.request_queue.push(PendingBlock::new(pb(0, i)));
+    }
+    pl.request_queue.push(PendingBlock::new(pb(1, 0)));
+    pl.request_queue.push(PendingBlock::new(pb(1, 1)));
+    let reqs = pl.send_block_requests(&t, 0, 1000, |_| false, |_| {});
+    // desired_queue_size = 4 → only 4 blocks sent (first queue drain)
+    assert_eq!(reqs.len(), 4);
+    assert_eq!(pl.download_queue.len(), 4);
+    assert_eq!(pl.request_queue.len(), 2);
+    assert_eq!(pl.requested_ms, 1000);
+}
+
+#[test]
+fn pipeline_merges_large() {
+    let t = FakeTorrent;
+    let mut pl = PeerPipeline::new(3, 10, 250);
+    pl.request_large_blocks = true;
+    pl.desired_queue_size = 8;
+    for i in 0..4 {
+        pl.request_queue.push(PendingBlock::new(pb(0, i)));
+    }
+    pl.request_queue.push(PendingBlock::new(pb(1, 0)));
+    let reqs = pl.send_block_requests(&t, 0, 0, |_| false, |_| {});
+    // all 5 contiguous blocks merge into ONE request of 5*16k
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].length, 5 * 0x4000);
+    assert_eq!(pl.download_queue.len(), 5);
+    assert_eq!(pl.outstanding_bytes, 5 * 0x4000);
+}
+
+#[test]
+fn pipeline_timeout() {
+    let mut pl = PeerPipeline::new(3, 10, 250);
+    // no samples → settings default
+    assert_eq!(pl.request_timeout(), 10);
+    pl.request_time.add_sample(1000);
+    // 1 sample → avg + avg/5 = 1200 ms → ceil 2 s
+    assert_eq!(pl.request_timeout(), 2);
+    for _ in 0..5 {
+        pl.request_time.add_sample(500);
+    }
+    // converged to ~500 ms avg → < 1 s → clamped to 2 s
+    assert_eq!(pl.request_timeout(), 2);
+}
+
+#[test]
+fn desired_queue_aimd() {
+    let mut pl = PeerPipeline::new(3, 10, 250);
+    // slow-start: +1 per piece
+    pl.on_piece_received(0);
+    assert_eq!(pl.desired_queue_size, 5);
+    // snubbed → 1
+    pl.snubbed = true;
+    assert_eq!(pl.desired_queue_size(), 1);
+    pl.snubbed = false;
+    pl.slow_start = false;
+    // rate 100 kB/s * queue_time 3 s = 300 kB → ~18 blocks of 16 kB
+    pl.update_desired_queue_size(100_000, 0x4000);
+    assert_eq!(pl.desired_queue_size, 18);
+    // clamped to max
+    pl.update_desired_queue_size(10_000_000, 0x4000);
+    assert_eq!(pl.desired_queue_size, 250);
+}

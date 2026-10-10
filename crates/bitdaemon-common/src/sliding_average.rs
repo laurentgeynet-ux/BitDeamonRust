@@ -144,4 +144,10 @@ impl<const INVERTED_GAIN: i64> SlidingAverage64<INVERTED_GAIN> {
             0
         }
     }
+
+    /// `num_samples()`.
+    #[must_use]
+    pub fn num_samples(&self) -> i64 {
+        self.num_samples
+    }
 }
