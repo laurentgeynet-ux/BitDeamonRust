@@ -725,6 +725,19 @@ impl Session {
         }
     }
 
+    /// `pause_flags_t::graceful_pause` — stop issuing requests but
+    /// let in-flight writes finish; the `stopped` announce runs
+    /// immediately (upstream auto-manage defers it via
+    /// `m_graceful_pause_mode`, an explicit graceful pause does not).
+    pub fn set_paused_graceful(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
+        if let Some(t) = self.torrents.get_mut(ih) {
+            if !t.paused {
+                t.graceful_pause = true;
+            }
+        }
+        self.set_paused(ih, true, out);
+    }
+
     /// `torrent::do_pause`/`~torrent` — `stopped` for trackers that
     /// already announced `started`.
     fn announce_stopped(&self, t: &Torrent, out: &mut Vec<SessionOut>) {

@@ -197,6 +197,10 @@ pub struct Torrent {
     /// by the session at `add_torrent`, rewritten by
     /// `queue_position_set`).
     pub queue_seq: i64,
+    /// `m_graceful_pause` — pausing without cancelling in-flight
+    /// writes; requests stop immediately (`pause_flags_t::
+    /// graceful_pause` upstream).
+    pub graceful_pause: bool,
     /// `m_super_seeding` (flag) — initial-seed: leak one piece at
     /// a time per peer (`super_seeding()` upstream).
     pub super_seeding: bool,
@@ -279,6 +283,7 @@ impl Torrent {
             last_saved_resume: None,
             queue_seq: 0,
             time_critical: std::collections::BTreeMap::new(),
+            graceful_pause: false,
             super_seeding: false,
             upload_mode: false,
             share_mode: false,
@@ -1423,7 +1428,7 @@ impl Torrent {
             upload_mode: self.upload_mode,
             valid_metadata: true,
             files_checked: true,
-            graceful_pause: false,
+            graceful_pause: self.graceful_pause,
             time_critical_mode: false,
             num_peers: self.peers.len() as i32,
             whole_pieces_threshold: 0,
@@ -1507,7 +1512,7 @@ impl Torrent {
             upload_mode: false,
             valid_metadata: true,
             files_checked: true,
-            graceful_pause: false,
+            graceful_pause: self.graceful_pause,
             time_critical_mode: false,
             num_peers: (self.peers.len() + 1) as i32,
             whole_pieces_threshold: 0,
