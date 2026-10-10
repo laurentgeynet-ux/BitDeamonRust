@@ -9,6 +9,13 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `RateLimiter` (token bucket async partagé, équivalent
+  `bandwidth_channel`) câblé sur le chemin d'upload : les writers
+  throttlent les payloads `Piece` selon
+  `settings.upload_rate_limit`, recharge 1 Hz au tick.
+
+### Added
+
 - `peer_timeout` au tick : `PeerConn::last_active` (en
   `session_time`) est rafraîchi à chaque message entrant ; un pair
   silencieux plus de `peer_timeout` s est déconnecté

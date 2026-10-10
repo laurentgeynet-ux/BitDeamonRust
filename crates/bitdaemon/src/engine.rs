@@ -43,6 +43,70 @@ struct InboundPeerMsg {
     packet: PeerPacket,
 }
 
+/// token-bucket rate limiter shared by every peer writer task —
+/// async counterpart of upstream's `bandwidth_channel` grant loop
+/// (`throttle` sets bytes/s; `0` = unlimited, refill each tick,
+/// burst capped at one second of quota).
+pub struct RateLimiter {
+    tokens: std::sync::atomic::AtomicI64,
+    limit: std::sync::atomic::AtomicI64,
+    notify: tokio::sync::Notify,
+}
+
+impl RateLimiter {
+    /// `bandwidth_channel` — `0` means unlimited.
+    #[must_use]
+    pub fn new(bytes_per_sec: i64) -> Self {
+        Self {
+            tokens: std::sync::atomic::AtomicI64::new(bytes_per_sec),
+            limit: std::sync::atomic::AtomicI64::new(bytes_per_sec),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// `throttle`.
+    pub fn set_limit(&self, bytes_per_sec: i64) {
+        self.limit
+            .store(bytes_per_sec, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `update_quota` — grant one `dt_ms` worth of tokens (cap = 1s).
+    pub fn refill(&self, dt_ms: i64) {
+        let limit = self.limit.load(std::sync::atomic::Ordering::Relaxed);
+        if limit <= 0 {
+            return;
+        }
+        let grant = limit * dt_ms / 1000;
+        let _ = self.tokens.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |t| Some((t + grant).min(limit)),
+        );
+        self.notify.notify_waiters();
+    }
+
+    /// `assign_bandwidth` — wait until `n` bytes may be sent.
+    pub async fn acquire(&self, n: i64) {
+        if self.limit.load(std::sync::atomic::Ordering::Relaxed) <= 0 {
+            return;
+        }
+        loop {
+            if self
+                .tokens
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |t| (t >= n).then_some(t - n),
+                )
+                .is_ok()
+            {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
 /// result of an async dial job (`session_impl::on_connection_attempt`).
 struct DialDone {
     ih: Sha1Hash,
@@ -98,6 +162,10 @@ pub struct Engine {
     pub request_timeout: i32,
     /// `settings_pack::max_out_request_queue`.
     pub max_out_request_queue: u16,
+    /// `settings_pack::upload_rate_limit` — shared upload token
+    /// bucket for every peer writer (payload bytes only, like
+    /// upstream's channel-0 data accounting).
+    pub upload_limiter: Arc<RateLimiter>,
 }
 
 impl Engine {
@@ -133,6 +201,7 @@ impl Engine {
             queue_time: 3,
             request_timeout: 60,
             max_out_request_queue: 500,
+            upload_limiter: Arc::new(RateLimiter::new(0)),
         }
     }
 
@@ -195,6 +264,10 @@ impl Engine {
             self.on_dial_done(d);
         }
 
+        // `update_quota` — refill the upload bucket each tick
+        self.upload_limiter
+            .set_limit(self.session.settings.upload_rate_limit);
+        self.upload_limiter.refill(1000);
         // refresh the acceptor's known info-hash set
         *self.known_ihs.lock().unwrap_or_else(|e| e.into_inner()) =
             self.session.torrents.keys().copied().collect();
@@ -697,6 +770,7 @@ impl Engine {
 
         let inbound_tx = self.inbound_tx.clone();
         let gone_tx = self.gone_tx.clone();
+        let ul = self.upload_limiter.clone();
         // one task owns the stream: select between inbound decode and
         // outbound encode (upstream's per-connection pump).
         let h = tokio::spawn(async move {
@@ -725,6 +799,11 @@ impl Engine {
                     w = rx.recv() => {
                         match w {
                             Some(msg) => {
+                                // throttle bulk payload (upstream
+                                // throttles on the send path)
+                                if let PeerMessage::Piece { data, .. } = &msg {
+                                    ul.acquire(data.len() as i64).await;
+                                }
                                 if write_message(&mut s, &msg).await.is_err() {
                                     break;
                                 }

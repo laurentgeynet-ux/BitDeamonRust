@@ -390,3 +390,28 @@ async fn acceptor_pump_registers_peer() {
     assert_eq!(eng.session.torrents[&ih].peers.len(), 1);
     remote.abort();
 }
+
+#[tokio::test]
+async fn rate_limiter_throttles() {
+    use bitdaemon::engine::RateLimiter;
+    use std::sync::Arc;
+    let rl = Arc::new(RateLimiter::new(100)); // 100 B/s
+    rl.acquire(60).await;
+    // 40 left — this must wait for a refill
+    let rl2 = rl.clone();
+    let h = tokio::spawn(async move {
+        rl2.acquire(80).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert!(!h.is_finished());
+    rl.refill(1000); // +100 tokens
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert!(h.is_finished());
+}
+
+#[tokio::test]
+async fn rate_limiter_unlimited() {
+    use bitdaemon::engine::RateLimiter;
+    let rl = RateLimiter::new(0);
+    rl.acquire(1 << 30).await; // instant
+}
