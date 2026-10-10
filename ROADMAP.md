@@ -160,7 +160,11 @@ keepalive, `receive_buffer`, `chained_buffer` → `BytesMut`),
 `pe_crypto` (DH-768 + RC4, MSE constants) ✅,
 `ip_voter`, `ip_notifier`, `enum_net`, `parse_url`, `escape_string`,
 `utf8`, `socket_io` ✅, `bandwidth_limit`/`bandwidth_manager`/
-`bandwidth_queue_entry` (shared with session crate — decide home).
+`bandwidth_queue_entry` ✅ (`net::bandwidth`, token buckets + request
+queue with ttl expiry and disconnect quota return),
+`receive_buffer` + `crypto_receive_buffer` ✅ (cursor buffer,
+watermark shrink), `chained_buffer` ✅ (send-buffer chain,
+`Box<dyn BufferHolder>`).
 
 `bitdaemon-session` (partial): `PiecePicker`, `piece_block_progress`,
 `Torrent` skeleton for driving connections, `SmartBan` extension hooks.

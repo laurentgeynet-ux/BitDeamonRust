@@ -9,6 +9,27 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `bitdaemon_net` Phase-4 wave 3 (peer plumbing):
+  `receive_buffer` — cursor-based recv arena verbatim
+  (`recv_start`/`recv_pos`/`recv_end`, `reserve`/`grow`/`cut`/
+  `normalize` with `sliding_average<int64_t,20>` watermark shrink —
+  added `SlidingAverage64` to `bitdaemon-common` for the >i32
+  samples), `crypto_receive_buffer` wrapper (pass-through ↔ crypto
+  tracking via `INT_MAX` sentinel → `Option<usize>`);
+  `test_receive_buffer.cpp` → 15/15.
+  `chained_buffer` — heterogeneous send-buffer chain:
+  `Box<dyn BufferHolder>` replaces upstream's type-erased holder +
+  destruct/move function pointers; partial `pop_front`, tail-slack
+  `append`/`allocate_appendix`, `build_iovec`/mutable variant.
+  `bandwidth` — `BandwidthChannel` token bucket (`inf` = INT_MAX,
+  3-second burst cap, `need_queueing` fast-path), `BwRequest`
+  (priority pro-rata `distribute_quota * priority / tmp`, ttl=20),
+  `BandwidthManager` (queue, disconnecting-peer quota return, LIFO
+  dispatch); `Rc<BandwidthChannel>`/`Rc<dyn BandwidthSocket>` replace
+  raw channel pointers and `shared_ptr<bandwidth_socket>`.
+  Tests: `test_buffers_bandwidth` 12/12 covering refill caps,
+  pro-rata split, queue/total accounting, disconnect return.
+
 - `bitdaemon_net` Phase-4 wave 2 (filters + MSE crypto):
   `ip_filter` — `filter_impl<A>` over `BTreeMap` (implicit range ends,
   zero/plus_one/minus_one/max_addr carry verbatim), `IpFilter` (v4+v6),

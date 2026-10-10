@@ -122,10 +122,10 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `bt_peer_connection.cpp` (`bt_peer_connection.hpp`) | `net::peer::bt` | not started | BT handshake + BEP-10 |
 | `web_connection_base.cpp`, `web_peer_connection.cpp` | `net::peer::web` | not started | web seeds (Phase 8) |
 | `request_blocks.cpp`, `merge_block_requests.hpp`, `suggest_piece.hpp`, `peer_list.cpp`, `peer_info.cpp`, `peer.cpp`, `peer.hpp` | `net::peer::*` | not started | |
-| `receive_buffer.cpp` (net side), `packet_buffer.cpp`, `bandwidth_queue_entry.cpp` | `net::buffer` | not started | |
+| `receive_buffer.cpp` + `crypto_receive_buffer` | `net::receive_buffer` | **ported** | cursor buffer verbatim (start/pos/end, `reserve`/`grow`/`cut`/`normalize` + watermark shrink); `test_receive_buffer.cpp` 15/15; `packet_buffer.cpp` deferred to Phase 5 (uTP-only) |
 | `socket_type.cpp`, `socket.hpp`, `polymorphic_socket.hpp`, `instantiate_connection.cpp`, `union_endpoint.hpp` | `net::socket` + `net::transport` | in progress | `PeerStream`/`PeerConnector`/`PeerAcceptor` traits scaffolded (ADR-0008) |
 | `socks5_stream.cpp`, `http_stream.hpp`, `ssl.cpp`, `ssl_stream.hpp`, `i2p_stream.cpp`, `rtc_stream.cpp`, `rtc_signaling.cpp`, `websocket_stream.cpp` | `net::stream::*` | not started | proxies/TLS/I2P/RTC — rustls not openssl |
-| `pe_crypto.cpp` (`pe_crypto.hpp`), `rc4` internals, `crypto_provider` | `net::crypto` | not started | MSE/PE; `chacha20poly1305`+`rc4` crates |
+| `chained_buffer.cpp` (send-buffer) | `net::chained_buffer` | **ported** | `Box<dyn BufferHolder>` replaces type-erased holder + destruct/move thunks; slack-append, pop_front partial/full, iovec build |
 | `http_connection.cpp`, `http_parser.cpp`, `parse_url.cpp`, `resolver.cpp`, `resolver_interface.hpp` | `net::http` | not started | |
 | `http_tracker_connection.cpp`, `udp_tracker_connection.cpp`, `websocket_tracker_connection.cpp`, `tracker_manager.cpp`, `tracker_list.cpp` (net side) | `net::tracker` | not started | announce retry semantics; UDP tracker consumes `DatagramSocket` (ADR-0008) |
 | `upnp.cpp`, `natpmp.cpp`, `portmap.cpp` | `net::nat` | not started | |
@@ -133,7 +133,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `udp_socket.cpp`, `session_udp_sockets.hpp`, `listen_socket_handle.cpp` | `net::udp` | not started | wraps `DatagramSocket` (ADR-0008); default impl = `TokioUdpSocket` |
 | `utp_stream.cpp`, `utp_socket_manager.cpp` | `net::utp` | not started | **Phase 5** (OnionBit peer transport); runs on injected `DatagramSocket`, exposed as `PeerConnector`/`PeerAcceptor` |
 | `ip_filter.cpp`, `ip_voter.cpp`, `ip_notifier.cpp`, `enum_net.cpp`, `netlink.cpp`, `route.h`, `bind_to_device.hpp` | `net::iface` | not started | |
-| `bandwidth_limit.cpp`, `bandwidth_manager.cpp`, `bandwidth_socket.hpp` | `net::bandwidth` | not started | shared w/ session — see ADR-0003 |
+| `bandwidth_limit.cpp`, `bandwidth_manager.cpp`, `bandwidth_queue_entry.cpp`, `bandwidth_socket.hpp` | `net::bandwidth` | **ported** | `BandwidthChannel` token bucket (3 s burst cap, `inf`=INT_MAX), `BwRequest` (priority pro-rata `distribute*prio/tmp`, ttl 20), `BandwidthManager` queue + disconnect quota return; `Rc<BandwidthChannel>`/`Rc<dyn BandwidthSocket>` replace raw ptr/`shared_ptr` |
 | `proxy_base.cpp`, `proxy_settings.cpp` | `net::proxy` | not started | |
 | `extensions.hpp`, `i2p_pex.cpp` (ext part), `ut_pex` protocol bits | `net::ext` | not started | extension registry |
 | `identify_client.cpp` (net side), `peer_class` filtering | `net::peer::class` | not started | |

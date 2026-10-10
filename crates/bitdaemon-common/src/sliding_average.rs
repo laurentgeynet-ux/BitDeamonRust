@@ -80,3 +80,68 @@ impl<const INVERTED_GAIN: i32> SlidingAverage<INVERTED_GAIN> {
         self.num_samples
     }
 }
+
+/// `sliding_average<std::int64_t, N>` — same algorithm on `i64`,
+/// used where samples may exceed `i32` (e.g. the receive-buffer
+/// watermark tracks up to tens of MiB).
+#[derive(Debug, Clone, Default)]
+pub struct SlidingAverage64<const INVERTED_GAIN: i64> {
+    /// `m_mean`.
+    mean: i64,
+    /// `m_average_deviation`.
+    average_deviation: i64,
+    /// `m_num_samples`.
+    num_samples: i64,
+}
+
+impl<const INVERTED_GAIN: i64> SlidingAverage64<INVERTED_GAIN> {
+    /// `fixed_point`.
+    pub const FIXED_POINT: i64 = 64;
+
+    /// `add_sample`.
+    pub fn add_sample(&mut self, sample: i64) {
+        let s = if sample >= i64::MAX / Self::FIXED_POINT / 4 {
+            i64::MAX / 4
+        } else if sample <= i64::MIN / Self::FIXED_POINT / 4 {
+            i64::MIN / 4
+        } else {
+            sample * Self::FIXED_POINT
+        };
+
+        let deviation = if self.num_samples > 0 {
+            (self.mean - s).abs()
+        } else {
+            0
+        };
+
+        if self.num_samples < INVERTED_GAIN {
+            self.num_samples += 1;
+        }
+
+        self.mean += (s - self.mean) / self.num_samples;
+
+        if self.num_samples > 1 {
+            self.average_deviation += (deviation - self.average_deviation) / (self.num_samples - 1);
+        }
+    }
+
+    /// `mean()`.
+    #[must_use]
+    pub fn mean(&self) -> i64 {
+        if self.num_samples > 0 {
+            (self.mean + 32) / Self::FIXED_POINT
+        } else {
+            0
+        }
+    }
+
+    /// `avg_deviation()`.
+    #[must_use]
+    pub fn avg_deviation(&self) -> i64 {
+        if self.num_samples > 1 {
+            (self.average_deviation + 32) / Self::FIXED_POINT
+        } else {
+            0
+        }
+    }
+}
