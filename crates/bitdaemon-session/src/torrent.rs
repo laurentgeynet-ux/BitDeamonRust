@@ -197,6 +197,9 @@ pub struct Torrent {
     /// by the session at `add_torrent`, rewritten by
     /// `queue_position_set`).
     pub queue_seq: i64,
+    /// optimistic-unchoke round-robin cursor (upstream rotates one
+    /// choked interested peer every `optimistic_unchoke_interval`).
+    pub optimistic_cursor: usize,
     /// `m_graceful_pause` — pausing without cancelling in-flight
     /// writes; requests stop immediately (`pause_flags_t::
     /// graceful_pause` upstream).
@@ -290,6 +293,7 @@ impl Torrent {
             last_saved_resume: None,
             queue_seq: 0,
             time_critical: std::collections::BTreeMap::new(),
+            optimistic_cursor: 0,
             graceful_pause: false,
             super_seeding: false,
             upload_mode: false,

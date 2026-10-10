@@ -1513,6 +1513,8 @@ impl Session {
         }
         let now = Instant::now();
         let slots = self.settings.unchoke_slots;
+        // upstream `optimistic_unchoke_interval` default 30 s.
+        let rotate_optimistic = self.session_time % 30 == 0;
         let ihs: Vec<Sha1Hash> = self.torrents.keys().copied().collect();
         for ih in ihs {
             let Some(t) = self.torrents.get_mut(&ih) else {
@@ -1550,7 +1552,24 @@ impl Session {
                 crate::choker::DEFAULT_SEEDING_PIECE_QUOTA,
                 now,
             );
-            let keep: std::collections::BTreeSet<u64> = list[..n].iter().map(|p| p.id).collect();
+            let mut keep: std::collections::BTreeSet<u64> =
+                list[..n].iter().map(|p| p.id).collect();
+            if rotate_optimistic {
+                // round-robin over choked interested peers not in
+                // the rate-sorted keep-set (upstream bumps the slot
+                // for the same peer when re-picked).
+                let cands: Vec<u64> = t
+                    .peers
+                    .iter()
+                    .filter(|(id, c)| c.choked && c.peer_interested && !keep.contains(id))
+                    .map(|(id, _)| *id)
+                    .collect();
+                if !cands.is_empty() {
+                    let pick = cands[t.optimistic_cursor % cands.len()];
+                    t.optimistic_cursor += 1;
+                    keep.insert(pick);
+                }
+            }
             let mut eff = Vec::new();
             for (id, c) in &mut t.peers {
                 let want_unchoke = keep.contains(id) && c.peer_interested;
