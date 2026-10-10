@@ -169,6 +169,11 @@ impl SessionHandle {
     }
 
     /// `torrent::pause`/`resume` by info-hash.
+    /// `apply_settings_pack` on the shared session.
+    pub fn apply_settings(&self, s: crate::settings::SessionSettings) {
+        lock(&self.inner).apply_settings(s);
+    }
+
     pub fn set_paused(&self, ih: &Sha1Hash, paused: bool) {
         lock(&self.inner).set_paused(ih, paused, &mut Vec::new());
     }

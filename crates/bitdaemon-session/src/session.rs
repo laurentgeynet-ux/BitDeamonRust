@@ -1260,6 +1260,13 @@ impl Session {
         self.ip_filter.access(addr)
     }
 
+    /// `apply_settings_pack` — hot-swap the settings bag. Upstream
+    /// re-reads everything lazily; we mirror that by replacing the
+    /// struct (all reads go through `self.settings`).
+    pub fn apply_settings(&mut self, s: crate::settings::SessionSettings) {
+        self.settings = s;
+    }
+
     /// `start_dht` — bind the DHT node for `bind_ip`'s family.
     /// `id`/`None` → generate (BEP-42 enforced by settings).
     pub fn enable_dht(

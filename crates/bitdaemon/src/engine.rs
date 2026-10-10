@@ -1127,6 +1127,17 @@ impl Engine {
         Ok(peer)
     }
 
+    /// `session_impl::apply_settings_pack` — swap settings and
+    /// re-arm the engine-side limiters/timeouts immediately.
+    pub fn apply_settings(&mut self, s: bitdaemon_session::settings::SessionSettings) {
+        self.upload_limiter.set_limit(s.upload_rate_limit);
+        self.download_limiter.set_limit(s.download_rate_limit);
+        self.queue_time = s.request_queue_time.as_secs() as i32;
+        self.request_timeout = s.request_timeout.as_secs() as i32;
+        self.max_out_request_queue = s.max_allowed_in_queue.clamp(0, i32::from(u16::MAX)) as u16;
+        slock(&self.session).apply_settings(s);
+    }
+
     /// `session_handle` for downstream — shares this engine's
     /// `Session` actor (`SessionHandle::from_shared`).
     #[must_use]
