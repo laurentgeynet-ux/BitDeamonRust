@@ -22,6 +22,8 @@
 
 #![forbid(unsafe_code)]
 
+/// `peer_connection` state machine (bitfield, choke, picker drive).
+pub mod peer_conn;
 /// `peer_connection` request pipeline + `merge_block_requests`.
 pub mod peer_pipeline;
 /// Client session (`libtorrent::session` / `session_handle`).

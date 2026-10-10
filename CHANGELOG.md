@@ -24,6 +24,12 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added — `bitdaemon-session` (piece picking)
 
+- `peer_conn` — the `peer_connection` state machine assembled:
+  remote bitfield (have/have-none/have-all/dont-have), bilateral
+  choke/interested flags, BEP-6 suggest + allowed-fast sets, BEP-10
+  remote extension ids, `peer_key()` identity for the picker, and
+  `drive_requests` which chains `request_a_block` →
+  `send_block_requests` into wire `PeerRequest`s.
 - `peer_pipeline` — the request-pipeline half of
   `aux_/peer_connection.cpp`: `pending_block`, request/download
   queues, `RequestMerger` block coalescing (byte-range merge with

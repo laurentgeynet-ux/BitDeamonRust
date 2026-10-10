@@ -633,7 +633,7 @@ fn pipeline_drains_queue() {
     }
     pl.request_queue.push(PendingBlock::new(pb(1, 0)));
     pl.request_queue.push(PendingBlock::new(pb(1, 1)));
-    let reqs = pl.send_block_requests(&t, 0, 1000, |_| false, |_| {});
+    let reqs = pl.send_block_requests(&t, 0, 1000, |_| false);
     // desired_queue_size = 4 → only 4 blocks sent (first queue drain)
     assert_eq!(reqs.len(), 4);
     assert_eq!(pl.download_queue.len(), 4);
@@ -651,7 +651,7 @@ fn pipeline_merges_large() {
         pl.request_queue.push(PendingBlock::new(pb(0, i)));
     }
     pl.request_queue.push(PendingBlock::new(pb(1, 0)));
-    let reqs = pl.send_block_requests(&t, 0, 0, |_| false, |_| {});
+    let reqs = pl.send_block_requests(&t, 0, 0, |_| false);
     // all 5 contiguous blocks merge into ONE request of 5*16k
     assert_eq!(reqs.len(), 1);
     assert_eq!(reqs[0].length, 5 * 0x4000);
@@ -691,4 +691,49 @@ fn desired_queue_aimd() {
     // clamped to max
     pl.update_desired_queue_size(10_000_000, 0x4000);
     assert_eq!(pl.desired_queue_size, 250);
+}
+
+// ---------- peer_conn (peer_connection assembled) ----------
+
+use bitdaemon_session::peer_conn::PeerConn;
+
+#[test]
+fn peer_conn_drive() {
+    let mut picker = PiecePicker::new(i64::from(4 * PIECE_SIZE), PIECE_SIZE);
+    let have = all_have(4);
+    picker.inc_refcount_bitfield(&have);
+
+    let mut conn = PeerConn::new(4, PeerPipeline::new(3, 10, 250), 0);
+    conn.on_bitfield(&have);
+    assert_eq!(conn.num_pieces, 4);
+    assert!(conn.has_piece(p(2)));
+    conn.on_unchoke(); // a choked peer picks only allowed-fast
+
+    let t = tctx();
+    let ft = FakeTorrent;
+    let mut stats = Stats([0; 16]);
+    let (invoked, _end, reqs) = conn.drive_requests(&mut picker, &t, &ft, 0, 0, 0, &mut stats);
+    assert!(invoked);
+    // desired_queue_size = 4 → 4 wire requests, marked in picker
+    assert_eq!(reqs.len(), 4);
+    assert!(reqs.iter().all(|r| picker.is_requested(PieceBlock {
+        piece_index: r.piece,
+        block_index: r.start / 0x4000,
+    })));
+}
+
+#[test]
+fn peer_conn_suggest_have() {
+    let mut conn = PeerConn::new(4, PeerPipeline::new(3, 10, 250), 0);
+    conn.on_suggest(p(3));
+    conn.on_suggest(p(3)); // dup ignored
+    conn.on_suggest(p(1));
+    assert_eq!(conn.suggested_pieces, vec![p(3), p(1)]);
+
+    // on_have marks the bit and reports interestingness
+    let we_have = |i: PieceIndex| i == p(0);
+    assert!(conn.on_have(p(1), we_have)); // we don't have 1 → interesting
+    assert!(conn.interesting);
+    assert!(!conn.on_have(p(0), we_have)); // we have it
+    assert!(!conn.on_have(p(1), we_have)); // already had the bit
 }

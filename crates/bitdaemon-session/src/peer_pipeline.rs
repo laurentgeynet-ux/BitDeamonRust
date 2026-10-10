@@ -255,17 +255,17 @@ impl PeerPipeline {
 
     /// `send_block_requests_impl` — move queued blocks to the wire.
     ///
-    /// Returns `(requests, bytes)`: each `PeerRequest` (already
-    /// coalesced when `request_large_blocks`) plus the send-buffer
-    /// offset bookkeeping. `is_downloaded`/`abort` are callbacks into
-    /// the picker for the "arrived anyway" case.
+    /// Returns the `PeerRequest`s to write (already coalesced when
+    /// `request_large_blocks`). `already_downloaded` is the callback
+    /// into the picker for the "arrived anyway" case: it must check
+    /// `is_downloaded` and call `abort_download` — returning true
+    /// drops the block without sending.
     pub fn send_block_requests<T: PipelineTorrent>(
         &mut self,
         t: &T,
         send_buffer_size: usize,
         now_ms: i64,
-        mut is_downloaded: impl FnMut(PieceBlock) -> bool,
-        mut abort_download: impl FnMut(PieceBlock),
+        mut already_downloaded: impl FnMut(PieceBlock) -> bool,
     ) -> Vec<PeerRequest> {
         if t.graceful_pause() || t.upload_mode() {
             return Vec::new();
@@ -289,8 +289,7 @@ impl PeerPipeline {
 
             // arrived "unexpectedly" (timed-out re-request that came
             // anyway): don't send it
-            if is_downloaded(block.block) {
-                abort_download(block.block);
+            if already_downloaded(block.block) {
                 continue;
             }
 
