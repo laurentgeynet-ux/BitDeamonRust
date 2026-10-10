@@ -934,6 +934,11 @@ impl Session {
                     msg: PeerMessage::DhtPort(port),
                 });
             }
+            // `peer_connect_alert` on successful registration.
+            self.alerts.post(Alert::PeerConnect {
+                ih: *ih,
+                remote: remote.to_string(),
+            });
             t.add_peer(peer, conn);
             // BEP-6: FAST peers get their allowed-fast set right
             // after connect (upstream `send_allowed_set`).
