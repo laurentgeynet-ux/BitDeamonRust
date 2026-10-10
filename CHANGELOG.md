@@ -9,6 +9,15 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **Ops stockage (`move_storage`/`rename_file`/`delete_files`)** —
+  entrées `Session` + nouvelles variantes `DiskCompleted`
+  (`MoveStorage`/`RenameFile`/`DeleteFiles`) routées via
+  `disk_completions`/`drain_disk_completed`; alertes upstream
+  `storage_moved{,_failed}`, `file_renamed{,_failed}`,
+  `torrent_deleted{,_failed}`; `save_path` mis à jour au succès;
+  `remove_torrent` poste désormais `torrent_removed_alert`.
+  API `TorrentHandle::{move_storage,rename_file,delete_files}`.
+
 - **Ops `torrent_handle`** — `force_recheck` (re-hash par pièce
   via `DiskHash`, `checking`/`checking_pieces` armé puis drainé par
   `on_piece_verified`), `prioritize_pieces`/`piece_priority`

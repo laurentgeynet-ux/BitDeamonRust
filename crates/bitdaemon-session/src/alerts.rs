@@ -124,6 +124,30 @@ pub enum Alert {
         /// statuses.
         statuses: Vec<crate::status::TorrentStatus>,
     },
+    /// `storage_moved_alert`.
+    StorageMoved { ih: Sha1Hash, path: String },
+    /// `storage_moved_failed_alert`.
+    StorageMovedFailed {
+        ih: Sha1Hash,
+        path: String,
+        error: String,
+    },
+    /// `file_renamed_alert`.
+    FileRenamed {
+        ih: Sha1Hash,
+        index: i32,
+        name: String,
+    },
+    /// `file_rename_failed_alert`.
+    FileRenameFailed {
+        ih: Sha1Hash,
+        index: i32,
+        error: String,
+    },
+    /// `torrent_deleted_alert`.
+    TorrentDeleted(Sha1Hash),
+    /// `torrent_delete_failed_alert`.
+    TorrentDeleteFailed { ih: Sha1Hash, error: String },
     /// `session_error_alert`.
     SessionError(String),
 }
@@ -141,9 +165,13 @@ impl Alert {
                 AlertCategory::PROGRESS
             }
             Self::PeerDisconnected { .. } | Self::PeerConnect { .. } => AlertCategory::PEER,
-            Self::HashFailed { .. } | Self::FileError { .. } => {
-                AlertCategory::ERROR.or(AlertCategory::STORAGE)
-            }
+            Self::HashFailed { .. }
+            | Self::FileError { .. }
+            | Self::StorageMovedFailed { .. }
+            | Self::FileRenameFailed { .. }
+            | Self::TorrentDeleteFailed { .. } => AlertCategory::ERROR.or(AlertCategory::STORAGE),
+            Self::StorageMoved { .. } | Self::FileRenamed { .. } => AlertCategory::STORAGE,
+            Self::TorrentDeleted(_) => AlertCategory::STATUS.or(AlertCategory::STORAGE),
             Self::TrackerError { .. }
             | Self::TrackerReply { .. }
             | Self::ScrapeReply { .. }

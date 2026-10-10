@@ -234,6 +234,26 @@ impl TorrentHandle {
         lock(&self.session).force_recheck(&self.info_hash, out);
     }
 
+    /// `move_storage`.
+    pub fn move_storage(
+        &self,
+        path: std::path::PathBuf,
+        flags: bitdaemon_disk::storage::MoveFlags,
+    ) {
+        lock(&self.session).move_storage(&self.info_hash, path, flags);
+    }
+
+    /// `rename_file`.
+    pub fn rename_file(&self, index: bitdaemon_common::types::FileIndex, name: std::path::PathBuf) {
+        lock(&self.session).rename_file(&self.info_hash, index, name);
+    }
+
+    /// `delete_files` — removes the torrent and schedules payload
+    /// deletion; `torrent_deleted{,_failed}` arrives via alerts.
+    pub fn delete_files(&self, out: &mut SessionOutVec) {
+        lock(&self.session).delete_files(&self.info_hash, 0, out);
+    }
+
     /// `file_progress` — per-file downloaded bytes.
     #[must_use]
     pub fn file_progress(&self) -> Vec<i64> {

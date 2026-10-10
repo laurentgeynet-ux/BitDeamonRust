@@ -191,6 +191,33 @@ pub enum DiskCompleted {
         /// job result.
         err: StorageError,
     },
+    /// `async_move_storage` verdict.
+    MoveStorage {
+        /// torrent.
+        ih: Sha1Hash,
+        /// new `save_path`.
+        path: std::path::PathBuf,
+        /// job result.
+        err: StorageError,
+    },
+    /// `async_rename_file` verdict.
+    RenameFile {
+        /// torrent.
+        ih: Sha1Hash,
+        /// the file.
+        index: bitdaemon_common::types::FileIndex,
+        /// requested name.
+        name: std::path::PathBuf,
+        /// job result.
+        err: StorageError,
+    },
+    /// `async_delete_files` verdict.
+    DeleteFiles {
+        /// torrent.
+        ih: Sha1Hash,
+        /// job result.
+        err: StorageError,
+    },
     /// `async_hash` — SHA-1 of `piece` is `hash` (compare pending
     /// — Torrent does not yet hold `TorrentInfo` piece hashes).
     Hash {
@@ -310,6 +337,56 @@ impl Session {
                                 }),
                             );
                         }
+                    }
+                }
+                DiskCompleted::MoveStorage { ih, path, err } => {
+                    // `storage_moved{,_failed}_alert`
+                    if err.is_ok() {
+                        if let Some(t) = self.torrents.get_mut(&ih) {
+                            t.save_path = path.to_string_lossy().into_owned();
+                        }
+                        self.alerts.post(Alert::StorageMoved {
+                            ih,
+                            path: path.to_string_lossy().into_owned(),
+                        });
+                    } else {
+                        self.alerts.post(Alert::StorageMovedFailed {
+                            ih,
+                            path: path.to_string_lossy().into_owned(),
+                            error: err.to_string(),
+                        });
+                    }
+                }
+                DiskCompleted::RenameFile {
+                    ih,
+                    index,
+                    name,
+                    err,
+                } => {
+                    // `file_renamed{,_failed}_alert`
+                    if err.is_ok() {
+                        self.alerts.post(Alert::FileRenamed {
+                            ih,
+                            index: index.0,
+                            name: name.to_string_lossy().into_owned(),
+                        });
+                    } else {
+                        self.alerts.post(Alert::FileRenameFailed {
+                            ih,
+                            index: index.0,
+                            error: err.to_string(),
+                        });
+                    }
+                }
+                DiskCompleted::DeleteFiles { ih, err } => {
+                    // `torrent_deleted{,_failed}_alert`
+                    if err.is_ok() {
+                        self.alerts.post(Alert::TorrentDeleted(ih));
+                    } else {
+                        self.alerts.post(Alert::TorrentDeleteFailed {
+                            ih,
+                            error: err.to_string(),
+                        });
                     }
                 }
                 DiskCompleted::CheckFiles { ih, accepted, err } => {
@@ -512,7 +589,11 @@ impl Session {
         if let Some(t) = self.torrents.get(ih) {
             self.announce_stopped(t, out);
         }
-        self.torrents.remove(ih)
+        let removed = self.torrents.remove(ih);
+        if removed.is_some() {
+            self.alerts.post(Alert::TorrentRemoved(*ih));
+        }
+        removed
     }
 
     /// `pause`/`resume` (user pause — the auto-managed queue
@@ -660,6 +741,95 @@ impl Session {
             t.recheck_piece_done();
         }
         self.route(*ih, eff, out);
+    }
+
+    /// `move_storage` — upstream `torrent_handle::move_storage`
+    /// → `async_move_storage` (verdict arrives as
+    /// `DiskCompleted::MoveStorage` → `storage_moved{,_failed}`).
+    pub fn move_storage(
+        &mut self,
+        ih: &Sha1Hash,
+        path: std::path::PathBuf,
+        flags: bitdaemon_disk::storage::MoveFlags,
+    ) {
+        let (Some(disk), Some(t)) = (self.disk.clone(), self.torrents.get(ih)) else {
+            return;
+        };
+        let storage = t.storage;
+        let tx = self.disk_tx.clone();
+        let ih = *ih;
+        let path2 = path.clone();
+        disk.async_move_storage(
+            storage,
+            path,
+            flags,
+            Box::new(move |_status, path, err| {
+                let _ = tx.send(DiskCompleted::MoveStorage {
+                    ih,
+                    path: if path.as_os_str().is_empty() {
+                        path2.clone()
+                    } else {
+                        path
+                    },
+                    err,
+                });
+            }),
+        );
+    }
+
+    /// `rename_file` — `async_rename_file` → `file_renamed{,_failed}`.
+    pub fn rename_file(
+        &mut self,
+        ih: &Sha1Hash,
+        index: bitdaemon_common::types::FileIndex,
+        name: std::path::PathBuf,
+    ) {
+        let (Some(disk), Some(t)) = (self.disk.clone(), self.torrents.get(ih)) else {
+            return;
+        };
+        let storage = t.storage;
+        let tx = self.disk_tx.clone();
+        let ih = *ih;
+        disk.async_rename_file(
+            storage,
+            index,
+            name,
+            Box::new(move |name, index, err| {
+                let _ = tx.send(DiskCompleted::RenameFile {
+                    ih,
+                    index,
+                    name,
+                    err,
+                });
+            }),
+        );
+    }
+
+    /// `delete_files` — upstream `torrent_handle::delete_files`:
+    /// remove the torrent then `async_delete_files` the payload
+    /// (`torrent_deleted{,_failed}` on completion).
+    pub fn delete_files(&mut self, ih: &Sha1Hash, options: u8, out: &mut Vec<SessionOut>) {
+        let Some(t) = self.torrents.get(ih) else {
+            return;
+        };
+        let storage = t.storage;
+        if self.disk.is_none() {
+            // no disk → just remove (upstream only schedules the job
+            // when a disk thread exists)
+            self.remove_torrent(ih, out);
+            return;
+        }
+        let disk = self.disk.clone().expect("checked");
+        self.remove_torrent(ih, out);
+        let tx = self.disk_tx.clone();
+        let ih = *ih;
+        disk.async_delete_files(
+            storage,
+            options,
+            Box::new(move |err| {
+                let _ = tx.send(DiskCompleted::DeleteFiles { ih, err });
+            }),
+        );
     }
 
     /// `force_recheck` — clear `have` and re-hash every piece
