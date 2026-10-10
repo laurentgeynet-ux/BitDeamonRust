@@ -7,6 +7,13 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — peer_info
+
+- `peer_info.rs` — snapshot public `peer_info` (flags
+  `PeerFlags`/`ConnectionType`/`BandwidthState` verbatim) +
+  `Torrent::peer_info` (peuplé depuis `PeerConn`/`PeerPipeline` —
+  champs non trackés documentés à 0).
+
 ### Added — fastresume glue
 
 - `Torrent::to_resume_data` / `apply_resume_data` — port fidèle de

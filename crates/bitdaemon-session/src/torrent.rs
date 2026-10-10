@@ -297,6 +297,112 @@ impl Torrent {
         }
     }
 
+    /// `get_peer_info` — build the public `peer_info` snapshot for
+    /// one connected peer (`Torrent::get_peer_info` upstream fills
+    /// from `peer_connection` counters).
+    #[must_use]
+    pub fn peer_info(
+        &self,
+        id: u64,
+        remote: Option<std::net::SocketAddr>,
+    ) -> Option<crate::peer_info::PeerInfo> {
+        use crate::peer_info::{BandwidthState, ConnectionType, PeerFlags, PeerInfo};
+        let c = self.peers.get(&id)?;
+        let mut flags = PeerFlags::default();
+        if c.interesting {
+            flags = flags.with(PeerFlags::INTERESTING);
+        }
+        if c.choked {
+            flags = flags.with(PeerFlags::CHOKED);
+        }
+        if c.peer_interested {
+            flags = flags.with(PeerFlags::REMOTE_INTERESTED);
+        }
+        if c.peer_choked {
+            flags = flags.with(PeerFlags::REMOTE_CHOKED);
+        }
+        if c.bitfield_received {
+            flags = flags.with(PeerFlags::HANDSHAKE);
+        }
+        if c.remote_upload_only {
+            flags = flags.with(PeerFlags::UPLOAD_ONLY);
+        }
+        if c.pipeline.snubbed {
+            flags = flags.with(PeerFlags::SNUBBED);
+        }
+        if c.pipeline.endgame {
+            flags = flags.with(PeerFlags::ENDGAME_MODE);
+        }
+        if c.num_pieces >= self.num_pieces {
+            flags = flags.with(PeerFlags::SEED);
+        }
+        Some(PeerInfo {
+            flags,
+            source: bitdaemon_common::flags::PeerSourceFlags::INCOMING,
+            up_speed: 0,
+            down_speed: 0,
+            payload_up_speed: 0,
+            payload_down_speed: 0,
+            pid: c.peer_id.unwrap_or_default(),
+            pieces: c.peer_pieces.clone(),
+            queue_bytes: c.pipeline.outstanding_bytes.min(i64::from(i32::MAX)) as i32,
+            request_timeout: if c.pipeline.download_queue.is_empty() {
+                -1
+            } else {
+                c.pipeline.request_timeout_setting
+            },
+            send_buffer_size: 0,
+            used_send_buffer: 0,
+            receive_buffer_size: 0,
+            used_receive_buffer: 0,
+            receive_buffer_watermark: 0,
+            num_hashfails: 0,
+            download_queue_length: c.pipeline.download_queue.len() as i32,
+            timed_out_requests: c
+                .pipeline
+                .download_queue
+                .iter()
+                .filter(|b| b.timed_out)
+                .count() as i32,
+            busy_requests: c.pipeline.download_queue.iter().filter(|b| b.busy).count() as i32,
+            requests_in_buffer: c.pipeline.request_queue.len() as i32,
+            target_dl_queue_length: i32::from(c.pipeline.desired_queue_size),
+            upload_queue_length: c.upload_queue.len() as i32,
+            failcount: 0,
+            downloading_piece_index: c
+                .pipeline
+                .download_queue
+                .first()
+                .map_or(-1, |b| b.block.piece_index.0),
+            downloading_block_index: c
+                .pipeline
+                .download_queue
+                .first()
+                .map_or(-1, |b| b.block.block_index),
+            downloading_progress: 0,
+            downloading_total: 0,
+            connection_type: ConnectionType::STANDARD_BITTORRENT,
+            pending_disk_bytes: 0,
+            pending_disk_read_bytes: 0,
+            send_quota: 0,
+            receive_quota: 0,
+            rtt: 0,
+            num_pieces: c.num_pieces,
+            download_rate_peak: 0,
+            upload_rate_peak: 0,
+            progress_ppm: if self.num_pieces > 0 {
+                (i64::from(c.num_pieces) * 1_000_000 / i64::from(self.num_pieces)) as i32
+            } else {
+                0
+            },
+            remote_endpoint: remote,
+            local_endpoint: None,
+            read_state: BandwidthState::NETWORK,
+            write_state: BandwidthState::NETWORK,
+            client: c.client_version.clone(),
+        })
+    }
+
     /// `is_seed`.
     #[must_use]
     pub fn is_seed(&self) -> bool {

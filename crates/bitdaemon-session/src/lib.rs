@@ -24,6 +24,8 @@
 
 /// `peer_connection` state machine (bitfield, choke, picker drive).
 pub mod peer_conn;
+/// `peer_info.hpp` — per-peer status snapshot + flag constants.
+pub mod peer_info;
 /// `peer_connection` request pipeline + `merge_block_requests`.
 pub mod peer_pipeline;
 /// Client session (`libtorrent::session` / `session_handle`).
