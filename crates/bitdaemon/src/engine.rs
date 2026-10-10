@@ -1220,8 +1220,8 @@ impl Engine {
                 remote: Some(remote),
                 stream: Ok(s),
                 outbound: true,
-                fast: hs.as_ref().map_or(false, |h| h.supports_fast()),
-                dht: hs.as_ref().map_or(false, |h| h.supports_dht()),
+                fast: hs.as_ref().is_ok_and(|h| h.supports_fast()),
+                dht: hs.as_ref().is_ok_and(|h| h.supports_dht()),
             });
         });
         self.tasks.push(h);
