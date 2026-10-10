@@ -202,6 +202,7 @@ dependencies = [
  "futures",
  "rand",
  "sha1",
+ "sha2",
  "thiserror",
  "tokio",
  "tracing",

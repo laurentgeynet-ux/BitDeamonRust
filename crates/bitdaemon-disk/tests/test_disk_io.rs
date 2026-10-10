@@ -189,7 +189,7 @@ fn hash_job_computes_piece_sha1() {
             ret: 0,
             error: Default::default(),
             action: JobKind::Hash(bitdaemon_disk::disk_job::HashJob {
-                handler: Box::new(move |_, h, _| {
+                handler: Box::new(move |_, h, _v2, _| {
                     *g2.lock().unwrap() = h;
                     d2.fetch_add(1, Ordering::Relaxed);
                 }),

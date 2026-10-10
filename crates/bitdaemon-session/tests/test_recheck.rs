@@ -288,3 +288,46 @@ fn flags_ban_and_tracker_ops() {
     th.set_max_connections(10);
     th.set_max_uploads(4);
 }
+
+#[test]
+fn v2_piece_verifies_via_merkle_blocks() {
+    // real v2 torrent: 1 file of exactly 4×16 KiB blocks = 1 piece.
+    use bitdaemon_common::Sha256Hash;
+    use bitdaemon_common::types::{FileIndex, PieceIndex, StorageIndex};
+    use bitdaemon_core::create_torrent::{CreateFileEntry, CreateFlags, CreateTorrent};
+    use bitdaemon_core::merkle::merkle_root;
+    use bitdaemon_core::torrent_info::{LoadTorrentLimits, load_torrent_buffer};
+    use bitdaemon_session::torrent::Torrent;
+    use sha2::{Digest as _, Sha256};
+
+    let data: Vec<u8> = (0..4 * 16384).map(|i| (i % 251) as u8).collect();
+    let blocks: Vec<Sha256Hash> = data
+        .chunks(16384)
+        .map(|c| Sha256Hash::from_bytes(&Sha256::digest(c)).unwrap())
+        .collect();
+    let root = merkle_root(&blocks, Sha256Hash::default());
+
+    let mut ct = CreateTorrent::new(
+        vec![CreateFileEntry {
+            filename: b"v2f".to_vec(),
+            size: 4 * 16384,
+            flags: bitdaemon_core::file_storage::FileFlags::NONE,
+            mtime: 0,
+            symlink: Vec::new(),
+        }],
+        4 * 16384,
+        CreateFlags::V2_ONLY,
+    )
+    .unwrap();
+    ct.set_hash2(FileIndex(0), 0, root).unwrap();
+    let buf = ct.generate_buf().unwrap();
+    let atp = load_torrent_buffer(&buf, &LoadTorrentLimits::default()).unwrap();
+    let mut t = Torrent::from_params(&atp, StorageIndex(0), &mut Vec::new()).unwrap();
+    assert!(t.is_v2_only());
+    assert!(t.verify_v2_blocks(PieceIndex(0), &blocks));
+
+    // corrupt one block hash → piece must fail
+    let mut bad = blocks.clone();
+    bad[2] = Sha256Hash::from_bytes(&[0xff; 32]).unwrap();
+    assert!(!t.verify_v2_blocks(PieceIndex(0), &bad));
+}

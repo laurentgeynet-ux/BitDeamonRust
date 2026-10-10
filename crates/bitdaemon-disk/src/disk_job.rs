@@ -106,8 +106,8 @@ pub struct WriteJob {
 
 /// `job::hash` — SHA-1 over a whole piece (+ block SHA-256s).
 pub struct HashJob {
-    /// handler — `(piece, sha1, error)`.
-    pub handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, StorageError) + Send>,
+    /// handler — `(piece, sha1, block_hashes, error)`.
+    pub handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, Vec<Sha256Hash>, StorageError) + Send>,
     /// `piece`.
     pub piece: PieceIndex,
     /// `block_hashes` — out: per-16KiB-block SHA-256 (v2).
@@ -278,7 +278,12 @@ impl DiskJob {
                 std::mem::take(&mut self.error),
             ),
             JobKind::Write(j) => (j.handler)(std::mem::take(&mut self.error)),
-            JobKind::Hash(j) => (j.handler)(j.piece, j.piece_hash, std::mem::take(&mut self.error)),
+            JobKind::Hash(mut j) => (j.handler)(
+                j.piece,
+                j.piece_hash,
+                std::mem::take(&mut j.block_hashes),
+                std::mem::take(&mut self.error),
+            ),
             JobKind::Hash2(j) => {
                 (j.handler)(j.piece, j.piece_hash2, std::mem::take(&mut self.error))
             }

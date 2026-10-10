@@ -260,6 +260,8 @@ pub enum DiskCompleted {
         piece: PieceIndex,
         /// computed SHA-1.
         hash: bitdaemon_common::Sha1Hash,
+        /// computed per-block SHA-256s (v2 pieces; empty for v1).
+        block_hashes: Vec<bitdaemon_common::Sha256Hash>,
         /// job result.
         err: StorageError,
     },
@@ -356,16 +358,18 @@ impl Session {
                         if t.piece_complete(req.piece) {
                             let tx = self.disk_tx.clone();
                             let storage = t.storage;
+                            let v2 = t.hash_job_v2_span(req.piece);
                             disk.async_hash(
                                 storage,
                                 req.piece,
-                                Vec::new(),
+                                v2,
                                 0,
-                                Box::new(move |piece, hash, err| {
+                                Box::new(move |piece, hash, block_hashes, err| {
                                     let _ = tx.send(DiskCompleted::Hash {
                                         ih,
                                         piece,
                                         hash,
+                                        block_hashes,
                                         err,
                                     });
                                 }),
@@ -471,17 +475,27 @@ impl Session {
                     ih,
                     piece,
                     hash,
+                    block_hashes,
                     err,
                 } => {
                     // upstream `torrent::piece_finished` compares
                     // `j.d.h.hash` vs `hash_for_piece` — mismatch is
                     // a `hash_failed_alert` + re-download.
-                    let passed = err.is_ok()
-                        && self
-                            .torrents
-                            .get(&ih)
-                            .and_then(|t| t.expected_hash(piece))
-                            .is_none_or(|want| want == hash);
+                    let passed = err.is_ok() && {
+                        let Some(t) = self.torrents.get_mut(&ih) else {
+                            continue;
+                        };
+                        if let Some(want) = t.expected_hash(piece) {
+                            want == hash
+                        } else if t.is_v2_only() {
+                            // v2: compare per-block SHA-256s against
+                            // the file's merkle tree (`on_blocks_hashed`).
+                            block_hashes.iter().any(|h| !h.is_all_zeros())
+                                && t.verify_v2_blocks(piece, &block_hashes)
+                        } else {
+                            true
+                        }
+                    };
                     if err.is_err() {
                         self.alerts.post(Alert::FileError {
                             ih,
@@ -581,17 +595,19 @@ impl Session {
                         continue;
                     };
                     let storage = t.storage;
+                    let v2 = t.hash_job_v2_span(*piece);
                     let (piece, tx) = (*piece, self.disk_tx.clone());
                     disk.async_hash(
                         storage,
                         piece,
-                        Vec::new(),
+                        v2,
                         0,
-                        Box::new(move |piece, hash, err| {
+                        Box::new(move |piece, hash, block_hashes, err| {
                             let _ = tx.send(DiskCompleted::Hash {
                                 ih,
                                 piece,
                                 hash,
+                                block_hashes,
                                 err,
                             });
                         }),

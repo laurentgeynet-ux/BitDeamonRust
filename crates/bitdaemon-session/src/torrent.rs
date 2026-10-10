@@ -83,6 +83,9 @@ pub struct Torrent {
     pub peers: BTreeMap<u64, PeerConn>,
     /// `m_trackers` — tier-ordered announce entries.
     pub trackers: crate::tracker_list::TrackerList,
+    /// `m_merkle_trees` — per-file v2 merkle trees (empty for v1).
+    /// `HashPicker` borrows it per verification call.
+    pub merkle_trees: Vec<bitdaemon_core::merkle_tree::MerkleTree>,
     /// `m_torrent_file` upstream — the parsed metainfo once we have
     /// it (None for unresolved magnets).
     pub ti: Option<std::sync::Arc<TorrentInfo>>,
@@ -223,6 +226,7 @@ impl Torrent {
             picker: None,
             peers: BTreeMap::new(),
             trackers: crate::tracker_list::TrackerList::default(),
+            merkle_trees: Vec::new(),
             ti: None,
             web_seeds: Vec::new(),
             files: None,
@@ -285,8 +289,13 @@ impl Torrent {
         storage: StorageIndex,
         out: &mut Vec<TorrentEffect>,
     ) -> Option<Self> {
+        // v1 swarm id when present; v2-only torrents key the session
+        // map with the truncated v2 hash (upstream `get(V2)`).
         let ih = if atp.info_hashes.has_v1() {
             atp.info_hashes.v1
+        } else if atp.info_hashes.has_v2() {
+            atp.info_hashes
+                .get(bitdaemon_common::info_hash::ProtocolVersion::V2)
         } else {
             atp.ti.as_ref().and_then(|ti| ti.info_hash_v1())?
         };
@@ -305,6 +314,9 @@ impl Torrent {
                         .collect(),
                 );
                 t.ti = Some(ti.clone());
+                if ti.v2() {
+                    t.build_merkle_trees(ti);
+                }
                 t.metadata_raw = Some(ti.info_section().to_vec());
                 t.files = Some(std::sync::Arc::new(ti.files().clone()));
                 t.init_picker(false);
@@ -396,6 +408,9 @@ impl Torrent {
                 .map(|i| info.hash_for_piece(PieceIndex(i)))
                 .collect(),
         );
+        if info.v2() {
+            self.build_merkle_trees(&info);
+        }
         self.ti = Some(std::sync::Arc::new(info));
         self.metadata_raw = Some(metadata.to_vec());
         self.magnet = false;
@@ -1445,6 +1460,76 @@ impl Torrent {
             }
         }
         self.piece_verified(piece, passed, out);
+    }
+
+    /// Build the per-file v2 merkle trees from `piece_layers`
+    /// (upstream materializes them from `atp.merkle_trees` at
+    /// `add_torrent`; same result — verified sparse vector or
+    /// full layer).
+    fn build_merkle_trees(&mut self, ti: &TorrentInfo) {
+        let fs = ti.files();
+        self.merkle_trees.clear();
+        for i in fs.file_range() {
+            let mut tree = bitdaemon_core::merkle_tree::MerkleTree::new(
+                fs.file_num_blocks(i) as usize,
+                fs.blocks_per_piece() as usize,
+                fs.root(i),
+            );
+            if let Some(layer) = ti.piece_layer(i) {
+                tree.load_piece_layer(layer);
+            }
+            self.merkle_trees.push(tree);
+        }
+    }
+
+    /// v2-only torrent (no v1 piece layer to compare).
+    #[must_use]
+    pub fn is_v2_only(&self) -> bool {
+        self.ti
+            .as_ref()
+            .is_some_and(|t| t.v2() && t.info_hash_v1().is_none())
+    }
+
+    /// The `block_hashes` span to pass to `async_hash`: sized to
+    /// `blocks_in_piece2` for v2-only torrents, empty otherwise
+    /// (upstream `hash_job` only fills v2 hashes when requested).
+    #[must_use]
+    pub fn hash_job_v2_span(&self, piece: PieceIndex) -> Vec<bitdaemon_common::Sha256Hash> {
+        if !self.is_v2_only() {
+            return Vec::new();
+        }
+        self.files
+            .as_ref()
+            .map(|fs| {
+                vec![bitdaemon_common::Sha256Hash::default(); fs.blocks_in_piece2(piece) as usize]
+            })
+            .unwrap_or_default()
+    }
+
+    /// `on_blocks_hashed` — feed computed block SHA-256s into the
+    /// file's merkle tree; true when the piece is fully verified
+    /// (upstream `torrent::on_blocks_hashed` return semantics).
+    pub fn verify_v2_blocks(
+        &mut self,
+        piece: PieceIndex,
+        block_hashes: &[bitdaemon_common::Sha256Hash],
+    ) -> bool {
+        let Some(fs) = self.files.clone() else {
+            return false;
+        };
+        let mut picker = bitdaemon_disk::hash_picker::HashPicker::new(&fs, &mut self.merkle_trees);
+        for (i, h) in block_hashes.iter().enumerate() {
+            let r = picker.set_block_hash(piece, (i * 16384) as i32, h);
+            match r.status {
+                bitdaemon_disk::hash_picker::SetBlockHashStatus::Success
+                | bitdaemon_disk::hash_picker::SetBlockHashStatus::Unknown => {}
+                bitdaemon_disk::hash_picker::SetBlockHashStatus::BlockHashFailed
+                | bitdaemon_disk::hash_picker::SetBlockHashStatus::PieceHashFailed => {
+                    return false;
+                }
+            }
+        }
+        picker.piece_verified(piece)
     }
 
     /// `flags()` — assemble the `torrent_flags` bitset from the

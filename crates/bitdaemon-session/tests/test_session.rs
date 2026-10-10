@@ -135,6 +135,7 @@ fn hash_mismatch_fails_piece() {
             ih,
             piece: PieceIndex(0),
             hash: bad,
+            block_hashes: Vec::new(),
             err: Default::default(),
         })
         .unwrap();

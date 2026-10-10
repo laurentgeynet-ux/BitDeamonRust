@@ -68,15 +68,16 @@ pub trait DiskIo: Send + Sync {
         flags: u8,
     ) -> bool;
 
-    /// `async_hash` — v2 block hashes filled when `v2` non-empty;
-    /// SHA-1 only when `flags & V1_HASH`.
+    /// `async_hash` — `v2` pre-sizes the out block-hash vec; the
+    /// computed per-16KiB SHA-256s are handed back (upstream keeps a
+    /// caller-owned span). SHA-1 only when `flags & V1_HASH`.
     fn async_hash(
         &self,
         storage: StorageIndex,
         piece: PieceIndex,
         v2: Vec<Sha256Hash>,
         flags: u8,
-        handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, StorageError) + Send>,
+        handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, Vec<Sha256Hash>, StorageError) + Send>,
     );
 
     /// `async_hash2` — single-block SHA-256.
@@ -266,9 +267,14 @@ impl DiskIo for DisabledDiskIo {
         piece: PieceIndex,
         _v2: Vec<Sha256Hash>,
         _f: u8,
-        handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, StorageError) + Send>,
+        handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, Vec<Sha256Hash>, StorageError) + Send>,
     ) {
-        handler(piece, Sha1Hash::default(), StorageError::default());
+        handler(
+            piece,
+            Sha1Hash::default(),
+            Vec::new(),
+            StorageError::default(),
+        );
     }
     fn async_hash2(
         &self,

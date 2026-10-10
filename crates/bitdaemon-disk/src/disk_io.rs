@@ -635,7 +635,7 @@ impl DiskIo for PreadDiskIo {
         piece: PieceIndex,
         v2: Vec<Sha256Hash>,
         _flags: u8,
-        handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, StorageError) + Send>,
+        handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, Vec<Sha256Hash>, StorageError) + Send>,
     ) {
         let j = self.mk_job(JobKind::Hash(HashJob {
             handler,
