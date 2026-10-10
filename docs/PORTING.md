@@ -96,7 +96,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `storage_constructor` / `default_storage_constructor` (in `disk_interface.hpp`/`storage.hpp`) | `disk::StorageFactory` | not started | **injectable storage** (ADR-0008) — OnionBit `PrivateStorageFactory` parity |
 | `disk_buffer_pool.cpp`, `disk_buffer_holder.cpp` | `disk::disk_buffer_pool` | **ported** | `Box<[u8]>` + RAII holder → allocator on drop; `in_use` + per-category histogram; `bulk_free_buffer` batch free |
 | `disabled_disk_io.cpp` | `disk::disk_interface::DisabledDiskIo` | **ported** | synchronous no-op completions |
-| `mmap.cpp`, `mmap_disk_io.cpp`, `mmap_storage.cpp`, `mmap_disk_job.hpp`, `file_view_pool.cpp` | `disk::mmap` | not started | `memmap2`, optional feature |
+| `mmap.cpp`, `mmap_disk_io.cpp`, `mmap_storage.cpp`, `mmap_disk_job.hpp`, `file_view_pool.cpp` | `disk::mmap` | deferred | requires `unsafe` (`memmap2::map_mut`) — `forbid(unsafe_code)`; `PreadDiskIo` is the reference backend; revisit as a separate unsafe-allowed crate if needed |
 | `posix_storage.cpp`, `posix_part_file.cpp` | `disk::storage` (shared) | merged | part file + storage identical to pread variant |
 | `pread_disk_io.cpp` | `disk::disk_io` | **ported** | full `DiskIo` impl; `StorageFactory` injection point (ADR-0008 — downstream private/encrypted storage); storage registry as `dyn DiskStorage` |
 | `storage_utils.cpp` | `disk::storage_utils` | **ported** | `initialize_storage`, `move_storage`, `delete_files`, `rename_file`, `verify_resume_data`, `has_any_file` |

@@ -63,3 +63,5 @@ pub mod readwrite;
 pub mod storage;
 /// `aux_/storage_utils.hpp` — check/move/delete helpers.
 pub mod storage_utils;
+/// `aux_/store_buffer.hpp` — read cache + back-pressure watermarks.
+pub mod store_buffer;

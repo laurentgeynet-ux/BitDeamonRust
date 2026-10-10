@@ -9,6 +9,16 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `bitdaemon_disk` Phase-3 wave 5: `store_buffer` — `aux::store_buffer`
+  read cache (`TorrentLocation`-keyed `Arc<[u8]>` buffers instead of raw
+  pointers — `forbid(unsafe_code)`), `get`/`get2`/`insert`/`erase` with
+  `BackPressure` wired in (observer registration at `max_size`,
+  posted release below low watermark).
+- mmap backend deferred: `aux::mmap`/`mmap_disk_io`/`mmap_storage`
+  require `unsafe` (`memmap2::map_mut`); the disk crate enforces
+  `forbid(unsafe_code)` and `PreadDiskIo` is the reference backend —
+  documented deviation in `PORTING.md`.
+
 - `bitdaemon_disk` Phase-3 wave 4 (v2 hash machinery):
   `hash_picker` — `validate_hash_request`, `HashPicker` (512-piece
   piece-layer chunks + per-piece block requests, 3 s

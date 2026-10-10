@@ -124,9 +124,10 @@ point** (ADR-0008 — OnionBit `PrivateStorageFactory` parity) ✅,
 `HashPicker` (v2 piece layers, single-request API — 10/10 upstream
 cases incl. coincident piece/block layer) ✅, `precomputed_block_hashes`
 ✅.
-*(still to do)*: `file_view_pool`/`mmap` (memmap2 feature),
-`store_buffer` watermarks (`max_queued_disk_bytes`/
-`send_buffer_watermark`).
+`store_buffer` (read cache + `BackPressure` watermarks) ✅.
+*(still to do)*: `file_view_pool`/`mmap_disk_io` — deferred:
+`mmap` requires `unsafe` and the crate is `forbid(unsafe_code)`;
+`PreadDiskIo` is the reference backend (documented deviation).
 
 **Fastresume** (`core::resume` lands Phase 2, applied here):
 byte-compatible with upstream `read_resume_data`/`write_resume_data`
