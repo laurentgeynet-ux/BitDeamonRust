@@ -73,7 +73,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `read_resume_data.cpp`, `write_resume_data.cpp` | `core::resume_data` | **ported** | file-version 1+2 read, v2 write; `test_read_resume.cpp` vectors + round-trip |
 | `resolve_duplicate_filenames.cpp` | `core::resolve` | **ported** | case-insensitive `.N` renames, dir/pad rules; upstream table 12/12 (Windows sep-safe) |
 | `apply_pad_files.hpp`, `resolve_duplicate_filenames.hpp` | `core::pad` | **ported** | folded into `resolve` |
-| `resolve_links.cpp` (`resolve_links.hpp`) | `core::resolve` | not started | needs session storage hooks — Phase 3 |
+| `resolve_links.cpp` (`resolve_links.hpp`) | `core::resolve_links` | **ported** | fixture table 14/14 (pad/align + v1 piece-hash + v2 root matching) |
 | `add_torrent_params.cpp` (`add_torrent_params.hpp`) | `core::add_torrent_params` | **ported** | single canonical struct used by torrent/magnet/resume |
 | `path.cpp` (string helpers), `aux_/path.hpp` | `core::path` | **ported** (string half) | `directory.cpp`/`drive_info.cpp` (fs-dependent) → Phase 3 |
 | `entry`-adjacent `client_data.hpp`, `fwd.hpp`, `version.cpp` | misc | not started | |
@@ -103,7 +103,8 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `part_file.cpp` (`part_file.hpp`) | `disk::part_file` | **ported** | header format + slot reuse + export frees full pieces |
 | `file.cpp`/`file.hpp`, `open_mode.hpp`, `file_pool_impl.cpp`/`file_pool.hpp` | `disk::file`, `disk::open_mode`, `disk::file_pool` | **ported** | `pread_all`/`pwrite_all`/`pwritev_all`; pool: LRU evict, open-waiter sharing, r/w upgrade race counter, ENOENT-mkdir retry, deferred close |
 | `file_progress.cpp` | `disk::file_progress` | **ported** | `init` takes the have-pieces `Bitfield` (picker dep swapped — documented deviation); `completed_cb` on file finish |
-| `hash_picker.cpp` (`hash_picker.hpp`), `precomputed_block_hashes.cpp` | `disk::hash_picker` | not started | v2 proofs |
+| `hash_picker.cpp` (`hash_picker.hpp`) | `disk::hash_picker` | **ported** | single-request `pick_hashes` API; both request shapes, 3 s retry interval, `test_hash_picker.cpp` 10/10 |
+| `precomputed_block_hashes.cpp` | `disk::precomputed_block_hashes` | **ported** | all-zero sentinel, `take`/`take_block`/`drop` |
 | `stat_cache.cpp` (disk side) | `disk::stat_cache` | **ported** | — |
 | `copy_file.cpp`, `drive_info.cpp`, `directory.cpp` | `disk::fs` | **ported** | hard-link-first copy; `free_space` via fs2; `truncate.cpp` folds into `set_len` |
 | `disk_observer.hpp`, `disk_completed_queue.hpp` | `disk::observer` | not started | → channel events |

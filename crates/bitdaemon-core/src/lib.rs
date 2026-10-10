@@ -38,6 +38,8 @@ pub mod merkle_tree;
 pub mod path;
 /// `resolve_duplicate_filenames.cpp` — collision-safe naming.
 pub mod resolve;
+/// `aux_/resolve_links.hpp` — mutable-torrent file dedup.
+pub mod resolve_links;
 /// `read_resume_data.cpp`/`write_resume_data.cpp` — fastresume wire format.
 pub mod resume_data;
 /// `torrent_info.cpp` + `load_torrent.cpp` — `.torrent` parsing

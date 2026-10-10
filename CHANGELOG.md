@@ -9,6 +9,24 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `bitdaemon_disk` Phase-3 wave 4 (v2 hash machinery):
+  `hash_picker` — `validate_hash_request`, `HashPicker` (512-piece
+  piece-layer chunks + per-piece block requests, 3 s
+  `min_request_interval`, `pick_hashes`/`add_hashes`/
+  `set_block_hash`/`hashes_rejected`/`verify_block_hashes`/
+  `have_hash`/`have_all`/`piece_verified`), both request shapes matched
+  independently for the `blocks_per_piece == 1` coincidence;
+  `precomputed_block_hashes` (all-zero-as-absent sentinel, mutex-guarded
+  per-piece vectors, `store`/`take`/`take_block`/`drop`); plus
+  `FileStorage::file_first_piece_node`/`file_first_block_node`.
+  `test_hash_picker.cpp` → 10/10 cases (piece-layer picking order,
+  empty trees, block-request timeout/resolution/retry, coincident
+  layers, leaf + piece hash insertion).
+- `bitdaemon_core::resolve_links` — `aux::resolve_links` for mutable
+  torrents: v1 matching by piece hashes on size+alignment candidates,
+  v2 matching by file merkle root, `RenamedFiles` path overlay.
+  `test_resolve_links.cpp` fixture table → 14/14.
+
 - `bitdaemon_disk` Phase-3 wave 3b (interface + injection):
   `disk_interface::DiskIo` — the full upstream `disk_interface`
   surface (`new_torrent`/`remove_torrent`/`async_read`/`async_write`

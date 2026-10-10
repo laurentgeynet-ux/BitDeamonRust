@@ -53,6 +53,10 @@ pub mod disk_job_fence;
 pub mod disk_pool;
 /// `aux_/file_progress.hpp` — per-file download accounting.
 pub mod file_progress;
+/// `aux_/hash_picker.hpp` — v2 merkle hash request scheduling.
+pub mod hash_picker;
+/// `aux_/precomputed_block_hashes.hpp` — in-memory block hash handoff.
+pub mod precomputed_block_hashes;
 /// `aux_/readwrite.hpp` — piece→file buffer walk.
 pub mod readwrite;
 /// `aux_/pread_storage.hpp` — positioned-I/O storage backend.

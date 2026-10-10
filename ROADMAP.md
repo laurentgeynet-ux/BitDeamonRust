@@ -83,8 +83,7 @@ Phase 3 — it wraps `file_storage`/`stat_file`, not a primitive).
 (parse + serialize) ✅, `load_torrent` ✅, `announce_entry`/`tracker_list`
 (Phase 5 — session machinery), `web_seed_entry` (data struct ✅),
 `info_hash` ✅, `fingerprint`/`identify_client` ✅,
-`read_resume_data`/`write_resume_data` wire format ✅, `resolve_links`
-(Phase 3 — needs storage hooks).
+`read_resume_data`/`write_resume_data` wire format ✅, `resolve_links` ✅.
 
 **Exit criteria**: `test_torrent_info.cpp`, `test_create_torrent.cpp`,
 `test_magnet.cpp`, `test_file_storage.cpp`, `test_read_resume.cpp`,
@@ -92,7 +91,7 @@ Phase 3 — it wraps `file_storage`/`stat_file`, not a primitive).
 *Status*: all upstream fixture vectors green (file_storage 28/28,
 torrent_info, magnet 24/24, resume, create_torrent 8/8,
 merkle_tree 22/22, identify_client, resolve_duplicates 12/12);
-remaining — `file_progress`, `resolve_links`, tracker machinery.
+remaining — `file_progress` (in disk), tracker machinery.
 
 ---
 
@@ -122,8 +121,10 @@ post) ✅, `pread_disk_io` orchestrator (`perform_job` dispatch,
 `DisabledDiskIo` ✅, **`StorageFactory`/`DiskStorage` injection
 point** (ADR-0008 — OnionBit `PrivateStorageFactory` parity) ✅,
 `FileProgress` ✅, back-pressure wired into `async_write` ✅.
-*(still to do)*: `HashPicker` (v2 piece layers),
-`precomputed_block_hashes`, `file_view_pool`/`mmap` (memmap2 feature),
+`HashPicker` (v2 piece layers, single-request API — 10/10 upstream
+cases incl. coincident piece/block layer) ✅, `precomputed_block_hashes`
+✅.
+*(still to do)*: `file_view_pool`/`mmap` (memmap2 feature),
 `store_buffer` watermarks (`max_queued_disk_bytes`/
 `send_buffer_watermark`).
 

@@ -698,6 +698,29 @@ impl FileStorage {
         self.files[index.get()].offset as i64
     }
 
+    /// `file_first_piece_node(index)` — flat tree index of the first
+    /// piece-layer node for the file's merkle tree.
+    #[must_use]
+    pub fn file_first_piece_node(&self, index: FileIndex) -> usize {
+        debug_assert!(index >= FileIndex(0) && index < self.end_file());
+        debug_assert!(self.piece_length() > 0);
+        let layer = crate::merkle::merkle_num_leafs(
+            usize::try_from(self.file_num_pieces(index)).unwrap_or(0),
+        );
+        crate::merkle::merkle_num_nodes(layer) - layer
+    }
+
+    /// `file_first_block_node(index)` — flat tree index of the first
+    /// block-layer (leaf) node.
+    #[must_use]
+    pub fn file_first_block_node(&self, index: FileIndex) -> usize {
+        debug_assert!(index >= FileIndex(0) && index < self.end_file());
+        let layer = crate::merkle::merkle_num_leafs(
+            usize::try_from(self.file_num_blocks(index)).unwrap_or(0),
+        );
+        crate::merkle::merkle_num_nodes(layer) - layer
+    }
+
     /// `file_num_pieces(index)` — pieces spanned (v2: file is piece-aligned).
     #[must_use]
     pub fn file_num_pieces(&self, index: FileIndex) -> i32 {
