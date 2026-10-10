@@ -469,3 +469,48 @@ fn dht_ip_key_votes_external_ip() {
         Some(std::net::IpAddr::from([203, 0, 113, 7]))
     );
 }
+
+#[test]
+fn unchoke_tick_unchokes_top_peer() {
+    use bitdaemon_session::peer_pipeline::PeerPipeline;
+    use bitdaemon_session::session::SessionOut;
+
+    let mut s = Session::new();
+    s.settings.unchoke_slots = 1;
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+    for pid in 1u64..=3 {
+        s.peer_connected(
+            &ih,
+            pid,
+            PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+            "127.0.0.1:6881".parse().unwrap(),
+        );
+        // mark them interested + give pid 1 the best upload rate
+        let t = s.torrents.get_mut(&ih).unwrap();
+        let c = t.peers.get_mut(&pid).unwrap();
+        c.peer_interested = true;
+        c.stat_up_round = (4 - pid as i64) * 1000;
+    }
+    // run 10 session ticks (the choker round fires at %10)
+    let mut unchoked = Vec::new();
+    for _ in 0..10 {
+        let mut out = Vec::new();
+        s.tick(&mut out);
+        for e in &out {
+            if let SessionOut::ToPeer {
+                peer,
+                msg: bitdaemon_net::peer_wire::PeerMessage::Unchoke,
+                ..
+            } = e
+            {
+                unchoked.push(*peer);
+            }
+        }
+    }
+    // the best uploader (pid 1, highest stat_up_round) gets the slot
+    assert_eq!(unchoked, vec![1]);
+    assert!(!s.torrents[&ih].peers[&1].choked);
+    assert!(s.torrents[&ih].peers[&2].choked);
+}

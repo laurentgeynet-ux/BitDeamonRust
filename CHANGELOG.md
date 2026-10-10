@@ -9,6 +9,14 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **Choker câblé** — `Session::unchoke_tick` toutes les 10 s :
+  `unchoke_sort` (FixedSlots/RoundRobin) sur les compteurs payload
+  `PeerConn` (`stat_up/down_total`+round, crédités aux `Piece`
+  émis/reçus), envoie `Choke`/`Unchoke`, réinitialise les
+  compteurs de round et `time_of_last_unchoke`.
+
+### Added
+
 - `ip_voter` câblé — votes `external_ip` depuis les trois sources
   upstream : clé `ip` des messages DHT (`SOURCE_DHT`, drainée via
   `DhtNode::drain_ip_votes`), `external ip` des réponses tracker

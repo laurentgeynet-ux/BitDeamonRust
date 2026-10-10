@@ -79,6 +79,17 @@ pub struct PeerConn {
     pub remote: Option<std::net::SocketAddr>,
     /// pex update bookkeeping — the set we last sent this peer.
     pub pex_sent: std::collections::BTreeSet<std::net::SocketAddr>,
+    /// `m_stat` payload accounting for the choker — lifetime bytes
+    /// and bytes since the last unchoke round.
+    pub stat_up_total: i64,
+    /// download payload lifetime bytes.
+    pub stat_down_total: i64,
+    /// upload payload bytes since the last unchoke round.
+    pub stat_up_round: i64,
+    /// download payload bytes since the last unchoke round.
+    pub stat_down_round: i64,
+    /// `time_of_last_unchoke` (round-robin quota bookkeeping).
+    pub last_unchoke: std::time::Instant,
 }
 
 impl PeerConn {
@@ -113,6 +124,11 @@ impl PeerConn {
             last_active: 0,
             remote: None,
             pex_sent: std::collections::BTreeSet::new(),
+            stat_up_total: 0,
+            stat_down_total: 0,
+            stat_up_round: 0,
+            stat_down_round: 0,
+            last_unchoke: std::time::Instant::now(),
         }
     }
 

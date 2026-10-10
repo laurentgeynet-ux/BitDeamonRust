@@ -826,7 +826,81 @@ impl Session {
             }
             self.route(ih, eff, out);
         }
+        self.unchoke_tick(out);
         wait
+    }
+
+    /// `session_impl` choker round — every ~10 s upstream picks the
+    /// top `unchoke_slots` peers (`unchoke_sort`) and sends
+    /// choke/unchoke; round counters reset each round.
+    fn unchoke_tick(&mut self, out: &mut Vec<SessionOut>) {
+        const UNCHOKE_INTERVAL_S: i32 = 10;
+        if self.session_time % UNCHOKE_INTERVAL_S != 0 {
+            return;
+        }
+        let now = Instant::now();
+        let slots = self.settings.unchoke_slots;
+        let ihs: Vec<Sha1Hash> = self.torrents.keys().copied().collect();
+        for ih in ihs {
+            let Some(t) = self.torrents.get_mut(&ih) else {
+                continue;
+            };
+            if t.peers.is_empty() {
+                continue;
+            }
+            let seeding = t.is_seed();
+            let total_size = t.files.as_ref().map_or(0, |f| f.total_size());
+            let mut list: Vec<crate::choker::ChokePeer> = t
+                .peers
+                .iter()
+                .map(|(id, c)| crate::choker::ChokePeer {
+                    id: *id,
+                    choked: c.choked,
+                    interested: c.peer_interested,
+                    uploaded_last: c.stat_up_round,
+                    downloaded_last: c.stat_down_round,
+                    last_unchoke: c.last_unchoke,
+                    seeding,
+                    num_pieces: c.peer_pieces.count() as i32,
+                    uploaded_total: c.stat_up_total,
+                    total_size,
+                    piece_length: t.piece_length,
+                    priority: 1.0,
+                })
+                .collect();
+            let n = crate::choker::unchoke_sort(
+                &mut list,
+                slots,
+                crate::choker::ChokingAlgorithm::FixedSlots,
+                crate::choker::SeedChokingAlgorithm::RoundRobin,
+                std::time::Duration::from_secs(UNCHOKE_INTERVAL_S as u64),
+                crate::choker::DEFAULT_SEEDING_PIECE_QUOTA,
+                now,
+            );
+            let keep: std::collections::BTreeSet<u64> = list[..n].iter().map(|p| p.id).collect();
+            let mut eff = Vec::new();
+            for (id, c) in &mut t.peers {
+                let want_unchoke = keep.contains(id) && c.peer_interested;
+                if want_unchoke && c.choked {
+                    c.choked = false;
+                    c.last_unchoke = now;
+                    eff.push(TorrentEffect::SendTo {
+                        peer: *id,
+                        msg: PeerMessage::Unchoke,
+                    });
+                } else if !want_unchoke && !c.choked {
+                    c.choked = true;
+                    eff.push(TorrentEffect::SendTo {
+                        peer: *id,
+                        msg: PeerMessage::Choke,
+                    });
+                }
+                // reset the round counters
+                c.stat_up_round = 0;
+                c.stat_down_round = 0;
+            }
+            self.route(ih, eff, out);
+        }
     }
 
     fn route(&mut self, ih: Sha1Hash, effects: Vec<TorrentEffect>, out: &mut Vec<SessionOut>) {
@@ -834,6 +908,16 @@ impl Session {
         for e in effects {
             match e {
                 TorrentEffect::SendTo { peer, msg } => {
+                    // `m_stat` upload accounting — payload bytes
+                    // feed the choker's round counters.
+                    if let PeerMessage::Piece { data, .. } = &msg
+                        && let Some(t) = self.torrents.get_mut(&ih)
+                        && let Some(c) = t.peers.get_mut(&peer)
+                    {
+                        let n = data.len() as i64;
+                        c.stat_up_total += n;
+                        c.stat_up_round += n;
+                    }
                     out.push(SessionOut::ToPeer { ih, peer, msg });
                 }
                 TorrentEffect::DisconnectPeer { peer, reason } => {

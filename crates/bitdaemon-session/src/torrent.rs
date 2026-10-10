@@ -935,6 +935,11 @@ impl Torrent {
         let mut effects = Vec::new();
         if let Some(c) = self.peers.get_mut(&peer_id) {
             c.last_active = now;
+            if let PeerMessage::Piece { data, .. } = msg {
+                let n = data.len() as i64;
+                c.stat_down_total += n;
+                c.stat_down_round += n;
+            }
             c.dispatch(msg, self.num_pieces, &mut effects);
         }
         self.apply_peer_effects(peer_id, effects, out);
