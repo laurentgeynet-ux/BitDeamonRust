@@ -378,6 +378,10 @@ impl Engine {
             .torrents
             .get(ih)
             .map_or(0, |t| t.num_pieces as usize);
+        // BEP-10: advertise our extension ids right after the handshake
+        let _ =
+            bitdaemon_net::bt_peer_conn::send_extended_handshake(&mut s, &self.ext_handshake(ih))
+                .await;
         let peer = self.next_peer;
         self.next_peer += 1;
         let conn = PeerConn::new(
@@ -392,6 +396,25 @@ impl Engine {
         self.session.peer_connected(ih, peer, conn, remote);
         self.attach_stream(*ih, peer, remote, s);
         Ok(peer)
+    }
+
+    /// our BEP-10 offer — `ut_metadata`/`ut_pex` ids (matching
+    /// `PeerConn::local_ut_*` defaults) + listen port and the
+    /// torrent's metadata size when known.
+    fn ext_handshake(&self, ih: &Sha1Hash) -> bitdaemon_net::bep10::ExtendedHandshake {
+        let mut hs = bitdaemon_net::bep10::ExtendedHandshake {
+            listen_port: Some(i64::from(self.session.listen_port)),
+            reqq: i64::from(self.max_out_request_queue),
+            ..Default::default()
+        };
+        hs.messages.insert("ut_metadata".into(), 1);
+        hs.messages.insert("ut_pex".into(), 2);
+        if let Some(t) = self.session.torrents.get(ih) {
+            if let Some(md) = &t.metadata_raw {
+                hs.metadata_size = Some(md.len() as i64);
+            }
+        }
+        hs
     }
 
     /// `on_incoming` — register an accepted stream: responder
