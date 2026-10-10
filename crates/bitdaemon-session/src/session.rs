@@ -15,9 +15,12 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use bitdaemon_common::types::{PeerRequest, PieceIndex};
 use bitdaemon_common::{Bitfield, Sha1Hash};
 use bitdaemon_dht::dht_tracker::DhtTracker;
+use bitdaemon_disk::disk_buffer_pool::DiskBufferHolder;
 use bitdaemon_disk::disk_interface::DiskIo;
+use bitdaemon_disk::storage_error::StorageError;
 use bitdaemon_net::peer_wire::PeerMessage;
 
 use crate::alerts::{Alert, AlertManager};
@@ -57,7 +60,6 @@ pub enum SessionOut {
 }
 
 /// `session_impl` — all state owned on one thread.
-#[derive(Default)]
 pub struct Session {
     /// `m_torrents` by info_hash.
     pub torrents: BTreeMap<Sha1Hash, Torrent>,
@@ -67,6 +69,62 @@ pub struct Session {
     pub disk: Option<Arc<dyn DiskIo>>,
     /// `m_alert_manager`.
     pub alerts: AlertManager,
+    /// completions pushed by disk-job callbacks (any thread).
+    disk_tx: std::sync::mpsc::Sender<DiskCompleted>,
+    disk_rx: std::sync::mpsc::Receiver<DiskCompleted>,
+}
+
+/// A disk job's result, delivered back onto the session thread.
+/// (`disk_io_job` completion → `torrent::on_disk_*`.)
+pub enum DiskCompleted {
+    /// `async_read` — block ready to send as `Piece`.
+    Read {
+        /// torrent.
+        ih: Sha1Hash,
+        /// requesting peer.
+        peer: u64,
+        /// the request it answers.
+        req: PeerRequest,
+        /// payload (`None` bytes when the job errored).
+        buf: DiskBufferHolder,
+        /// job result.
+        err: StorageError,
+    },
+    /// `async_write` — block persisted; schedule piece hash.
+    Write {
+        /// torrent.
+        ih: Sha1Hash,
+        /// block written.
+        req: PeerRequest,
+        /// job result.
+        err: StorageError,
+    },
+    /// `async_hash` — SHA-1 of `piece` is `hash` (compare pending
+    /// — Torrent does not yet hold `TorrentInfo` piece hashes).
+    Hash {
+        /// torrent.
+        ih: Sha1Hash,
+        /// the piece.
+        piece: PieceIndex,
+        /// computed SHA-1.
+        hash: bitdaemon_common::Sha1Hash,
+        /// job result.
+        err: StorageError,
+    },
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        let (disk_tx, disk_rx) = std::sync::mpsc::channel();
+        Self {
+            torrents: BTreeMap::new(),
+            dht: DhtTracker::default(),
+            disk: None,
+            alerts: AlertManager::default(),
+            disk_tx,
+            disk_rx,
+        }
+    }
 }
 
 impl Session {
@@ -74,6 +132,137 @@ impl Session {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// the sender disk-job callbacks clone to report completions.
+    #[must_use]
+    pub fn disk_completions(&self) -> std::sync::mpsc::Sender<DiskCompleted> {
+        self.disk_tx.clone()
+    }
+
+    /// `on_disk_*` — drain completed disk jobs into swarm effects.
+    /// Read → `Piece` to the peer. Write → `async_hash` the piece.
+    /// Hash → `piece_verified` (passed = no error; hash comparison
+    /// lands with `TorrentInfo` on `Torrent`).
+    pub fn drain_disk_completed(&mut self, out: &mut Vec<SessionOut>) {
+        while let Ok(c) = self.disk_rx.try_recv() {
+            match c {
+                DiskCompleted::Read {
+                    ih,
+                    peer,
+                    req,
+                    buf,
+                    err,
+                } => {
+                    if err.is_err() {
+                        self.alerts.post(Alert::FileError {
+                            ih,
+                            path: String::new(),
+                            error: err.to_string(),
+                        });
+                        continue;
+                    }
+                    if let Some(data) = buf.data().map(|d| d.to_vec()) {
+                        out.push(SessionOut::ToPeer {
+                            ih,
+                            peer,
+                            msg: PeerMessage::Piece {
+                                piece: req.piece,
+                                offset: req.start,
+                                data: data.into(),
+                            },
+                        });
+                    }
+                }
+                DiskCompleted::Write { ih, req, err } => {
+                    if err.is_err() {
+                        self.alerts.post(Alert::FileError {
+                            ih,
+                            path: String::new(),
+                            error: err.to_string(),
+                        });
+                        continue;
+                    }
+                    // whole piece complete? then hash it
+                    if let (Some(disk), Some(t)) = (self.disk.clone(), self.torrents.get(&ih)) {
+                        if t.piece_complete(req.piece) {
+                            let tx = self.disk_tx.clone();
+                            let storage = t.storage;
+                            disk.async_hash(
+                                storage,
+                                req.piece,
+                                Vec::new(),
+                                0,
+                                Box::new(move |piece, hash, err| {
+                                    let _ = tx.send(DiskCompleted::Hash {
+                                        ih,
+                                        piece,
+                                        hash,
+                                        err,
+                                    });
+                                }),
+                            );
+                        }
+                    }
+                }
+                DiskCompleted::Hash { ih, piece, err, .. } => {
+                    self.on_piece_verified(&ih, piece, err.is_ok(), out);
+                }
+            }
+        }
+    }
+
+    /// translate `TorrentEffect::DiskRead/DiskWrite` into real
+    /// jobs on the injected `DiskIo` (the `m_disk_thread` glue).
+    fn dispatch_disk(&mut self, ih: Sha1Hash, effects: &[TorrentEffect]) {
+        let Some(disk) = self.disk.clone() else {
+            return;
+        };
+        for e in effects {
+            match e {
+                TorrentEffect::DiskRead { peer, req } => {
+                    let Some(t) = self.torrents.get(&ih) else {
+                        continue;
+                    };
+                    let storage = t.storage;
+                    let (peer, req, tx) = (*peer, *req, self.disk_tx.clone());
+                    disk.async_read(
+                        storage,
+                        req,
+                        Box::new(move |buf, err| {
+                            let _ = tx.send(DiskCompleted::Read {
+                                ih,
+                                peer,
+                                req,
+                                buf,
+                                err,
+                            });
+                        }),
+                        0,
+                    );
+                }
+                TorrentEffect::DiskWrite { req, data } => {
+                    let Some(t) = self.torrents.get(&ih) else {
+                        continue;
+                    };
+                    let storage = t.storage;
+                    let req = *req;
+                    let tx = self.disk_tx.clone();
+                    let holder = DiskBufferHolder::from_owned(data.clone());
+                    disk.async_write(
+                        storage,
+                        req,
+                        holder,
+                        None,
+                        Box::new(move |err| {
+                            let _ = tx.send(DiskCompleted::Write { ih, req, err });
+                        }),
+                        0,
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 
     /// attach the disk backend (`session_params` wiring).
@@ -150,6 +339,7 @@ impl Session {
 
     /// `tick` — drive every torrent's peers + dht timeouts.
     pub fn tick(&mut self, out: &mut Vec<SessionOut>) -> std::time::Duration {
+        self.drain_disk_completed(out);
         let wait = self.dht.tick();
         while let Some((pkt, to)) = self.dht.poll() {
             out.push(SessionOut::UdpPacket(pkt, to));
@@ -173,6 +363,7 @@ impl Session {
     }
 
     fn route(&mut self, ih: Sha1Hash, effects: Vec<TorrentEffect>, out: &mut Vec<SessionOut>) {
+        self.dispatch_disk(ih, &effects);
         for e in effects {
             match e {
                 TorrentEffect::SendTo { peer, msg } => {

@@ -7,6 +7,22 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — session wave 3: disk-job bridge
+
+- `session::Session::dispatch_disk` — `TorrentEffect::DiskRead`/
+  `DiskWrite` translated into `async_read`/`async_write` on the
+  injected `DiskIo` (`m_disk_thread` glue).
+- `DiskCompleted` channel — job callbacks (any thread) push into
+  an mpsc the session drains on `tick`: Read → `Piece` to the
+  requesting peer, Write → `async_hash` when the picker reports the
+  piece finished, Hash → `piece_verified` → have broadcast/seed.
+- `StorageError::is_ok`/`is_err` — the `default()` success sentinel
+  upstream relies on (`!error`).
+- `DiskBufferHolder::from_owned` — pool-less holder for incoming
+  peer data.
+- `Torrent::piece_complete` — `is_piece_finished` bridge.
+
+
 ### Added — session wave 2: wire driver, handles, session-state, web seeds, NAT-PMP
 
 - `net::bt_peer_conn` — `bt_peer_connection` driver: `run_handshake`

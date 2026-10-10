@@ -309,6 +309,23 @@ impl Torrent {
         }
     }
 
+    /// `is_seed`-side helper — all blocks of `piece` have been
+    /// written (`picker` tracks open pieces; a piece leaves the
+    /// open queue when every block is finished).
+    #[must_use]
+    pub fn piece_complete(&self, piece: PieceIndex) -> bool {
+        // conservative: written when our have-bit set OR the picker
+        // reports the piece fully downloaded; full fidelity needs
+        // per-block state → treat picker-open as incomplete.
+        if (piece.0 as usize) < self.have.size() && self.have.get_bit(piece.0 as usize) {
+            return true;
+        }
+        // `is_piece_finished` = every block written/finished
+        self.picker
+            .as_ref()
+            .is_some_and(|p| p.is_piece_finished(piece))
+    }
+
     /// `piece_finished` — verification result. `passed` → have-bit
     /// + broadcast; failed → restore want + smart_ban hook point.
     pub fn piece_verified(

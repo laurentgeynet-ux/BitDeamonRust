@@ -66,6 +66,18 @@ pub struct StorageError {
 }
 
 impl StorageError {
+    /// `!storage_error` — success sentinel (`default()` = no error).
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.file == FileIndex(-1) && self.operation == Operation::Unknown
+    }
+
+    /// `error_code` present — the op failed.
+    #[must_use]
+    pub fn is_err(&self) -> bool {
+        !self.is_ok()
+    }
+
     /// Construct from an `io::Error`.
     pub fn new(io: io::Error, file: FileIndex, operation: Operation) -> Self {
         Self {

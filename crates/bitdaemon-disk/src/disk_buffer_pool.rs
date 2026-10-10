@@ -103,6 +103,17 @@ pub struct DiskBufferHolder {
 }
 
 impl DiskBufferHolder {
+    /// Wrap an owned buffer (no pool — drop frees the box).
+    /// Used by the session glue for incoming peer data.
+    #[must_use]
+    pub fn from_owned(v: Vec<u8>) -> Self {
+        Self {
+            buf: Some(v.into_boxed_slice()),
+            alloc: None,
+            category: "peer data",
+        }
+    }
+
     /// Empty holder (upstream default ctor).
     #[must_use]
     pub fn empty() -> Self {
