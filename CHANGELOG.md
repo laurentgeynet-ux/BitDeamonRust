@@ -9,6 +9,21 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `bitdaemon_net` Phase-4 wave 4 (peer records + uTP ring):
+  `torrent_peer` — `PeerAddr` enum replaces the `ipv4_peer`/
+  `ipv6_peer`/`i2p_peer` subclass hierarchy; packed bitfield → named
+  fields (failcount:5, fast_reconnects:4, trust_points signed-4,
+  source:6 as `PeerSourceFlags` — new flag type in `common::flags`);
+  kiB-precision accounting with live-connection stats override;
+  `peer_priority` — BEP-40 CRC32C ranking (v4 /24-/16 masks,
+  v6 first-difference masking, ordered ports for identical IPs);
+  `test_peer_priority.cpp` vectors byte-exact incl. the BEP-40
+  constants `0xec2d7224`/`0x99568189`.
+  `packet_buffer` — uTP circular store over a wrapping 16-bit
+  sequence space (`Vec<Option<T>>` replaces `unique_ptr<packet[]>`);
+  window grow/shift, backward insert via `compare_less_wrap`,
+  cursor/span tracking; `test_packet_buffer.cpp` → 6/6.
+
 - `bitdaemon_net` Phase-4 wave 3 (peer plumbing):
   `receive_buffer` — cursor-based recv arena verbatim
   (`recv_start`/`recv_pos`/`recv_end`, `reserve`/`grow`/`cut`/

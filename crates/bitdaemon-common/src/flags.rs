@@ -187,6 +187,27 @@ impl PexFlags {
 }
 
 bitfield_flag!(
+    /// `peer_source_flags_t` — where a peer was learned from
+    /// (`peer_info.hpp`).
+    PeerSourceFlags, u8
+);
+
+impl PeerSourceFlags {
+    /// `peer_source_flags::tracker` (0_bit).
+    pub const TRACKER: Self = Self::bit(0);
+    /// `peer_source_flags::dht` (1_bit).
+    pub const DHT: Self = Self::bit(1);
+    /// `peer_source_flags::pex` (2_bit).
+    pub const PEX: Self = Self::bit(2);
+    /// `peer_source_flags::lsd` (3_bit).
+    pub const LSD: Self = Self::bit(3);
+    /// `peer_source_flags::resume_data` (4_bit).
+    pub const RESUME_DATA: Self = Self::bit(4);
+    /// `peer_source_flags::incoming` (5_bit) — no advertised listen port.
+    pub const INCOMING: Self = Self::bit(5);
+}
+
+bitfield_flag!(
     /// `dht::announce_flags_t` — flags on a DHT announce
     /// (`kademlia/announce_flags.hpp`).
     AnnounceFlags, u8

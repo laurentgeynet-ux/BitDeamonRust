@@ -122,7 +122,9 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `bt_peer_connection.cpp` (`bt_peer_connection.hpp`) | `net::peer::bt` | not started | BT handshake + BEP-10 |
 | `web_connection_base.cpp`, `web_peer_connection.cpp` | `net::peer::web` | not started | web seeds (Phase 8) |
 | `request_blocks.cpp`, `merge_block_requests.hpp`, `suggest_piece.hpp`, `peer_list.cpp`, `peer_info.cpp`, `peer.cpp`, `peer.hpp` | `net::peer::*` | not started | |
-| `receive_buffer.cpp` + `crypto_receive_buffer` | `net::receive_buffer` | **ported** | cursor buffer verbatim (start/pos/end, `reserve`/`grow`/`cut`/`normalize` + watermark shrink); `test_receive_buffer.cpp` 15/15; `packet_buffer.cpp` deferred to Phase 5 (uTP-only) |
+| `receive_buffer.cpp` + `crypto_receive_buffer` | `net::receive_buffer` | **ported** | cursor buffer verbatim (start/pos/end, `reserve`/`grow`/`cut`/`normalize` + watermark shrink); `test_receive_buffer.cpp` 15/15 |
+| `packet_buffer.cpp` | `net::packet_buffer` | **ported** | 16-bit wrapping circular store, window grow/shift verbatim (`compare_less_wrap`), `test_packet_buffer.cpp` 6/6; used by uTP (Phase 5) |
+| `torrent_peer.cpp` + `aux_/torrent_peer.hpp` | `net::torrent_peer` | **ported** | `PeerAddr` enum replaces the ipv4/ipv6/i2p subclass hierarchy; packed bitfield → named fields; `peer_priority` BEP-40 verbatim; `test_peer_priority.cpp` vectors exact incl. v6 prefix masks |
 | `socket_type.cpp`, `socket.hpp`, `polymorphic_socket.hpp`, `instantiate_connection.cpp`, `union_endpoint.hpp` | `net::socket` + `net::transport` | in progress | `PeerStream`/`PeerConnector`/`PeerAcceptor` traits scaffolded (ADR-0008) |
 | `socks5_stream.cpp`, `http_stream.hpp`, `ssl.cpp`, `ssl_stream.hpp`, `i2p_stream.cpp`, `rtc_stream.cpp`, `rtc_signaling.cpp`, `websocket_stream.cpp` | `net::stream::*` | not started | proxies/TLS/I2P/RTC — rustls not openssl |
 | `chained_buffer.cpp` (send-buffer) | `net::chained_buffer` | **ported** | `Box<dyn BufferHolder>` replaces type-erased holder + destruct/move thunks; slack-append, pop_front partial/full, iovec build |

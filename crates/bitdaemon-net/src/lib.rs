@@ -26,6 +26,8 @@ pub mod bandwidth;
 pub mod chained_buffer;
 /// `ip_filter.hpp` — IPv4/IPv6 + port range access rules.
 pub mod ip_filter;
+/// `aux_/packet_buffer` — 16-bit-wrapping circular packet store (uTP).
+pub mod packet_buffer;
 /// `pe_crypto` — MSE/PE: DH-768 key exchange + RC4 (`libTomCrypt`).
 pub mod pe_crypto;
 /// Peer wire framing + message codec (`bt_peer_connection` packets).
@@ -34,6 +36,8 @@ pub mod peer_wire;
 pub mod receive_buffer;
 /// `aux_/socket_io.hpp` — BE wire helpers + endpoint codec.
 pub mod socket_io;
+/// `aux_/torrent_peer` — per-peer record + BEP-40 `peer_priority`.
+pub mod torrent_peer;
 pub mod transport;
 
 /// Networking errors (`boost::system::error_code` usages in

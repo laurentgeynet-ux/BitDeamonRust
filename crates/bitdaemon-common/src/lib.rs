@@ -47,7 +47,7 @@ pub use bitfield::Bitfield;
 pub use bloom_filter::{BloomFilter, count_zero_bits, has_bits, set_bits};
 pub use crc32c::{crc32c_32, crc32c_words};
 pub use error::{Error, Result};
-pub use flags::{AnnounceFlags, PexFlags, TorrentFlags};
+pub use flags::{AnnounceFlags, PeerSourceFlags, PexFlags, TorrentFlags};
 pub use hash::{Digest, Sha1Hash, Sha256Hash};
 pub use hex::{HexError, from_hex, is_hex, to_hex, to_hex_into};
 pub use index_range::{IndexIter, IndexRange, IndexStep, index_range};
