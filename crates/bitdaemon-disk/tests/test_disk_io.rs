@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bitdaemon_common::Sha1Hash;
-use bitdaemon_common::types::{DownloadPriority, PieceIndex, StorageIndex};
+use bitdaemon_common::types::{DownloadPriority, FileIndex, PieceIndex, StorageIndex};
 use bitdaemon_core::file_storage::{FileFlags, FileStorage, RenamedFiles};
 use bitdaemon_disk::disk_buffer_pool::DiskBufferHolder;
 use bitdaemon_disk::disk_io::PreadDiskIo;
@@ -116,7 +116,7 @@ fn read_job(piece: i32, got: Arc<Mutex<Vec<u8>>>, done: Arc<AtomicUsize>) -> Box
 fn immediate_execute_round_trip() {
     let d = dir("imm");
     let (io, _drained) = make_io(0);
-    io.new_torrent(StorageIndex(0), storage(&make_fs(), &d));
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs(), &d)));
 
     let done = Arc::new(AtomicUsize::new(0));
     let got = Arc::new(Mutex::new(Vec::new()));
@@ -144,7 +144,7 @@ fn immediate_execute_round_trip() {
 fn threaded_pool_executes_and_completes() {
     let d = dir("thr");
     let (io, _drained) = make_io(4);
-    io.new_torrent(StorageIndex(0), storage(&make_fs(), &d));
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs(), &d)));
 
     let done = Arc::new(AtomicUsize::new(0));
     let got = Arc::new(Mutex::new(Vec::new()));
@@ -173,7 +173,7 @@ fn threaded_pool_executes_and_completes() {
 fn hash_job_computes_piece_sha1() {
     let d = dir("hash");
     let (io, _drained) = make_io(0);
-    io.new_torrent(StorageIndex(0), storage(&make_fs(), &d));
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs(), &d)));
     let done = Arc::new(AtomicUsize::new(0));
 
     io.add_job(StorageIndex(0), write_job(0, 0x11, &io, Arc::clone(&done)));
@@ -207,4 +207,51 @@ fn hash_job_computes_piece_sha1() {
     assert_eq!(&got.lock().unwrap().as_bytes()[..], &expect[..]);
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn file_progress_accounts_per_file() {
+    use bitdaemon_common::bitfield::Bitfield;
+    use bitdaemon_disk::file_progress::FileProgress;
+    let fs = make_fs();
+    let mut fp = FileProgress::new();
+    let mut have = Bitfield::new();
+    have.resize_with(2, false);
+    have.set_bit(0);
+    fp.init(&have, &fs);
+    // piece 0 = 24 bytes in a.bin tail + 1000 in b.bin head? no —
+    // piece 0 covers bytes 0..1024: a.bin[0..1000] + b.bin[0..24]
+    let mut v = Vec::new();
+    fp.export_progress(&mut v);
+    assert_eq!(v, vec![1000, 24]);
+    assert_eq!(fp.total_on_disk(), 1024);
+
+    // completing piece 1 (remaining 976 bytes of b.bin)
+    let mut completed = Vec::new();
+    fp.update(&fs, PieceIndex(1), |f| completed.push(f));
+    fp.export_progress(&mut v);
+    assert_eq!(v, vec![1000, 1000]);
+    assert_eq!(completed, vec![FileIndex(1)]);
+}
+
+#[test]
+fn disabled_backend_completes_noop() {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::{DisabledDiskIo, DiskIo};
+    let io = DisabledDiskIo::new();
+    let hit = Arc::new(AtomicUsize::new(0));
+    let h = Arc::clone(&hit);
+    io.async_read(
+        StorageIndex(0),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start: 0,
+            length: 0x4000,
+        },
+        Box::new(move |_, _| {
+            h.fetch_add(1, Ordering::Relaxed);
+        }),
+        0,
+    );
+    assert_eq!(hit.load(Ordering::Relaxed), 1);
 }

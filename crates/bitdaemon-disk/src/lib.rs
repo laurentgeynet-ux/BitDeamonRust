@@ -17,16 +17,7 @@
 
 #![forbid(unsafe_code)]
 
-/// Async disk backend abstraction (`libtorrent::disk_interface`).
-///
-/// TODO: implement — `async_read`/`async_write`/`async_hash`/`async_hash2`/
-/// `async_move_storage`/`async_release_files`/`async_delete_files`/
-/// `async_check_files`/`async_rename_file`/`async_clear_piece` +
-/// `new_torrent`/`remove_torrent`/`abort_jobs`/`update_stats`.
-/// C++ uses a job-queue + completion-callback model; in Rust this maps
-/// to `async fn` returning `Result<...>` or `mpsc` completion events.
-pub trait DiskIo {}
-
+/// `disk_interface` is in [`disk_interface::DiskIo`].
 /// `aux_/file.hpp` — positioned I/O handle.
 pub mod file;
 /// `aux_/path.hpp` fs-half + `directory.cpp` + `drive_info.cpp` +
@@ -50,6 +41,8 @@ pub mod back_pressure;
 pub mod disk_buffer_pool;
 /// `aux_/disk_completed_queue.hpp` — network-thread completion drain.
 pub mod disk_completed;
+/// `disk_interface.hpp` — `DiskIo` trait, `StorageHolder`, `disabled`.
+pub mod disk_interface;
 /// `pread_disk_io.cpp` — positioned-I/O orchestrator.
 pub mod disk_io;
 /// `aux_/disk_job.hpp` — job types, flags, completion.
@@ -58,6 +51,8 @@ pub mod disk_job;
 pub mod disk_job_fence;
 /// `aux_/disk_io_thread_pool.hpp` + `disk_job_pool` counters.
 pub mod disk_pool;
+/// `aux_/file_progress.hpp` — per-file download accounting.
+pub mod file_progress;
 /// `aux_/readwrite.hpp` — piece→file buffer walk.
 pub mod readwrite;
 /// `aux_/pread_storage.hpp` — positioned-I/O storage backend.

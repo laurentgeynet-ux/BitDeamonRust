@@ -75,6 +75,7 @@ pub enum StorageMode {
 }
 
 /// `storage_params` — parameter pack for constructing a storage.
+#[derive(Clone)]
 pub struct StorageParams<'a> {
     /// `files` — the torrent's file layout.
     pub files: &'a FileStorage,
@@ -637,4 +638,147 @@ impl PreadStorage {
             &self.save_path,
         )
     }
+}
+
+/// `DiskStorage` — object-safe view of a torrent storage, the seam the
+/// disk-io orchestrator dispatches through. This is the downstream
+/// **injection point** (ADR-0008): OnionBit's `PrivateStorageFactory`
+/// supplies its own implementation; the default is `PreadStorage`.
+///
+/// Upstream libtorrent 2.x removed `storage_interface` as a
+/// customization point (see `storage.hpp` — "customize disk_interface
+/// instead"); we keep a narrower trait because OnionBit replaces
+/// *storage* (encrypted, opaque names), not the job machinery.
+pub trait DiskStorage: Send + Sync {
+    /// `storage_index`/`set_storage_index`.
+    fn set_storage_index(&self, idx: StorageIndex);
+    /// `files()`.
+    fn files(&self) -> &FileStorage;
+    /// `file_priorities`.
+    fn file_priorities(&self) -> &[DownloadPriority];
+    /// piece-aligned read (part-file aware).
+    fn read(
+        &self,
+        buf: &mut [u8],
+        piece: PieceIndex,
+        offset: i64,
+        mode: OpenMode,
+        volatile: bool,
+    ) -> StorageResult<i64>;
+    /// piece-aligned write.
+    fn write(
+        &self,
+        buf: &[u8],
+        piece: PieceIndex,
+        offset: i64,
+        mode: OpenMode,
+    ) -> StorageResult<i64>;
+    /// `hash` — feed every byte of the range to `feed`.
+    fn hash_with(
+        &self,
+        feed: &mut dyn FnMut(&[u8]),
+        len: i64,
+        piece: PieceIndex,
+        offset: i64,
+        mode: OpenMode,
+        volatile: bool,
+    ) -> StorageResult<i64>;
+    /// `release_files`.
+    fn release_files(&self) -> StorageResult<()>;
+    /// `move_storage` — `(status, new_path)`.
+    fn move_storage(&self, path: PathBuf, flags: MoveFlags) -> StorageResult<(u8, PathBuf)>;
+    /// `delete_files`.
+    fn delete_files(&self, options: u8) -> StorageResult<()>;
+    /// `rename_file`.
+    fn rename_file(&mut self, index: FileIndex, new_name: &[u8]) -> StorageResult<()>;
+    /// `set_file_priority`.
+    fn set_file_priority(&mut self, prio: &[DownloadPriority]) -> StorageResult<()>;
+    /// `verify_resume_data`.
+    fn verify_resume_data(
+        &self,
+        have_pieces: &bitdaemon_common::bitfield::Bitfield,
+        seed_mode: bool,
+        links: &[PathBuf],
+    ) -> StorageResult<bool>;
+}
+
+impl DiskStorage for PreadStorage {
+    fn set_storage_index(&self, idx: StorageIndex) {
+        PreadStorage::set_storage_index(self, idx);
+    }
+    fn files(&self) -> &FileStorage {
+        &self.files
+    }
+    fn file_priorities(&self) -> &[DownloadPriority] {
+        &self.file_priority
+    }
+    fn read(
+        &self,
+        buf: &mut [u8],
+        piece: PieceIndex,
+        offset: i64,
+        mode: OpenMode,
+        volatile: bool,
+    ) -> StorageResult<i64> {
+        PreadStorage::read(self, buf, piece, offset, mode, volatile)
+    }
+    fn write(
+        &self,
+        buf: &[u8],
+        piece: PieceIndex,
+        offset: i64,
+        mode: OpenMode,
+    ) -> StorageResult<i64> {
+        PreadStorage::write(self, buf, piece, offset, mode)
+    }
+    fn hash_with(
+        &self,
+        feed: &mut dyn FnMut(&[u8]),
+        len: i64,
+        piece: PieceIndex,
+        offset: i64,
+        mode: OpenMode,
+        volatile: bool,
+    ) -> StorageResult<i64> {
+        PreadStorage::hash_with(self, |d| feed(d), len, piece, offset, mode, volatile)
+    }
+    fn release_files(&self) -> StorageResult<()> {
+        PreadStorage::release_files(self)
+    }
+    fn move_storage(&self, path: PathBuf, flags: MoveFlags) -> StorageResult<(u8, PathBuf)> {
+        PreadStorage::move_storage(self, path, flags)
+    }
+    fn delete_files(&self, options: u8) -> StorageResult<()> {
+        PreadStorage::delete_files(self, options)
+    }
+    fn rename_file(&mut self, index: FileIndex, new_name: &[u8]) -> StorageResult<()> {
+        PreadStorage::rename_file(self, index, new_name)
+    }
+    fn set_file_priority(&mut self, prio: &[DownloadPriority]) -> StorageResult<()> {
+        PreadStorage::set_file_priority(self, prio)
+    }
+    fn verify_resume_data(
+        &self,
+        have_pieces: &bitdaemon_common::bitfield::Bitfield,
+        seed_mode: bool,
+        links: &[PathBuf],
+    ) -> StorageResult<bool> {
+        PreadStorage::verify_resume_data(self, have_pieces, seed_mode, links)
+    }
+}
+
+/// `StorageFactory` — injected constructor (upstream's removed
+/// `storage_constructor` customization point, kept as a seam per
+/// ADR-0008). Given `storage_params` + shared `FilePool`, produce the
+/// torrent's storage.
+pub type StorageFactory = Arc<
+    dyn for<'a> Fn(&StorageParams<'a>, Arc<crate::file_pool::FilePool>) -> Box<dyn DiskStorage>
+        + Send
+        + Sync,
+>;
+
+/// `default_storage_constructor` — the upstream default.
+#[must_use]
+pub fn default_storage_factory() -> StorageFactory {
+    Arc::new(|params, pool| Box::new(PreadStorage::new(params.clone(), pool)))
 }

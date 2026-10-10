@@ -118,12 +118,14 @@ condvar wait, `try_thread_exit`) ✅, `disk_buffer_pool` + RAII
 formulas verbatim) ✅, `disk_completed_queue` (single in-flight drain
 post) ✅, `pread_disk_io` orchestrator (`perform_job` dispatch,
 `immediate_execute` 0-thread fallback, abort) ✅.
+`DiskIo` trait (full upstream surface) ✅, `StorageHolder` ✅,
+`DisabledDiskIo` ✅, **`StorageFactory`/`DiskStorage` injection
+point** (ADR-0008 — OnionBit `PrivateStorageFactory` parity) ✅,
+`FileProgress` ✅, back-pressure wired into `async_write` ✅.
 *(still to do)*: `HashPicker` (v2 piece layers),
 `precomputed_block_hashes`, `file_view_pool`/`mmap` (memmap2 feature),
-`disabled` backend, `FileProgress`, **`StorageFactory` trait**
-(ADR-0008 — downstream `PrivateStorageFactory`/OBD parity), async
-`DiskIo` trait surface for the session, `store_buffer` watermarks
-(`max_queued_disk_bytes`/`send_buffer_watermark`).
+`store_buffer` watermarks (`max_queued_disk_bytes`/
+`send_buffer_watermark`).
 
 **Fastresume** (`core::resume` lands Phase 2, applied here):
 byte-compatible with upstream `read_resume_data`/`write_resume_data`

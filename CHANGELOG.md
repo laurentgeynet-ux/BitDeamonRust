@@ -9,6 +9,24 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `bitdaemon_disk` Phase-3 wave 3b (interface + injection):
+  `disk_interface::DiskIo` — the full upstream `disk_interface`
+  surface (`new_torrent`/`remove_torrent`/`async_read`/`async_write`
+  (returns back-pressure bool)/`async_hash`/`async_hash2`/
+  `async_move_storage`/`async_release_files`/`async_check_files`/
+  `async_stop_torrent`/`async_rename_file`/`async_delete_files`/
+  `async_set_file_priority`/`async_clear_piece`/`get_status`/`abort`/
+  `submit_jobs`), `StorageHolder` RAII (drop → `remove_torrent`),
+  `DisabledDiskIo` test backend, **`DiskStorage` trait +
+  `StorageFactory` injection point** — the ADR-0008 seam for
+  OnionBit's `PrivateStorageFactory` (upstream removed
+  `storage_interface` in 2.0; we keep a narrow storage-only seam),
+  `file_progress` (per-file passed-hash byte accounting,
+  `completed_cb` on file finish; `init` takes the have-pieces
+  bitfield — documented deviation from `piece_picker`), `DiskIo`
+  impl for `PreadDiskIo` wiring fence jobs vs. normal jobs.
+  Back-pressure level = buffer-pool `in_use`.
+
 - `bitdaemon_disk` Phase-3 wave 2+3 (job machinery + orchestrator):
   `disk_job` (all 13 upstream `job_action_t` kinds, `fence`/
   `in_progress`/`aborted` flag bits, per-job completion handlers),

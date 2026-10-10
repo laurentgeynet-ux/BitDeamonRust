@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bitdaemon_common::types::{FileIndex, StorageIndex};
+use bitdaemon_common::types::{FileIndex, PieceIndex, StorageIndex};
 use bitdaemon_common::{Sha1Hash, Sha256Hash};
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
@@ -35,13 +35,13 @@ use crate::disk_job::{
 use crate::disk_job_fence::{DiskJobFence, FENCE_POST_FENCE, FenceCounters};
 use crate::disk_pool::{DiskIoThreadPool, JobQueue, WaitResult};
 use crate::open_mode::OpenMode;
-use crate::storage::PreadStorage;
+use crate::storage::{DiskStorage, StorageFactory, StorageParams};
 use crate::storage_error::{Operation, StorageError};
 
 /// Per-torrent state owned by the disk io — upstream the fence hangs
 /// off `storage_interface`; here both live behind one entry.
 struct StorageEntry {
-    storage: Mutex<PreadStorage>,
+    storage: Mutex<Box<dyn DiskStorage>>,
     fence: DiskJobFence,
 }
 
@@ -54,12 +54,31 @@ pub struct PreadDiskIo {
     /// `m_abort` — after abort, add_job posts straight to completions.
     abort: AtomicBool,
     buffer_pool: Arc<crate::disk_buffer_pool::DiskBufferPool>,
+    /// `storage_constructor` — injected (ADR-0008).
+    factory: StorageFactory,
+    file_pool: Arc<crate::file_pool::FilePool>,
+    /// `m_back_pressure`.
+    back_pressure: crate::back_pressure::BackPressure,
 }
 
 impl PreadDiskIo {
     /// `pread_disk_io(ios, cnt)` — `poster` drains completions on the
     /// network thread.
     pub fn new(max_threads: i64, poster: crate::disk_completed::DrainPoster) -> Arc<Self> {
+        Self::with_factory(
+            max_threads,
+            poster,
+            crate::storage::default_storage_factory(),
+        )
+    }
+
+    /// `pread_disk_io` with an injected `StorageFactory` (ADR-0008 —
+    /// downstream private/encrypted storage).
+    pub fn with_factory(
+        max_threads: i64,
+        poster: crate::disk_completed::DrainPoster,
+        factory: StorageFactory,
+    ) -> Arc<Self> {
         let buffer_pool = Arc::new(crate::disk_buffer_pool::DiskBufferPool::new());
         let completed = Arc::new(DiskCompletedQueue::new(poster));
         // the worker loop needs the orchestrator — two-phase init:
@@ -83,6 +102,9 @@ impl PreadDiskIo {
             fence_counters: FenceCounters::default(),
             abort: AtomicBool::new(false),
             buffer_pool,
+            factory,
+            file_pool: Arc::new(crate::file_pool::FilePool::new(40)),
+            back_pressure: crate::back_pressure::BackPressure::new(),
         });
         *io_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&io));
         io.pool.set_max_threads(max_threads);
@@ -101,8 +123,29 @@ impl PreadDiskIo {
         Arc::clone(&self.completed)
     }
 
-    /// `new_torrent(storage_index, params)` — register a storage.
-    pub fn new_torrent(&self, idx: StorageIndex, storage: PreadStorage) {
+    /// `new_torrent(storage_params, torrent)` — build the storage via
+    /// the injected `StorageFactory`, register it, return its index
+    /// (upstream `storage_holder`).
+    pub fn new_torrent(&self, params: &StorageParams<'_>) -> StorageIndex {
+        let mut g = self.storages.lock().unwrap_or_else(|e| e.into_inner());
+        let mut idx = StorageIndex(0);
+        while g.contains_key(&idx) {
+            idx = StorageIndex(idx.0.wrapping_add(1));
+        }
+        let storage = (self.factory)(params, Arc::clone(&self.file_pool));
+        storage.set_storage_index(idx);
+        g.insert(
+            idx,
+            Arc::new(StorageEntry {
+                storage: Mutex::new(storage),
+                fence: DiskJobFence::new(),
+            }),
+        );
+        idx
+    }
+
+    /// Register a pre-built storage (tests / custom wiring).
+    pub fn insert_storage(&self, idx: StorageIndex, storage: Box<dyn DiskStorage>) {
         storage.set_storage_index(idx);
         self.storages
             .lock()
@@ -290,7 +333,7 @@ impl PreadDiskIo {
             return;
         };
         let mut st_guard = e.storage.lock().unwrap_or_else(|p| p.into_inner());
-        let st = &mut *st_guard;
+        let st: &mut dyn DiskStorage = &mut **st_guard;
         j.error = match &mut j.action {
             JobKind::Read(r) => read_job(st, r),
             JobKind::PartialRead(r) => partial_read_job(st, r),
@@ -367,7 +410,7 @@ impl PreadDiskIo {
     }
 }
 
-fn read_job(st: &PreadStorage, r: &mut ReadJob) -> StorageError {
+fn read_job(st: &dyn DiskStorage, r: &mut ReadJob) -> StorageError {
     let Some(buf) = r.buf.data_mut() else {
         return StorageError::new(
             std::io::Error::from(std::io::ErrorKind::OutOfMemory),
@@ -391,7 +434,7 @@ fn read_job(st: &PreadStorage, r: &mut ReadJob) -> StorageError {
     }
 }
 
-fn partial_read_job(st: &PreadStorage, r: &mut PartialReadJob) -> StorageError {
+fn partial_read_job(st: &dyn DiskStorage, r: &mut PartialReadJob) -> StorageError {
     // unaligned read into buf at buffer_offset (upstream semantics)
     let Some(buf) = r.buf.data_mut() else {
         return StorageError::new(
@@ -414,7 +457,7 @@ fn partial_read_job(st: &PreadStorage, r: &mut PartialReadJob) -> StorageError {
     }
 }
 
-fn write_job(st: &PreadStorage, w: &mut WriteJob) -> StorageError {
+fn write_job(st: &dyn DiskStorage, w: &mut WriteJob) -> StorageError {
     let Some(buf) = w.buf.data() else {
         return StorageError::new(
             std::io::Error::from(std::io::ErrorKind::InvalidInput),
@@ -432,7 +475,7 @@ fn write_job(st: &PreadStorage, w: &mut WriteJob) -> StorageError {
     }
 }
 
-fn hash_job(st: &PreadStorage, h: &mut HashJob) -> StorageError {
+fn hash_job(st: &dyn DiskStorage, h: &mut HashJob) -> StorageError {
     // SHA-1 over the whole piece; also fills per-block SHA-256 when the
     // caller provided a block_hashes span (v2) — upstream hash job.
     let mut sha1 = Sha1::new();
@@ -442,7 +485,7 @@ fn hash_job(st: &PreadStorage, h: &mut HashJob) -> StorageError {
     let mut block_idx = 0usize;
     let len = i64::from(st.files().piece_size(h.piece));
     let r = st.hash_with(
-        |data| {
+        &mut |data| {
             sha1.update(data);
             if blocks_wanted {
                 let mut d = data;
@@ -481,10 +524,10 @@ fn hash_job(st: &PreadStorage, h: &mut HashJob) -> StorageError {
     }
 }
 
-fn hash2_job(st: &PreadStorage, h: &mut Hash2Job) -> StorageError {
+fn hash2_job(st: &dyn DiskStorage, h: &mut Hash2Job) -> StorageError {
     let mut sha = Sha256::new();
     let r = st.hash_with(
-        |d| sha.update(d),
+        &mut |d| sha.update(d),
         i64::try_from(DEFAULT_BLOCK_SIZE).unwrap_or(0),
         h.piece,
         i64::from(h.offset),
@@ -498,4 +541,255 @@ fn hash2_job(st: &PreadStorage, h: &mut Hash2Job) -> StorageError {
         }
         Err(e) => e,
     }
+}
+
+// ---------------------------------------------------------------------------
+// `disk_interface` implementation
+// ---------------------------------------------------------------------------
+
+use crate::back_pressure::DiskObserver;
+use crate::disk_interface::{DiskIo, flags as io_flags};
+use bitdaemon_common::types::{DownloadPriority, PeerRequest};
+use bitdaemon_core::add_torrent_params::AddTorrentParams;
+use std::path::PathBuf;
+
+/// field — declared on `PreadDiskIo` struct below via include-style.
+impl PreadDiskIo {
+    fn mk_job(&self, action: JobKind) -> Box<DiskJob> {
+        Box::new(DiskJob {
+            storage: StorageIndex(u32::MAX),
+            flags: 0,
+            ret: 0,
+            error: StorageError::default(),
+            action,
+        })
+    }
+
+    /// `settings_updated` — applies max_threads from the caller's
+    /// settings snapshot (upstream reads settings_interface).
+    pub fn set_max_threads(&self, n: i64) {
+        self.pool.set_max_threads(n);
+    }
+}
+
+impl DiskIo for PreadDiskIo {
+    fn new_torrent(&self, p: &StorageParams<'_>, _torrent: Arc<dyn Send + Sync>) -> StorageIndex {
+        PreadDiskIo::new_torrent(self, p)
+    }
+
+    fn remove_torrent(&self, idx: StorageIndex) {
+        PreadDiskIo::remove_torrent(self, idx);
+    }
+
+    fn async_read(
+        &self,
+        storage: StorageIndex,
+        r: PeerRequest,
+        handler: Box<dyn FnOnce(crate::disk_buffer_pool::DiskBufferHolder, StorageError) + Send>,
+        flags: u8,
+    ) {
+        let buf = self.buffer_pool.allocate_buffer("read");
+        let length = r.length;
+        let j = self.mk_job(JobKind::Read(ReadJob {
+            handler,
+            buf,
+            buffer_size: u16::try_from(length).unwrap_or(u16::MAX),
+            piece: r.piece,
+            offset: r.start,
+            volatile: flags & io_flags::VOLATILE_READ != 0,
+        }));
+        self.add_job(storage, j);
+    }
+
+    fn async_write(
+        &self,
+        storage: StorageIndex,
+        r: PeerRequest,
+        buf: crate::disk_buffer_pool::DiskBufferHolder,
+        o: Option<Arc<dyn DiskObserver>>,
+        handler: Box<dyn FnOnce(StorageError) + Send>,
+        _flags: u8,
+    ) -> bool {
+        // `async_write` returns true when the queue is full — the peer
+        // stops and waits on the observer (upstream contract)
+        if self
+            .back_pressure
+            .has_back_pressure(self.buffer_pool.in_use(), o)
+        {
+            return true;
+        }
+        let j = self.mk_job(JobKind::Write(WriteJob {
+            handler,
+            buf,
+            piece: r.piece,
+            offset: r.start,
+            buffer_size: u16::try_from(r.length).unwrap_or(u16::MAX),
+        }));
+        self.add_job(storage, j);
+        false
+    }
+
+    fn async_hash(
+        &self,
+        storage: StorageIndex,
+        piece: PieceIndex,
+        v2: Vec<Sha256Hash>,
+        _flags: u8,
+        handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, StorageError) + Send>,
+    ) {
+        let j = self.mk_job(JobKind::Hash(HashJob {
+            handler,
+            piece,
+            block_hashes: v2,
+            piece_hash: Sha1Hash::default(),
+        }));
+        self.add_job(storage, j);
+    }
+
+    fn async_hash2(
+        &self,
+        storage: StorageIndex,
+        piece: PieceIndex,
+        offset: i32,
+        _flags: u8,
+        handler: Box<dyn FnOnce(PieceIndex, Sha256Hash, StorageError) + Send>,
+    ) {
+        let j = self.mk_job(JobKind::Hash2(Hash2Job {
+            handler,
+            piece,
+            offset,
+            piece_hash2: Sha256Hash::default(),
+        }));
+        self.add_job(storage, j);
+    }
+
+    fn async_move_storage(
+        &self,
+        storage: StorageIndex,
+        path: PathBuf,
+        flags: crate::storage::MoveFlags,
+        handler: Box<dyn FnOnce(Status, PathBuf, StorageError) + Send>,
+    ) {
+        self.add_fence_job(
+            storage,
+            self.mk_job(JobKind::MoveStorage(crate::disk_job::MoveStorageJob {
+                handler,
+                path,
+                move_flags: flags,
+            })),
+        );
+    }
+
+    fn async_release_files(&self, storage: StorageIndex, handler: Box<dyn FnOnce() + Send>) {
+        self.add_fence_job(
+            storage,
+            self.mk_job(JobKind::ReleaseFiles(crate::disk_job::ReleaseFilesJob {
+                handler,
+            })),
+        );
+    }
+
+    fn async_check_files(
+        &self,
+        storage: StorageIndex,
+        resume_data: Option<Box<AddTorrentParams>>,
+        links: Vec<String>,
+        handler: Box<dyn FnOnce(Status, StorageError) + Send>,
+    ) {
+        self.add_fence_job(
+            storage,
+            self.mk_job(JobKind::CheckFastresume(
+                crate::disk_job::CheckFastresumeJob {
+                    handler,
+                    links,
+                    resume_data,
+                },
+            )),
+        );
+    }
+
+    fn async_stop_torrent(&self, storage: StorageIndex, handler: Box<dyn FnOnce() + Send>) {
+        self.add_fence_job(
+            storage,
+            self.mk_job(JobKind::StopTorrent(crate::disk_job::StopTorrentJob {
+                handler,
+            })),
+        );
+    }
+
+    fn async_rename_file(
+        &self,
+        storage: StorageIndex,
+        index: FileIndex,
+        name: PathBuf,
+        handler: Box<dyn FnOnce(PathBuf, FileIndex, StorageError) + Send>,
+    ) {
+        self.add_fence_job(
+            storage,
+            self.mk_job(JobKind::RenameFile(crate::disk_job::RenameFileJob {
+                handler,
+                file_index: index,
+                name,
+            })),
+        );
+    }
+
+    fn async_delete_files(
+        &self,
+        storage: StorageIndex,
+        options: u8,
+        handler: Box<dyn FnOnce(StorageError) + Send>,
+    ) {
+        self.add_fence_job(
+            storage,
+            self.mk_job(JobKind::DeleteFiles(crate::disk_job::DeleteFilesJob {
+                handler,
+                flags: i32::from(options),
+            })),
+        );
+    }
+
+    fn async_set_file_priority(
+        &self,
+        storage: StorageIndex,
+        prio: Vec<DownloadPriority>,
+        handler: Box<dyn FnOnce(StorageError, Vec<DownloadPriority>) + Send>,
+    ) {
+        self.add_fence_job(
+            storage,
+            self.mk_job(JobKind::FilePriority(crate::disk_job::FilePriorityJob {
+                handler,
+                prio,
+            })),
+        );
+    }
+
+    fn async_clear_piece(
+        &self,
+        storage: StorageIndex,
+        index: PieceIndex,
+        handler: Box<dyn FnOnce(PieceIndex) + Send>,
+    ) {
+        self.add_fence_job(
+            storage,
+            self.mk_job(JobKind::ClearPiece(crate::disk_job::ClearPieceJob {
+                handler,
+                piece: index,
+            })),
+        );
+    }
+
+    fn get_status(&self, storage: StorageIndex) -> Vec<crate::file_pool::OpenFileState> {
+        self.file_pool.get_status(storage)
+    }
+
+    fn abort(&self, wait: bool) {
+        self.abort_jobs(wait);
+    }
+
+    fn submit_jobs(&self) {
+        self.pool.submit_jobs();
+    }
+
+    fn settings_updated(&self) {}
 }
