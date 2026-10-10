@@ -68,6 +68,9 @@ pub struct Engine {
     /// disconnect events from dead streams.
     gone_rx: mpsc::UnboundedReceiver<(Sha1Hash, u64)>,
     gone_tx: mpsc::UnboundedSender<(Sha1Hash, u64)>,
+    /// inbound datagrams (DHT, UDP tracker replies).
+    udp_rx: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
+    udp_tx: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
     /// spawned task handles (kept for abort on drop).
     tasks: Vec<JoinHandle<()>>,
     /// pipeline settings handed to every new `PeerConn`
@@ -89,6 +92,7 @@ impl Engine {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let (announce_tx, announce_rx) = mpsc::unbounded_channel();
         let (gone_tx, gone_rx) = mpsc::unbounded_channel();
+        let (udp_tx, udp_rx) = mpsc::unbounded_channel();
         Self {
             session: Session::new(),
             connector,
@@ -102,11 +106,32 @@ impl Engine {
             announce_tx,
             gone_rx,
             gone_tx,
+            udp_rx,
+            udp_tx,
             tasks: Vec::new(),
             queue_time: 3,
             request_timeout: 60,
             max_out_request_queue: 500,
         }
+    }
+
+    /// start the datagram pump — every received packet is queued
+    /// for `session.on_udp` at the next `tick` (upstream's
+    /// `udp_socket` → `on_receive` fan-out; the injected socket
+    /// decides what arrives — an anonymous circuit mux demuxes here).
+    pub fn start_udp_pump(&mut self) {
+        let Some(dg) = self.datagram.clone() else {
+            return;
+        };
+        let tx = self.udp_tx.clone();
+        self.tasks.push(tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            while let Ok((n, from)) = dg.recv_from(&mut buf).await {
+                if tx.send((from, buf[..n].to_vec())).is_err() {
+                    return;
+                }
+            }
+        }));
     }
 
     /// `listen_port` passthrough (announce `port=`).
@@ -141,6 +166,9 @@ impl Engine {
         }
         while let Ok(a) = self.announce_rx.try_recv() {
             self.session.on_announce_response(&a.ih, &a.url, a.result);
+        }
+        while let Ok((from, buf)) = self.udp_rx.try_recv() {
+            self.session.on_udp(from, &buf, &mut out);
         }
 
         self.session.tick(&mut out);

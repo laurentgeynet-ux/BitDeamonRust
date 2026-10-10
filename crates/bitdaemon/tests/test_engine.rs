@@ -200,3 +200,91 @@ async fn http_announce_via_resolver() {
     responder.await.unwrap();
     assert_eq!(eng.session.torrents[&ih].peer_list.num_peers(), 1);
 }
+
+// ---------- UDP pump → DHT ----------
+
+use tokio::sync::mpsc as tmpsc;
+
+#[derive(Debug)]
+struct ChanDatagram {
+    inbound: tokio::sync::Mutex<tmpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>>,
+    inbound_tx: tmpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
+    sent: tokio::sync::Mutex<tmpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+    sent_tx: tmpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
+}
+
+impl ChanDatagram {
+    fn new() -> Self {
+        let (itx, irx) = tmpsc::unbounded_channel();
+        let (stx, srx) = tmpsc::unbounded_channel();
+        Self {
+            inbound: tokio::sync::Mutex::new(irx),
+            inbound_tx: itx,
+            sent: tokio::sync::Mutex::new(srx),
+            sent_tx: stx,
+        }
+    }
+}
+
+impl bitdaemon_net::transport::DatagramSocket for ChanDatagram {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> bitdaemon_net::transport::BoxFut<'a, usize> {
+        Box::pin(async move {
+            let n = buf.len();
+            let _ = self.sent_tx.send((buf.to_vec(), target));
+            Ok(n)
+        })
+    }
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> bitdaemon_net::transport::BoxFut<'a, (usize, SocketAddr)> {
+        Box::pin(async move {
+            let mut rx = self.inbound.lock().await;
+            match rx.recv().await {
+                Some((from, data)) => {
+                    let n = data.len().min(buf.len());
+                    buf[..n].copy_from_slice(&data[..n]);
+                    Ok((n, from))
+                }
+                None => Err(std::io::Error::other("closed")),
+            }
+        })
+    }
+    fn local_addr(&self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6881)
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dht_ping_round_trip() {
+    let dg = Arc::new(ChanDatagram::new());
+    let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(None)));
+    let mut eng = Engine::new(conn, Some(dg.clone()));
+    eng.session.enable_dht(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        None,
+        bitdaemon_dht::dht_settings::DhtSettings::default(),
+    );
+    eng.start_udp_pump();
+
+    // a remote node pings our DHT
+    let from = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 51413);
+    let ping = b"d1:ad2:id20:aaaaaaaaaaaaaaaaaaaae1:q4:ping1:t2:aa1:y1:qe";
+    dg.inbound_tx.send((from, ping.to_vec())).unwrap();
+
+    for _ in 0..30 {
+        tokio::task::yield_now().await;
+        eng.tick(std::time::Instant::now()).await;
+        if let Ok((data, to)) = dg.sent.lock().await.try_recv() {
+            let s = String::from_utf8_lossy(&data);
+            assert_eq!(to, from);
+            assert!(s.contains("1:y1:r"), "response: {s}");
+            return;
+        }
+    }
+    panic!("no dht response routed");
+}

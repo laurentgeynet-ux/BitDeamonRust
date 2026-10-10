@@ -530,6 +530,17 @@ impl Session {
         self.route(*ih, eff, out);
     }
 
+    /// `start_dht` — bind the DHT node for `bind_ip`'s family.
+    /// `id`/`None` → generate (BEP-42 enforced by settings).
+    pub fn enable_dht(
+        &mut self,
+        bind_ip: std::net::IpAddr,
+        id: Option<bitdaemon_dht::node_id::NodeId>,
+        settings: bitdaemon_dht::dht_settings::DhtSettings,
+    ) {
+        self.dht.bind(bind_ip, id, settings);
+    }
+
     /// UDP datagram → dht tracker (any family).
     pub fn on_udp(&mut self, from: SocketAddr, buf: &[u8], out: &mut Vec<SessionOut>) {
         if let Some((pkt, to)) = self.dht.incoming(from, buf) {
