@@ -132,6 +132,9 @@ struct DialDone {
     /// `false` — an outbound dial failure feeds the reconnect
     /// backoff; an inbound accept failure is just dropped.
     outbound: bool,
+    /// reserved-bit caps parsed from the peer's handshake.
+    fast: bool,
+    dht: bool,
 }
 
 /// A web-seed fetch completion: per-block data or the failed
@@ -1151,6 +1154,9 @@ impl Engine {
         let remote = d
             .remote
             .unwrap_or_else(|| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0));
+        let mut conn = conn;
+        conn.supports_fast = d.fast;
+        conn.supports_dht = d.dht;
         let mut out = Vec::new();
         self.session
             .peer_connected(&d.ih, peer, conn, remote, &mut out);
@@ -1174,6 +1180,8 @@ impl Engine {
                     remote: Some(remote),
                     stream: Err(e),
                     outbound: true,
+                    fast: false,
+                    dht: false,
                 });
             };
             let mut s = match connector.connect(remote).await {
@@ -1212,6 +1220,8 @@ impl Engine {
                 remote: Some(remote),
                 stream: Ok(s),
                 outbound: true,
+                fast: hs.as_ref().map_or(false, |h| h.supports_fast()),
+                dht: hs.as_ref().map_or(false, |h| h.supports_dht()),
             });
         });
         self.tasks.push(h);
@@ -1250,6 +1260,8 @@ impl Engine {
                             remote: None,
                             stream: Ok(s),
                             outbound: false,
+                            fast: hs.supports_fast(),
+                            dht: hs.supports_dht(),
                         });
                     }
                     Err(e) => {

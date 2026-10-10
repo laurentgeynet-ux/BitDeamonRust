@@ -75,6 +75,12 @@ pub struct PeerConn {
     pub num_pieces: i32,
     /// ms timestamp the connection was established (`m_connect`).
     pub connect_ms: i64,
+    /// `m_supports_fast` — remote negotiated the FAST extension
+    /// (reserved byte 7 bit 0x04). Rejects/allowed-fast only exist
+    /// when set.
+    pub supports_fast: bool,
+    /// `m_supports_dht_port` — remote advertised a DHT port bit.
+    pub supports_dht: bool,
     /// `m_interested` — WE sent `interested` (upstream tracks the
     /// wire state to avoid duplicate sends).
     pub we_sent_interested: bool,
@@ -135,6 +141,8 @@ impl PeerConn {
             stat_down_total: 0,
             stat_up_round: 0,
             stat_down_round: 0,
+            supports_fast: false,
+            supports_dht: false,
             we_sent_interested: false,
             last_unchoke: std::time::Instant::now(),
         }

@@ -1105,7 +1105,24 @@ impl Torrent {
                     out.push(TorrentEffect::DiskWrite { req, data });
                 }
                 PeerEffect::ReadRequest(req) => {
-                    out.push(TorrentEffect::DiskRead { peer: peer_id, req });
+                    // upstream `incoming_request`: a peer we choke
+                    // only gets BEP-6 `allowed_fast` pieces; a piece
+                    // we don't have gets a FAST `reject` (or silent
+                    // drop when fast isn't negotiated) — never a
+                    // disk read.
+                    let allowed = self.peers.get(&peer_id).is_some_and(|c| {
+                        (!c.choked || c.allowed_fast.contains(&req.piece))
+                            && (req.piece.0 as usize) < self.have.size()
+                            && self.have.get_bit(req.piece.0 as usize)
+                    });
+                    if allowed {
+                        out.push(TorrentEffect::DiskRead { peer: peer_id, req });
+                    } else if self.peers.get(&peer_id).is_some_and(|c| c.supports_fast) {
+                        out.push(TorrentEffect::SendTo {
+                            peer: peer_id,
+                            msg: PeerMessage::RejectRequest(req),
+                        });
+                    }
                 }
                 PeerEffect::CancelRequest(_) => {}
                 PeerEffect::MarkDownloaded(b) => {
