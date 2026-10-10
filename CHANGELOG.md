@@ -7,6 +7,16 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — `bitdaemon-net` (proxies)
+
+- `socks` — SOCKS4/SOCKS5 handshake (auth negotiation, user/pass
+  sub-negotiation, CONNECT/UDP-ASSOCIATE, bound-address drain) as an
+  `async fn` over `AsyncRead + AsyncWrite` — identical wire protocol,
+  works over injected streams.
+- `http_stream` — HTTP `CONNECT` proxy handshake (`Host` header,
+  `Proxy-Authorization: Basic`, byte-wise header terminator scan,
+  200-status check) plus `base64_encode`. 7 tests green.
+
 ### Added — `bitdaemon-session` (piece picking)
 
 - `peer_pipeline` — the request-pipeline half of
