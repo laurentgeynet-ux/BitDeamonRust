@@ -12,8 +12,8 @@
 
 /// Owned bencoded value (`libtorrent::entry`).
 ///
-/// TODO: implement — variants: Int(i64), String(ByteString),
-/// List(Vec<Entry>), Dict(BTreeMap<ByteString, Entry>).
+/// TODO: implement — variants: `Int(i64)`, `String(ByteString)`,
+/// `List(Vec<Entry>)`, `Dict(BTreeMap<ByteString, Entry>)`.
 /// C++ keeps dict keys sorted and deduplicated; preserve that invariant.
 pub enum Entry {}
 

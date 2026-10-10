@@ -54,6 +54,42 @@ feeding decoded messages into the session actor (preferred — isolates
 socket I/O), or (b) run socket reads inline in the actor via `select!`.
 Decide in Phase 4; record as ADR.
 
+## Injectable transports (ADR-0008)
+
+No crate below `session` binds an OS socket. All UDP-based subsystems
+consume `Arc<dyn DatagramSocket>`; all peer connections come from
+`PeerConnector`/`PeerAcceptor` trait objects (defined in
+`bitdaemon_net::transport`):
+
+```
+                 ┌──────────────────────────────┐
+                 │ session: SessionParams        │
+                 │  dht_socket ─┐                │
+                 │  udp_tracker_socket ─┐        │
+                 │  utp_socket ─┐       │        │
+                 │  enable_outgoing_tcp │        │
+                 │  anonymous_mode …    │        │
+                 └──────┬───────┴────────┴───────┘
+                        ▼ Arc<dyn DatagramSocket> / Arc<dyn PeerConnector>
+        ┌───────────────┬───────────────┬────────────┐
+        │ DHT node      │ UDP trackers  │ uTP mgr    │  …LSD
+        └───────────────┴───────────────┴────────────┘
+                        ▲ implements
+        ┌───────────────┴────────────────────────────┐
+        │ TokioUdpSocket (default) │ TunnelUdpSocket │  custom impls:
+        │ (tokio::net::UdpSocket)  │ (OnionBit onion │  anonymity lanes,
+        │                          │  `data` cells)  │  simulators
+        └──────────────────────────┴─────────────────┘
+```
+
+- Anonymous lane (`enable_outgoing_tcp=false` + injected datagram
+  sockets) = upstream `anonymous_mode`/`force_proxy` semantics —
+  **zero** real UDP binds and **zero** TCP for peers.
+- This seam is also the Phase-8 network simulator's injection point.
+- Storage likewise: `disk::StorageFactory` (upstream
+  `storage_constructor`) lets downstream swap the storage engine
+  (OnionBit `PrivateStorageFactory` equivalent).
+
 ## Data flow — downloading a piece (target state)
 
 ```

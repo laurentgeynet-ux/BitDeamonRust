@@ -17,6 +17,10 @@ human or AI — contributing code. Read it fully before touching anything.
   BitTorrent clients (libtorrent, qBittorrent, Transmission…) cannot
   distinguish it on the wire, and when it round-trips libtorrent's
   resume data and `.session` files.
+- **First downstream consumer**: OnionBit (`D:\Projet\Tribler-Rust-Torrent`)
+  — replaces its vendored/patched librqbit. Its anonymous lanes require
+  injectable transports and a storage factory; that shaped ADR-0008 and
+  the milestone ONIONBIT-1 in `ROADMAP.md`.
 
 ## 2. Repository layout
 
@@ -93,6 +97,16 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and an MSRV
     C code (`src/ed25519`, `puff.cpp`, `win_cng`). See ADR-0007.
 12. **Tracing**: instrument with `tracing` (`debug!`/`info!`/`error!`),
     no `println!`/`eprintln!` outside `bitdaemon-cli` and tests.
+13. **No subsystem binds OS sockets** (ADR-0008): DHT, uTP, UDP
+    trackers, LSD all take `Arc<dyn transport::DatagramSocket>`;
+    peer connections come from `PeerConnector`/`PeerAcceptor`. The
+    session hands them down from `SessionParams`. A direct
+    `UdpSocket::bind`/`TcpListener::bind` outside the default
+    `TokioUdpSocket`/`TcpConnector` impls is a review-blocking bug —
+    it breaks anonymous-tunnel lanes *and* the future simulator.
+14. **Storage is a factory** (`disk::StorageFactory`, upstream
+    `storage_constructor`) — downstream can inject custom storage
+    (OnionBit's `PrivateStorageFactory` pattern).
 
 ## 5. Porting workflow (follow it for every module)
 
@@ -138,7 +152,7 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and an MSRV
 | `aux::session_impl` (one network thread) | one `tokio` task + handle/command channel |
 | `disk_io_thread` + job queue | `spawn_blocking` pool + `mpsc` results |
 | `deadline_timer` | `tokio::time::{sleep, Sleep}` |
-| `socket_type` variant (TCP/SSL/SOCKS5/uTP) | `enum Socket` + trait `AsyncSocket` |
+| `socket_type` variant (TCP/SSL/SOCKS5/uTP) | `PeerConnector`/`PeerAcceptor`/`DatagramSocket` traits (`net::transport`, ADR-0008) |
 
 ## 7. Definition of done for a ported module
 

@@ -11,11 +11,33 @@
 //! (`http_connection`, `http_parser`, `parse_url`, `resolver`,
 //! `udp_socket`, `enum_net`, `ip_notifier`, `ip_filter`, `ip_voter`).
 //!
-//! All sockets are tokio-based; see ADR-0002.
+//! All sockets are tokio-based (ADR-0002) and **all transports are
+//! injectable** (ADR-0008): nothing in this crate binds an OS socket
+//! directly — UDP subsystems consume `transport::DatagramSocket`, peer
+//! connections come from `transport::PeerConnector`/`PeerAcceptor`.
 //!
 //! Status: **not ported yet** — see `docs/PORTING.md`.
 
 #![forbid(unsafe_code)]
+
+pub mod transport;
+
+/// Networking errors (`boost::system::error_code` usages in
+/// `socket.hpp`, `http_connection`, `utp_stream`, trackers…).
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum NetError {
+    /// I/O failure from the underlying transport.
+    #[error("transport error: {0}")]
+    Transport(#[from] std::io::Error),
+    /// The configured transports cannot reach a peer (TCP disabled and
+    /// no uTP connector, missing proxy, port 0, …).
+    #[error("no usable transport: {0}")]
+    NoTransport(&'static str),
+}
+
+/// Convenience alias for net operations.
+pub type Result<T> = std::result::Result<T, NetError>;
 
 /// Peer wire message codec (`libtorrent::peer_connection` message
 /// dispatch + `bt_peer_connection` serialization).

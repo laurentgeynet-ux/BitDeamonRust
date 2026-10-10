@@ -4,6 +4,27 @@ Port of libtorrent `master` @ `v2.1.2-45-gc019e80ef` (~170k LOC C++).
 No dates — phases unlock each other. Live file-level status lives in
 [`docs/PORTING.md`](docs/PORTING.md); this document is the strategy.
 
+## Downstream driver: OnionBit
+
+BitDaemon's first consumer is [**OnionBit**](https://github.com/laurentgeynet-ux)
+(`D:\Projet\Tribler-Rust-Torrent`, GPL-3.0) — an anonymous P2P stack
+porting Tribler, which currently embeds a **vendored + patched
+librqbit** for its `onionbit-bittorrent` engine. BitDaemon replaces it.
+
+Consequences that shape this roadmap:
+
+- **Transports are injectable from day 1** (ADR-0008): DHT, uTP, UDP
+  trackers consume `Arc<dyn DatagramSocket>`; peers come from
+  `PeerConnector`/`PeerAcceptor`. Anonymous lanes route everything
+  through onion `data` cells — a real UDP bind in the anonymous lane is
+  a *leak*, not a fallback.
+- **uTP is pulled forward to Phase 5** (upstream treats it as core;
+  for OnionBit's anonymous lane it is the *only* peer transport).
+- **BitTorrent v1 first.** v2 merkle/hash-picker, web seeds, SSL
+  torrents, WebRTC stay deferred — OnionBit ships v1 swarms.
+- Milestone **ONIONBIT-1** (end of Phase 6) = drop-in engine parity
+  with vendored rqbit's feature subset.
+
 Legend: ⬜ not started · 🟨 in progress · ✅ done (module-level status in PORTING.md)
 
 ---
@@ -104,26 +125,42 @@ piece round-trip.
 
 ---
 
-## Phase 5 — Trackers & discovery ⬜
+## Phase 5 — Trackers, discovery & uTP ⬜
 
-*~15k LOC C++.*
+*~20k LOC C++.* uTP lives here (not Phase 8) because OnionBit's
+anonymous lane runs **peer traffic exclusively over uTP** routed
+through injected datagram sockets (ADR-0008).
 
 `bitdaemon-net`: `HttpConnection` + `http_parser` (incl. gzip via
-`flate2`), `HttpTrackerConnection`, `UdpTrackerConnection`,
-`TrackerManager` (+ announce retry/backoff semantics), `upnp`,
-`natpmp`, `portmap`, `lsd` (local service discovery),
-`websocket_stream`/`websocket_tracker_connection`, `udp_socket`,
-`session_udp_sockets` plumbing, `resolver` for tracker DNS.
+`flate2`), `HttpTrackerConnection`, `UdpTrackerConnection` (**over
+`DatagramSocket`**), `TrackerManager` (+ announce retry/backoff
+semantics), `upnp`, `natpmp`, `portmap`, `lsd` (local service
+discovery), `websocket_stream`/`websocket_tracker_connection`,
+`udp_socket`, `session_udp_sockets` plumbing, `resolver` for tracker
+DNS — **and** `utp_stream`, `utp_socket_manager`, `packet_buffer`,
+`packet_pool` (LEDBAT congestion control, µs timestamps; port
+constants verbatim before any tuning — AGENTS.md §9).
 
 **Exit criteria**: announce to a local tracker stub (port
-`test_tracker` harness) succeeds; LSD discovers a loopback peer;
-UPnP/NAT-PMP mapping requests well-formed (mock IGD).
+`test_tracker` harness) succeeds over both real UDP and an injected
+in-memory `DatagramSocket`; LSD discovers a loopback peer; UPnP/NAT-PMP
+mapping requests well-formed (mock IGD); uTP connects + transfers a
+block loopback through an injected socket pair.
 
 ---
 
 ## Phase 6 — Session core ⬜
 
 *~30k LOC C++.* Everything comes together — a working client.
+Ends at milestone **ONIONBIT-1**: `onionbit-bittorrent` can drop
+vendored rqbit and drive `bitdaemon` instead. Required parity surface
+(their `EngineConfig`): injected `utp_socket`/`utp_listen_socket`/
+`dht_socket`/`udp_tracker_socket`, `enable_tcp=false` anonymous lane,
+`utp_only`, `enable_dht`/`disable_trackers`/`disable_lsd`,
+`fastresume` (upstream-compatible resume data), bandwidth caps,
+`StorageFactory` injection (their `PrivateStorageFactory`),
+`OpaqueBitV`-style info-hash privacy support (Phase 8+ hardening,
+design seam reserved).
 
 `bitdaemon-session`: `Session` actor (`session_impl` equivalent),
 `SessionHandle`/`SessionParams`, `Settings` (typed `settings_pack`
@@ -170,9 +207,8 @@ DHT works.
 ## Phase 8 — Advanced / v2+ features ⬜
 
 Defer everything non-essential until Phase 6 is solid.
+(uTP moved to Phase 5 — OnionBit anonymous lanes need it.)
 
-- **uTP** (`utp_stream`, `utp_socket_manager`, `packet_buffer`,
-  `packet_pool`) — LEDBAT congestion control, microsecond timestamps.
 - **Web seeds** (`web_connection_base`, `web_peer_connection`,
   `http_seed`/`getright`/`holtb` URL types).
 - **Stream encryption hardening** (`smart_ban`, full `pe_crypto`

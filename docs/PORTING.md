@@ -81,6 +81,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 |---|---|---|---|
 | `disk_interface.hpp`, `disk_job.cpp`, `disk_job_fence.cpp`, `disk_job_pool.cpp` | `disk::job` | not started | job model → async traits |
 | `disk_io_thread_pool.cpp`, `back_pressure.cpp` | `disk::pool` | not started | `spawn_blocking` pool |
+| `storage_constructor` / `default_storage_constructor` (in `disk_interface.hpp`/`storage.hpp`) | `disk::StorageFactory` | not started | **injectable storage** (ADR-0008) — OnionBit `PrivateStorageFactory` parity |
 | `disk_buffer_pool.cpp`, `disk_buffer_holder.cpp`, `store_buffer.hpp`, `receive_buffer.cpp`, `chained_buffer.cpp`, `packet_pool.hpp` | `disk::buffer` | not started | `Bytes` slab |
 | `disabled_disk_io.cpp` | `disk::disabled` | not started | test backend |
 | `mmap.cpp`, `mmap_disk_io.cpp`, `mmap_storage.cpp`, `mmap_disk_job.hpp`, `file_view_pool.cpp` | `disk::mmap` | not started | `memmap2`, optional feature |
@@ -105,15 +106,15 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `web_connection_base.cpp`, `web_peer_connection.cpp` | `net::peer::web` | not started | web seeds (Phase 8) |
 | `request_blocks.cpp`, `merge_block_requests.hpp`, `suggest_piece.hpp`, `peer_list.cpp`, `peer_info.cpp`, `peer.cpp`, `peer.hpp` | `net::peer::*` | not started | |
 | `receive_buffer.cpp` (net side), `packet_buffer.cpp`, `bandwidth_queue_entry.cpp` | `net::buffer` | not started | |
-| `socket_type.cpp`, `socket.hpp`, `polymorphic_socket.hpp`, `instantiate_connection.cpp`, `union_endpoint.hpp` | `net::socket` | not started | `AsyncSocket` trait + enum |
+| `socket_type.cpp`, `socket.hpp`, `polymorphic_socket.hpp`, `instantiate_connection.cpp`, `union_endpoint.hpp` | `net::socket` + `net::transport` | in progress | `PeerStream`/`PeerConnector`/`PeerAcceptor` traits scaffolded (ADR-0008) |
 | `socks5_stream.cpp`, `http_stream.hpp`, `ssl.cpp`, `ssl_stream.hpp`, `i2p_stream.cpp`, `rtc_stream.cpp`, `rtc_signaling.cpp`, `websocket_stream.cpp` | `net::stream::*` | not started | proxies/TLS/I2P/RTC — rustls not openssl |
 | `pe_crypto.cpp` (`pe_crypto.hpp`), `rc4` internals, `crypto_provider` | `net::crypto` | not started | MSE/PE; `chacha20poly1305`+`rc4` crates |
 | `http_connection.cpp`, `http_parser.cpp`, `parse_url.cpp`, `resolver.cpp`, `resolver_interface.hpp` | `net::http` | not started | |
-| `http_tracker_connection.cpp`, `udp_tracker_connection.cpp`, `websocket_tracker_connection.cpp`, `tracker_manager.cpp`, `tracker_list.cpp` (net side) | `net::tracker` | not started | announce retry semantics |
+| `http_tracker_connection.cpp`, `udp_tracker_connection.cpp`, `websocket_tracker_connection.cpp`, `tracker_manager.cpp`, `tracker_list.cpp` (net side) | `net::tracker` | not started | announce retry semantics; UDP tracker consumes `DatagramSocket` (ADR-0008) |
 | `upnp.cpp`, `natpmp.cpp`, `portmap.cpp` | `net::nat` | not started | |
 | `lsd.cpp` (`lsd.hpp`) | `net::lsd` | not started | |
-| `udp_socket.cpp`, `session_udp_sockets.hpp`, `listen_socket_handle.cpp` | `net::udp` | not started | |
-| `utp_stream.cpp`, `utp_socket_manager.cpp` | `net::utp` | not started | Phase 8 |
+| `udp_socket.cpp`, `session_udp_sockets.hpp`, `listen_socket_handle.cpp` | `net::udp` | not started | wraps `DatagramSocket` (ADR-0008); default impl = `TokioUdpSocket` |
+| `utp_stream.cpp`, `utp_socket_manager.cpp` | `net::utp` | not started | **Phase 5** (OnionBit peer transport); runs on injected `DatagramSocket`, exposed as `PeerConnector`/`PeerAcceptor` |
 | `ip_filter.cpp`, `ip_voter.cpp`, `ip_notifier.cpp`, `enum_net.cpp`, `netlink.cpp`, `route.h`, `bind_to_device.hpp` | `net::iface` | not started | |
 | `bandwidth_limit.cpp`, `bandwidth_manager.cpp`, `bandwidth_socket.hpp` | `net::bandwidth` | not started | shared w/ session — see ADR-0003 |
 | `proxy_base.cpp`, `proxy_settings.cpp` | `net::proxy` | not started | |
@@ -127,7 +128,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 
 | C++ source | Rust target | Status | Notes |
 |---|---|---|---|
-| `node.cpp` (`node.hpp`) | `dht::node` | not started | main state machine |
+| `node.cpp` (`node.hpp`) | `dht::node` | not started | main state machine; UDP socket injected via `DatagramSocket` (ADR-0008) |
 | `routing_table.cpp` | `dht::routing_table` | not started | |
 | `rpc_manager.cpp` | `dht::rpc` | not started | transaction/timeouts |
 | `traversal_algorithm.cpp` | `dht::traversal` | not started | base algo |
@@ -144,7 +145,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 
 | C++ source | Rust target | Status | Notes |
 |---|---|---|---|
-| `session.cpp`, `session_impl.cpp` (`session_impl.hpp`), `session_call.cpp`, `session_handle.cpp` (`session_handle.hpp`), `session_interface.hpp`, `session_params.cpp`, `session_types.hpp` | `session::session` | not started | actor + handle (ADR-0001) |
+| `session.cpp`, `session_impl.cpp` (`session_impl.hpp`), `session_call.cpp`, `session_handle.cpp` (`session_handle.hpp`), `session_interface.hpp`, `session_params.cpp`, `session_types.hpp` | `session::session` | not started | actor + handle (ADR-0001); `SessionParams` carries injected transports + anonymous-lane flags (ADR-0008) |
 | `torrent.cpp` (`torrent.hpp`, `torrent_impl.hpp`), `torrent_handle.cpp`, `torrent_status.cpp`, `torrent_list.hpp`, `torrent_peer.cpp`, `torrent_peer_allocator.cpp` | `session::torrent` | not started | per-torrent state machine |
 | `alert.cpp`, `alert_manager.cpp`, `alert_types.hpp`, `alert.hpp` | `session::alert` | not started | enum-based alerts |
 | `settings_pack.cpp`, `session_settings.cpp`, `session_stats.cpp`, `performance_counters.cpp` | `session::settings` | not started | typed struct + defaults = spec |
