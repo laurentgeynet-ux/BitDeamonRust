@@ -7,6 +7,9 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Ajouté
+- Pont uTP async (`bitdaemon-net::utp_stream`) : `UtpConnector` implémente `PeerConnector` sur `DatagramSocket` injecté — `UtpStream` en `AsyncRead`/`AsyncWrite` (canaux), pump qui draine l'outbox + tick périodique, routage des datagrammes entrants par conn_id ; le répondeur émet le STATE différé (`send_deferred_ack`) comme upstream.
+
 ### Added — Engine (session_impl async)
 
 - `bitdaemon::engine::Engine` — boucle `tick` : draine messages

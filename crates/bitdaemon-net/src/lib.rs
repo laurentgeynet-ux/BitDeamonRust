@@ -107,6 +107,8 @@ pub mod socks;
 pub mod socks_udp;
 /// `udp_tracker_connection` — BEP-15 announce/scrape over `DatagramSocket`.
 pub mod udp_tracker;
+/// `utp_stream` — AsyncRead/Write bridge + PeerConnector over DatagramSocket.
+pub mod utp_stream;
 
 /// `upnp.cpp` SOAP core — port-mapping requests + device parsing.
 pub mod upnp;
