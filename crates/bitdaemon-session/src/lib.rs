@@ -37,6 +37,9 @@ pub mod piece_picker;
 /// `aux_/request_blocks` — `request_a_block` glue picker↔peer.
 pub mod request_blocks;
 
+/// `extensions/smart_ban` — corrupt-block peer banning.
+pub mod smart_ban;
+
 /// Client session (`libtorrent::session` / `session_handle`).
 pub struct Session;
 

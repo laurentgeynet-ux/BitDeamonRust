@@ -342,6 +342,11 @@ Until `1.0.0`, breaking changes may occur in any release.
   voter identity, 40-entry cap with upstream's stable-sort eviction,
   25-vote provisional / 50-vote or 5-min rotation, 2/3 majority
   rule).
+- `bitdaemon_session::smart_ban` — `smart_ban` core ported: per-block
+  CRC map keyed by `PieceBlock` (shared `common::types`), ban on
+  differing digest from the same peer across failures and on stored
+  CRC mismatch after a piece passes; disk reads injected as closures,
+  decisions returned as `BanDecision` events.
 - Tests: 67 conformance cases ported from `test_bdecode.cpp`, 16 from
   `test_bitfield.cpp`, 8 from `test_sliding_average.cpp`, 5 from
   `test_bloom_filter.cpp`, `test_crc32.cpp` vectors (RFC 3720 B.4),

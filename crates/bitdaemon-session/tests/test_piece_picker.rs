@@ -737,3 +737,64 @@ fn peer_conn_suggest_have() {
     assert!(!conn.on_have(p(0), we_have)); // we have it
     assert!(!conn.on_have(p(1), we_have)); // already had the bit
 }
+
+// ---------- smart_ban ----------
+
+use bitdaemon_common::hash::Sha1Hash;
+use bitdaemon_session::smart_ban::{BanDecision, SmartBan};
+
+#[test]
+fn smart_ban_differing_crc() {
+    let mut sb = SmartBan::new();
+    let a: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let good = Sha1Hash::from_bytes(&[1u8; 20]).unwrap();
+    let bad = Sha1Hash::from_bytes(&[2u8; 20]).unwrap();
+    let pb = PieceBlock {
+        piece_index: PieceIndex(0),
+        block_index: 0,
+    };
+    // first failure records the digest, no ban
+    assert_eq!(sb.record_failed_block(pb, 42, a, bad), BanDecision::None);
+    // same peer, different digest on second failure → ban
+    assert_eq!(
+        sb.record_failed_block(pb, 42, a, good),
+        BanDecision::Ban(42)
+    );
+    // other peer's differing digest just records its own entry
+    assert_eq!(sb.record_failed_block(pb, 7, a, good), BanDecision::None);
+}
+
+#[test]
+fn smart_ban_on_piece_passed() {
+    let mut sb = SmartBan::new();
+    let a: std::net::IpAddr = "1.1.1.1".parse().unwrap();
+    let bad = Sha1Hash::from_bytes(&[9u8; 20]).unwrap();
+    let good = Sha1Hash::from_bytes(&[1u8; 20]).unwrap();
+    sb.record_failed_block(
+        PieceBlock {
+            piece_index: PieceIndex(3),
+            block_index: 1,
+        },
+        5,
+        a,
+        bad,
+    );
+    // piece now passes; block digest is `good` → the bad sender banned
+    let bans = sb.on_piece_passed(PieceIndex(3), 32 * 1024, |_| Some(good));
+    assert_eq!(bans, vec![BanDecision::Ban(5)]);
+    // erase_peers drops entries
+    sb.record_failed_block(
+        PieceBlock {
+            piece_index: PieceIndex(4),
+            block_index: 0,
+        },
+        8,
+        a,
+        bad,
+    );
+    sb.erase_peers(&[8]);
+    assert!(
+        sb.on_piece_passed(PieceIndex(4), 16 * 1024, |_| Some(good))
+            .is_empty()
+    );
+}
