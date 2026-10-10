@@ -43,6 +43,10 @@ pub mod alerts;
 pub mod choker;
 /// `session`/`session_impl` — orchestrator core.
 pub mod session;
+/// `session_handle`/`torrent_handle` — public API.
+pub mod session_handle;
+/// `.session` state file.
+pub mod session_state;
 /// `settings_pack`/`session_params`.
 pub mod settings;
 /// `extensions/smart_ban` — corrupt-block peer banning.

@@ -7,6 +7,25 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — session wave 2: wire driver, handles, session-state, web seeds, NAT-PMP
+
+- `net::bt_peer_conn` — `bt_peer_connection` driver: `run_handshake`
+  (send+validate 68 B, reserved bits, info_hash check), extended
+  handshake send/read, `read_message`/`write_message` pump — all over
+  the injected `BoxedPeerStream` so onion lanes carry peers verbatim.
+- `session::session_handle` — `SessionHandle`/`TorrentHandle`
+  (`session_call` equivalent): add/remove/find torrents, statuses,
+  pop_alerts, peer-message feed, tick; poison-tolerant Mutex.
+- `session::session_state` — `.session` file: bencoded
+  `{torrents: {ih: resume-blob}, dht: …}` round-trip reusing
+  `write_resume_data_buf` verbatim per swarm.
+- `net::web_seed` — `web_peer_connection` core: `build_piece_request`
+  (BEP-19 `GET path HTTP/1.1` + `Range: bytes=` verbatim, multi-file
+  via `map_block`, pad files skipped), `add_headers` + `consume_body`.
+- `net::natpmp` — NAT-PMP codec: `build_map_request` (12-byte
+  datagram), public-IP request, `parse_response`, result strings.
+
+
 ### Added — session & torrent glue (Phase 6 wave 1)
 
 - `session::torrent` — `Torrent` per-swarm state machine: peer registry,

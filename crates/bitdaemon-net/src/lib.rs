@@ -68,6 +68,8 @@ pub type Result<T> = std::result::Result<T, NetError>;
 pub struct PeerWireCodec;
 /// BEP-10 extended handshake build/parse + framing.
 pub mod bep10;
+/// `bt_peer_connection` — async wire driver over PeerStream.
+pub mod bt_peer_conn;
 /// `aux_/http_parser` — incremental HTTP parser.
 pub mod http_parser;
 /// `aux_/http_stream` — HTTP CONNECT proxy handshake.
@@ -80,6 +82,8 @@ pub mod ip_helpers;
 pub mod ip_voter;
 /// `lsd` — BEP-14 BT-SEARCH announce parse/render.
 pub mod lsd;
+/// `natpmp` — NAT-PMP/PCP datagram codec.
+pub mod natpmp;
 /// `parse_url.cpp` — URL components/split/validation.
 pub mod parse_url;
 /// `socks5_stream` — SOCKS4/5 handshake over any async stream.
@@ -92,3 +96,5 @@ pub mod udp_tracker;
 pub mod utp;
 /// `utp_socket_impl` — the uTP reliable-stream state machine.
 pub mod utp_socket;
+/// `web_peer_connection`/`web_connection_base` — url-seed GETs.
+pub mod web_seed;
