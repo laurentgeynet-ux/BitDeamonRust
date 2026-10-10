@@ -96,6 +96,9 @@ pub mod socks;
 pub mod socks_udp;
 /// `udp_tracker_connection` — BEP-15 announce/scrape over `DatagramSocket`.
 pub mod udp_tracker;
+
+/// `upnp.cpp` SOAP core — port-mapping requests + device parsing.
+pub mod upnp;
 /// uTP wire layer: `utp_header`, extension walk, conn-id demux.
 pub mod utp;
 /// `utp_socket_impl` — the uTP reliable-stream state machine.

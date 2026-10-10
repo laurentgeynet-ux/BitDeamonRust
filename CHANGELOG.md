@@ -35,6 +35,14 @@ Until `1.0.0`, breaking changes may occur in any release.
 - `Torrent::piece_complete` — `is_piece_finished` bridge.
 
 
+### Added — session wave 5: UPnP SOAP core
+
+- `net::upnp` — `upnp.cpp` core: verbatim AddPortMapping/
+  DeletePortMapping/GetExternalIPAddress SOAP bodies, `SOAPAction`
+  header, `find_control_url` device-description parse (WANIP/PPP
+  services), `GetExternalIPAddress` + SOAP fault `errorCode`
+  parsing. SSDP/HTTP transport stays injected (ADR-0008).
+
 ### Added — session wave 4: magnet glue, auto-managed queue, smart_ban wiring
 
 - `Torrent::set_metadata` — BEP-9: SHA-1 of the raw info section
