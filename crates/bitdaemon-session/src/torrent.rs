@@ -1096,6 +1096,21 @@ impl Torrent {
         now: i32,
         out: &mut Vec<TorrentEffect>,
     ) {
+        match msg {
+            PeerMessage::HashRequest(req) => {
+                self.on_hash_request(peer_id, req, out);
+                return;
+            }
+            PeerMessage::Hashes { req, hashes } => {
+                self.on_hashes(req, hashes, out);
+                return;
+            }
+            PeerMessage::HashReject(req) => {
+                self.on_hash_reject(req);
+                return;
+            }
+            _ => {}
+        }
         let mut effects = Vec::new();
         if let Some(c) = self.peers.get_mut(&peer_id) {
             c.last_active = now;
@@ -1107,6 +1122,95 @@ impl Torrent {
             c.dispatch(msg, self.num_pieces, &mut effects);
         }
         self.apply_peer_effects(peer_id, effects, out);
+    }
+
+    /// `torrent::get_hashes` — serve a `hash_request` from our
+    /// merkle trees. Out-of-range file/root or missing tree →
+    /// `hash_reject` (upstream drops invalid requests the same way).
+    pub fn on_hash_request(
+        &mut self,
+        peer: u64,
+        req: &bitdaemon_net::peer_wire::HashRequestWire,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        let resp = (|| {
+            let fs = self.files.as_ref()?;
+            let f = fs.file_index_for_root(&req.file_root);
+            if usize::try_from(f.0).ok()? >= self.merkle_trees.len() {
+                return None;
+            }
+            self.merkle_trees[f.0 as usize].get_hashes(
+                req.base as usize,
+                req.index as usize,
+                req.count as usize,
+                req.proof_layers as usize,
+            )
+        })();
+        let msg = match resp {
+            Some(hashes) => PeerMessage::Hashes {
+                req: req.clone(),
+                hashes,
+            },
+            None => PeerMessage::HashReject(req.clone()),
+        };
+        out.push(TorrentEffect::SendTo { peer, msg });
+    }
+
+    /// `torrent::add_hashes` — feed received `hashes` into the
+    /// merkle trees; verified pieces flip to `have`, mismatches
+    /// mark the piece failed for re-download.
+    pub fn on_hashes(
+        &mut self,
+        req: &bitdaemon_net::peer_wire::HashRequestWire,
+        hashes: &[bitdaemon_common::Sha256Hash],
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        let Some(fs) = self.files.clone() else {
+            return;
+        };
+        let f = fs.file_index_for_root(&req.file_root);
+        let Ok(fidx) = usize::try_from(f.0) else {
+            return;
+        };
+        if fidx >= self.merkle_trees.len() {
+            return;
+        }
+        let hp_req = bitdaemon_disk::hash_picker::HashRequest {
+            file: f,
+            base: req.base,
+            index: req.index,
+            count: req.count,
+            proof_layers: req.proof_layers,
+        };
+        let mut picker = bitdaemon_disk::hash_picker::HashPicker::new(&fs, &mut self.merkle_trees);
+        let result = picker.add_hashes(&hp_req, hashes);
+        drop(picker);
+        for (piece, _blocks) in result.hash_failed {
+            self.piece_verified(piece, false, out);
+        }
+        for piece in result.hash_passed {
+            if !self.have.get_bit(piece.0 as usize) {
+                self.piece_verified(piece, true, out);
+            }
+        }
+    }
+
+    /// `torrent::hashes_rejected` — the remote refused; upstream
+    /// un-marks the request so another peer can be asked.
+    pub fn on_hash_reject(&mut self, req: &bitdaemon_net::peer_wire::HashRequestWire) {
+        let Some(fs) = self.files.clone() else {
+            return;
+        };
+        let f = fs.file_index_for_root(&req.file_root);
+        let hp_req = bitdaemon_disk::hash_picker::HashRequest {
+            file: f,
+            base: req.base,
+            index: req.index,
+            count: req.count,
+            proof_layers: req.proof_layers,
+        };
+        let mut picker = bitdaemon_disk::hash_picker::HashPicker::new(&fs, &mut self.merkle_trees);
+        picker.hashes_rejected(&hp_req);
     }
 
     /// `request_a_block` for one peer — `drive_requests` emits the

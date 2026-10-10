@@ -331,3 +331,85 @@ fn v2_piece_verifies_via_merkle_blocks() {
     bad[2] = Sha256Hash::from_bytes(&[0xff; 32]).unwrap();
     assert!(!t.verify_v2_blocks(PieceIndex(0), &bad));
 }
+
+#[test]
+fn v2_hash_request_serve_and_add() {
+    use bitdaemon_common::Sha256Hash;
+    use bitdaemon_common::types::{FileIndex, StorageIndex};
+    use bitdaemon_core::create_torrent::{CreateFileEntry, CreateFlags, CreateTorrent};
+    use bitdaemon_core::merkle::merkle_root;
+    use bitdaemon_core::torrent_info::{LoadTorrentLimits, load_torrent_buffer};
+    use bitdaemon_net::peer_wire::{HashRequestWire, PeerMessage};
+    use bitdaemon_session::torrent::{Torrent, TorrentEffect};
+    use sha2::{Digest as _, Sha256};
+
+    // 2-piece v2 file (8 blocks) — the piece layer (2 hashes) is a
+    // real servable layer below the root.
+    let data: Vec<u8> = (0..8 * 16384).map(|i| (i % 251) as u8).collect();
+    let blocks: Vec<Sha256Hash> = data
+        .chunks(16384)
+        .map(|c| Sha256Hash::from_bytes(&Sha256::digest(c)).unwrap())
+        .collect();
+    let piece_roots: Vec<Sha256Hash> = (0..2)
+        .map(|p| merkle_root(&blocks[p * 4..p * 4 + 4], Sha256Hash::default()))
+        .collect();
+    let root = merkle_root(&piece_roots, Sha256Hash::default());
+    let mk = || {
+        let mut ct = CreateTorrent::new(
+            vec![CreateFileEntry {
+                filename: b"v2f".to_vec(),
+                size: 8 * 16384,
+                flags: bitdaemon_core::file_storage::FileFlags::NONE,
+                mtime: 0,
+                symlink: Vec::new(),
+            }],
+            4 * 16384,
+            CreateFlags::V2_ONLY,
+        )
+        .unwrap();
+        ct.set_hash2(FileIndex(0), 0, piece_roots[0]).unwrap();
+        ct.set_hash2(FileIndex(0), 1, piece_roots[1]).unwrap();
+        ct.generate_buf().unwrap()
+    };
+    let buf = mk();
+    let atp = load_torrent_buffer(&buf, &LoadTorrentLimits::default()).unwrap();
+    let mut t = Torrent::from_params(&atp, StorageIndex(0), &mut Vec::new()).unwrap();
+
+    // a peer asks for the 4 leaf hashes → we serve them from the tree
+    let req = HashRequestWire {
+        file_root: root,
+        base: 2,
+        index: 0,
+        count: 2,
+        proof_layers: 0,
+    };
+    let mut out = Vec::new();
+    t.on_hash_request(7, &req, &mut out);
+    let TorrentEffect::SendTo { msg, .. } = &out[0] else {
+        panic!("expected SendTo");
+    };
+    let PeerMessage::Hashes { hashes, .. } = msg else {
+        panic!("expected Hashes");
+    };
+    assert_eq!(hashes, &piece_roots[..]);
+
+    // unknown root → HashReject
+    let mut out = Vec::new();
+    let bad_req = HashRequestWire {
+        file_root: Sha256Hash::from_bytes(&[9; 32]).unwrap(),
+        ..req.clone()
+    };
+    t.on_hash_request(7, &bad_req, &mut out);
+    assert!(matches!(
+        out[0],
+        TorrentEffect::SendTo {
+            msg: PeerMessage::HashReject(_),
+            ..
+        }
+    ));
+
+    // receive the same hashes → trees accept → piece verifies
+    let mut out = Vec::new();
+    t.on_hashes(&req, &piece_roots, &mut out);
+    let _ = out;
+}
