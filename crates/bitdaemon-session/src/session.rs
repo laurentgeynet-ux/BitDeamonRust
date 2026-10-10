@@ -1040,6 +1040,7 @@ impl Session {
             self.route(ih, eff, out);
         }
         self.unchoke_tick(out);
+        self.resume_save_tick(now);
         wait
     }
 
@@ -1426,6 +1427,44 @@ impl Session {
                     error: e,
                 });
             }
+        }
+    }
+
+    /// `save_resume_data` — upstream `torrent::save_resume_data`
+    /// → `save_resume_data_alert` carrying the bencoded resume
+    /// blob. `only_if_modified` honors `need_save_resume`
+    /// (upstream `flags & only_if_modified`).
+    pub fn save_resume_data(&mut self, ih: &Sha1Hash, only_if_modified: bool) {
+        let Some(t) = self.torrents.get_mut(ih) else {
+            return;
+        };
+        if only_if_modified && !t.need_save_resume {
+            return;
+        }
+        let mut atp = bitdaemon_core::AddTorrentParams::default();
+        t.to_resume_data(&mut atp);
+        t.need_save_resume = false;
+        t.last_saved_resume = Some(Instant::now());
+        let data = bitdaemon_core::resume_data::write_resume_data_buf(&atp);
+        self.alerts.post(Alert::SaveResumeData { ih: *ih, data });
+    }
+
+    /// `auto_save_resume` — periodic flush of dirty resume data
+    /// (upstream saves every `save_resume_data_interval`).
+    fn resume_save_tick(&mut self, now: Instant) {
+        let interval = self.settings.save_resume_interval;
+        let due: Vec<Sha1Hash> = self
+            .torrents
+            .values()
+            .filter(|t| {
+                t.need_save_resume
+                    && t.last_saved_resume
+                        .is_none_or(|t0| now.duration_since(t0) >= interval)
+            })
+            .map(|t| t.info_hash)
+            .collect();
+        for ih in due {
+            self.save_resume_data(&ih, false);
         }
     }
 

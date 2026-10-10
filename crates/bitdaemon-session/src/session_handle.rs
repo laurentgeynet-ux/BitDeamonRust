@@ -263,6 +263,12 @@ impl TorrentHandle {
             .map_or_else(Vec::new, Torrent::file_progress)
     }
 
+    /// `save_resume_data` — posts `save_resume_data_alert` with
+    /// the bencoded resume blob (`only_if_modified` gate).
+    pub fn save_resume_data(&self, only_if_modified: bool) {
+        lock(&self.session).save_resume_data(&self.info_hash, only_if_modified);
+    }
+
     /// `set_upload_limit` / `set_download_limit` — bytes/s, 0 = ∞.
     pub fn set_upload_limit(&self, bytes_per_sec: i64) {
         if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {

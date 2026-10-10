@@ -9,6 +9,13 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **`save_resume_data` pipeline** — `Torrent::need_save_resume`
+  (marqué par pièce vérifiée, priorités, métadonnées, verdict de
+  check), `Session::save_resume_data(ih, only_if_modified)` poste
+  `save_resume_data_alert` avec le blob bencode relisible par
+  `read_resume_data`, flush périodique `save_resume_interval`
+  (défaut 60 s) dans `tick`. `TorrentHandle::save_resume_data`.
+
 - **Limites de débit par torrent** — `Torrent::{upload,download}_limit`
   (bytes/s, 0 = illimité) + `TorrentHandle::set_{up,down}load_limit`;
   l'engine maintient un `RateLimiter` par info-hash

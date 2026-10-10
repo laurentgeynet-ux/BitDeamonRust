@@ -65,3 +65,42 @@ fn piece_priorities_and_sequential() {
     t.set_sequential_download(true);
     assert!(t.sequential);
 }
+
+#[test]
+fn save_resume_data_alert_and_interval() {
+    use bitdaemon_session::alerts::Alert;
+    let ih = Sha1Hash::from_bytes(&[7; 20]).unwrap();
+    let mut t = Torrent::new(ih, 2, 128 * 1024, Bitfield::with_size(2), StorageIndex(0));
+    t.piece_hashes = Some(vec![Sha1Hash::from_bytes(&[0; 20]).unwrap(); 2]);
+    t.init_picker(false);
+    let mut s = Session::new();
+    s.add_torrent(t);
+    s.pop_alerts();
+
+    // not dirty → only_if_modified suppresses
+    s.save_resume_data(&ih, true);
+    assert!(s.pop_alerts().is_empty());
+
+    // verify a piece → dirty → save posts the blob alert
+    s.on_piece_verified(&ih, PieceIndex(0), true, &mut Vec::new());
+    s.pop_alerts();
+    s.save_resume_data(&ih, true);
+    let alerts = s.pop_alerts();
+    let blob = alerts.iter().find_map(|a| {
+        if let Alert::SaveResumeData { data, .. } = a {
+            Some(data.clone())
+        } else {
+            None
+        }
+    });
+    assert!(blob.is_some(), "expected SaveResumeData alert");
+    // blob round-trips through upstream's resume reader
+    let rd = bitdaemon_core::resume_data::read_resume_data(
+        &blob.unwrap(),
+        &bitdaemon_core::torrent_info::LoadTorrentLimits::default(),
+    );
+    assert!(rd.is_ok());
+    // flag cleared — a second save is suppressed
+    s.save_resume_data(&ih, true);
+    assert!(s.pop_alerts().is_empty());
+}

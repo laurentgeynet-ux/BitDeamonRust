@@ -170,6 +170,12 @@ pub struct Torrent {
     pub upload_limit: i64,
     /// download bytes/s limit.
     pub download_limit: i64,
+    /// `m_need_save_resume_data` — set by state changes
+    /// (verified piece, priorities, metadata, check verdict);
+    /// cleared when a `save_resume_data` dump is produced.
+    pub need_save_resume: bool,
+    /// last resume dump instant (`auto_save_resume` cadence).
+    pub last_saved_resume: Option<Instant>,
 }
 
 impl Torrent {
@@ -230,6 +236,8 @@ impl Torrent {
             last_error: String::new(),
             upload_limit: 0,
             download_limit: 0,
+            need_save_resume: false,
+            last_saved_resume: None,
         }
     }
 
@@ -352,6 +360,7 @@ impl Torrent {
         self.metadata_raw = Some(metadata.to_vec());
         self.magnet = false;
         self.init_picker(true);
+        self.need_save_resume = true;
         true
     }
 
@@ -618,6 +627,7 @@ impl Torrent {
             }
             picker.set_piece_priority(PieceIndex(i as i32), *prio);
         }
+        self.need_save_resume = true;
         for (piece, blocks) in &atp.unfinished_pieces {
             let idx = PieceIndex(*piece);
             if *piece < 0 || *piece >= self.num_pieces || self.have.get_bit(*piece as usize) {
@@ -771,6 +781,7 @@ impl Torrent {
     /// per-piece `DiskHash` jobs for the real check.
     pub fn on_files_checked(&mut self, accepted: bool, out: &mut Vec<TorrentEffect>) {
         self.checking = false;
+        self.need_save_resume = true;
         if !accepted {
             // the picker's have-tracking only knows pieces that
             // passed `piece_verified` — resume bits live solely in
@@ -1307,6 +1318,7 @@ impl Torrent {
             if (piece.0 as usize) < self.have.size() && !self.have.get_bit(piece.0 as usize) {
                 self.have.set_bit(piece.0 as usize);
             }
+            self.need_save_resume = true;
             out.push(TorrentEffect::PiecePassed(piece));
             // broadcast `have` to every connected peer
             for id in self.peers.keys().copied().collect::<Vec<_>>() {
@@ -1389,6 +1401,7 @@ impl Torrent {
         for (i, prio) in prios.iter().enumerate().take(self.num_pieces as usize) {
             picker.set_piece_priority(PieceIndex(i as i32), *prio);
         }
+        self.need_save_resume = true;
     }
 
     /// `piece_priority(index)` — current picker priority.
@@ -1449,6 +1462,7 @@ impl Torrent {
     /// `update_piece_priorities`: every piece's priority becomes
     /// the max of the files overlapping it.
     pub fn prioritize_files(&mut self, new: &[bitdaemon_common::types::DownloadPriority]) {
+        self.need_save_resume = true;
         let Some(fs) = self.files.clone() else {
             return;
         };
