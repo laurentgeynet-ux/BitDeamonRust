@@ -479,6 +479,69 @@ impl TorrentHandle {
         }
     }
 
+    /// `torrent_handle::get_torrent_info` — the shared metainfo
+    /// (upstream `torrent_file()`); `None` while a magnet is
+    /// unresolved.
+    #[must_use]
+    pub fn torrent_file(
+        &self,
+    ) -> Option<std::sync::Arc<bitdaemon_core::torrent_info::TorrentInfo>> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .and_then(|t| t.ti.clone())
+    }
+
+    /// `torrent_handle::need_save_resume_data`.
+    #[must_use]
+    pub fn need_save_resume_data(&self) -> bool {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .is_some_and(|t| t.need_save_resume)
+    }
+
+    /// `torrent_handle::clear_error` — clears `m_error` /
+    /// `error_file`.
+    pub fn clear_error(&self) {
+        let mut s = lock(&self.session);
+        if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+            t.last_error.clear();
+        }
+    }
+
+    /// `torrent_handle::clear_piece_deadlines` — drop every
+    /// `set_piece_deadline` entry (upstream iterates the map).
+    pub fn clear_piece_deadlines(&self) {
+        let mut s = lock(&self.session);
+        if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+            t.time_critical.clear();
+        }
+    }
+
+    /// `torrent_handle::name` — torrent name from metainfo
+    /// (`m_name` fallback for magnets).
+    #[must_use]
+    pub fn name(&self) -> String {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map(|t| {
+                t.ti.as_ref().map_or_else(
+                    || t.name.clone(),
+                    |ti| String::from_utf8_lossy(ti.name()).into_owned(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// `torrent_handle::force_lsd_announce` — one-shot local
+    /// service discovery broadcast for this torrent.
+    pub fn force_lsd_announce(&self, out: &mut Vec<SessionOut>) {
+        let mut s = lock(&self.session);
+        s.force_lsd_announce(&self.info_hash, out);
+    }
+
     /// `torrent_handle::set_max_connections` (per-torrent).
     pub fn set_max_connections(&self, max: i32) {
         {

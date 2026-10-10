@@ -918,6 +918,31 @@ impl Session {
         self.route(*ih, eff, out);
     }
 
+    /// `torrent::lsd_announce` — emit a one-shot LSD broadcast for
+    /// `ih` (same payload as the periodic tick).
+    pub fn force_lsd_announce(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
+        if self.settings.anonymous_mode {
+            return;
+        }
+        let Some(t) = self.torrents.get(ih) else {
+            return;
+        };
+        if t.private {
+            return;
+        }
+        let hex = bitdaemon_common::hex::to_hex(t.info_hash.as_bytes());
+        for v6 in [false, true] {
+            let pkt =
+                bitdaemon_net::lsd::render_lsd_packet(self.listen_port, &hex, self.lsd_cookie, v6);
+            let to = if v6 {
+                SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR6.into(), 6771)
+            } else {
+                SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR4.into(), 6771)
+            };
+            out.push(SessionOut::UdpPacket(pkt, to));
+        }
+    }
+
     /// `peer_connect_failed` — an outbound dial never completed the
     /// handshake; report it so the swarm entry backs off.
     pub fn peer_connect_failed(&mut self, ih: &Sha1Hash, remote: SocketAddr) {
