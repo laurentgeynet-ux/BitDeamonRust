@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+flate2.workspace = true
 bitdaemon-common.workspace = true
 bitdaemon-bencode.workspace = true
 bitdaemon-core.workspace = true

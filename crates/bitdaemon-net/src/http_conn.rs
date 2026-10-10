@@ -49,6 +49,8 @@ pub async fn send_request(
     req.push_str(" HTTP/1.1\r\nHost: ");
     req.push_str(host);
     req.push_str("\r\n");
+    // upstream always advertises gzip (http_connection.cpp:191)
+    req.push_str("Accept-Encoding: gzip\r\n");
     for (k, v) in headers {
         req.push_str(k);
         req.push_str(": ");
@@ -94,9 +96,26 @@ impl HttpResponse {
                 let (s, e) = (s.max(0) as usize, e.max(0) as usize);
                 out.extend_from_slice(&self.raw[s.min(self.raw.len())..e.min(self.raw.len())]);
             }
-            return out;
+            return self.maybe_inflate(&out);
         }
-        self.parser.get_body(&self.raw).to_vec()
+        self.maybe_inflate(self.parser.get_body(&self.raw))
+    }
+
+    /// `Content-Encoding: gzip|x-gzip` → inflate (upstream calls
+    /// `inflate_gzip` on the buffered body, http_connection.cpp:642).
+    fn maybe_inflate(&self, body: &[u8]) -> Vec<u8> {
+        match self.parser.header("content-encoding") {
+            Some(enc) if enc.eq_ignore_ascii_case("gzip") || enc.eq_ignore_ascii_case("x-gzip") => {
+                use std::io::Read;
+                let mut d = flate2::read::GzDecoder::new(body);
+                let mut out = Vec::with_capacity(body.len() * 2);
+                match d.read_to_end(&mut out) {
+                    Ok(_) => out,
+                    Err(_) => body.to_vec(), // garbled encoding → raw body
+                }
+            }
+            _ => body.to_vec(),
+        }
     }
 
     /// `header(name)` — case-insensitive.

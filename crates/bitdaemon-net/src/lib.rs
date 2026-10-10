@@ -34,6 +34,7 @@ pub mod pe_crypto;
 pub mod peer_wire;
 /// `aux_/receive_buffer` — cursor-based recv buffer + crypto wrapper.
 pub mod receive_buffer;
+pub mod resolver;
 /// `aux_/socket_io.hpp` — BE wire helpers + endpoint codec.
 pub mod socket_io;
 /// `aux_/torrent_peer` — per-peer record + BEP-40 `peer_priority`.
