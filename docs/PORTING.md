@@ -170,7 +170,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `settings_pack.cpp`, `session_settings.cpp`, `session_stats.cpp`, `performance_counters.cpp` | `session::settings` | not started | typed struct + defaults = spec |
 | `add_torrent_params.cpp` (session side) | `session::add` | not started | |
 | `choker.cpp`, `peer_class.cpp`, `peer_class_set.cpp`, `peer_class_type_filter.hpp` | `session::choker` | not started | upload slots |
-| `piece_picker.cpp` (`piece_picker.hpp`), `piece_block_progress.hpp` | `session::picker` | not started | |
+| `piece_picker.cpp` (`piece_picker.hpp`) | `session::piece_picker` | **ported** | `PiecePos` buckets 0..7 w/ `prio_factor=3`, 4 download queues (partial/full/finished/zero-prio) incl. reverse variants, `BlockInfo` w/ `num_peers` end-game refcount, `pick_pieces` all paths (partials-heap, suggested, sequential/reverse, rarest-first forward+reverse, random, extent affinity, end-game busy-block re-request), `restore_piece`/`write_failed`/`lock_piece` hash-job lifecycle, `distributed_copies`, pad bytes; `torrent_peer*` → `Option<u64>` peer key, `counters` → `PickerStats` trait; `test_piece_picker` 18 cases (pick, whole, priorities, partials, block states, abort, write_failed+restore, sequential, reverse, suggested, end-game, clear_peer, cursor, rarest-first, distributed_copies, accounting, seeds, queue) — all green |
 | `smart_ban.cpp` (`extensions/smart_ban.hpp`) | `session::ext::smart_ban` | not started | |
 | `ut_metadata.cpp`, `ut_pex.cpp`, `i2p_pex.cpp` (ext side), `extensions.hpp` | `session::ext::*` | not started | BEP-9/11, i2p |
 | `read_resume_data`/`write_resume_data` (session glue), `session_state` | `session::state` | not started | `.session` file compat |

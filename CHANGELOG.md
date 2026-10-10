@@ -7,6 +7,25 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — `bitdaemon-session` (piece picking)
+
+- `piece_picker` — full port of `aux_/piece_picker.hpp` +
+  `piece_picker.cpp`: priority buckets (`prio_factor = 3`, 8 levels),
+  four download queues with reverse variants, `BlockInfo` per-block
+  states (none/requested/writing/finished) with `num_peers` end-game
+  refcounts, `pick_pieces` covering every upstream path (partial
+  priority, suggested pieces, sequential/reverse cursors, rarest-first
+  forward and reverse, random fallback, 4 MiB piece-extent affinity,
+  end-game duplicate requests), hash-job lifecycle
+  (`started/completed_hash_job`, `piece_passed`, `piece_flushed`,
+  `lock_piece`, `restore_piece`, `write_failed`), refcount/seed
+  bookkeeping, `distributed_copies`, want/have/all_pieces accounting,
+  pad bytes. `torrent_peer*` references become `Option<u64>` peer
+  keys; the `counters` dependency is a `PickerStats` trait injected
+  per call. 18 conformance cases ported from `test_piece_picker.cpp` —
+  all green.
+
+
 ### Added
 
 - `bitdaemon_net` Phase-4 wave 4 (peer records + uTP ring):

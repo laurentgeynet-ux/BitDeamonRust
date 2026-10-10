@@ -28,6 +28,10 @@
 /// `post_torrent_updates`, `pop_alerts`, `apply_settings`, `save_state`
 /// / `load_state` (`.session` file, bencoded), `is_listening`, ports
 /// mapping, DHT/LSD/UPnP/NAT-PMP toggles.
+/// `aux_/piece_picker` — piece availability, priorities, picking.
+pub mod piece_picker;
+
+/// Client session (`libtorrent::session` / `session_handle`).
 pub struct Session;
 
 /// Per-torrent handle (`libtorrent::torrent_handle`).
