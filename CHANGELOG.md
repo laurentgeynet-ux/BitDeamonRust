@@ -7,6 +7,14 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — peer_list
+
+- `peer_list.rs` — swarm list fidèle : `add_peer`/`update_peer_port`,
+  `find_connect_candidates` (round-robin 300, top-10 `compare_peer`,
+  élagage à 95 % de `max_peerlist_size`), `erase_peers` (force-erase
+  115 %), `apply_ip_filter`, `ban_peer`, `primary_source`/`source_rank`.
+- `enum_net.rs` + `ip_helpers::is_global` (vague précédente).
+
 ### Added — peripheral ports (enum_net / i2p / websocket / tracker client)
 
 - `enum_net` — `build_netmask` / `match_addr_mask` / `get_gateway` /

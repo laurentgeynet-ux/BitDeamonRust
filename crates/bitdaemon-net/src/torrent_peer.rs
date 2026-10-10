@@ -66,6 +66,20 @@ pub trait PeerStats {
     fn total_payload_upload(&self) -> i64;
 }
 
+/// Null `PeerStats` used by `peer_list` to mark "has a connection"
+/// without owning the `peer_connection` (upstream stores a pointer).
+#[derive(Debug)]
+pub struct NullStats;
+
+impl PeerStats for NullStats {
+    fn total_payload_download(&self) -> i64 {
+        0
+    }
+    fn total_payload_upload(&self) -> i64 {
+        0
+    }
+}
+
 /// `aux::torrent_peer`. Bitfield flags are stored as named `bool`/
 /// small-int fields — identical semantics to the packed bitfield
 /// (upstream widths documented per field).

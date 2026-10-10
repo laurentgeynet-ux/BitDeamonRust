@@ -99,6 +99,8 @@ pub mod natpmp;
 pub mod parse_url;
 /// `peer_class`/`peer_class_pool`/`peer_class_set`.
 pub mod peer_class;
+/// `aux_/peer_list` — swarm list: candidates, ranking, weeding.
+pub mod peer_list;
 /// `socks5_stream` — SOCKS4/5 handshake over any async stream.
 pub mod socks;
 /// `udp_socket::wrap`/`socks5_unwrap` — SOCKS5-UDP relay framing.
