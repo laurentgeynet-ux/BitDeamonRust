@@ -7,6 +7,17 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added
+
+- `dht`: iterative Kademlia `traversal` (port of `traversal_algorithm` +
+  `observer`) — distance-sorted results, id dedup, /24 diversity
+  (`restrict_search_ips`), router seeding, branch-factor growth on
+  short timeout, 100-result cap
+- `dht::rpc` — `rpc_manager` port: transaction-id dispatch by
+  `(tid, endpoint)`, query construction (`y/q/a.id/t/ro/want`),
+  BEP-42 `dht_enforce_node_id`, 1 s short-timeout / 15 s timeout tick,
+  injected send hook (no direct sockets)
+
 ### Added — `bitdaemon-net` (proxies)
 
 - `socks` — SOCKS4/SOCKS5 handshake (auth negotiation, user/pass

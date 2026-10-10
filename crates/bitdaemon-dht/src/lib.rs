@@ -23,5 +23,7 @@ pub mod msg;
 pub mod node_entry;
 pub mod node_id;
 pub mod routing_table;
+pub mod rpc;
+pub mod traversal;
 
 pub use node_id::NodeId;
