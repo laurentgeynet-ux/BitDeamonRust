@@ -263,6 +263,20 @@ impl TorrentHandle {
             .map_or_else(Vec::new, Torrent::file_progress)
     }
 
+    /// `set_upload_limit` / `set_download_limit` — bytes/s, 0 = ∞.
+    pub fn set_upload_limit(&self, bytes_per_sec: i64) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.set_upload_limit(bytes_per_sec);
+        }
+    }
+
+    /// `set_download_limit`.
+    pub fn set_download_limit(&self, bytes_per_sec: i64) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.set_download_limit(bytes_per_sec);
+        }
+    }
+
     /// `scrape_tracker` — immediate scrape of tracker entry `idx`.
     pub fn scrape_tracker(&self, tracker_idx: usize, out: &mut SessionOutVec) {
         lock(&self.session).scrape_tracker(&self.info_hash, tracker_idx, out);

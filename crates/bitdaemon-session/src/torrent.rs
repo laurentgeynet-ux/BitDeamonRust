@@ -164,6 +164,12 @@ pub struct Torrent {
     /// `m_error` — last tracker/disk error string for
     /// `torrent_status::error` ("" = no error).
     pub last_error: String,
+    /// `m_channel` per-torrent rate limits — `upload_limit`/
+    /// `download_limit` bytes/s, 0 = unlimited (upstream
+    /// `torrent::set_upload_limit` → `peer_class` channel).
+    pub upload_limit: i64,
+    /// download bytes/s limit.
+    pub download_limit: i64,
 }
 
 impl Torrent {
@@ -222,6 +228,8 @@ impl Torrent {
             sequential: false,
             checking_pieces: 0,
             last_error: String::new(),
+            upload_limit: 0,
+            download_limit: 0,
         }
     }
 
@@ -1390,6 +1398,17 @@ impl Torrent {
         index: PieceIndex,
     ) -> Option<bitdaemon_common::types::DownloadPriority> {
         self.picker.as_ref().map(|p| p.piece_priority(index))
+    }
+
+    /// `set_upload_limit` / `set_download_limit` — per-torrent
+    /// bandwidth throttle (bytes/s, 0 = unlimited).
+    pub fn set_upload_limit(&mut self, bytes_per_sec: i64) {
+        self.upload_limit = bytes_per_sec.max(0);
+    }
+
+    /// `set_download_limit`.
+    pub fn set_download_limit(&mut self, bytes_per_sec: i64) {
+        self.download_limit = bytes_per_sec.max(0);
     }
 
     /// `set_sequential_download` (upstream `torrent::set_sequential_download`).

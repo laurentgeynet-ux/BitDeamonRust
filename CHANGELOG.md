@@ -9,6 +9,13 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **Limites de débit par torrent** — `Torrent::{upload,download}_limit`
+  (bytes/s, 0 = illimité) + `TorrentHandle::set_{up,down}load_limit`;
+  l'engine maintient un `RateLimiter` par info-hash
+  (`torrent_up_limiters`/`torrent_down_limiters`, créés/sync au tick,
+  `acquire` sur les payloads `Piece` émis ET reçus — back-pressure
+  TCP côté lecture comme upstream).
+
 - **API `torrent_handle` complétée** — `scrape_tracker`,
   `get_peer_info`, `piece_availability`, `get_download_queue`
   (partial pieces upstream `partial_piece_info`), `connect_peer`

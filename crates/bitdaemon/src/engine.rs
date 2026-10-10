@@ -225,6 +225,12 @@ pub struct Engine {
     /// bucket for every peer writer (payload bytes only, like
     /// upstream's channel-0 data accounting).
     pub upload_limiter: Arc<RateLimiter>,
+    /// per-torrent limiters (`torrent::set_upload_limit`/
+    /// `set_download_limit` → `peer_class` channels upstream).
+    /// Created lazily in `attach_stream`, re-throttled each tick.
+    pub torrent_up_limiters: std::collections::HashMap<Sha1Hash, Arc<RateLimiter>>,
+    /// per-torrent download limiters.
+    pub torrent_down_limiters: std::collections::HashMap<Sha1Hash, Arc<RateLimiter>>,
 }
 
 impl Engine {
@@ -272,6 +278,8 @@ impl Engine {
             request_timeout: 60,
             max_out_request_queue: 500,
             upload_limiter: Arc::new(RateLimiter::new(0)),
+            torrent_up_limiters: std::collections::HashMap::new(),
+            torrent_down_limiters: std::collections::HashMap::new(),
         }
     }
 
@@ -365,6 +373,28 @@ impl Engine {
         self.upload_limiter
             .set_limit(self.session.settings.upload_rate_limit);
         self.upload_limiter.refill(1000);
+        // per-torrent channels — `torrent::set_{up,down}load_limit`
+        for (ih, t) in &self.session.torrents {
+            self.torrent_up_limiters
+                .entry(*ih)
+                .or_insert_with(|| Arc::new(RateLimiter::new(t.upload_limit)))
+                .set_limit(t.upload_limit);
+            self.torrent_down_limiters
+                .entry(*ih)
+                .or_insert_with(|| Arc::new(RateLimiter::new(t.download_limit)))
+                .set_limit(t.download_limit);
+        }
+        self.torrent_up_limiters
+            .retain(|ih, _| self.session.torrents.contains_key(ih));
+        self.torrent_down_limiters
+            .retain(|ih, _| self.session.torrents.contains_key(ih));
+        for l in self
+            .torrent_up_limiters
+            .values()
+            .chain(self.torrent_down_limiters.values())
+        {
+            l.refill(1000);
+        }
         // refresh the acceptor's known info-hash set
         *self.known_ihs.lock().unwrap_or_else(|e| e.into_inner()) =
             self.session.torrents.keys().copied().collect();
@@ -1324,6 +1354,8 @@ impl Engine {
         let inbound_tx = self.inbound_tx.clone();
         let gone_tx = self.gone_tx.clone();
         let ul = self.upload_limiter.clone();
+        let tul = self.torrent_up_limiters.get(&ih).cloned();
+        let tdl = self.torrent_down_limiters.get(&ih).cloned();
         // one task owns the stream: select between inbound decode and
         // outbound encode (upstream's per-connection pump).
         let h = tokio::spawn(async move {
@@ -1332,6 +1364,14 @@ impl Engine {
                     m = read_message(&mut s) => {
                         match m {
                             Ok(msg) => {
+                                // download throttle — hold the
+                                // pump, TCP back-pressure does the
+                                // rest (upstream rate-limits reads)
+                                if let PeerMessage::Piece { data, .. } = &msg
+                                    && let Some(l) = &tdl
+                                {
+                                    l.acquire(data.len() as i64).await;
+                                }
                                 if inbound_tx
                                     .send(InboundPeerMsg {
                                         packet: PeerPacket {
@@ -1356,6 +1396,9 @@ impl Engine {
                                 // throttles on the send path)
                                 if let PeerMessage::Piece { data, .. } = &msg {
                                     ul.acquire(data.len() as i64).await;
+                                    if let Some(l) = &tul {
+                                        l.acquire(data.len() as i64).await;
+                                    }
                                 }
                                 if write_message(&mut s, &msg).await.is_err() {
                                     break;

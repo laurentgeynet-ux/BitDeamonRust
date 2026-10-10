@@ -537,3 +537,42 @@ async fn upnp_map_cycle() {
         Some(std::net::IpAddr::from([203, 0, 113, 9]))
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn per_torrent_rate_limiters() {
+    // `torrent::set_upload_limit` → a per-ih `RateLimiter` the
+    // writer pump acquires on payload sends.
+    let ih = Sha1Hash::from_bytes(&[6; 20]).unwrap();
+    let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(None)));
+    let mut eng = Engine::new(conn, None);
+    let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
+    t.set_upload_limit(10);
+    t.set_download_limit(20);
+    eng.session.add_torrent(t);
+
+    let _ = eng.tick(std::time::Instant::now()).await;
+    let ul = eng.torrent_up_limiters.get(&ih).unwrap().clone();
+    let dl = eng.torrent_down_limiters.get(&ih).unwrap().clone();
+
+    // 10 B/s bucket starts full; drain then block until refill
+    ul.acquire(10).await;
+    let waiter = tokio::spawn({
+        let ul = ul.clone();
+        async move { ul.acquire(5).await }
+    });
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    ul.refill(1000);
+    waiter.await.unwrap();
+
+    // download limiter exists with its own budget
+    dl.acquire(15).await;
+    dl.acquire(5).await;
+    // empty now — a further acquire must wait for refill
+    let dl2 = dl.clone();
+    let w2 = tokio::spawn(async move { dl2.acquire(1).await });
+    tokio::task::yield_now().await;
+    assert!(!w2.is_finished());
+    dl.refill(1000);
+    w2.await.unwrap();
+}
