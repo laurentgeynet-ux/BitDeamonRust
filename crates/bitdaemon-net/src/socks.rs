@@ -241,8 +241,7 @@ async fn socks4<S: AsyncRead + AsyncWrite + Unpin>(
             "SOCKS4 request rejected",
         ))),
         r @ (92 | 93) => Err(SocksError::Identd(r)),
-        _ => Err(SocksError::ProxyFailure(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        _ => Err(SocksError::ProxyFailure(std::io::Error::other(
             "SOCKS4 general failure",
         ))),
     }
