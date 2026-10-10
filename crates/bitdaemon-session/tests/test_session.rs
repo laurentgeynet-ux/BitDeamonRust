@@ -172,3 +172,60 @@ fn lsd_emit_and_receive() {
     let p = &t.peer_list.peers()[0];
     assert_eq!(p.ip().map(|a| a.port()), Some(5555));
 }
+
+#[test]
+fn connect_candidates_backoff_on_failure() {
+    use bitdaemon_net::peer_list::PeerListState;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let mut s = Session::new();
+    let ih = Sha1Hash::from_bytes(&[9; 20]).unwrap();
+    let mut t = Torrent::new(
+        ih,
+        1,
+        16384,
+        bitdaemon_common::Bitfield::with_size(1),
+        StorageIndex(0),
+    );
+    let ep = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 6881);
+    t.add_swarm_peer(ep, bitdaemon_common::flags::PeerSourceFlags::TRACKER, true);
+    s.add_torrent(t);
+    let mut _o = Vec::new();
+    s.tick(&mut _o); // session_time = 1 (0 means "never connected" upstream)
+
+    let st = PeerListState {
+        is_finished: false,
+        external_ip: None,
+        external_port: 6881,
+        min_reconnect_time: 60,
+        max_peerlist_size: 0,
+        max_failcount: 3,
+        allow_multiple_connections_per_ip: false,
+    };
+    let c = s.torrents.get_mut(&ih).unwrap().connect_candidates(0, &st);
+    assert_eq!(c, vec![ep]);
+    // already marked connecting — no candidate next round
+    assert!(
+        s.torrents
+            .get_mut(&ih)
+            .unwrap()
+            .connect_candidates(0, &st)
+            .is_empty()
+    );
+    // dial fails → backoff window blocks re-dial at t=1
+    s.peer_connect_failed(&ih, ep);
+    assert!(
+        s.torrents
+            .get_mut(&ih)
+            .unwrap()
+            .connect_candidates(1, &st)
+            .is_empty()
+    );
+    // after min_reconnect_time*(failcount+1)=120s it's a candidate again
+    let c = s
+        .torrents
+        .get_mut(&ih)
+        .unwrap()
+        .connect_candidates(200, &st);
+    assert_eq!(c, vec![ep]);
+}

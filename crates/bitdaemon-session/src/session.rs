@@ -100,6 +100,9 @@ pub struct Session {
     pub lsd_cookie: u32,
     /// last LSD broadcast.
     last_lsd: Option<Instant>,
+    /// `m_session_time` — seconds since session start, bumped once
+    /// per `tick` (peer_list reconnect backoff epoch).
+    pub session_time: i32,
 }
 
 /// A disk job's result, delivered back onto the session thread.
@@ -168,6 +171,7 @@ impl Default for Session {
             },
             lsd_cookie: rand::random::<u32>(),
             last_lsd: None,
+            session_time: 0,
             disk_tx,
             disk_rx,
         }
@@ -512,6 +516,7 @@ impl Session {
         if let Some(t) = self.torrents.get_mut(ih) {
             let mut conn = conn;
             conn.remote = Some(remote);
+            t.peer_connected_addr(remote);
             t.add_peer(peer, conn);
             self.counters.set(
                 Counter::PeersConnected,
@@ -524,9 +529,20 @@ impl Session {
     pub fn peer_disconnected(&mut self, ih: &Sha1Hash, peer: u64, out: &mut Vec<SessionOut>) {
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(ih) {
+            if let Some(remote) = t.peers.get(&peer).and_then(|c| c.remote) {
+                t.peer_disconnected_addr(remote, self.session_time);
+            }
             t.remove_peer(peer, &mut eff);
         }
         self.route(*ih, eff, out);
+    }
+
+    /// `peer_connect_failed` — an outbound dial never completed the
+    /// handshake; report it so the swarm entry backs off.
+    pub fn peer_connect_failed(&mut self, ih: &Sha1Hash, remote: SocketAddr) {
+        if let Some(t) = self.torrents.get_mut(ih) {
+            t.peer_connect_failed(remote, self.session_time);
+        }
     }
 
     /// a disk write/read/hash completed for `ih`.
@@ -616,6 +632,7 @@ impl Session {
 
     /// `tick` — drive every torrent's peers + dht timeouts.
     pub fn tick(&mut self, out: &mut Vec<SessionOut>) -> std::time::Duration {
+        self.session_time += 1;
         self.drain_disk_completed(out);
         let wait = self.dht.tick();
         while let Some((pkt, to)) = self.dht.poll() {

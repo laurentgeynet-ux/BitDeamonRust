@@ -9,6 +9,15 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- Cycle de connexion peer_list fidèle : `connect_candidates` marque
+  `set_connected` au début du dial (comme le ctor `peer_connection`
+  upstream), `peer_connect_failed`/`peer_disconnected_addr` appliquent
+  `connection_closed` + `inc_failcount` avec le backoff
+  `min_reconnect_time*(failcount+1)`. `Session::session_time`
+  (`m_session_time`) alimente l'époque de reconnexion.
+
+### Added
+
 - LSD (BEP-14) côté session : `Session::lsd_tick` (annonces multicast
   v4+v6 toutes les 5 min, port d'écoute, cookie) et réception dans
   `Session::on_udp` → `peer_list.add_peer` avec `PeerSourceFlags::LSD`.

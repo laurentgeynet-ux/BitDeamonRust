@@ -732,11 +732,49 @@ impl Torrent {
         // keep `finished` in sync so seeds skip seeds/upload-only
         let mut st = state.clone();
         st.is_finished = self.is_seed();
-        self.peer_list
-            .find_connect_candidates(session_time, &st)
-            .into_iter()
+        let idxs = self.peer_list.find_connect_candidates(session_time, &st);
+        // `set_connection` at dial start (upstream's peer_connection
+        // ctor) — the entry stops being a candidate until
+        // `peer_connect_failed`/`peer_disconnected` reports back.
+        for i in &idxs {
+            self.peer_list.set_connected(*i);
+        }
+        idxs.into_iter()
             .filter_map(|i| self.peer_list.peers().get(i).and_then(|p| p.ip()))
             .collect()
+    }
+
+    /// `connection_closed` for a dial that never completed —
+    /// bumps `last_connected` and `failcount` so the peer isn't
+    /// retried immediately (`inc_failcount` + timestamp upstream).
+    pub fn peer_connect_failed(&mut self, remote: std::net::SocketAddr, session_time: i32) {
+        if let Some(i) = self.peer_index(remote) {
+            self.peer_list.connection_closed(i, session_time);
+            self.peer_list.inc_failcount(i);
+        }
+    }
+
+    /// `set_connection` — mark the swarm entry for `remote` as
+    /// connected (also covers inbound accepts).
+    pub fn peer_connected_addr(&mut self, remote: std::net::SocketAddr) {
+        if let Some(i) = self.peer_index(remote) {
+            self.peer_list.set_connected(i);
+        }
+    }
+
+    /// `connection_closed` — clear the connection flag + stamp
+    /// `last_connected` for the dial backoff.
+    pub fn peer_disconnected_addr(&mut self, remote: std::net::SocketAddr, session_time: i32) {
+        if let Some(i) = self.peer_index(remote) {
+            self.peer_list.connection_closed(i, session_time);
+        }
+    }
+
+    fn peer_index(&self, remote: std::net::SocketAddr) -> Option<usize> {
+        self.peer_list
+            .peers()
+            .iter()
+            .position(|p| p.ip() == Some(remote))
     }
 
     /// `add_peer` — a new connection registered.

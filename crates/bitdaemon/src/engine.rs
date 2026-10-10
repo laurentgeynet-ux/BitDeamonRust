@@ -344,18 +344,20 @@ impl Engine {
         remote: SocketAddr,
         encrypted: bool,
     ) -> std::io::Result<u64> {
-        let mut s = self
-            .connector
-            .clone()
-            .connect(remote)
-            .await
-            .map_err(std::io::Error::other)?;
+        let s_res = self.connector.clone().connect(remote).await;
+        let mut s = match s_res {
+            Ok(s) => s,
+            Err(e) => {
+                self.session.peer_connect_failed(ih, remote);
+                return Err(std::io::Error::other(e));
+            }
+        };
         let pid = self.session.peer_id;
         // encrypted flag selects the MSE path upstream-style;
         // plaintext default for now (`run_handshake_encrypted_*`
         // available when the caller wants PE)
         let _hs = if encrypted {
-            bitdaemon_net::bt_peer_conn::run_handshake_encrypted_initiator(
+            match bitdaemon_net::bt_peer_conn::run_handshake_encrypted_initiator(
                 &mut s,
                 ih,
                 &pid,
@@ -365,12 +367,21 @@ impl Engine {
                 0,
             )
             .await
-            .map_err(std::io::Error::other)?
-            .0
+            {
+                Ok((hs, _)) => hs,
+                Err(e) => {
+                    self.session.peer_connect_failed(ih, remote);
+                    return Err(std::io::Error::other(e));
+                }
+            }
         } else {
-            run_handshake(&mut s, ih, &pid, false, false)
-                .await
-                .map_err(std::io::Error::other)?
+            match run_handshake(&mut s, ih, &pid, false, false).await {
+                Ok(hs) => hs,
+                Err(e) => {
+                    self.session.peer_connect_failed(ih, remote);
+                    return Err(std::io::Error::other(e));
+                }
+            }
         };
 
         let num_pieces = self
