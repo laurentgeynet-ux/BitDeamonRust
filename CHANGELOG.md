@@ -8,6 +8,8 @@ Until `1.0.0`, breaking changes may occur in any release.
 ## [Unreleased]
 
 ### Ajouté
+- `bitdaemon-net::ws_tracker` : annonces `ws://`/`wss://` WebTorrent (JSON `announce` sur frames WS) — `build_announce`/`build_answer`/`parse_response` verbatim (latin-1↔UTF-8, `key` %08X, events completed/started/stopped/paused), `announce_ws` (upgrade + validation `Sec-WebSocket-Accept` + un frame aller-retour, Pong auto). Câblé dans `Engine` pour les URLs `ws`/`wss`.
+- `web_seed::fetch_block` : driver async — écrit les GET `Range` de `build_piece_request` et lit une réponse HTTP par fichier non-pad (`got_get`), vérifie statut 2xx et longueur.
 - `Engine` : résolution des hostnames de trackers via `Resolver` injecté (`set_resolver` — jamais de DNS direct ; les littéraux IP passent sans résolveur), URLs parsées via `parse_url_components`, ports par défaut http/https, annonces UDP résolues aussi.
 - `bitdaemon-net::resolver` : trait `Resolver` injectable (`async_resolve` upstream), `resolve_host` (raccourci littéral IP), `SystemResolver` pour les déploiements non anonymes.
 - `http_conn` : `Accept-Encoding: gzip` émis dans chaque requête et corps `Content-Encoding: gzip|x-gzip` décodé via flate2 (announces compressés).

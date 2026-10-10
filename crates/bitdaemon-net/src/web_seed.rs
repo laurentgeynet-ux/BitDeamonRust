@@ -20,6 +20,9 @@ pub struct FileRequest {
     pub start: i64,
     /// `length`.
     pub length: i64,
+    /// `got_get` — false for pad files (they get no GET, so no
+    /// response to consume on the wire).
+    pub got_get: bool,
 }
 
 /// `web_connection_base` request context.
@@ -104,6 +107,7 @@ pub fn build_piece_request(
             file_index: 0,
             start: i64::from(piece.0) * piece_length + offset,
             length,
+            got_get: true,
         };
         request.push_str("GET ");
         request.push_str(if using_proxy { url } else { path });
@@ -117,12 +121,14 @@ pub fn build_piece_request(
         files.push(fr);
     } else {
         for sl in fs.map_block(piece, offset, length) {
-            let fr = FileRequest {
+            let mut fr = FileRequest {
                 file_index: sl.file_index.get(),
                 start: sl.offset,
                 length: sl.size,
+                got_get: true,
             };
             if fs.pad_file_at(sl.file_index) {
+                fr.got_get = false;
                 files.push(fr);
                 continue;
             }
@@ -162,4 +168,60 @@ pub fn consume_body(files: &[FileRequest], mut bytes: i64) -> Vec<(usize, i64, i
         bytes -= take;
     }
     out
+}
+
+/// `http_error` categories surfaced to the caller.
+#[derive(Debug, thiserror::Error)]
+pub enum WebSeedError {
+    /// stream / parser failure.
+    #[error("transport: {0}")]
+    Transport(#[from] crate::http_conn::HttpError),
+    /// non-2xx status with the server's message.
+    #[error("http {0}: {1}")]
+    Http(i32, String),
+    /// response shorter than the requested range.
+    #[error("short body: got {got}, want {want}")]
+    ShortBody {
+        /// received.
+        got: i64,
+        /// requested.
+        want: i64,
+    },
+}
+
+/// `web_peer_connection`'s read side: write `req.request` and read
+/// one HTTP response **per non-pad file request** (upstream issues
+/// one GET per file slice; each gets its own 206 response).
+///
+/// Returns `(file_index, file_offset, bytes)` segments — the caller
+/// reassembles the block; pad files yield no segment (upstream
+/// synthesizes zeroes).
+pub async fn fetch_block(
+    s: &mut crate::transport::BoxedPeerStream,
+    req: &WebSeedRequest,
+    max_response: usize,
+) -> Result<Vec<(usize, i64, Vec<u8>)>, WebSeedError> {
+    use tokio::io::AsyncWriteExt;
+    s.write_all(req.request.as_bytes())
+        .await
+        .map_err(crate::http_conn::HttpError::Io)?;
+    let mut out = Vec::new();
+    for f in req.files.iter().filter(|f| f.got_get) {
+        let r = crate::http_conn::recv_response(s, max_response).await?;
+        if !(200..300).contains(&r.status()) {
+            return Err(WebSeedError::Http(
+                r.status(),
+                r.header("server").unwrap_or("").to_string(),
+            ));
+        }
+        let body = r.body();
+        if body.len() as i64 != f.length {
+            return Err(WebSeedError::ShortBody {
+                got: body.len() as i64,
+                want: f.length,
+            });
+        }
+        out.push((f.file_index, f.start, body));
+    }
+    Ok(out)
 }

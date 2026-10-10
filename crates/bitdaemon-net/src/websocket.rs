@@ -44,7 +44,10 @@ pub enum WsError {
     Handshake(&'static str),
     /// frame violated the protocol.
     #[error("protocol: {0}")]
-    Protocol(&'static str),
+    Protocol(String),
+    /// peer sent a Close frame.
+    #[error("closed")]
+    Closed,
 }
 
 /// `Sec-WebSocket-Accept` = b64(sha1(key | GUID)).
@@ -154,7 +157,7 @@ pub async fn ws_read_frame(s: &mut BoxedPeerStream) -> Result<(WsOpcode, Vec<u8>
     s.read_exact(&mut hdr).await?;
     let fin = hdr[0] & 0x80 != 0;
     if !fin {
-        return Err(WsError::Protocol("fragmented frames unsupported"));
+        return Err(WsError::Protocol("fragmented frames unsupported".into()));
     }
     let opcode = match hdr[0] & 0x0F {
         0x0 => WsOpcode::Continuation,
@@ -163,7 +166,7 @@ pub async fn ws_read_frame(s: &mut BoxedPeerStream) -> Result<(WsOpcode, Vec<u8>
         0x8 => WsOpcode::Close,
         0x9 => WsOpcode::Ping,
         0xA => WsOpcode::Pong,
-        _ => return Err(WsError::Protocol("bad opcode")),
+        _ => return Err(WsError::Protocol("bad opcode".into())),
     };
     let masked = hdr[1] & 0x80 != 0;
     let mut len = u64::from(hdr[1] & 0x7F);
@@ -177,7 +180,7 @@ pub async fn ws_read_frame(s: &mut BoxedPeerStream) -> Result<(WsOpcode, Vec<u8>
         len = u64::from_be_bytes(e);
     }
     if len > 64 * 1024 * 1024 {
-        return Err(WsError::Protocol("frame too large"));
+        return Err(WsError::Protocol("frame too large".into()));
     }
     let mut mask = [0u8; 4];
     if masked {

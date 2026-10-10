@@ -92,3 +92,91 @@ async fn upgrade_request_verbatim() {
     assert!(req.contains("Sec-WebSocket-Version: 13"));
     assert!(req.contains("User-Agent: bitdaemon/1.0"));
 }
+
+#[tokio::test]
+async fn ws_announce_round_trip() {
+    use bitdaemon_net::tracker_client::AnnounceParams;
+    use bitdaemon_net::websocket::{WsOpcode, ws_accept_key, ws_read_frame, ws_write_frame};
+    use bitdaemon_net::ws_tracker::{announce_ws, build_announce, latin1_utf8, parse_response};
+
+    let ih = [7u8; 20];
+    let p = AnnounceParams {
+        info_hash: ih,
+        peer_id: *b"-OB0001-123456789012",
+        port: 6881,
+        uploaded: 5,
+        downloaded: 9,
+        left: 100,
+        event: 2, // started
+        num_want: 50,
+        key: 0x0BADCAFE,
+    };
+    let payload = build_announce(&p, &[], 0);
+    assert!(payload.contains("\"action\":\"announce\""));
+    assert!(payload.contains("\"event\":\"started\""));
+    assert!(payload.contains("\"key\":\"0BADCAFE\""));
+    // latin-1 info_hash survives as a JSON string (control chars u-escaped)
+    let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(v["info_hash"].as_str().unwrap(), latin1_utf8(&ih));
+
+    let (a, b) = tokio::io::duplex(64 * 1024);
+    let mut cli: bitdaemon_net::transport::BoxedPeerStream = Box::new(a);
+    let mut srv: bitdaemon_net::transport::BoxedPeerStream = Box::new(b);
+
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // read the upgrade request — may arrive split
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 512];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = srv.read(&mut tmp).await.unwrap();
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        let req = String::from_utf8_lossy(&buf);
+        let key = req
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("sec-websocket-key:"))
+            .map(|l| l.split(':').nth(1).unwrap().trim().to_string())
+            .unwrap();
+        let accept = ws_accept_key(&key);
+        srv.write_all(
+            format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        // read the announce frame
+        let (op, data) = ws_read_frame(&mut srv).await.unwrap();
+        assert_eq!(op, WsOpcode::Text);
+        assert!(String::from_utf8_lossy(&data).contains("\"action\":\"announce\""));
+        // reply — unmasked server frame
+        let resp = serde_json::to_string(&serde_json::json!({
+            "action": "announce",
+            "info_hash": latin1_utf8(&ih),
+            "interval": 900,
+            "complete": 3,
+            "incomplete": 1,
+        }))
+        .unwrap();
+        ws_write_frame(&mut srv, WsOpcode::Text, resp.as_bytes(), 0)
+            .await
+            .unwrap();
+    });
+
+    let r = announce_ws(
+        &mut cli,
+        "t.example",
+        "/announce",
+        "dGhlIHNhbXBsZSBub25jZQ==",
+        &payload,
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.info_hash, ih);
+    assert_eq!(r.interval, 900);
+    assert_eq!(r.complete, 3);
+    assert_eq!(r.incomplete, 1);
+
+    // bad ih size is rejected
+    let bad = parse_response(b"{\"info_hash\":\"short\",\"interval\":1}");
+    assert!(bad.is_err());
+}

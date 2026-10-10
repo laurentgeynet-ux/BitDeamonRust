@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 flate2.workspace = true
+serde_json.workspace = true
 bitdaemon-common.workspace = true
 bitdaemon-bencode.workspace = true
 bitdaemon-core.workspace = true

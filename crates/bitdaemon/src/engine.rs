@@ -226,8 +226,45 @@ impl Engine {
                         Err(e) => Err(e),
                     }
                 }
+                Ok(c) if c.protocol == "ws" || c.protocol == "wss" => {
+                    // websocket tracker — WebTorrent JSON signaling;
+                    // upstream never delivers peer lists here, only
+                    // RTC offers + interval/complete stats
+                    let port = u16::try_from(c.port).unwrap_or(80);
+                    match resolve(&resolver, &c.hostname, port).await {
+                        Ok(addr) => match connector.connect(addr).await {
+                            Ok(mut s) => {
+                                let host = if c.port < 0 {
+                                    c.hostname.clone()
+                                } else {
+                                    format!("{}:{}", c.hostname, port)
+                                };
+                                let key: String = (0..16)
+                                    .map(|_| format!("{:02x}", rand::random::<u8>()))
+                                    .collect();
+                                let payload =
+                                    bitdaemon_net::ws_tracker::build_announce(&params, &[], 0);
+                                bitdaemon_net::ws_tracker::announce_ws(
+                                    &mut s, &host, &c.path, &key, &payload,
+                                )
+                                .await
+                                .map(|r| bitdaemon_net::http_tracker::TrackerResponse {
+                                    interval: r.interval as i32,
+                                    min_interval: r.min_interval as i32,
+                                    complete: r.complete,
+                                    incomplete: r.incomplete,
+                                    downloaded: r.downloaded,
+                                    ..Default::default()
+                                })
+                                .map_err(|e| e.to_string())
+                            }
+                            Err(e) => Err(format!("connect: {e}")),
+                        },
+                        Err(e) => Err(e),
+                    }
+                }
                 Ok(c) => {
-                    // http/https/ws — dial a stream and GET
+                    // http/https — dial a stream and GET
                     let default_port = if c.protocol == "https" { 443 } else { 80 };
                     let port = u16::try_from(c.port).unwrap_or(default_port);
                     match resolve(&resolver, &c.hostname, port).await {
