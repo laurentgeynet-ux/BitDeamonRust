@@ -139,6 +139,18 @@ struct WebSeedDone {
     result: Result<Vec<(PeerRequest, Vec<u8>)>, Vec<PeerRequest>>,
 }
 
+/// `natpmp` per-protocol mapping state — the 12-byte request +
+/// the expiry of the last successful map.
+#[derive(Debug)]
+pub struct NatpmpState {
+    /// gateway address the map datagrams go to (`:5351`).
+    pub gateway: SocketAddr,
+    /// `(proto, local_port, external_port, expires)` per mapping.
+    pub mappings: Vec<(bitdaemon_net::natpmp::PortmapProtocol, u16, u16, Instant)>,
+    /// lease TTL we asked for (`settings_pack::natpmp_lease_time`-like).
+    pub ttl: u32,
+}
+
 /// `Engine` — everything outside `Session` that upstream does in
 /// `session_impl`'s io-context loop.
 pub struct Engine {
@@ -176,6 +188,9 @@ pub struct Engine {
     /// resolved `.torrent` `nodes` hosts → router seeds.
     dhtnode_rx: mpsc::UnboundedReceiver<SocketAddr>,
     dhtnode_tx: mpsc::UnboundedSender<SocketAddr>,
+    /// `natpmp` mapping state — `None` until `start_natpmp` (or
+    /// under `anonymous_mode`, where upstream never maps).
+    pub natpmp: Option<NatpmpState>,
     /// spawned task handles (kept for abort on drop).
     tasks: Vec<JoinHandle<()>>,
     /// info-hash set shared with acceptor tasks (`m_torrents` check
@@ -229,6 +244,7 @@ impl Engine {
             webseed_tx,
             dhtnode_rx,
             dhtnode_tx,
+            natpmp: None,
             tasks: Vec::new(),
             known_ihs: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
             queue_time: 3,
@@ -291,7 +307,14 @@ impl Engine {
             self.session.on_announce_response(&a.ih, &a.url, a.result);
         }
         while let Ok((from, buf)) = self.udp_rx.try_recv() {
-            self.session.on_udp(from, &buf, &mut out);
+            // demux: NAT-PMP replies come from the gateway :5351 —
+            // upstream binds a separate socket; injected transports
+            // multiplex on one, so dispatch by sender.
+            if self.natpmp.as_ref().is_some_and(|n| from == n.gateway) {
+                self.on_natpmp_response(&buf);
+            } else {
+                self.session.on_udp(from, &buf, &mut out);
+            }
         }
         while let Ok(d) = self.connect_rx.try_recv() {
             self.on_dial_done(d);
@@ -320,6 +343,7 @@ impl Engine {
         self.session.tick(&mut out);
         self.session.tracker_announce_due(now, 0, &mut out);
         self.dispatch(out).await;
+        self.natpmp_renew().await;
         self.session.pop_alerts()
     }
 
@@ -595,6 +619,95 @@ impl Engine {
             });
         });
         self.tasks.push(handle);
+    }
+
+    /// `natpmp` start — map `local` (the listen port) UDP+TCP
+    /// through the gateway over the injected datagram transport.
+    /// Upstream queries the default gateway from the routing
+    /// table; injected transports pass it in.
+    pub async fn start_natpmp(&mut self, gateway: SocketAddr, local_port: u16, ttl: u32) {
+        use bitdaemon_net::natpmp::{PortmapProtocol, build_map_request};
+        if self.session.settings.anonymous_mode {
+            return; // upstream: no port mapping under anonymity
+        }
+        let Some(dg) = self.datagram.clone() else {
+            return;
+        };
+        self.natpmp = Some(NatpmpState {
+            gateway,
+            mappings: vec![
+                (PortmapProtocol::Tcp, local_port, 0, Instant::now()),
+                (PortmapProtocol::Udp, local_port, 0, Instant::now()),
+            ],
+            ttl,
+        });
+        for proto in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
+            let _ = dg
+                .send_to(&build_map_request(proto, local_port, 0, ttl), gateway)
+                .await;
+        }
+        let _ = dg
+            .send_to(&bitdaemon_net::natpmp::build_ip_request(), gateway)
+            .await;
+    }
+
+    /// `natpmp::on_reply` — update mapping state, feed `ip_voter`
+    /// with the router's view of our public IP.
+    fn on_natpmp_response(&mut self, buf: &[u8]) {
+        use bitdaemon_net::natpmp::NatPmpResponse;
+        let Some(r) = bitdaemon_net::natpmp::parse_response(buf) else {
+            return;
+        };
+        let now = Instant::now();
+        match r {
+            NatPmpResponse::PublicIp(ip) => {
+                self.session.ip_voter.cast_vote(
+                    std::net::IpAddr::V4(ip),
+                    bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_ROUTER,
+                    &std::net::IpAddr::V4(ip),
+                );
+            }
+            NatPmpResponse::Map {
+                private_port,
+                public_port,
+                lifetime,
+                result,
+            } => {
+                if let Some(n) = &mut self.natpmp {
+                    if let Some(m) = n.mappings.iter_mut().find(|m| m.1 == private_port) {
+                        if result == 0 {
+                            m.2 = public_port;
+                            // renew at half the lease (upstream
+                            // `mapping.expires` semantics)
+                            m.3 = now + std::time::Duration::from_secs(u64::from(lifetime / 2));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `natpmp` renew — upstream remaps at half the lease. Called
+    /// from `tick`; resends the 12-byte map request per proto.
+    async fn natpmp_renew(&mut self) {
+        use bitdaemon_net::natpmp::build_map_request;
+        let Some(n) = &self.natpmp else {
+            return;
+        };
+        let Some(dg) = self.datagram.clone() else {
+            return;
+        };
+        let now = Instant::now();
+        let gw = n.gateway;
+        let ttl = n.ttl;
+        // upstream renews at half the lease — the stored deadline
+        // already encodes it (set to `lifetime/2` on response).
+        let due: Vec<_> = n.mappings.iter().filter(|m| m.3 <= now).copied().collect();
+        for (proto, local, _ext, _exp) in due {
+            let _ = dg
+                .send_to(&build_map_request(proto, local, 0, ttl), gw)
+                .await;
+        }
     }
 
     /// drop finished handles.

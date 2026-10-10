@@ -415,3 +415,40 @@ async fn rate_limiter_unlimited() {
     let rl = RateLimiter::new(0);
     rl.acquire(1 << 30).await; // instant
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn natpmp_map_and_ip_vote() {
+    let dg = Arc::new(ChanDatagram::new());
+    let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(None)));
+    let mut eng = Engine::new(conn, Some(dg.clone()));
+    let gw: SocketAddr = "192.168.0.1:5351".parse().unwrap();
+    eng.start_natpmp(gw, 6881, 7200).await;
+
+    // 3 datagrams sent: tcp map, udp map, ip query
+    for _ in 0..3 {
+        let (data, to) = dg.sent.lock().await.try_recv().expect("map request");
+        assert_eq!(to, gw);
+        assert_eq!(data[0], 0);
+    }
+
+    // gateway answers the TCP map + public IP
+    let mut map = [0u8; 16];
+    map[1] = 2; // tcp op
+    map[8..10].copy_from_slice(&6881u16.to_be_bytes());
+    map[10..12].copy_from_slice(&44123u16.to_be_bytes());
+    map[12..16].copy_from_slice(&7200u32.to_be_bytes());
+    let mut ipq = [0u8; 12];
+    ipq[8..12].copy_from_slice(&[203, 0, 113, 42]);
+    eng.start_udp_pump();
+    dg.inbound_tx.send((gw, map.to_vec())).unwrap();
+    dg.inbound_tx.send((gw, ipq.to_vec())).unwrap();
+    tokio::task::yield_now().await;
+    eng.tick(std::time::Instant::now()).await;
+
+    let n = eng.natpmp.as_ref().expect("natpmp state");
+    assert_eq!(n.mappings[0].2, 44123); // external tcp port
+    assert_eq!(
+        eng.session.ip_voter.external_address(),
+        Some(std::net::IpAddr::from([203, 0, 113, 42]))
+    );
+}

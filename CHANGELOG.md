@@ -9,6 +9,15 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **NATPMP câblé** — `Engine::start_natpmp(gateway, port, ttl)`
+  envoie les mappings TCP+UDP + requête IP publique sur la socket
+  datagramme injectée ; démux des réponses par adresse passerelle
+  (upstream lie une socket dédiée), `ip_voter` alimenté
+  (`SOURCE_ROUTER`), renouvellement à mi-lease dans `tick`.
+  Désactivé sous `anonymous_mode` comme upstream.
+
+### Added
+
 - **Choker câblé** — `Session::unchoke_tick` toutes les 10 s :
   `unchoke_sort` (FixedSlots/RoundRobin) sur les compteurs payload
   `PeerConn` (`stat_up/down_total`+round, crédités aux `Piece`
