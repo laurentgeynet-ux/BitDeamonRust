@@ -75,6 +75,8 @@ dependencies = [
  "bitdaemon-disk",
  "bitdaemon-net",
  "bitdaemon-session",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

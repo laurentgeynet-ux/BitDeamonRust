@@ -12,8 +12,6 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use rand::Rng as _;
-
 use crate::http_conn::{HttpError, http_get};
 use crate::http_tracker::{HttpTrackerError, TrackerResponse, announce_query, parse_response};
 use crate::transport::{BoxedPeerStream, DatagramSocket};
@@ -112,12 +110,11 @@ pub async fn announce_udp(
     max_tries: u32,
 ) -> Result<TrackerResponse, AnnounceError> {
     let mut buf = vec![0u8; 2048];
-    let mut rng = rand::rng();
 
     // connect exchange (one retry inside upstream too)
     let mut conn_id = None;
     for _ in 0..max_tries.max(1) {
-        let tid = rng.random::<u32>();
+        let tid = rand::random::<u32>();
         let _ = dgram.send_to(&build_connect(tid), tracker).await?;
         let (n, _from) = tokio::time::timeout(timeout, dgram.recv_from(&mut buf))
             .await
@@ -136,7 +133,7 @@ pub async fn announce_udp(
 
     // announce exchange
     for _ in 0..max_tries.max(1) {
-        let tid = rng.random::<u32>();
+        let tid = rand::random::<u32>();
         let req = AnnounceRequest {
             info_hash: p.info_hash,
             peer_id: p.peer_id,

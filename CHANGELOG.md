@@ -7,6 +7,18 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — Engine (session_impl async)
+
+- `bitdaemon::engine::Engine` — boucle `tick` : draine messages
+  entrants, complétions announce, disconnects, `session.tick` +
+  `tracker_announce_due`, dispatch `SessionOut` (ToPeer→writer,
+  UdpPacket→DatagramSocket, TrackerAnnounce→task HTTP/UDP).
+- `connect_peer` — dial via `PeerConnector` injecté, handshake BT
+  (ou MSE `crypto_provide` PLAINTEXT|RC4), `PeerConn` enregistré,
+  stream split reader/writer tasks.
+- `announce_udp` : `rand::random` à la volée (futur `Send` pour
+  `tokio::spawn`).
+
 ### Added — tracker announce pump
 
 - `Torrent.trackers` (`TrackerList` tiers) alimenté par

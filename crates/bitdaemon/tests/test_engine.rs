@@ -1,0 +1,84 @@
+// This file is part of OnionBit.
+// Copyright (C) 2026 Laurent Geynet
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! `Engine` e2e — scripted duplex transport: dial → handshake →
+//! PeerConn registered → bitfield flows in.
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
+use std::sync::Arc;
+
+use bitdaemon::engine::Engine;
+use bitdaemon_common::types::StorageIndex;
+use bitdaemon_common::{Bitfield, Sha1Hash};
+use bitdaemon_net::peer_wire::{PeerMessage, write_handshake};
+use bitdaemon_net::transport::{BoxedPeerStream, PeerConnector};
+use bitdaemon_session::torrent::Torrent;
+use tokio::io::{AsyncWriteExt, DuplexStream};
+
+#[derive(Debug)]
+struct DuplexConnector(tokio::sync::Mutex<Option<DuplexStream>>);
+
+impl PeerConnector for DuplexConnector {
+    fn connect(
+        self: Arc<Self>,
+        _addr: SocketAddr,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = bitdaemon_net::Result<BoxedPeerStream>> + Send + Sync>,
+    > {
+        let me = self.clone();
+        Box::pin(async move {
+            me.0.lock()
+                .await
+                .take()
+                .map(|s| -> BoxedPeerStream { Box::new(s) })
+                .ok_or_else(|| std::io::Error::other("no peer queued").into())
+        })
+    }
+}
+
+fn ep() -> SocketAddr {
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 6881)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn connect_and_receive_bitfield() {
+    let ih = Sha1Hash::from_bytes(&[9; 20]).unwrap();
+    let (mine, theirs) = tokio::io::duplex(64 * 1024);
+    let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(Some(mine))));
+
+    let mut eng = Engine::new(conn, None);
+    let t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
+    eng.session.add_torrent(t);
+
+    // scripted remote: handshake + bitfield(0,2) — keep the stream
+    // alive after writes or the engine sees a disconnect.
+    let remote_pid = eng.session.peer_id; // any id works; reuse ours
+    let mut boxed: BoxedPeerStream = Box::new(theirs);
+    let hs = write_handshake(&ih, &remote_pid, false, false, false, false);
+    boxed.write_all(&hs).await.unwrap();
+    let mut buf = [0u8; 68];
+    let dial = eng.connect_peer(&ih, ep(), false);
+    let (res, _) = tokio::join!(
+        dial,
+        tokio::io::AsyncReadExt::read_exact(&mut boxed, &mut buf)
+    );
+    let peer = res.unwrap();
+    let mut bf = Bitfield::with_size(4);
+    bf.set_bit(0);
+    bf.set_bit(2);
+    bitdaemon_net::bt_peer_conn::write_message(
+        &mut boxed,
+        &PeerMessage::Bitfield(bf.bytes().to_vec().into()),
+    )
+    .await
+    .unwrap();
+
+    // pump: reader delivers the bitfield → session routes
+    tokio::task::yield_now().await;
+    let _ = eng.tick(std::time::Instant::now()).await;
+    let t = eng.session.torrents.get(&ih).unwrap();
+    let c = t.peers.get(&peer).unwrap();
+    assert!(c.peer_pieces.get_bit(0) && c.peer_pieces.get_bit(2));
+}

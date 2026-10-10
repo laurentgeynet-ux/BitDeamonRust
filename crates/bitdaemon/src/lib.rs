@@ -21,3 +21,6 @@ pub use bitdaemon_dht as dht;
 pub use bitdaemon_disk as disk;
 pub use bitdaemon_net as net;
 pub use bitdaemon_session as session;
+
+/// `Engine` — the async `session_impl` driver over injected transports.
+pub mod engine;

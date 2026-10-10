@@ -21,3 +21,5 @@ bitdaemon-disk.workspace = true
 bitdaemon-net.workspace = true
 bitdaemon-dht.workspace = true
 bitdaemon-session.workspace = true
+tokio.workspace = true
+tracing.workspace = true
