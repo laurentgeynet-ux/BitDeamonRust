@@ -1674,6 +1674,28 @@ impl Session {
                         error,
                     });
                 }
+                TorrentEffect::BecameSeed => {
+                    // upstream `torrent::finished()` →
+                    // `torrent_finished_alert` + `upload_only`
+                    // re-announce to every peer that negotiated
+                    // BEP-21.
+                    self.alerts.post(Alert::TorrentFinished(ih));
+                    if let Some(t) = self.torrents.get(&ih) {
+                        for (pid, c) in &t.peers {
+                            if c.ext_upload_only != 0 {
+                                out.push(SessionOut::ToPeer {
+                                    ih,
+                                    peer: *pid,
+                                    msg: PeerMessage::Extended {
+                                        id: c.ext_upload_only,
+                                        data: bytes::Bytes::new(),
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    out.push(SessionOut::Torrent(TorrentEffect::BecameSeed));
+                }
                 other => out.push(SessionOut::Torrent(other)),
             }
         }

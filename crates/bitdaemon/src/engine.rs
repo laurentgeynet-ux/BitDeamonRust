@@ -1331,6 +1331,10 @@ impl Engine {
             if let Some(md) = &t.metadata_raw {
                 hs.metadata_size = Some(md.len() as i64);
             }
+            // BEP-21 — seeds advertise `upload_only`; likewise
+            // `share_mode` when the swarm flag is set.
+            hs.upload_only = t.is_seed();
+            hs.share_mode = t.share_mode;
         }
         hs
     }
