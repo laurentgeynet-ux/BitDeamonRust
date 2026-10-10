@@ -27,6 +27,18 @@ Consequences that shape this roadmap:
 
 Legend: ⬜ not started · 🟨 in progress · ✅ done (module-level status in PORTING.md)
 
+> **Status snapshot (latest session)** — the engine is feature-complete
+> enough for real-swarm validation: full peer wire (MSE/PE, BEP-10,
+> ut_metadata/ut_pex/lt_donthave, FAST, super-seeding, keepalive,
+> Interested/NotInterested), disk pipeline (write→hash v1/v2→Have,
+> part_file, fences, back-pressure), trackers HTTP/UDP/WS + scrape,
+> DHT announce/get_peers, LSD, NAT-PMP, UPnP, I2P/SAM, SOCKS5,
+> WebSocket, uTP in+out, `Engine::handle()` shared `Arc<Mutex<Session>>`
+> for OnionBit, default OS transports, working `bitdaemon-cli`,
+> `apply_settings`, `remove_torrent` storage release.
+> **Remaining work is frozen below** — next step is interop
+> validation against a live swarm, not more porting.
+
 ---
 
 ## Phase 0 — Scaffolding ⬜ → 🟨
@@ -73,7 +85,7 @@ Phase 3 — it wraps `file_storage`/`stat_file`, not a primitive).
 
 ---
 
-## Phase 2 — Metainfo 🟨
+## Phase 2 — Metainfo ✅
 
 *~10k LOC C++.* Unlocks loading real `.torrent` files and magnets.
 
@@ -95,7 +107,7 @@ remaining — `file_progress` (in disk), tracker machinery.
 
 ---
 
-## Phase 3 — Disk I/O 🟨
+## Phase 3 — Disk I/O ✅
 
 *~20k LOC C++.* Storage must be correct before any download exists —
 and this phase is a **primary motivation for the port** (ADR-0009):
@@ -143,7 +155,7 @@ access (upstream semantics).
 
 ---
 
-## Phase 4 — Peer wire 🟨
+## Phase 4 — Peer wire ✅
 
 *~25k LOC C++.* The core protocol, on tokio.
 
@@ -173,10 +185,17 @@ watermark shrink), `chained_buffer` ✅ (send-buffer chain,
 `test_socks5.cpp`, `test_ip_filter.cpp`, `test_http_connection.cpp`
 pass; a scripted peer (test harness) completes handshake + bitfield +
 piece round-trip.
+*Status*: ✅ done — handshake + MSE/PE + BEP-10, bitfield/have
+emission, keepalive (60 s idle), Interested/NotInterested, FAST
+(HaveAll/HaveNone/AllowedFast/Suggest/Reject, BEP-6 deterministic set),
+super-seed gating, lt_donthave, DhtPort both ways, unsolicited-block
+drop, request gating (choked→allowed_fast only, missing→reject),
+graceful pause, optimistic unchoke rotation, per-peer rate sampling,
+keepalive. Remaining: `ut_holepunch` (deferred, Phase 8).
 
 ---
 
-## Phase 5 — Trackers, discovery & uTP ⬜
+## Phase 5 — Trackers, discovery & uTP 🟨
 
 *~20k LOC C++.* uTP lives here (not Phase 8) because OnionBit's
 anonymous lane runs **peer traffic exclusively over uTP** routed
@@ -197,10 +216,16 @@ constants verbatim before any tuning — AGENTS.md §9).
 in-memory `DatagramSocket`; LSD discovers a loopback peer; UPnP/NAT-PMP
 mapping requests well-formed (mock IGD); uTP connects + transfers a
 block loopback through an injected socket pair.
+*Status*: 🟨 — HTTP/UDP announce + scrape end-to-end (hostname via
+injected `Resolver`), WS tracker (BEP-RTC JSON signaling), uTP
+connector + acceptor e2e on injected datagram sockets, LSD emit+receive,
+NAT-PMP + UPnP SOAP e2e against scripted gateways, `parse_url`, gzip.
+Remaining: `resolver` caching layer polish, `session_udp_sockets`
+multi-interface bind, tracker retry parity details.
 
 ---
 
-## Phase 6 — Session core ⬜
+## Phase 6 — Session core 🟨
 
 *~30k LOC C++.* Everything comes together — a working client.
 Ends at milestone **ONIONBIT-1**: `onionbit-bittorrent` can drop
@@ -232,10 +257,22 @@ extensions: `ut_metadata`, `ut_pex`, `smart_ban`, `metadata` +
 **Exit criteria**: end-to-end download of a fixture torrent between two
 BitDaemon instances on loopback; `test_session` equivalents pass;
 alerts delivered in upstream-compatible order.
+*Status*: 🟨 — `Engine` async actor + `SessionHandle` shared
+(`Arc<Mutex<Session>>`, `Engine::handle()`), `add_torrent_params`
+(resume+magnet+peers), `check_files`, choker + optimistic rotation,
+queue positions, piece deadlines/`read_piece`, `save_resume_data`
+(dirty flag), `move_storage`/`delete_files`/`rename_file`, alerts
+(StateUpdate, ReadPiece, TorrentChecked, PeerBan…), `.session` state
+round-trip incl. settings, `apply_settings` hot-swap, ip_filter
+in+out, per-torrent + global rate limiters, web seeds fetched via
+injected connector, v2 merkle verify + HASH_REQUEST/HASHES.
+Remaining: `peer_class`/`peer_class_set`, `TorrentPeerAllocator`
+(slab), `listen_socket_handle` multi-iface, `SmartBan`, `ut_holepunch`,
+`i2p_pex` (I2P connector/acceptor done), full `performance_counters`.
 
 ---
 
-## Phase 7 — DHT ⬜
+## Phase 7 — DHT 🟨
 
 *~12k LOC C++.* Trackerless operation.
 
@@ -252,41 +289,85 @@ put/get semantics per BEP-44.
 **Exit criteria**: `test_dht.cpp` (all `simulation`-ported cases where
 feasible), bootstrap + `get_peers`/`announce` against the live Mainline
 DHT works.
+*Status*: 🟨 — NodeId/BEP-42, routing table, RPC manager, traversal +
+GetPeers, announce_peer after get_peers, DhtPort wire both ways,
+external-IP votes → `ip_voter`, `enable_dht`/`bind`, `dht_add_node`
+(from `.torrent` nodes + ping-only peer candidates), DhtState persist.
+Remaining: BEP-44 mutable/immutable items (`GetItem`/`PutData`),
+`SampleInfohashes` (BEP-51), `DosBlocker`, full observer wiring.
 
 ---
 
-## Phase 8 — Advanced / v2+ features ⬜
+## Phase 8 — Advanced / v2+ features 🟨
 
 Defer everything non-essential until Phase 6 is solid.
 (uTP moved to Phase 5 — OnionBit anonymous lanes need it.)
 
-- **Web seeds** (`web_connection_base`, `web_peer_connection`,
-  `http_seed`/`getright`/`holtb` URL types).
+- ~~**Web seeds**~~ ✅ done (`web_seed` driver: multi-file GET pipeline
+  over `http_conn` on injected connector; engine `WebSeedFetch` pump).
+  Remaining polish: `getright`/`holtb` URL-type quirks.
 - **Stream encryption hardening** (`smart_ban`, full `pe_crypto`
   policy modes, `crypto_provider` abstraction incl. `win_cng`→RustCrypto).
-- **I2P** (`i2p_stream`, `i2p_pex`).
-- **SSL torrents** (`ssl` context, cert pinning, `ssl_stream`).
+- **I2P** — ✅ `i2p_stream` (SAM handshake) + `I2pConnector`/`I2pAcceptor`
+  e2e; remaining: `i2p_pex`.
+- **`ut_holepunch`** (BEP-55 rendezvous via a mutual peer).
+- **SSL torrents** (`ssl` context, cert pinning, `ssl_stream`) —
+  deferred; rustls per ADR-0007.
 - **WebRTC signaling** (`rtc_stream`, `rtc_signaling`) — newest,
   least-stable upstream surface; evaluate `webrtc` crate vs bespoke.
-- **Streaming** (`read_piece`, `have_piece` deadlines,
-  `time_critical` piece logic inside `torrent`).
-- **`super_seeding`**, `seed_mode`, `share_mode` corner cases.
+- ~~**Streaming**~~ ✅ done (`set_piece_deadline`, `read_piece`,
+  `time_critical`, `ReadPiece` alert, `cancel_non_critical`).
+- ~~**`super_seeding`**~~ ✅ done (piece-at-a-time leak per peer).
+  Remaining: `seed_mode`/`share_mode` corner cases.
 - **`simulation` harness port** — libtorrent's network simulator for
   deterministic swarm tests; large but transformative for CI quality.
 
 ---
 
-## Phase 9 — Hardening & conformance ⬜
+## Phase 9 — Hardening & conformance ⬜ ← NEXT
 
+- [ ] **Real-swarm validation** — `bitdaemon-cli` against a public
+      swarm (Linux ISO, hundreds of seeds, mixed clients). Watch:
+      full download, sane rates, no disconnect storms,
+      `piece_verified`/`Have`/seed transition. **This is the next
+      action — the port stops here until it passes.**
+- [ ] **ONIONBIT-1** — swap rqbit → bitdaemon in
+      `Tribler-Rust-Torrent`. `Engine::handle()`, `StorageFactory`,
+      `Resolver`, injected transports are ready; fragile point =
+      `.bitv` private storage adapter.
 - [ ] Fuzzing (`cargo-fuzz`): bdecode, peer-wire codec, DHT msg parser,
       resume data, tracker responses — mirroring upstream `fuzzers/`.
 - [ ] Differential tests: BitDaemon ↔ C++ libtorrent client pairs
-      (seed/leeach both directions, resume, magnet, DHT).
-- [ ] Real-swarm validation against qBittorrent/Transmission/aria2.
+      (seed/leech both directions, resume, magnet, DHT).
+- [ ] Golden-vector generator (Phase 0 leftover) — dump fixtures from
+      the C++ checkout for wire/resume conformance.
 - [ ] Benchmarks vs C++: piece hashing throughput, connection churn,
       memory under 1000-torrent load (upstream `examples/run_benchmarks`).
-- [ ] `cargo deny` licenses/advisories green; `cargo doc` complete.
+- [ ] `cargo deny` licenses/advisories green; `rust-toolchain.toml`.
 - [ ] Resume/`.session` upgrade+downgrade round-trip matrix vs upstream.
+
+---
+
+## Remaining port work — frozen list
+
+Deferred modules, in priority order. None blocks the OnionBit swap.
+
+1. `ut_holepunch` (BEP-55) — NAT rendezvous via mutual peer.
+2. `i2p_pex` — I2P destinations over PEX (I2P transport itself done).
+3. SSL/TLS streams — `ssl_stream` (rustls), HTTPS trackers,
+   SSL torrents.
+4. `smart_ban` — hash-failure peer learning/banning.
+5. `peer_class`/`peer_class_set` + `performance_counters` —
+   upstream stats fidelity.
+6. `TorrentPeerAllocator` (slab) — allocation perf, correctness-neutral.
+7. `session_udp_sockets` multi-interface + `listen_socket_handle`.
+8. DHT leftovers: BEP-44 items, BEP-51 `sample_infohashes`,
+   `DosBlocker`, observer wiring.
+9. `getright`/`holtb` web-seed URL quirks (BEP-17/19 variants).
+10. `seed_mode`/`share_mode` corner cases; tracker retry parity details.
+11. `file_view_pool`/`mmap_disk_io` — **permanently deferred**:
+    `mmap` needs `unsafe`; `PreadDiskIo` is the reference backend.
+12. WebRTC (`rtc_stream`/`rtc_signaling`) — evaluate `webrtc` crate.
 
 ---
 
