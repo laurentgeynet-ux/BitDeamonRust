@@ -643,6 +643,8 @@ impl Session {
         t.queue_seq = self.next_queue_seq;
         self.next_queue_seq += 1;
         self.torrents.insert(ih, t);
+        // `add_torrent_alert`
+        self.alerts.post(Alert::TorrentAdded(ih));
         ih
     }
 
@@ -690,6 +692,7 @@ impl Session {
         let t = Torrent::from_params(atp, storage, &mut eff)?;
         let ih = t.info_hash;
         self.torrents.insert(ih, t);
+        self.alerts.post(Alert::TorrentAdded(ih));
         self.route(ih, eff, out);
         // `.torrent` `nodes` — `dht->m_add_node` upstream: seed
         // router nodes through the async resolution path.
