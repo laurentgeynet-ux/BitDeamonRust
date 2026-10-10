@@ -19,17 +19,25 @@ pub const VERSION_STR: &[u8] = b"2.1.2.0";
 
 /// `add_torrent_params.hpp` — the session-add parameter bundle.
 pub mod add_torrent_params;
+/// `create_torrent.hpp`/`create_torrent.cpp` — `.torrent` construction.
+pub mod create_torrent;
 pub mod error;
 /// `aux_/escape_string.hpp`/`escape_string.cpp` — URL encoding, base32.
 pub mod escape_string;
 /// `aux::file_storage` — the torrent file list and piece↔file mapping.
 pub mod file_storage;
+/// `fingerprint.cpp`/`identify_client.cpp` — peer-id client decode.
+pub mod fingerprint;
 /// `magnet_uri.hpp`/`magnet_uri.cpp` — magnet link parse/serialize.
 pub mod magnet_uri;
 /// `aux_/merkle.hpp`/`merkle.cpp` — BEP-52 merkle tree math.
 pub mod merkle;
+/// `aux_/merkle_tree.hpp`/`merkle_tree.cpp` — per-file merkle tree.
+pub mod merkle_tree;
 /// `aux_/path.hpp`/`path.cpp` — pure path-string helpers (byte-oriented).
 pub mod path;
+/// `resolve_duplicate_filenames.cpp` — collision-safe naming.
+pub mod resolve;
 /// `read_resume_data.cpp`/`write_resume_data.cpp` — fastresume wire format.
 pub mod resume_data;
 /// `torrent_info.cpp` + `load_torrent.cpp` — `.torrent` parsing
@@ -51,8 +59,6 @@ pub use torrent_info::{
     parse_torrent_file,
 };
 
-/// Builder for new torrents (`libtorrent::create_torrent`).
-///
-/// TODO: implement — piece-size selection, v1/v2/hybrid generation,
-/// merkle tree computation, `set_hashes` from disk.
-pub struct CreateTorrent;
+pub use create_torrent::{
+    CreateFileEntry, CreateFlags, CreateTorrent, canonicalize, list_files, set_piece_hashes,
+};

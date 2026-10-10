@@ -63,16 +63,17 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 |---|---|---|---|
 | `torrent_info.cpp` (`torrent_info.hpp`) | `core::torrent_info` | **ported** | v1+v2+hybrid; v2 piece-layer merkle validation; byte-oriented names |
 | `file_storage.cpp` (`file_storage.hpp`), `file_layout.hpp` | `core::file_storage` | **ported** | byte-oriented paths (upstream `std::string` semantics); `test_file_storage.cpp` 28/28 |
-| `create_torrent.cpp` (`create_torrent.hpp`) | `core::create` | not started | |
-| `merkle.cpp` (`merkle.hpp`) | `core::merkle` | partial | pure math + `load_piece_layer` root validation done; sparse `merkle_tree` (Phase 3) |
+| `create_torrent.cpp` (`create_torrent.hpp`) | `core::create_torrent` | **ported** | canonicalize + v1/v2/hybrid generate; `set_piece_hashes`; `test_create_torrent.cpp` 8/8 |
+| `merkle.cpp` (`merkle.hpp`), `aux_/merkle_tree.hpp` + `merkle_tree.cpp` | `core::merkle`, `core::merkle_tree` | **ported** | full sparse/piece-layer tree, proofs, verified-bitfield; `test_merkle_tree.cpp` 22/22 |
 | `magnet_uri.cpp` (`magnet_uri.hpp`) | `core::magnet_uri` | **ported** | `test_magnet.cpp` parse vectors 24/24 |
 | `load_torrent.cpp` (`load_torrent.hpp`) | `core::torrent_info` (`load_torrent*`) | **ported** | `parse_torrent_file`/`load_torrent_buffer` |
 | `announce_entry.cpp`, `tracker_list.cpp` | `core::tracker` | not started | tier + failover semantics |
-| `web_seed_entry.cpp` (`web_seed_entry.hpp`) | `core::web_seed` | not started | |
-| `fingerprint.cpp`, `identify_client.cpp` | `core::fingerprint` | not started | client identification table |
+| `web_seed_entry.cpp` (`web_seed_entry.hpp`) | `core::web_seed` | partial | `WebSeedEntry` data struct; endpoint/scrape logic is Phase 5 |
+| `fingerprint.cpp`, `identify_client.cpp` | `core::fingerprint` | **ported** | az/shadow/mainline/TR-legacy styles + name map; `test_identify_client.cpp` 2/2 |
 | `read_resume_data.cpp`, `write_resume_data.cpp` | `core::resume_data` | **ported** | file-version 1+2 read, v2 write; `test_read_resume.cpp` vectors + round-trip |
-| `resolve_links.cpp`, `resolve_duplicate_filenames.cpp` | `core::resolve` | not started | |
-| `apply_pad_files.hpp`, `resolve_duplicate_filenames.hpp` | `core::pad` | not started | |
+| `resolve_duplicate_filenames.cpp` | `core::resolve` | **ported** | case-insensitive `.N` renames, dir/pad rules; upstream table 12/12 (Windows sep-safe) |
+| `apply_pad_files.hpp`, `resolve_duplicate_filenames.hpp` | `core::pad` | **ported** | folded into `resolve` |
+| `resolve_links.cpp` (`resolve_links.hpp`) | `core::resolve` | not started | needs session storage hooks — Phase 3 |
 | `add_torrent_params.cpp` (`add_torrent_params.hpp`) | `core::add_torrent_params` | **ported** | single canonical struct used by torrent/magnet/resume |
 | `path.cpp` (string helpers), `aux_/path.hpp` | `core::path` | **ported** (string half) | `directory.cpp`/`drive_info.cpp` (fs-dependent) → Phase 3 |
 | `entry`-adjacent `client_data.hpp`, `fwd.hpp`, `version.cpp` | misc | not started | |

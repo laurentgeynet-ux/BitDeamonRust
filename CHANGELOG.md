@@ -78,6 +78,24 @@ Until `1.0.0`, breaking changes may occur in any release.
   Conformance: `test_file_storage` 28/28, upstream `.torrent` fixtures
   (valid + invalid incl. piece-layer root), `test_magnet` 24/24,
   `test_read_resume` vectors + full round-trip.
+- `bitdaemon_core` Phase-2 second wave:
+  `merkle_tree` (full `aux::merkle_tree` port — sparse trees, piece-layer
+  mode, `set_block`/`add_hashes` proofs, verified-bitfield tracking,
+  `Unknown`/`Ok`/`HashFailed`/`BlockHashFailed` results),
+  `create_torrent` (`CreateTorrent`/`CreateFileEntry`, `canonicalize`
+  pad-file insertion, v1/v2/hybrid `generate` via canonical `Entry`,
+  `set_piece_hashes` hashing files from disk, piece-size table rules),
+  `write_torrent_file` (piece layers, tracker tiers, url seeds, DHT
+  nodes, similar/collections, comment/creator/creation date),
+  `fingerprint`/`identify_client` (Azureus/Shadow/Mainline/Transmission
+  legacy styles + name map; `Fingerprint::generate`),
+  `resolve` (`resolve_duplicate_filenames` — case-insensitive `.N`
+  renames, directory precedence, pad-file collision exceptions,
+  collision-limit error; wired into `parse_torrent_file` populating
+  `renamed_files`), `web_seed` data struct. Conformance:
+  `test_merkle_tree` 22/22, `test_create_torrent` 8/8,
+  `test_identify_client` + generate vectors, `test_resolve_duplicates`
+  12/12 (upstream table, POSIX-normalized for Windows separators).
 - Tests: 67 conformance cases ported from `test_bdecode.cpp`, 16 from
   `test_bitfield.cpp`, 8 from `test_sliding_average.cpp`, 5 from
   `test_bloom_filter.cpp`, `test_crc32.cpp` vectors (RFC 3720 B.4),

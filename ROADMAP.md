@@ -77,16 +77,22 @@ Phase 3 — it wraps `file_storage`/`stat_file`, not a primitive).
 
 *~10k LOC C++.* Unlocks loading real `.torrent` files and magnets.
 
-`bitdaemon-core`: `FileStorage` (+ `path`, `resolve_duplicate_filenames`),
-`TorrentInfo` (v1, v2, hybrid, merkle `info` verification, `file_progress`),
-`CreateTorrent` (+ `merkle_tree`, `merkle` hashing), `magnet_uri`
-(parse + serialize), `load_torrent`, `announce_entry`, `tracker_list`,
-`web_seed_entry`, `info_hash`, `fingerprint`, `identify_client`,
-`read_resume_data`/`write_resume_data` wire format, `resolve_links`.
+`bitdaemon-core`: `FileStorage` (+ `path`, `resolve_duplicate_filenames`) ✅,
+`TorrentInfo` (v1, v2, hybrid, merkle `info` verification ✅; `file_progress` pending),
+`CreateTorrent` (+ `merkle_tree`, `merkle` hashing) ✅, `magnet_uri`
+(parse + serialize) ✅, `load_torrent` ✅, `announce_entry`/`tracker_list`
+(Phase 5 — session machinery), `web_seed_entry` (data struct ✅),
+`info_hash` ✅, `fingerprint`/`identify_client` ✅,
+`read_resume_data`/`write_resume_data` wire format ✅, `resolve_links`
+(Phase 3 — needs storage hooks).
 
 **Exit criteria**: `test_torrent_info.cpp`, `test_create_torrent.cpp`,
 `test_magnet.cpp`, `test_file_storage.cpp`, `test_read_resume.cpp`,
 `test_merkle.cpp` pass; can parse every fixture torrent incl. v2/hybrid.
+*Status*: all upstream fixture vectors green (file_storage 28/28,
+torrent_info, magnet 24/24, resume, create_torrent 8/8,
+merkle_tree 22/22, identify_client, resolve_duplicates 12/12);
+remaining — `file_progress`, `resolve_links`, tracker machinery.
 
 ---
 

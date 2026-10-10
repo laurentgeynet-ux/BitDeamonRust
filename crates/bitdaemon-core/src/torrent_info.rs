@@ -1132,6 +1132,33 @@ pub fn parse_torrent_file(
         if e.is_valid() {
             let layers = parse_piece_layers(&e, ti.files())?;
             ti.set_piece_layers(layers);
+            // upstream also materializes the sparse merkle trees +
+            // masks + verified-leaf bitfields into `atp`
+            let fs = ti.files();
+            out.merkle_trees.resize(fs.num_files() as usize, Vec::new());
+            out.merkle_tree_mask
+                .resize(fs.num_files() as usize, Default::default());
+            out.verified_leaf_hashes
+                .resize(fs.num_files() as usize, Default::default());
+            for i in fs.file_range() {
+                if fs.file_size(i) <= i64::from(fs.piece_length()) {
+                    continue;
+                }
+                let Some(layer) = ti.piece_layer(i) else {
+                    continue;
+                };
+                let mut tree = crate::merkle_tree::MerkleTree::new(
+                    fs.file_num_blocks(i) as usize,
+                    fs.blocks_per_piece() as usize,
+                    fs.root(i),
+                );
+                if tree.load_piece_layer(layer) {
+                    let (sparse, mask) = tree.build_sparse_vector();
+                    out.merkle_trees[i.0 as usize] = sparse;
+                    out.merkle_tree_mask[i.0 as usize] = mask;
+                    out.verified_leaf_hashes[i.0 as usize] = tree.verified_leafs();
+                }
+            }
         }
     }
 
@@ -1259,6 +1286,14 @@ pub fn parse_torrent_file(
             .to_vec();
     }
     verify_encoding(&mut out.created_by);
+
+    // `load_torrent_parsed` — collision-safe filename resolution fills
+    // `renamed_files` (the storage layout itself keeps original names)
+    let renamed = crate::resolve::resolve_duplicate_filenames(
+        ti.files(),
+        cfg.max_duplicate_filenames as i32,
+    )?;
+    out.renamed_files = renamed.into_iter().map(|(k, v)| (k.0, v)).collect();
 
     out.info_hashes = *ti.info_hashes();
     out.ti = Some(std::sync::Arc::new(ti));

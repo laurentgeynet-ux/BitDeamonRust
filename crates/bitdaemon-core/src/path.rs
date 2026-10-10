@@ -598,3 +598,32 @@ pub fn sanitize_append_path_element(path: &mut Vec<u8>, element: &[u8], force_el
         path.push(b'_');
     }
 }
+
+/// Convert raw torrent-path bytes to `std::path::PathBuf`
+/// (OsStr-as-bytes on Unix; lossy UTF-8 on Windows).
+#[must_use]
+pub fn bytes_to_path(p: &[u8]) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(p))
+    }
+    #[cfg(not(unix))]
+    {
+        std::path::PathBuf::from(String::from_utf8_lossy(p).as_ref())
+    }
+}
+
+/// Inverse of [`bytes_to_path`].
+#[must_use]
+pub fn path_to_bytes(p: &std::path::Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        p.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        p.as_os_str().to_string_lossy().as_bytes().to_vec()
+    }
+}

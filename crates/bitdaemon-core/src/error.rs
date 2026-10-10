@@ -72,6 +72,9 @@ pub enum TorrentError {
     /// `invalid_file_tag`.
     #[error("invalid file tag")]
     InvalidFileTag,
+    /// `too_many_duplicate_filenames`.
+    #[error("too many duplicate filenames in torrent")]
+    TooManyDuplicateFilenames,
 
     /// `torrent_unknown_version` (210).
     #[error("the torrent file has an unknown meta version")]
@@ -103,6 +106,12 @@ pub enum TorrentError {
     /// `torrent_directory_too_deep`.
     #[error("directory structure in torrent file exceeds depth limit")]
     TorrentDirectoryTooDeep,
+    /// `invalid_piece_size` (create_torrent).
+    #[error("invalid piece size")]
+    InvalidPieceSize,
+    /// `invalid_hash_entry` (create_torrent — missing or mismatched hashes).
+    #[error("piece hashes are missing or inconsistent")]
+    InvalidHashEntry,
 }
 
 /// Top-level error for the crate.

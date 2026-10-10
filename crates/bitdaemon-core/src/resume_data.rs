@@ -14,7 +14,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use bitdaemon_bencode::{BdecodeNode, NodeType};
-use bitdaemon_bencode::{Entry, bencode};
+use bitdaemon_bencode::{Dictionary, Entry, bencode};
 use bitdaemon_common::flags::TorrentFlags;
 use bitdaemon_common::types::DownloadPriority;
 use bitdaemon_common::{Bitfield, Sha1Hash, Sha256Hash};
@@ -683,4 +683,184 @@ pub fn write_resume_data(atp: &AddTorrentParams) -> Entry {
 #[must_use]
 pub fn write_resume_data_buf(atp: &AddTorrentParams) -> Vec<u8> {
     bencode(&write_resume_data(atp))
+}
+
+/// `build_tracker_list` — announce-list style nested tier lists.
+#[must_use]
+pub fn build_tracker_list(trackers: &[Vec<u8>], tracker_tiers: &[i32]) -> Entry {
+    let mut tr_list: Vec<Entry> = Vec::new();
+    if trackers.is_empty() {
+        return Entry::List(tr_list);
+    }
+    tr_list.push(Entry::List(Vec::new()));
+    let mut tier = 0usize;
+    let mut tier_it = tracker_tiers.iter();
+    for tr in trackers {
+        if let Some(&t) = tier_it.next() {
+            tier = (t.max(0) as usize).min(1024);
+        }
+        if tr_list.len() <= tier {
+            tr_list.resize(tier + 1, Entry::List(Vec::new()));
+        }
+        if let Entry::List(l) = &mut tr_list[tier] {
+            l.push(Entry::String(tr.clone()));
+        }
+    }
+    Entry::List(tr_list)
+}
+
+/// `write_torrent_flags_t`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WriteTorrentFlags {
+    /// `write_flags::allow_missing_piece_layer` — v2 torrents may be
+    /// written without `piece layers` (e.g. magnet-like output).
+    pub allow_missing_piece_layer: bool,
+    /// `write_flags::no_http_seeds`.
+    pub no_http_seeds: bool,
+    /// `write_flags::include_dht_nodes`.
+    pub include_dht_nodes: bool,
+}
+
+/// `write_torrent_file(atp, flags)` — rebuild a `.torrent` dict from
+/// `AddTorrentParams` (verbatim info section + reconstructed layers).
+///
+/// # Errors
+/// `TorrentMissingInfo`, `TorrentMissingPieceLayer`,
+/// `TorrentInvalidPieceLayer`, `Bdecode` (malformed stored info section).
+pub fn write_torrent_file(atp: &AddTorrentParams, flags: WriteTorrentFlags) -> Result<Entry> {
+    let Some(ti) = &atp.ti else {
+        return Err(crate::TorrentError::TorrentMissingInfo.into());
+    };
+    let mut ret = Dictionary::new();
+
+    // verbatim info dict
+    let info_node = bitdaemon_bencode::bdecode_limits(ti.info_section(), 100, 2_000_000);
+    ret.insert(
+        b"info".to_vec(),
+        Entry::Preformatted(ti.info_section().to_vec()),
+    );
+
+    if !atp.comment.is_empty() {
+        ret.insert(b"comment".to_vec(), Entry::String(atp.comment.clone()));
+    }
+    if atp.creation_date != 0 {
+        ret.insert(b"creation date".to_vec(), Entry::Int(atp.creation_date));
+    }
+    if !atp.created_by.is_empty() {
+        ret.insert(
+            b"created by".to_vec(),
+            Entry::String(atp.created_by.clone()),
+        );
+    }
+
+    if !atp.merkle_trees.is_empty() {
+        let fs = ti.files();
+        if atp.merkle_trees.len() != fs.num_files() as usize {
+            return Err(crate::TorrentError::TorrentMissingPieceLayer.into());
+        }
+        let mut piece_layers = Dictionary::new();
+        for f in fs.file_range() {
+            if fs.pad_file_at(f) || fs.file_size(f) <= i64::from(fs.piece_length()) {
+                continue;
+            }
+            let mut tree = crate::merkle_tree::MerkleTree::new(
+                fs.file_num_blocks(f) as usize,
+                fs.blocks_per_piece() as usize,
+                fs.root(f),
+            );
+            let empty_verified = Bitfield::new();
+            let verified = atp
+                .verified_leaf_hashes
+                .get(f.0 as usize)
+                .unwrap_or(&empty_verified);
+            let sparse = &atp.merkle_trees[f.0 as usize];
+            if let Some(mask) = atp.merkle_tree_mask.get(f.0 as usize) {
+                if !mask.is_empty() {
+                    tree.load_sparse_tree(sparse, mask, verified);
+                } else {
+                    tree.load_tree(sparse, verified);
+                }
+            } else {
+                tree.load_tree(sparse, verified);
+            }
+            let piece_layer = tree.get_piece_layer();
+            if piece_layer.len() != fs.file_num_pieces(f) as usize {
+                return Err(crate::TorrentError::TorrentInvalidPieceLayer.into());
+            }
+            let mut layer = Vec::with_capacity(piece_layer.len() * 32);
+            for h in &piece_layer {
+                layer.extend_from_slice(h.as_bytes());
+            }
+            piece_layers.insert(tree.root().as_bytes().to_vec(), Entry::String(layer));
+        }
+        ret.insert(b"piece layers".to_vec(), Entry::Dict(piece_layers));
+    } else if ti.v2() && !flags.allow_missing_piece_layer {
+        // v2 torrents need piece layers to be valid .torrent files
+        return Err(crate::TorrentError::TorrentMissingPieceLayer.into());
+    }
+
+    if !atp.url_seeds.is_empty() && !flags.no_http_seeds {
+        ret.insert(
+            b"url-list".to_vec(),
+            Entry::List(atp.url_seeds.iter().cloned().map(Entry::String).collect()),
+        );
+    }
+    if !atp.http_seeds.is_empty() && !flags.no_http_seeds {
+        ret.insert(
+            b"httpseeds".to_vec(),
+            Entry::List(atp.http_seeds.iter().cloned().map(Entry::String).collect()),
+        );
+    }
+    if !atp.dht_nodes.is_empty() && flags.include_dht_nodes {
+        let nodes: Vec<Entry> = atp
+            .dht_nodes
+            .iter()
+            .map(|(h, p)| Entry::List(vec![Entry::String(h.clone()), Entry::Int(i64::from(*p))]))
+            .collect();
+        ret.insert(b"nodes".to_vec(), Entry::List(nodes));
+    }
+
+    // similar/collections live in the info dict upstream; only add
+    // top-level entries if the info section doesn't carry them already
+    if info_node.error().is_none() && info_node.is_valid() {
+        if !ti.similar_torrents().is_empty() && !info_node.dict_find(b"similar").is_valid() {
+            ret.insert(
+                b"similar".to_vec(),
+                Entry::List(
+                    ti.similar_torrents()
+                        .iter()
+                        .map(|h| Entry::String(h.as_bytes().to_vec()))
+                        .collect(),
+                ),
+            );
+        }
+        if !ti.collections().is_empty() && !info_node.dict_find(b"collections").is_valid() {
+            ret.insert(
+                b"collections".to_vec(),
+                Entry::List(
+                    ti.collections()
+                        .iter()
+                        .cloned()
+                        .map(Entry::String)
+                        .collect(),
+                ),
+            );
+        }
+    }
+
+    if atp.trackers.len() == 1 {
+        ret.insert(b"announce".to_vec(), Entry::String(atp.trackers[0].clone()));
+    } else if atp.trackers.len() > 1 {
+        ret.insert(
+            b"announce-list".to_vec(),
+            build_tracker_list(&atp.trackers, &atp.tracker_tiers),
+        );
+    }
+
+    Ok(Entry::Dict(ret))
+}
+
+/// `write_torrent_file_buf`.
+pub fn write_torrent_file_buf(atp: &AddTorrentParams, flags: WriteTorrentFlags) -> Result<Vec<u8>> {
+    Ok(bencode(&write_torrent_file(atp, flags)?))
 }
