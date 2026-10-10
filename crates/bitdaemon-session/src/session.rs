@@ -155,6 +155,9 @@ pub struct Session {
     /// `(v6, lookup idx)` → info_hash — maps DHT traversal events
     /// back to the torrent they serve.
     dht_lookup_map: std::collections::BTreeMap<(bool, usize), Sha1Hash>,
+    /// `external_udp_port()` — the port our DHT socket listens on,
+    /// advertised to peers via the `port` message (BEP-5 §port).
+    pub dht_port: Option<u16>,
     /// last `session_time` a DHT announce ran per torrent
     /// (`m_dht_announce_timer` upstream).
     dht_last_announce: std::collections::BTreeMap<Sha1Hash, i32>,
@@ -290,6 +293,7 @@ impl Default for Session {
             settings: crate::settings::SessionSettings::default(),
             ip_voter: bitdaemon_net::ip_voter::IpVoter::new(),
             dht_lookup_map: std::collections::BTreeMap::new(),
+            dht_port: None,
             dht_last_announce: std::collections::BTreeMap::new(),
             disk_tx,
             disk_rx,
@@ -913,6 +917,17 @@ impl Session {
             if let Some(msg) = msg {
                 out.push(SessionOut::ToPeer { ih: *ih, peer, msg });
             }
+            // upstream `peer_connection::init` sends `port` when
+            // the peer negotiated DHT and our dht is bound.
+            if conn.supports_dht
+                && let Some(port) = self.dht_port
+            {
+                out.push(SessionOut::ToPeer {
+                    ih: *ih,
+                    peer,
+                    msg: PeerMessage::DhtPort(port),
+                });
+            }
             t.add_peer(peer, conn);
             let n = self.torrents.values().map(|t| t.peers.len() as i64).sum();
             self.counters.set(Counter::PeersConnected, n);
@@ -1230,6 +1245,13 @@ impl Session {
         settings: bitdaemon_dht::dht_settings::DhtSettings,
     ) {
         self.dht.bind(bind_ip, id, settings);
+    }
+
+    /// `session_impl::external_udp_port` — set once the injected
+    /// datagram socket is bound so `peer_connected` can advertise
+    /// it to DHT-capable peers.
+    pub fn set_dht_port(&mut self, port: u16) {
+        self.dht_port = Some(port);
     }
 
     /// UDP datagram → dht tracker (any family) — and LSD announces
