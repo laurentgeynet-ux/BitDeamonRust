@@ -1187,6 +1187,26 @@ impl Torrent {
                     out.push(TorrentEffect::DiskWrite { req, data });
                 }
                 PeerEffect::ReadRequest(req) => {
+                    // super-seeding: requests outside the piece we
+                    // leaked get rejected outright (upstream
+                    // `incoming_request` → `write_reject_request`).
+                    if self.super_seeding {
+                        let leaked = self.peers.get(&peer_id).and_then(|c| c.superseed_piece);
+                        if leaked != Some(req.piece) {
+                            if let Some(c) = self.peers.get_mut(&peer_id) {
+                                c.num_invalid_requests += 1;
+                                // `write_reject_request` is gated
+                                // on the FAST extension upstream.
+                                if c.supports_fast {
+                                    out.push(TorrentEffect::SendTo {
+                                        peer: peer_id,
+                                        msg: PeerMessage::RejectRequest(req),
+                                    });
+                                }
+                            }
+                            continue;
+                        }
+                    }
                     // upstream `incoming_request`: a peer we choke
                     // only gets BEP-6 `allowed_fast` pieces; a piece
                     // we don't have gets a FAST `reject` (or silent
