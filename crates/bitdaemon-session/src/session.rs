@@ -90,6 +90,16 @@ pub enum SessionOut {
         /// blocks to fetch.
         reqs: Vec<bitdaemon_common::types::PeerRequest>,
     },
+    /// `dht->m_add_node` — a `.torrent` `nodes` entry (host, port)
+    /// to resolve and seed into `router_nodes`. Resolution goes
+    /// through the injected resolver (anonymous deployments must
+    /// not leak a direct DNS query).
+    DhtAddNode {
+        /// hostname.
+        host: String,
+        /// port.
+        port: i32,
+    },
 }
 
 /// `session_impl` — all state owned on one thread.
@@ -125,6 +135,9 @@ pub struct Session {
     ip_filter: bitdaemon_net::ip_filter::IpFilter,
     /// `settings_pack` — typed session knobs (`m_settings` upstream).
     pub settings: crate::settings::SessionSettings,
+    /// `m_ip_voter` — external-address voting (DHT `ip`, tracker
+    /// `external ip`, peer `yourip`).
+    pub ip_voter: bitdaemon_net::ip_voter::IpVoter,
 }
 
 /// A disk job's result, delivered back onto the session thread.
@@ -196,6 +209,7 @@ impl Default for Session {
             session_time: 0,
             ip_filter: bitdaemon_net::ip_filter::IpFilter::new(),
             settings: crate::settings::SessionSettings::default(),
+            ip_voter: bitdaemon_net::ip_voter::IpVoter::new(),
             disk_tx,
             disk_rx,
         }
@@ -459,6 +473,16 @@ impl Session {
         let ih = t.info_hash;
         self.torrents.insert(ih, t);
         self.route(ih, eff, out);
+        // `.torrent` `nodes` — `dht->m_add_node` upstream: seed
+        // router nodes through the async resolution path.
+        if !self.settings.anonymous_mode {
+            for (host, port) in &atp.dht_nodes {
+                out.push(SessionOut::DhtAddNode {
+                    host: String::from_utf8_lossy(host).into_owned(),
+                    port: *port,
+                });
+            }
+        }
         Some(ih)
     }
 
@@ -676,7 +700,19 @@ impl Session {
     pub fn on_udp(&mut self, from: SocketAddr, buf: &[u8], out: &mut Vec<SessionOut>) {
         if let Some((pkt, to)) = self.dht.incoming(from, buf) {
             out.push(SessionOut::UdpPacket(pkt, to));
-            return;
+        }
+        // `ip_voter::cast_vote` — the `ip` key a node echoed back is
+        // its view of our external address (upstream `dht.cpp`).
+        for v6 in [false, true] {
+            if let Some(n) = self.dht.get_node_mut(v6) {
+                for ip in n.drain_ip_votes() {
+                    self.ip_voter.cast_vote(
+                        ip,
+                        bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_DHT,
+                        &from.ip(),
+                    );
+                }
+            }
         }
         if let Some(a) = bitdaemon_net::lsd::process_packet(buf, from, self.lsd_cookie) {
             for ih_raw in a.info_hashes {
@@ -815,6 +851,14 @@ impl Session {
                     self.alerts.post(Alert::HashFailed { ih, piece });
                     out.push(SessionOut::Torrent(TorrentEffect::PieceFailed(piece)));
                 }
+                TorrentEffect::YourIp(ip) => {
+                    // BEP-10 `yourip` → `ip_voter` (source_peer)
+                    self.ip_voter.cast_vote(
+                        ip,
+                        bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_PEER,
+                        &ip,
+                    );
+                }
                 other => out.push(SessionOut::Torrent(other)),
             }
         }
@@ -845,6 +889,16 @@ impl Session {
                     params: t.announce_params(pid, port, event, key),
                 });
             }
+        }
+    }
+
+    /// `dht->add_router_node` — a resolved `.torrent` `nodes` host.
+    /// Routes on the address family like upstream (`add_node`
+    /// picks the v4/v6 node by the resolved address).
+    pub fn dht_add_node(&mut self, addr: SocketAddr) {
+        let v6 = addr.is_ipv6();
+        if let Some(n) = self.dht.get_node_mut(v6) {
+            n.table.add_router_node(addr);
         }
     }
 
@@ -892,6 +946,15 @@ impl Session {
         let now = std::time::Instant::now();
         match resp {
             Ok(r) => {
+                // `tracker response "external ip"` → ip_voter
+                // (`source_tracker` — upstream `on_announce`).
+                if let Some(ip) = r.external_ip {
+                    self.ip_voter.cast_vote(
+                        ip,
+                        bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_TRACKER,
+                        &ip,
+                    );
+                }
                 for ep in r.peers {
                     t.add_swarm_peer(ep, bitdaemon_common::flags::PeerSourceFlags::TRACKER, true);
                 }

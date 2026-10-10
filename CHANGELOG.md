@@ -9,6 +9,17 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `ip_voter` câblé — votes `external_ip` depuis les trois sources
+  upstream : clé `ip` des messages DHT (`SOURCE_DHT`, drainée via
+  `DhtNode::drain_ip_votes`), `external ip` des réponses tracker
+  (`SOURCE_TRACKER`), `yourip` des handshakes BEP-10
+  (`SOURCE_PEER`, via `PeerEffect::YourIp` → `TorrentEffect::YourIp`).
+- `.torrent` `nodes` → `SessionOut::DhtAddNode` : résolution via le
+  résolveur injecté puis `dht_add_node` seed `router_nodes`
+  (supprimé en `anonymous_mode` comme upstream).
+
+### Added
+
 - `proxy.rs` — `ProxySettings` (`settings_pack::proxy_*`) +
   `SocksConnector`/`HttpConnectConnector` : des `PeerConnector`
   qui décorent le transport injecté (dial du proxy via `inner`

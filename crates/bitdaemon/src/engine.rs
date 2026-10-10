@@ -173,6 +173,9 @@ pub struct Engine {
     /// web-seed fetch completions.
     webseed_rx: mpsc::UnboundedReceiver<WebSeedDone>,
     webseed_tx: mpsc::UnboundedSender<WebSeedDone>,
+    /// resolved `.torrent` `nodes` hosts → router seeds.
+    dhtnode_rx: mpsc::UnboundedReceiver<SocketAddr>,
+    dhtnode_tx: mpsc::UnboundedSender<SocketAddr>,
     /// spawned task handles (kept for abort on drop).
     tasks: Vec<JoinHandle<()>>,
     /// info-hash set shared with acceptor tasks (`m_torrents` check
@@ -204,6 +207,7 @@ impl Engine {
         let (udp_tx, udp_rx) = mpsc::unbounded_channel();
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();
         let (webseed_tx, webseed_rx) = mpsc::unbounded_channel();
+        let (dhtnode_tx, dhtnode_rx) = mpsc::unbounded_channel();
         Self {
             session: Session::new(),
             connector,
@@ -223,6 +227,8 @@ impl Engine {
             connect_tx,
             webseed_rx,
             webseed_tx,
+            dhtnode_rx,
+            dhtnode_tx,
             tasks: Vec::new(),
             known_ihs: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
             queue_time: 3,
@@ -300,6 +306,9 @@ impl Engine {
                 Err(reqs) => self.session.on_web_seed_error(&w.ih, &reqs),
             }
         }
+        while let Ok(a) = self.dhtnode_rx.try_recv() {
+            self.session.dht_add_node(a);
+        }
 
         // `update_quota` — refill the upload bucket each tick
         self.upload_limiter
@@ -347,6 +356,19 @@ impl Engine {
                     reqs,
                 } => {
                     self.spawn_web_seed(ih, url, files, piece_length, single_file, reqs);
+                }
+                SessionOut::DhtAddNode { host, port } => {
+                    let resolver = self.resolver.clone();
+                    self.tasks_forget();
+                    let dht_tx = self.dhtnode_tx.clone();
+                    self.tasks.push(tokio::spawn(async move {
+                        let Ok(port) = u16::try_from(port) else {
+                            return;
+                        };
+                        if let Ok(addr) = resolve(&resolver, &host, port).await {
+                            let _ = dht_tx.send(addr);
+                        }
+                    }));
                 }
                 SessionOut::Torrent(e) => {
                     if let bitdaemon_session::torrent::TorrentEffect::DisconnectPeer {

@@ -74,6 +74,9 @@ pub struct DhtNode {
     outbox: Outbox,
     /// events drained by the caller (`dht_observer` upstream).
     events: Vec<DhtEvent>,
+    /// `external_ip` votes collected from `ip` keys in incoming
+    /// messages (drained by the session into `ip_voter`).
+    ip_votes: Vec<std::net::IpAddr>,
 }
 
 impl DhtNode {
@@ -95,6 +98,7 @@ impl DhtNode {
             lookups: Vec::new(),
             outbox: Vec::new(),
             events: Vec::new(),
+            ip_votes: Vec::new(),
         }
     }
 
@@ -204,8 +208,29 @@ impl DhtNode {
     }
 
     /// `incoming(m)` — feed a raw datagram.
+    /// drain pending external-ip votes.
+    pub fn drain_ip_votes(&mut self) -> Vec<std::net::IpAddr> {
+        std::mem::take(&mut self.ip_votes)
+    }
+
     pub fn incoming(&mut self, buf: &[u8], from: SocketAddr) -> Option<(Vec<u8>, SocketAddr)> {
         let root = bdecode_checked(buf).ok()?;
+        // upstream `dht::node::on_bdecode` — a top-level `ip` key
+        // is the peer's view of our external address; vote on it.
+        let ip = root.dict_find_string_value(b"ip", b"");
+        match ip.len() {
+            4 => {
+                self.ip_votes.push(std::net::IpAddr::from(
+                    <[u8; 4]>::try_from(ip).expect("len"),
+                ));
+            }
+            16 => {
+                self.ip_votes.push(std::net::IpAddr::from(
+                    <[u8; 16]>::try_from(ip).expect("len"),
+                ));
+            }
+            _ => {}
+        }
         let y = root.dict_find_string_value(b"y", b"");
         let tid = root.dict_find_string_value(b"t", b"").to_vec();
         match y {

@@ -350,6 +350,22 @@ impl PeerConn {
                         if let Some(v) = hs.client_version {
                             self.client_version = v;
                         }
+                        // `yourip` — the peer's view of our address
+                        // (upstream feeds `ip_voter::cast_vote` with
+                        // `source_peer`).
+                        match hs.your_ip.as_deref() {
+                            Some(ip) if ip.len() == 4 => {
+                                eff.push(PeerEffect::YourIp(std::net::IpAddr::from(
+                                    <[u8; 4]>::try_from(ip).expect("len 4"),
+                                )));
+                            }
+                            Some(ip) if ip.len() == 16 => {
+                                eff.push(PeerEffect::YourIp(std::net::IpAddr::from(
+                                    <[u8; 16]>::try_from(ip).expect("len 16"),
+                                )));
+                            }
+                            _ => {}
+                        }
                         eff.push(PeerEffect::ExtHandshake);
                     }
                 } else if id == self.local_ut_metadata {
@@ -546,6 +562,9 @@ pub enum PeerEffect {
     MetadataPacket(Vec<u8>),
     /// a `ut_pex` message body.
     PexPacket(Vec<u8>),
+    /// `yourip` from the BEP-10 handshake — the peer's view of our
+    /// external address (`ip_voter` `source_peer`).
+    YourIp(std::net::IpAddr),
     /// protocol violation — drop the connection.
     Disconnect(&'static str),
 }

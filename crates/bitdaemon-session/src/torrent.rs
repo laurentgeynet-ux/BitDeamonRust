@@ -53,6 +53,9 @@ pub enum TorrentEffect {
     BecameSeed,
     /// disconnect a misbehaving peer.
     DisconnectPeer { peer: u64, reason: &'static str },
+    /// `yourip` seen in a BEP-10 handshake — routed to the
+    /// session's `ip_voter` (`source_peer`).
+    YourIp(std::net::IpAddr),
 }
 
 /// `torrent` — one swarm.
@@ -907,6 +910,9 @@ impl Torrent {
                     self.on_pex_packet(&body);
                 }
                 PeerEffect::DhtPort(_) => {}
+                PeerEffect::YourIp(ip) => {
+                    out.push(TorrentEffect::YourIp(ip));
+                }
                 PeerEffect::Disconnect(r) => {
                     out.push(TorrentEffect::DisconnectPeer {
                         peer: peer_id,
