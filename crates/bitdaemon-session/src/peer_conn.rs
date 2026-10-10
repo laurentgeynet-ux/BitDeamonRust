@@ -72,6 +72,9 @@ pub struct PeerConn {
     pub num_pieces: i32,
     /// ms timestamp the connection was established (`m_connect`).
     pub connect_ms: i64,
+    /// `m_last_seen` — last session_time a message arrived (peer
+    /// timeout bookkeeping).
+    pub last_active: i32,
     /// remote endpoint (`m_remote`) — needed for `ut_pex` diffs.
     pub remote: Option<std::net::SocketAddr>,
     /// pex update bookkeeping — the set we last sent this peer.
@@ -107,6 +110,7 @@ impl PeerConn {
             num_invalid_requests: 0,
             num_pieces: 0,
             connect_ms: now_ms,
+            last_active: 0,
             remote: None,
             pex_sent: std::collections::BTreeSet::new(),
         }

@@ -881,14 +881,17 @@ impl Torrent {
     }
 
     /// feed one decoded message from `peer` — `dispatch` + effects.
+    /// `now` is `session_time` (s) for inactivity bookkeeping.
     pub fn on_peer_message(
         &mut self,
         peer_id: u64,
         msg: &PeerMessage,
+        now: i32,
         out: &mut Vec<TorrentEffect>,
     ) {
         let mut effects = Vec::new();
         if let Some(c) = self.peers.get_mut(&peer_id) {
+            c.last_active = now;
             c.dispatch(msg, self.num_pieces, &mut effects);
         }
         self.apply_peer_effects(peer_id, effects, out);

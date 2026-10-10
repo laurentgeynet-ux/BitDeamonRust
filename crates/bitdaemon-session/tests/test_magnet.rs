@@ -149,6 +149,7 @@ fn pex_feeds_swarm_and_broadcasts() {
             id: 0,
             data: bitdaemon_bencode::bencode(&hs.build()).into(),
         },
+        0,
         &mut out,
     );
 
@@ -161,6 +162,7 @@ fn pex_feeds_swarm_and_broadcasts() {
             id: 2, // our local pex id (PeerConn::local_ut_pex)
             data: body.into(),
         },
+        0,
         &mut out,
     );
     assert_eq!(t.peer_list.num_peers(), 1);

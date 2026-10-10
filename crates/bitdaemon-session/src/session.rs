@@ -539,7 +539,7 @@ impl Session {
         }
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(&p.info_hash) {
-            t.on_peer_message(p.peer, &p.msg, &mut eff);
+            t.on_peer_message(p.peer, &p.msg, self.session_time, &mut eff);
         }
         self.route(p.info_hash, eff, out);
     }
@@ -730,6 +730,7 @@ impl Session {
             .filter(|(_, t)| !t.paused && t.want_peers())
             .map(|(ih, _)| *ih)
             .collect();
+        let peer_timeout = self.settings.peer_timeout.as_secs() as i32;
         for ih in ihs {
             let mut eff = Vec::new();
             if let Some(t) = self.torrents.get_mut(&ih) {
@@ -737,6 +738,21 @@ impl Session {
                 t.pex_tick(Instant::now(), &mut eff);
                 for id in t.peers.keys().copied().collect::<Vec<_>>() {
                     t.drive_peer(id, &mut eff);
+                }
+                // `peer_timeout` — disconnect peers silent for
+                // `peer_timeout` seconds (upstream second_tick)
+                let stale: Vec<u64> = t
+                    .peers
+                    .iter()
+                    .filter(|(_, c)| self.session_time - c.last_active > peer_timeout)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in stale {
+                    t.remove_peer(id, &mut eff);
+                    self.alerts.post(Alert::PeerDisconnected {
+                        ih,
+                        reason: format!("peer {id}: timed out"),
+                    });
                 }
             }
             self.route(ih, eff, out);

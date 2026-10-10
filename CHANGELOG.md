@@ -9,6 +9,13 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `peer_timeout` au tick : `PeerConn::last_active` (en
+  `session_time`) est rafraîchi à chaque message entrant ; un pair
+  silencieux plus de `peer_timeout` s est déconnecté
+  (`second_tick` upstream).
+
+### Added
+
 - `Engine::start_acceptor` (`listen_socket` accept pump) : une tâche
   par accepteur — chaque stream inbound fait le handshake répondeur
   (info-hash filtré par le set partagé `known_ihs`, rafraîchi au tick)

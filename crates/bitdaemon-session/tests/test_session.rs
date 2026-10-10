@@ -319,3 +319,30 @@ fn pause_announces_stopped() {
     });
     assert!(stopped, "pause should emit a stopped announce");
 }
+
+#[test]
+fn idle_peer_times_out() {
+    let mut s = Session::new();
+    s.settings.peer_timeout = std::time::Duration::from_secs(5);
+    let ih = Sha1Hash::from_bytes(&[33; 20]).unwrap();
+    let mut t = Torrent::new(
+        ih,
+        1,
+        16384,
+        bitdaemon_common::Bitfield::with_size(1),
+        StorageIndex(0),
+    );
+    t.add_peer(1, PeerConn::new(1, PeerPipeline::new(1, 1, 1), 0));
+    s.add_torrent(t);
+    // last_active=0; session_time=0 → no timeout yet
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    assert_eq!(s.torrents[&ih].peers.len(), 1);
+    // age the peer past the timeout
+    s.session_time = 100;
+    s.tick(&mut out);
+    assert!(
+        s.torrents[&ih].peers.is_empty(),
+        "idle peer should be dropped"
+    );
+}
