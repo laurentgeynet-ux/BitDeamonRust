@@ -330,6 +330,20 @@ fn v2_piece_verifies_via_merkle_blocks() {
     let mut bad = blocks.clone();
     bad[2] = Sha256Hash::from_bytes(&[0xff; 32]).unwrap();
     assert!(!t.verify_v2_blocks(PieceIndex(0), &bad));
+
+    // resume round-trip exports + restores the merkle state
+    t.verify_v2_blocks(PieceIndex(0), &blocks);
+    let mut atp2 = Default::default();
+    t.to_resume_data(&mut atp2);
+    assert_eq!(atp2.merkle_trees.len(), 1);
+    assert!(!atp2.merkle_trees[0].is_empty());
+    let blob = bitdaemon_core::resume_data::write_resume_data_buf(&atp2);
+    let atp3 = bitdaemon_core::resume_data::read_resume_data(&blob, &LoadTorrentLimits::default())
+        .unwrap();
+    let mut t2 = Torrent::from_params(&atp, StorageIndex(0), &mut Vec::new()).unwrap();
+    t2.apply_resume_data(&atp3, &mut Vec::new());
+    // the block leaf verified before save must still be in the tree
+    assert!(t2.merkle_trees[0].has_node(0));
 }
 
 #[test]

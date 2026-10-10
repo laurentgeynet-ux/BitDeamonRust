@@ -633,7 +633,14 @@ impl Torrent {
     /// `unfinished_pieces` (downloading pieces with ≥1
     /// finished/writing block → finished-block bitmask).
     pub fn to_resume_data(&self, atp: &mut AddTorrentParams) {
-        atp.info_hashes.v1 = self.info_hash;
+        // both hashes when we have metainfo — v2-only torrents must
+        // carry `info-hash2` or `read_resume_data` rejects the
+        // embedded info dict (MismatchingInfoHash).
+        if let Some(ti) = &self.ti {
+            atp.info_hashes = *ti.info_hashes();
+        } else {
+            atp.info_hashes.v1 = self.info_hash;
+        }
         atp.have_pieces = self.have.clone();
         atp.verified_pieces = self.have.clone();
         // upstream embeds the `info` dict when the torrent has
@@ -644,6 +651,19 @@ impl Torrent {
             let node = bitdaemon_bencode::bdecode(raw);
             if let Ok(ti) = TorrentInfo::from_info_node(&node, &LoadTorrentLimits::default()) {
                 atp.ti = Some(std::sync::Arc::new(ti));
+            }
+        }
+        // v2: export sparse trees + masks + verified leafs
+        // (upstream `resume_data` "trees" table).
+        if !self.merkle_trees.is_empty() {
+            atp.merkle_trees.clear();
+            atp.merkle_tree_mask.clear();
+            atp.verified_leaf_hashes.clear();
+            for tree in &self.merkle_trees {
+                let (sparse, mask) = tree.build_sparse_vector();
+                atp.merkle_trees.push(sparse);
+                atp.merkle_tree_mask.push(mask);
+                atp.verified_leaf_hashes.push(tree.verified_leafs());
             }
         }
         if let Some(p) = self.picker.as_ref() {
@@ -673,6 +693,20 @@ impl Torrent {
     /// (`verify_piece` upstream → we emit `Hash` requests via
     /// `PieceReady`-style effect: here `HashPiece` alerts).
     pub fn apply_resume_data(&mut self, atp: &AddTorrentParams, out: &mut Vec<TorrentEffect>) {
+        // v2: restore sparse merkle trees + verified-leaf masks from
+        // the resume `trees` table (upstream `set_merkle_trees`).
+        for (f, sparse) in atp.merkle_trees.iter().enumerate() {
+            let Some(tree) = self.merkle_trees.get_mut(f) else {
+                break;
+            };
+            if sparse.is_empty() {
+                continue;
+            }
+            let empty = Default::default();
+            let mask = atp.merkle_tree_mask.get(f).unwrap_or(&empty);
+            let verified = atp.verified_leaf_hashes.get(f).unwrap_or(&empty);
+            tree.load_sparse_tree(sparse, mask, verified);
+        }
         self.init_picker(false);
         let picker = self.picker.as_mut();
         let Some(picker) = picker else { return };
