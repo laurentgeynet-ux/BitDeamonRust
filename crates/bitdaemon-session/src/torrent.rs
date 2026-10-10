@@ -83,6 +83,11 @@ pub struct Torrent {
     pub peers: BTreeMap<u64, PeerConn>,
     /// `m_trackers` — tier-ordered announce entries.
     pub trackers: crate::tracker_list::TrackerList,
+    /// `m_hash_requests` — (file, chunk-index) → last-request time;
+    /// a fresh `HashPicker` is built per call (it derives
+    /// `piece_hash_requested.have` from the trees) so the only state
+    /// worth keeping is the send throttle.
+    pub hash_requests_sent: std::collections::HashMap<(i32, i32), std::time::Instant>,
     /// `m_merkle_trees` — per-file v2 merkle trees (empty for v1).
     /// `HashPicker` borrows it per verification call.
     pub merkle_trees: Vec<bitdaemon_core::merkle_tree::MerkleTree>,
@@ -226,6 +231,7 @@ impl Torrent {
             picker: None,
             peers: BTreeMap::new(),
             trackers: crate::tracker_list::TrackerList::default(),
+            hash_requests_sent: std::collections::HashMap::new(),
             merkle_trees: Vec::new(),
             ti: None,
             web_seeds: Vec::new(),
@@ -1185,6 +1191,8 @@ impl Torrent {
         let mut picker = bitdaemon_disk::hash_picker::HashPicker::new(&fs, &mut self.merkle_trees);
         let result = picker.add_hashes(&hp_req, hashes);
         drop(picker);
+        // the served chunk is no longer throttled
+        self.hash_requests_sent.remove(&(f.0, req.index));
         for (piece, _blocks) in result.hash_failed {
             self.piece_verified(piece, false, out);
         }
@@ -1193,6 +1201,56 @@ impl Torrent {
                 self.piece_verified(piece, true, out);
             }
         }
+    }
+
+    /// `bt_peer_connection::maybe_send_hash_request` — pick the next
+    /// hash layer the peer can serve us (its have-bitfield gates the
+    /// request) and queue the wire message.
+    pub fn maybe_send_hash_request(&mut self, peer: u64, out: &mut Vec<TorrentEffect>) {
+        if self.merkle_trees.is_empty() {
+            return;
+        }
+        let Some(fs) = self.files.clone() else {
+            return;
+        };
+        let (Some(c), Some(pieces)) = (
+            self.peers.get(&peer),
+            self.peers.get(&peer).map(|c| c.peer_pieces.clone()),
+        ) else {
+            return;
+        };
+        let _ = c;
+        let mut picker = bitdaemon_disk::hash_picker::HashPicker::new(&fs, &mut self.merkle_trees);
+        let req = picker.pick_hashes(&pieces);
+        if req.file.0 < 0 {
+            return;
+        }
+        // throttle: upstream keeps `last_request` per chunk in the
+        // picker; ours lives here since the picker is per-call.
+        let key = (req.file.0, req.index);
+        let now = std::time::Instant::now();
+        if self
+            .hash_requests_sent
+            .get(&key)
+            .is_some_and(|t| now.duration_since(*t) < std::time::Duration::from_secs(3))
+        {
+            return;
+        }
+        self.hash_requests_sent.insert(key, now);
+        let Some(root_idx) = usize::try_from(req.file.0).ok() else {
+            return;
+        };
+        let _ = root_idx;
+        out.push(TorrentEffect::SendTo {
+            peer,
+            msg: PeerMessage::HashRequest(bitdaemon_net::peer_wire::HashRequestWire {
+                file_root: fs.root(req.file),
+                base: req.base,
+                index: req.index,
+                count: req.count,
+                proof_layers: req.proof_layers,
+            }),
+        });
     }
 
     /// `torrent::hashes_rejected` — the remote refused; upstream
@@ -1211,6 +1269,8 @@ impl Torrent {
         };
         let mut picker = bitdaemon_disk::hash_picker::HashPicker::new(&fs, &mut self.merkle_trees);
         picker.hashes_rejected(&hp_req);
+        drop(picker);
+        self.hash_requests_sent.remove(&(f.0, req.index));
     }
 
     /// `request_a_block` for one peer — `drive_requests` emits the
@@ -1246,6 +1306,11 @@ impl Torrent {
                 c.outstanding(),
             )
         };
+        // v2 hash exchange — request missing tree layers alongside
+        // data requests (upstream `maybe_send_hash_request`).
+        if !self.merkle_trees.is_empty() {
+            self.maybe_send_hash_request(peer_id, out);
+        }
         let mut picked = Vec::new();
         // simple drive: ask the picker for blocks this peer has
         let mut pc_stats = crate::piece_picker::NullPickerStats;
