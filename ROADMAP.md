@@ -96,26 +96,27 @@ remaining — `file_progress`, `resolve_links`, tracker machinery.
 
 ---
 
-## Phase 3 — Disk I/O ⬜
+## Phase 3 — Disk I/O 🟨
 
 *~20k LOC C++.* Storage must be correct before any download exists —
 and this phase is a **primary motivation for the port** (ADR-0009):
 rqbit's I/O and memory behavior is what broke downstream. Port the
 full machinery, not a simplified subset.
 
-`bitdaemon-disk`: `DiskIo` trait + async job queue with per-torrent
-`disk_job_fence` ordering, `disk_io_thread_pool` → blocking pool,
-**bounded** `disk_buffer_pool` (`Bytes` slab + `max_queued_disk_bytes`/
-`send_buffer_watermark` settings), `back_pressure`, `FilePool`
-(lazy-open + LRU handle cap — a 10k-file torrent restores in
-milliseconds, not minutes), `StatCache`, `FileProgress`, `PartFile`,
-`storage_utils` (move/delete/rename, `apply_pad_files`,
-`free_space`/`drive_info`), `HashPicker` (v2 piece layers),
-`precomputed_block_hashes`, `copy_file`, `truncate`,
-`file`/`directory`/`file_view_pool`/`mmap` wrappers, **`StorageFactory`
-trait** (ADR-0008 — downstream `PrivateStorageFactory`/OBD parity).
-Two backends: `std::fs` positioned I/O (default) + `memmap2` (feature),
-plus `disabled` for tests.
+`bitdaemon-disk` — landed so far: `OpenMode` flags ✅, `File`/
+`pread_all`/`pwrite_all`/`pwritev_all` ✅, `fs` (stat/rename/hardlink/
+canonicalize/`copy_file`/`drive_info`) ✅, `StatCache` (error-caching,
+poison-tolerant) ✅, `FilePool` (**lazy-open + LRU cap + open-waiter
+sharing + read→write upgrade race counter + ENOENT→mkdir retry** —
+the 349 s→ms fix, ADR-0009) ✅, `PartFile` ✅, `readwrite` piece→file
+walk ✅, `pread_storage` (read/write/hash/initialize/set_file_priority/
+move/delete/rename/verify_resume_data) ✅, `storage_utils` ✅.
+*(still to do)*: `DiskIo` job queue + per-torrent `disk_job_fence`,
+`disk_io_thread_pool` → blocking pool, **bounded** `disk_buffer_pool`,
+`back_pressure`, `FileProgress`, `HashPicker` (v2 piece layers),
+`precomputed_block_hashes`, `file_view_pool`/`mmap` (memmap2 feature),
+`disk_completed_queue`, `disabled` backend, **`StorageFactory` trait**
+(ADR-0008 — downstream `PrivateStorageFactory`/OBD parity).
 
 **Fastresume** (`core::resume` lands Phase 2, applied here):
 byte-compatible with upstream `read_resume_data`/`write_resume_data`

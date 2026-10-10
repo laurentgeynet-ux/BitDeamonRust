@@ -78,6 +78,33 @@ Until `1.0.0`, breaking changes may occur in any release.
   Conformance: `test_file_storage` 28/28, upstream `.torrent` fixtures
   (valid + invalid incl. piece-layer root), `test_magnet` 24/24,
   `test_read_resume` vectors + full round-trip.
+- `bitdaemon_disk` Phase-3 first wave (the disk-fidelity milestone):
+  `open_mode` flags (11 bits matching upstream), `file` positioned
+  I/O (`pread_all`/`pwrite_all`/`pwritev_all`/`pread_best_effort`,
+  Windows `FILE_FLAG_*` mapping, `set_len` prealloc), `fs` (`stat_file`
+  with atime/mtime/ctime+attrs, `dont_follow_links`, `rename`,
+  `create_directories`, `remove`, `exists`, `is_directory`,
+  `hard_link`, `copy_file` hard-link-first, `drive_info` via fs2,
+  `canonicalize_path`/`complete`/`remove_all`), `stat_cache`
+  (error-caching with sentinel encoding, poison-tolerant mutex),
+  `file_pool` — **the ADR-0009 core**: lazy open, LRU eviction at
+  capacity, per-file open-waiter dedup (stalls counter), read→write
+  upgrade race handling, ENOENT→mkdir retry, deferred close outside
+  the mutex, `part_file` (byte-compatible header: `[u32 n][u32 ps]
+  [i32 slot×n]` rounded to 1 KiB, slot reuse, `export_file` freeing
+  full pieces, empty→delete), `readwrite` (upstream `readwrite_impl`/
+  `readwrite_vec_impl` piece→file walk incl. empty-file skipping and
+  short-read EOF semantics), `pread_storage` (read/write/writev/
+  hash-with-feeder, pad-file zeroes, part-file redirection for
+  `dont_download`, `initialize` with part-file compat + oversized
+  detection, `set_file_priority` moving data out of the part file,
+  `move_storage` with all 5 upstream modes + cross-volume copy
+  fallback, `delete_files` with dir cleanup, `rename_file`,
+  `verify_resume_data` seed/non-seed paths incl. hard-link pick-up),
+  `storage_error` (`operation_t` parity). Tests: part_file 4/4,
+  fs/stat_cache, file_pool 5/5 (LRU/upgrade/release), storage
+  end-to-end 6/6 (cross-file piece I/O, part-file round-trip,
+  resume verify incl. seed-mode size check).
 - `bitdaemon_core` Phase-2 second wave:
   `merkle_tree` (full `aux::merkle_tree` port — sparse trees, piece-layer
   mode, `set_block`/`add_hashes` proofs, verified-bitfield tracking,

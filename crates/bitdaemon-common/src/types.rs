@@ -67,6 +67,11 @@ impl From<FileIndex> for i32 {
     }
 }
 
+/// `aux::strong_typedef<std::uint32_t, storage_index_tag_t>` — identifies
+/// a torrent's storage (one per added torrent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct StorageIndex(pub u32);
+
 /// `libtorrent::peer_request` — a byte range within a piece, used for
 /// incoming piece requests (`peer_request.hpp`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

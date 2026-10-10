@@ -12,7 +12,8 @@
 //! processed by a dedicated blocking pool (`tokio::task::spawn_blocking`
 //! or a bespoke thread pool) — see ADR-0002 and `docs/architecture.md`.
 //!
-//! Status: **not ported yet** — see `docs/PORTING.md`.
+//! Status: **in progress** — `open_mode`, `file`, `fs`, `stat_cache`,
+//! `part_file` ported.
 
 #![forbid(unsafe_code)]
 
@@ -25,3 +26,27 @@
 /// C++ uses a job-queue + completion-callback model; in Rust this maps
 /// to `async fn` returning `Result<...>` or `mpsc` completion events.
 pub trait DiskIo {}
+
+/// `aux_/file.hpp` — positioned I/O handle.
+pub mod file;
+/// `aux_/path.hpp` fs-half + `directory.cpp` + `drive_info.cpp` +
+/// `copy_file.cpp`.
+pub mod fs;
+/// `aux_/open_mode.hpp` — file open flags.
+pub mod open_mode;
+/// `aux_/part_file.hpp`.
+pub mod part_file;
+/// `aux_/stat_cache.hpp`.
+pub mod stat_cache;
+
+/// `aux_/file_pool_impl.hpp` — LRU open-handle pool.
+pub mod file_pool;
+/// `storage_error.hpp` — operation-scoped disk errors.
+pub mod storage_error;
+
+/// `aux_/readwrite.hpp` — piece→file buffer walk.
+pub mod readwrite;
+/// `aux_/pread_storage.hpp` — positioned-I/O storage backend.
+pub mod storage;
+/// `aux_/storage_utils.hpp` — check/move/delete helpers.
+pub mod storage_utils;

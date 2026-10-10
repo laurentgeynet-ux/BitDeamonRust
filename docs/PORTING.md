@@ -41,7 +41,7 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `hex.cpp` | `common::hex` | ported | to/from hex, validation; upstream messages |
 | `crc32c.cpp`, `cpuid.cpp` | `common::crc32c` | ported | `crc32c` crate, no CPUID needed; `crc32c_32`/`crc32c_words` (LE memory order); RFC 3720 B.4 vectors pass |
 | `sliding_average.hpp`, `stat.cpp` | `common::sliding_average`/`common::stat` | ported | `SlidingAverage<G>` (fixed-point ×64, clamped, deviation) — all 8 `test_sliding_average.cpp` cases pass; `StatChannel`+`Stat` (6 channels, SYN/IP-overhead formulas) |
-| `stat_cache.cpp` | `disk` | blocked | needs `file_storage`/`filenames`/`stat_file` — Phase 2/3 dependency, not a `common` primitive |
+| `stat_cache.cpp` | `disk::stat_cache` | **ported** | sentinel-encoded errors, poison-tolerant |
 | `bloom_filter.cpp` | `common::bloom_filter` | ported | `BloomFilter<N>` + free `set_bits`/`has_bits`/`count_zero_bits`; `test_bloom_filter.cpp` cases pass |
 | `assert.cpp`, `invariant_check.hpp` | — | won't port | → `debug_assert!` |
 | `numeric_cast.hpp`, `noexcept_movable.hpp`, `copy_ptr.hpp`, `unique_ptr.hpp`, `alloca.hpp`, `array.hpp`, `container_wrapper.hpp`, `deque.hpp`, `vector.hpp`, `vector_utils.hpp`, `heterogeneous_queue.hpp`, `tailqueue.hpp`, `link.hpp`, `pool.hpp`, `stack_allocator.hpp`, `string_ptr.hpp`, `strview_less.hpp`, `byteswap.hpp`, `range.hpp`, `scope_end.hpp`, `throw.hpp`, `set_socket_buffer.hpp`, `keepalive.hpp`, `io.hpp`, `io_bytes.hpp`, `visit_block_iovecs.hpp` | idiomatic Rust | won't port | STL/boost shims — use std equivalents |
@@ -97,15 +97,15 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 | `disk_buffer_pool.cpp`, `disk_buffer_holder.cpp`, `store_buffer.hpp`, `receive_buffer.cpp`, `chained_buffer.cpp`, `packet_pool.hpp` | `disk::buffer` | not started | `Bytes` slab + **bounded** memory caps (`max_queued_disk_bytes`, `send_buffer_watermark`) |
 | `disabled_disk_io.cpp` | `disk::disabled` | not started | test backend |
 | `mmap.cpp`, `mmap_disk_io.cpp`, `mmap_storage.cpp`, `mmap_disk_job.hpp`, `file_view_pool.cpp` | `disk::mmap` | not started | `memmap2`, optional feature |
-| `posix_disk_io.cpp`, `posix_storage.cpp`, `posix_part_file.cpp` | `disk::fs` | not started | one `std::fs` backend |
-| `pread_disk_io.cpp`, `pread_storage.cpp` | merged into `disk::fs` | not started | positioned I/O |
-| `storage_utils.cpp`, `storage_array.hpp`, `storage_free_list.hpp` | `disk::storage` | not started | |
-| `part_file.cpp` (`part_file.hpp`) | `disk::part_file` | not started | |
-| `file.cpp`, `file.hpp`, `file_pool_impl.cpp`, `file_pool.hpp`, `file_descriptor.hpp`, `file_pointer.hpp`, `open_mode.hpp` | `disk::file` | not started | lazy open + LRU handle cap — the 349 s→ms fix (ADR-0009) |
+| `posix_storage.cpp`, `posix_part_file.cpp` | `disk::storage` (shared) | merged | part file + storage identical to pread variant |
+| `pread_storage.cpp` (`pread_storage.hpp`), `aux_/readwrite.hpp` | `disk::storage`, `disk::readwrite` | **ported** (core I/O) | read/write/hash via `readwrite` walk; part-file redirection; `pread_disk_io` job layer pending |
+| `storage_utils.cpp` | `disk::storage_utils` | **ported** | `initialize_storage`, `move_storage`, `delete_files`, `rename_file`, `verify_resume_data`, `has_any_file` |
+| `part_file.cpp` (`part_file.hpp`) | `disk::part_file` | **ported** | header format + slot reuse + export frees full pieces |
+| `file.cpp`/`file.hpp`, `open_mode.hpp`, `file_pool_impl.cpp`/`file_pool.hpp` | `disk::file`, `disk::open_mode`, `disk::file_pool` | **ported** | `pread_all`/`pwrite_all`/`pwritev_all`; pool: LRU evict, open-waiter sharing, r/w upgrade race counter, ENOENT-mkdir retry, deferred close |
 | `file_progress.cpp`, `has_block.hpp` | `disk::progress` | not started | |
 | `hash_picker.cpp` (`hash_picker.hpp`), `precomputed_block_hashes.cpp` | `disk::hash_picker` | not started | v2 proofs |
-| `stat_cache.cpp` (disk side), `debug_disk_thread.hpp` | `disk::cache` | not started | |
-| `copy_file.cpp`, `truncate.cpp` | `disk::util` | not started | |
+| `stat_cache.cpp` (disk side) | `disk::stat_cache` | **ported** | — |
+| `copy_file.cpp`, `drive_info.cpp`, `directory.cpp` | `disk::fs` | **ported** | hard-link-first copy; `free_space` via fs2; `truncate.cpp` folds into `set_len` |
 | `disk_observer.hpp`, `disk_completed_queue.hpp` | `disk::observer` | not started | → channel events |
 | `win_file_handle.hpp`, `windows.hpp`, `win_util.hpp` | — | won't port | platform shims → `std::os` |
 
