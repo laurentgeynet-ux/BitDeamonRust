@@ -150,11 +150,11 @@ when names differ. `aux_*` headers live in `include/libtorrent/aux_/`.
 
 | C++ source | Rust target | Status | Notes |
 |---|---|---|---|
-| `node.cpp` (`node.hpp`) | `dht::node` | not started | main state machine; UDP socket injected via `DatagramSocket` (ADR-0008) |
+| `node.cpp` (`node.hpp`) | `dht::dht_node` | **ported** | query dispatch ping/find_node/get_peers/announce/get/put/sample_infohashes, write tokens (4B sha1), BEP-42/44 verify, lookup pump — outbox injecté (ADR-0008) |
 | `routing_table.cpp` (+`node_entry.cpp`, `node_id.cpp`) | `dht::routing_table`, `dht::node_entry`, `dht::node_id` | **ported** | BEP-42 vectors verbatim (5/5); k-bucket split (extended `{16,8,4,2}`× limits), `compare_ip_cidr` /24+//64 dedup, `restrict_routing_ips`, `classify_prefix` spread-replacement, `find_node` k-closest, `next_refresh`, `update_node_id` |
 | `rpc_manager.cpp` | `dht::rpc` | ported | tid dispatch, short/final timeout tick, ro/want |
 | `traversal_algorithm.cpp` + `observer.hpp` | `dht::traversal` | ported | sorted results, dedup, /24 diversity, branch factor, short-timeout |
-| `find_data.cpp`, `get_peers.cpp`, `get_item.cpp`, `put_data.cpp`, `refresh.cpp`, `sample_infohashes.cpp` | `dht::ops::*` | not started | traversal specializations |
+| `find_data.cpp`, `get_peers.cpp`, `get_item.cpp`, `put_data.cpp`, `sample_infohashes.cpp` | `dht::lookups` + `dht::dht_node` | **ported** | per-kind query shapes, obfuscated get_peers, reply extraction, write phase announce/put |
 | `dht_settings.cpp`, `dht_state.cpp`, `dht_storage.cpp`, `msg.cpp`, `item.cpp`, `ed25519.cpp`, `dos_blocker.cpp` | `dht::{dht_settings, dht_state, dht_storage, msg, item, ed25519, dos_blocker}` | **ported** | storage: announce/get_peers (scrape blooms, write-token gate), BEP-44 items (canonical_string verbatim, ed25519-dalek per ADR-0007, seq/sig/k/salt), BEP-51 sample_infohashes, tick expiry; `verify_message` schema walker; dos_blocker 10s-window ban; `dht_tracker` pending |
 | `dht_tracker.cpp` | `dht::dht_tracker` | ported | v4/v6 mux, secret rotation, injected transport | session glue |
 | (see `dht_storage` row) | — | merged | |
