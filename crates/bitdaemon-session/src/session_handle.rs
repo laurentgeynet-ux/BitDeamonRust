@@ -24,7 +24,9 @@ use crate::torrent::Torrent;
 /// `torrent_status` — re-export of the ported status snapshot.
 pub use crate::status::TorrentStatus;
 
-fn lock(s: &Mutex<Session>) -> MutexGuard<'_, Session> {
+/// lock with poison recovery — upstream has no poison concept; a
+/// panicked caller must not wedge the session actor.
+pub fn lock(s: &Mutex<Session>) -> MutexGuard<'_, Session> {
     s.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -35,6 +37,13 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// `from_shared` — wrap an existing shared `Session` (e.g. the
+    /// one an `Engine` drives) so handle ops act on the same actor.
+    #[must_use]
+    pub fn from_shared(inner: Arc<Mutex<Session>>) -> Self {
+        Self { inner }
+    }
+
     /// `session` ctor — build the core from params.
     #[must_use]
     pub fn new(params: SessionParams) -> Self {

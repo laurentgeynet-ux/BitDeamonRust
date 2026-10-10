@@ -14,6 +14,7 @@ use bitdaemon_common::types::StorageIndex;
 use bitdaemon_common::{Bitfield, Sha1Hash};
 use bitdaemon_net::peer_wire::{PeerMessage, write_handshake};
 use bitdaemon_net::transport::{BoxedPeerStream, PeerConnector};
+use bitdaemon_session::session_handle::lock;
 use bitdaemon_session::torrent::Torrent;
 use tokio::io::{AsyncWriteExt, DuplexStream};
 
@@ -50,11 +51,11 @@ async fn connect_and_receive_bitfield() {
 
     let mut eng = Engine::new(conn, None);
     let t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
-    eng.session.add_torrent(t);
+    lock(&eng.session).add_torrent(t);
 
     // scripted remote: handshake + bitfield(0,2) — keep the stream
     // alive after writes or the engine sees a disconnect.
-    let remote_pid = eng.session.peer_id; // any id works; reuse ours
+    let remote_pid = lock(&eng.session).peer_id; // any id works; reuse ours
     let mut boxed: BoxedPeerStream = Box::new(theirs);
     let hs = write_handshake(&ih, &remote_pid, false, false, false, false);
     boxed.write_all(&hs).await.unwrap();
@@ -78,7 +79,8 @@ async fn connect_and_receive_bitfield() {
     // pump: reader delivers the bitfield → session routes
     tokio::task::yield_now().await;
     let _ = eng.tick(std::time::Instant::now()).await;
-    let t = eng.session.torrents.get(&ih).unwrap();
+    let ses = lock(&eng.session);
+    let t = ses.torrents.get(&ih).unwrap();
     let c = t.peers.get(&peer).unwrap();
     assert!(c.peer_pieces.get_bit(0) && c.peer_pieces.get_bit(2));
 }
@@ -94,7 +96,7 @@ async fn connect_pump_lists_candidates() {
         bitdaemon_common::flags::PeerSourceFlags::TRACKER,
         true,
     );
-    eng.session.add_torrent(t);
+    lock(&eng.session).add_torrent(t);
     let st = bitdaemon_net::peer_list::PeerListState::default();
     let dialing = eng.connect_pump(0, &st, 10);
     assert_eq!(dialing, vec![(ih, ep())]);
@@ -106,7 +108,7 @@ async fn accept_inbound_handshake() {
     let (mine, theirs) = tokio::io::duplex(64 * 1024);
     let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(None)));
     let mut eng = Engine::new(conn, None);
-    eng.session.add_torrent(Torrent::new(
+    lock(&eng.session).add_torrent(Torrent::new(
         ih,
         4,
         128 * 1024,
@@ -114,7 +116,7 @@ async fn accept_inbound_handshake() {
         StorageIndex(0),
     ));
 
-    let pid = eng.session.peer_id;
+    let pid = lock(&eng.session).peer_id;
     let mut boxed: BoxedPeerStream = Box::new(theirs);
     let hs = write_handshake(&ih, &pid, false, false, false, false);
     let accept = eng.accept_stream(ep(), Box::new(mine));
@@ -125,7 +127,7 @@ async fn accept_inbound_handshake() {
     tokio::io::AsyncReadExt::read_exact(&mut boxed, &mut buf)
         .await
         .unwrap();
-    assert!(eng.session.torrents[&ih].peers.contains_key(&peer));
+    assert!(lock(&eng.session).torrents[&ih].peers.contains_key(&peer));
 }
 
 #[derive(Debug)]
@@ -159,7 +161,7 @@ async fn http_announce_via_resolver() {
     eng.set_listen_port(6881);
     let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
     t.add_tracker("http://tracker.example:6969/announce".into(), 0);
-    eng.session.add_torrent(t);
+    lock(&eng.session).add_torrent(t);
 
     // scripted HTTP tracker: read the GET, answer compact peers.
     let mut srv: BoxedPeerStream = Box::new(theirs);
@@ -193,12 +195,12 @@ async fn http_announce_via_resolver() {
     for _ in 0..20 {
         tokio::task::yield_now().await;
         eng.tick(now).await;
-        if eng.session.torrents[&ih].peer_list.num_peers() > 0 {
+        if lock(&eng.session).torrents[&ih].peer_list.num_peers() > 0 {
             break;
         }
     }
     responder.await.unwrap();
-    assert_eq!(eng.session.torrents[&ih].peer_list.num_peers(), 1);
+    assert_eq!(lock(&eng.session).torrents[&ih].peer_list.num_peers(), 1);
 }
 
 // ---------- UDP pump → DHT ----------
@@ -264,7 +266,7 @@ async fn dht_ping_round_trip() {
     let dg = Arc::new(ChanDatagram::new());
     let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(None)));
     let mut eng = Engine::new(conn, Some(dg.clone()));
-    eng.session.enable_dht(
+    lock(&eng.session).enable_dht(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         None,
         bitdaemon_dht::dht_settings::DhtSettings::default(),
@@ -295,7 +297,7 @@ async fn spawn_dial_connects_peer() {
     let (mine, theirs) = tokio::io::duplex(64 * 1024);
     let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(Some(mine))));
     let mut eng = Engine::new(conn, None);
-    eng.session.add_torrent(Torrent::new(
+    lock(&eng.session).add_torrent(Torrent::new(
         ih,
         1,
         16384,
@@ -328,12 +330,12 @@ async fn spawn_dial_connects_peer() {
     });
     for _ in 0..100 {
         eng.tick(std::time::Instant::now()).await;
-        if !eng.session.torrents[&ih].peers.is_empty() {
+        if !lock(&eng.session).torrents[&ih].peers.is_empty() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    assert_eq!(eng.session.torrents[&ih].peers.len(), 1);
+    assert_eq!(lock(&eng.session).torrents[&ih].peers.len(), 1);
     remote.abort();
 }
 
@@ -363,7 +365,7 @@ async fn acceptor_pump_registers_peer() {
         Arc::new(DuplexConnector(tokio::sync::Mutex::new(None))),
         None,
     );
-    eng.session.add_torrent(Torrent::new(
+    lock(&eng.session).add_torrent(Torrent::new(
         ih,
         1,
         16384,
@@ -382,12 +384,12 @@ async fn acceptor_pump_registers_peer() {
     });
     for _ in 0..100 {
         eng.tick(std::time::Instant::now()).await;
-        if !eng.session.torrents[&ih].peers.is_empty() {
+        if !lock(&eng.session).torrents[&ih].peers.is_empty() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    assert_eq!(eng.session.torrents[&ih].peers.len(), 1);
+    assert_eq!(lock(&eng.session).torrents[&ih].peers.len(), 1);
     remote.abort();
 }
 
@@ -448,7 +450,7 @@ async fn natpmp_map_and_ip_vote() {
     let n = eng.natpmp.as_ref().expect("natpmp state");
     assert_eq!(n.mappings[0].2, 44123); // external tcp port
     assert_eq!(
-        eng.session.ip_voter.external_address(),
+        lock(&eng.session).ip_voter.external_address(),
         Some(std::net::IpAddr::from([203, 0, 113, 42]))
     );
 }
@@ -528,12 +530,12 @@ async fn upnp_map_cycle() {
     for _ in 0..50 {
         tokio::task::yield_now().await;
         eng.tick(std::time::Instant::now()).await;
-        if eng.session.ip_voter.external_address().is_some() {
+        if lock(&eng.session).ip_voter.external_address().is_some() {
             break;
         }
     }
     assert_eq!(
-        eng.session.ip_voter.external_address(),
+        lock(&eng.session).ip_voter.external_address(),
         Some(std::net::IpAddr::from([203, 0, 113, 9]))
     );
 }
@@ -548,7 +550,7 @@ async fn per_torrent_rate_limiters() {
     let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
     t.set_upload_limit(10);
     t.set_download_limit(20);
-    eng.session.add_torrent(t);
+    lock(&eng.session).add_torrent(t);
 
     let _ = eng.tick(std::time::Instant::now()).await;
     let ul = eng.torrent_up_limiters.get(&ih).unwrap().clone();
