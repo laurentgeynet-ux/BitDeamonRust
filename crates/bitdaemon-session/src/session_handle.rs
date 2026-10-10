@@ -92,6 +92,25 @@ impl SessionHandle {
         lock(&self.inner).remove_torrent(ih, &mut Vec::new());
     }
 
+    /// `session_impl::add_torrent` — the real entry point:
+    /// `AddTorrentParams` carries resume data, metadata or magnet
+    /// state, url seeds and swarm peers.
+    pub fn add_torrent_params(
+        &self,
+        atp: &bitdaemon_core::AddTorrentParams,
+    ) -> Option<TorrentHandle> {
+        let mut out = Vec::new();
+        let ih = lock(&self.inner).add_torrent_params(
+            atp,
+            bitdaemon_common::types::StorageIndex(0),
+            &mut out,
+        )?;
+        Some(TorrentHandle {
+            session: self.inner.clone(),
+            info_hash: ih,
+        })
+    }
+
     /// `find_torrent` → handle.
     #[must_use]
     pub fn find_torrent(&self, ih: &Sha1Hash) -> Option<TorrentHandle> {
@@ -142,6 +161,30 @@ impl SessionHandle {
     /// `session_tick` — drive the periodic pump; returns wait.
     pub fn tick(&self, out: &mut Vec<SessionOut>) -> std::time::Duration {
         lock(&self.inner).tick(out)
+    }
+
+    /// `session::save_state` + `save_session_state_buf` — the
+    /// `.session` blob (per-torrent resume data + DHT state).
+    #[must_use]
+    pub fn save_state_buf(&self) -> Vec<u8> {
+        crate::session_state::save_session_state_buf(&lock(&self.inner).save_state())
+    }
+
+    /// `session::load_state` — restore torrents + DHT state from a
+    /// `.session` blob; returns how many torrents were added.
+    pub fn load_state(&self, buf: &[u8]) -> usize {
+        lock(&self.inner).load_state(buf, &mut Vec::new())
+    }
+
+    /// `post_session_stats` — snapshot the session counters.
+    #[must_use]
+    pub fn session_stats(&self) -> crate::counters::SessionStats {
+        lock(&self.inner).session_stats()
+    }
+
+    /// `torrent::pause`/`resume` by info-hash.
+    pub fn set_paused(&self, ih: &Sha1Hash, paused: bool) {
+        lock(&self.inner).set_paused(ih, paused, &mut Vec::new());
     }
 }
 

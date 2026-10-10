@@ -9,6 +9,17 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `proxy.rs` — `ProxySettings` (`settings_pack::proxy_*`) +
+  `SocksConnector`/`HttpConnectConnector` : des `PeerConnector`
+  qui décorent le transport injecté (dial du proxy via `inner`
+  puis handshake SOCKS4/5 ou `CONNECT`) — aucune socket directe,
+  compatible lanes anonymes.
+- `SessionHandle` : `add_torrent_params`, `save_state_buf`,
+  `load_state`, `session_stats`, `set_paused` — l'API publique
+  couvre maintenant resume/magnet/persistence/stats.
+
+### Added
+
 - **Web seeds bout-en-bout** : `Torrent.web_seeds` (BEP-17/19
   `url-list`/`ws=`) alimente un pair virtuel `WEB_SEED_PEER` —
   `inc_refcount_all` (le seed a tout), `next_web_seed_blocks`
