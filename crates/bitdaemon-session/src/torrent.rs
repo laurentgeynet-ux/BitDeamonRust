@@ -14,12 +14,18 @@
 
 use std::collections::BTreeMap;
 
+use bitdaemon_common::types::PieceBlock;
 use bitdaemon_common::types::{FileIndex, PieceIndex, StorageIndex};
 use bitdaemon_common::{Bitfield, PeerRequest, Sha1Hash};
+
+use bitdaemon_bencode::bdecode_checked;
+use bitdaemon_core::torrent_info::{LoadTorrentLimits, TorrentInfo};
 use bitdaemon_net::peer_wire::PeerMessage;
 
 use crate::peer_conn::{PeerConn, PeerEffect};
 use crate::piece_picker::{PickerOptions, PiecePicker};
+use crate::smart_ban::{BanDecision, SmartBan};
+use crate::ut_metadata::{MetadataResult, UtMetadataTracker};
 
 /// Side-effect the session must perform — the disk/tracker/wire
 /// calls upstream makes directly on `session_impl`.
@@ -76,6 +82,19 @@ pub struct Torrent {
     pub want_peers: bool,
     /// `m_resume_data` fields the picker needs at init.
     pub piece_priority_dirty: bool,
+    /// `ut_metadata` download state — magnet-added torrents only.
+    pub metadata_tracker: UtMetadataTracker,
+    /// `m_magnet_link` — added without metadata.
+    pub magnet: bool,
+    /// `smart_ban` plugin state (`extensions/smart_ban.cpp`).
+    pub smart_ban: SmartBan,
+    /// `m_auto_managed` — queue promotion/demotion is the
+    /// session's job (`active_downloads`/`active_seeds`).
+    pub auto_managed: bool,
+    /// `is_torrent_queued` — held back by the auto-managed queue
+    /// (distinct from user `paused`, like upstream
+    /// `graceful_pause` vs the queue state).
+    pub queued: bool,
 }
 
 impl Torrent {
@@ -105,7 +124,80 @@ impl Torrent {
             verified_bytes: 0,
             want_peers: true,
             piece_priority_dirty: false,
+            metadata_tracker: UtMetadataTracker::new(),
+            magnet: false,
+            smart_ban: SmartBan::new(),
+            auto_managed: true,
+            queued: false,
         }
+    }
+
+    /// `set_metadata` — a magnet just resolved: SHA-1 of the raw
+    /// info section must equal `info_hash` (BEP-9). On match the
+    /// torrent_info is parsed and picker+hashes initialized.
+    /// Returns `false` on hash mismatch (`failed_hash_check`
+    /// upstream — caller penalizes sources via
+    /// `metadata_tracker.reset_on_hash_failure`).
+    pub fn set_metadata(&mut self, metadata: &[u8], cfg: &LoadTorrentLimits) -> bool {
+        use sha1::Digest as _;
+        let mut h = sha1::Sha1::new();
+        h.update(metadata);
+        let actual = Sha1Hash::from_bytes(&h.finalize()).unwrap_or_default();
+        if actual != self.info_hash {
+            return false;
+        }
+        let node = match bdecode_checked(metadata) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        let Ok(info) = TorrentInfo::from_info_node(&node, cfg) else {
+            return false;
+        };
+        self.num_pieces = info.num_pieces();
+        self.piece_length = i64::from(info.piece_length());
+        self.have = Bitfield::with_size(info.num_pieces() as usize);
+        self.piece_hashes = Some(
+            (0..info.num_pieces())
+                .map(|i| info.hash_for_piece(PieceIndex(i)))
+                .collect(),
+        );
+        self.magnet = false;
+        self.init_picker(true);
+        true
+    }
+
+    /// `on_metadata` — one `ut_metadata` `data` packet arrived.
+    /// `peer` = the peer that served it (source bookkeeping).
+    /// Returns the outcome; on `Complete` the caller feeds
+    /// `metadata_tracker.metadata()` to [`Torrent::set_metadata`].
+    pub fn on_ut_metadata_data(
+        &mut self,
+        buf: &[u8],
+        piece: i32,
+        total_size: i64,
+        peer: u64,
+        max_metadata_size: i64,
+    ) -> MetadataResult {
+        let r = self.metadata_tracker.received_metadata(
+            buf,
+            piece,
+            total_size,
+            max_metadata_size,
+            self.piece_hashes.is_some(),
+        );
+        if matches!(r, MetadataResult::Stored | MetadataResult::Complete) {
+            self.metadata_tracker.set_source(piece, peer);
+        }
+        r
+    }
+
+    /// `metadata_request` — which ut_metadata piece to ask for next
+    /// (-1 = nothing requestable right now). Caller wraps it in a
+    /// `ut_metadata` `request` packet via `metadata_packet`.
+    pub fn metadata_request(&mut self) -> i32 {
+        let peers = &self.peers;
+        self.metadata_tracker
+            .metadata_request(self.piece_hashes.is_some(), |src| peers.contains_key(&src))
     }
 
     /// `init_picker` — create the picker (metadata arrived or
@@ -373,9 +465,58 @@ impl Torrent {
         }
     }
 
+    /// `piece_verified` + the `smart_ban` bookkeeping upstream does
+    /// in `on_piece_finished`/`on_piece_failed`: on failure the
+    /// per-block CRC of every downloader is recorded, on success the
+    /// stored CRCs are re-checked. `addr` resolves a peer id, and
+    /// `read_digest` re-reads a block's SHA-1 from storage (the
+    /// session performs the disk read; `None` = skip, like upstream
+    /// ignoring read errors). Bans become `DisconnectPeer` effects.
+    pub fn piece_verified_ban(
+        &mut self,
+        piece: PieceIndex,
+        piece_size: i64,
+        passed: bool,
+        out: &mut Vec<TorrentEffect>,
+        addr: impl FnMut(u64) -> std::net::IpAddr,
+        mut read_digest: impl FnMut(PieceBlock) -> Option<Sha1Hash>,
+    ) {
+        if passed {
+            for d in self
+                .smart_ban
+                .on_piece_passed(piece, piece_size, &mut read_digest)
+            {
+                if let BanDecision::Ban(peer) = d {
+                    self.remove_peer(peer, out);
+                    out.push(TorrentEffect::DisconnectPeer {
+                        peer,
+                        reason: "smart_ban: corrupt block",
+                    });
+                }
+            }
+        } else {
+            let downloaders = self
+                .picker
+                .as_ref()
+                .map(|p| p.get_downloaders(piece))
+                .unwrap_or_default();
+            if let BanDecision::Ban(peer) =
+                self.smart_ban
+                    .on_piece_failed(piece, piece_size, &downloaders, addr, read_digest)
+            {
+                self.remove_peer(peer, out);
+                out.push(TorrentEffect::DisconnectPeer {
+                    peer,
+                    reason: "smart_ban: corrupt block",
+                });
+            }
+        }
+        self.piece_verified(piece, passed, out);
+    }
+
     /// `want_more_peers` — downstream connect decisions.
     #[must_use]
     pub fn want_peers(&self) -> bool {
-        self.want_peers && !self.paused && !self.is_seed()
+        self.want_peers && !self.paused && !self.queued && !self.is_seed()
     }
 }

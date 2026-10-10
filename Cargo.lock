@@ -190,6 +190,7 @@ dependencies = [
  "bytes",
  "futures",
  "rand",
+ "sha1",
  "thiserror",
  "tokio",
  "tracing",

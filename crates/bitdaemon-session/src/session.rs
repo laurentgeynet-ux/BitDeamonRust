@@ -307,10 +307,43 @@ impl Session {
         self.torrents.remove(ih)
     }
 
-    /// `pause`/`resume`.
+    /// `pause`/`resume` (user pause — the auto-managed queue
+    /// uses `queued` instead, like upstream).
     pub fn set_paused(&mut self, ih: &Sha1Hash, paused: bool) {
         if let Some(t) = self.torrents.get_mut(ih) {
             t.paused = paused;
+        }
+    }
+
+    /// `session_impl` auto-managed queue — promote/demotion
+    /// against `active_downloads`/`active_seeds`. A torrent
+    /// counts toward `active_seeds` once `is_seed`, else
+    /// `active_downloads`. Non-auto-managed and user-paused
+    /// torrents are left alone (upstream `auto_managed` flag).
+    /// `-1` limits mean unlimited.
+    pub fn manage_queue(&mut self, active_downloads: i32, active_seeds: i32) {
+        let mut dl_active = 0i32;
+        let mut seed_active = 0i32;
+        // BTreeMap order → deterministic promotion, oldest-ih first
+        for t in self.torrents.values_mut() {
+            if !t.auto_managed || t.paused {
+                t.queued = false;
+                continue;
+            }
+            let seed = t.is_seed();
+            let over = if seed {
+                seed_active >= active_seeds && active_seeds >= 0
+            } else {
+                dl_active >= active_downloads && active_downloads >= 0
+            };
+            t.queued = over;
+            if !over {
+                if seed {
+                    seed_active += 1;
+                } else {
+                    dl_active += 1;
+                }
+            }
         }
     }
 

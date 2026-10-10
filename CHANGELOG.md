@@ -35,6 +35,21 @@ Until `1.0.0`, breaking changes may occur in any release.
 - `Torrent::piece_complete` — `is_piece_finished` bridge.
 
 
+### Added — session wave 4: magnet glue, auto-managed queue, smart_ban wiring
+
+- `Torrent::set_metadata` — BEP-9: SHA-1 of the raw info section
+  must equal `info_hash`; on match `TorrentInfo::from_info_node`
+  fills `num_pieces`/`piece_length`/`piece_hashes` and inits the
+  picker (`init_picker` now reachable from magnet-added torrents).
+- `Torrent::on_ut_metadata_data` / `metadata_request` — glue over
+  `ut_metadata::UtMetadataTracker` (source bookkeeping per piece).
+- `Session::manage_queue` — auto-managed promotion/demotion against
+  `active_downloads`/`active_seeds` (`Torrent::queued` is separate
+  from user `paused`, like upstream `is_torrent_queued`).
+- `Torrent::piece_verified_ban` — wires `smart_ban` into
+  `piece_finished`/`on_piece_failed`: per-block CRC record on
+  failure, re-check on success, `DisconnectPeer` effects on bans.
+
 ### Added — session wave 3: MSE/PE crypto over the wire driver
 
 - `net::mse` — `bt_peer_connection` PE1–PE4 handshake verbatim:
