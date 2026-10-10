@@ -151,6 +151,15 @@ pub struct NatpmpState {
     pub ttl: u32,
 }
 
+/// A UPnP SOAP response back to the engine loop — `Ip` answers
+/// `GetExternalIPAddress`, `Map` answers add/delete posts.
+struct UpnpReply {
+    dev: usize,
+    mapping: usize,
+    is_ip_query: bool,
+    body: Result<String, String>,
+}
+
 /// `Engine` — everything outside `Session` that upstream does in
 /// `session_impl`'s io-context loop.
 pub struct Engine {
@@ -191,6 +200,12 @@ pub struct Engine {
     /// `natpmp` mapping state — `None` until `start_natpmp` (or
     /// under `anonymous_mode`, where upstream never maps).
     pub natpmp: Option<NatpmpState>,
+    /// UPnP per-device drivers (SSDP discovery is transport-side;
+    /// OnionBit feeds `RootDevice`s through `portmap_add_device`).
+    pub upnp_devices: Vec<bitdaemon_net::upnp::UpnpDriver>,
+    /// UPnP SOAP response completions.
+    upnp_rx: mpsc::UnboundedReceiver<UpnpReply>,
+    upnp_tx: mpsc::UnboundedSender<UpnpReply>,
     /// spawned task handles (kept for abort on drop).
     tasks: Vec<JoinHandle<()>>,
     /// info-hash set shared with acceptor tasks (`m_torrents` check
@@ -223,6 +238,7 @@ impl Engine {
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();
         let (webseed_tx, webseed_rx) = mpsc::unbounded_channel();
         let (dhtnode_tx, dhtnode_rx) = mpsc::unbounded_channel();
+        let (upnp_tx, upnp_rx) = mpsc::unbounded_channel();
         Self {
             session: Session::new(),
             connector,
@@ -245,6 +261,9 @@ impl Engine {
             dhtnode_rx,
             dhtnode_tx,
             natpmp: None,
+            upnp_devices: Vec::new(),
+            upnp_rx,
+            upnp_tx,
             tasks: Vec::new(),
             known_ihs: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
             queue_time: 3,
@@ -331,6 +350,9 @@ impl Engine {
         }
         while let Ok(a) = self.dhtnode_rx.try_recv() {
             self.session.dht_add_node(a);
+        }
+        while let Ok(r) = self.upnp_rx.try_recv() {
+            self.on_upnp_reply(r);
         }
 
         // `update_quota` — refill the upload bucket each tick
@@ -684,6 +706,145 @@ impl Engine {
                     }
                 }
             }
+        }
+    }
+
+    /// `upnp` device registration — a discovered `RootDevice`
+    /// (control_url/service namespace known). Maps the listen port
+    /// TCP+UDP like `portmap` upstream. Skipped under
+    /// `anonymous_mode`.
+    pub fn portmap_add_device(
+        &mut self,
+        dev: bitdaemon_net::upnp::RootDevice,
+        local_port: u16,
+        description: String,
+    ) {
+        use bitdaemon_net::upnp::{PortmapProtocol, UpnpDriver};
+        if self.session.settings.anonymous_mode {
+            return;
+        }
+        let mut d = UpnpDriver::new(dev, 3600, description);
+        let outs = d.set_mappings(vec![
+            (PortmapProtocol::Tcp, local_port, local_port, String::new()),
+            (PortmapProtocol::Udp, local_port, local_port, String::new()),
+        ]);
+        self.upnp_devices.push(d);
+        let idx = self.upnp_devices.len() - 1;
+        // ask for the router's external address first (upstream
+        // chains discovery → GetExternalIPAddress → AddPortMapping)
+        let outs = std::iter::once(self.upnp_devices[idx].discover())
+            .chain(outs)
+            .collect::<Vec<_>>();
+        self.drive_upnp_outs(idx, outs);
+    }
+
+    /// execute `UpnpOut` actions — SOAP posts ride the injected
+    /// connector + resolver (no direct sockets).
+    fn drive_upnp_outs(&mut self, dev: usize, outs: Vec<bitdaemon_net::upnp::UpnpOut>) {
+        use bitdaemon_net::upnp::UpnpOut;
+        for o in outs {
+            match o {
+                UpnpOut::Post {
+                    mapping,
+                    action,
+                    body,
+                } => self.spawn_upnp_post(dev, mapping, action, body),
+                UpnpOut::Mapped {
+                    external_ip: Some(ip),
+                    ..
+                } => {
+                    self.session.ip_voter.cast_vote(
+                        ip,
+                        bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_ROUTER,
+                        &ip,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// one SOAP POST through the injected transport, result back
+    /// through `upnp_tx`.
+    fn spawn_upnp_post(&mut self, dev: usize, mapping: usize, action: String, body: String) {
+        let Some(d) = self.upnp_devices.get(dev) else {
+            return;
+        };
+        let is_ip_query = action.contains("GetExternalIPAddress");
+        let url = d.dev.control_url.clone();
+        let tx = self.upnp_tx.clone();
+        let connector = self.connector.clone();
+        let resolver = self.resolver.clone();
+        self.tasks_forget();
+        self.tasks.push(tokio::spawn(async move {
+            let send = |b: Result<String, String>| async move {
+                let _ = tx.send(UpnpReply {
+                    dev,
+                    mapping,
+                    is_ip_query,
+                    body: b,
+                });
+            };
+            let Ok(c) = bitdaemon_net::parse_url::parse_url_components(&url) else {
+                send(Err("bad control url".into())).await;
+                return;
+            };
+            let port = u16::try_from(c.port).unwrap_or(80);
+            let Ok(addr) = resolve(&resolver, &c.hostname, port).await else {
+                send(Err("resolve".into())).await;
+                return;
+            };
+            let Ok(mut s) = connector.connect(addr).await else {
+                send(Err("connect".into())).await;
+                return;
+            };
+            let host = if c.port < 0 {
+                c.hostname.clone()
+            } else {
+                format!("{}:{}", c.hostname, port)
+            };
+            let headers = [
+                ("Content-Type".to_string(), "text/xml".to_string()),
+                ("SOAPAction".to_string(), action),
+            ];
+            let r = async {
+                bitdaemon_net::http_conn::send_request(
+                    &mut s,
+                    "POST",
+                    &c.path,
+                    &host,
+                    &headers,
+                    body.as_bytes(),
+                )
+                .await?;
+                bitdaemon_net::http_conn::recv_response(&mut s, 64 * 1024).await
+            }
+            .await;
+            match r {
+                Ok(resp) => {
+                    send(Ok(String::from_utf8_lossy(&resp.body()).into_owned())).await;
+                }
+                Err(e) => send(Err(e.to_string())).await,
+            }
+        }));
+    }
+
+    /// feed a SOAP response back into the driver's state machine.
+    fn on_upnp_reply(&mut self, r: UpnpReply) {
+        let Ok(body) = r.body else {
+            return; // transport errors drop like upstream timeouts
+        };
+        let outs = if r.is_ip_query {
+            self.upnp_devices
+                .get_mut(r.dev)
+                .map(|d| d.on_ip_response(&body))
+        } else {
+            self.upnp_devices
+                .get_mut(r.dev)
+                .map(|d| d.on_map_response(r.mapping, &body, rand::random::<u16>()))
+        };
+        if let Some(outs) = outs {
+            self.drive_upnp_outs(r.dev, outs);
         }
     }
 

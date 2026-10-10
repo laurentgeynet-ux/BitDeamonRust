@@ -9,6 +9,16 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **UPnP câblé** — `Engine::portmap_add_device(RootDevice, port,
+  desc)` enregistre un `UpnpDriver` par routeur, mappe le port
+  d'écoute TCP+UDP et enchaîne `GetExternalIPAddress` →
+  `AddPortMapping` ; les posts SOAP passent par le connecteur +
+  résolveur injectés (`http_conn`), `ip_voter` alimenté
+  (`SOURCE_ROUTER`), codes d'erreur 725/718/501/716 gérés par le
+  driver. Désactivé sous `anonymous_mode`.
+
+### Added
+
 - **NATPMP câblé** — `Engine::start_natpmp(gateway, port, ttl)`
   envoie les mappings TCP+UDP + requête IP publique sur la socket
   datagramme injectée ; démux des réponses par adresse passerelle

@@ -452,3 +452,88 @@ async fn natpmp_map_and_ip_vote() {
         Some(std::net::IpAddr::from([203, 0, 113, 42]))
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn upnp_map_cycle() {
+    use tokio::io::AsyncReadExt;
+    // one stream per POST: GetExternalIPAddress, add TCP, add UDP
+    let mut server_ends = Vec::new();
+    let mut client_ends = Vec::new();
+    for _ in 0..3 {
+        let (c, s) = tokio::io::duplex(64 * 1024);
+        client_ends.push(c);
+        server_ends.push(s);
+    }
+    #[derive(Debug)]
+    struct Q(tokio::sync::Mutex<Vec<DuplexStream>>);
+    impl PeerConnector for Q {
+        fn connect(
+            self: Arc<Self>,
+            _a: SocketAddr,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<Output = bitdaemon_net::Result<BoxedPeerStream>>
+                    + Send
+                    + Sync,
+            >,
+        > {
+            let me = self.clone();
+            Box::pin(async move {
+                me.0.lock()
+                    .await
+                    .pop()
+                    .map(|s| -> BoxedPeerStream { Box::new(s) })
+                    .ok_or_else(|| std::io::Error::other("empty").into())
+            })
+        }
+    }
+    client_ends.reverse();
+    let conn = Arc::new(Q(tokio::sync::Mutex::new(client_ends)));
+
+    let mut eng = Engine::new(conn, None);
+    eng.portmap_add_device(
+        bitdaemon_net::upnp::RootDevice {
+            control_url: "http://192.168.0.1:49152/ctl/IPConn".into(),
+            service_namespace: "urn:schemas-upnp-org:service:WANIPConnection:1".into(),
+            ..Default::default()
+        },
+        6881,
+        "bitdaemon".into(),
+    );
+
+    // serve 3 SOAP requests in order
+    let ok_xml = "HTTP/1.1 200 OK\r\nContent-Length: 24\r\nContent-Type: text/xml\r\n\r\n<u>ok</u>               ";
+    let ip_xml = "HTTP/1.1 200 OK\r\nContent-Length: 87\r\nContent-Type: text/xml\r\n\r\n<NewExternalIPAddress>203.0.113.9</NewExternalIPAddress>      ";
+    tokio::spawn(async move {
+        let bodies = [ip_xml, ok_xml, ok_xml];
+        for (mut s, b) in server_ends.into_iter().zip(bodies) {
+            let mut req = Vec::new();
+            let mut tmp = [0u8; 2048];
+            // read until end of SOAP body (headers contain
+            // Content-Length but simplest: read until "</")
+            loop {
+                let n = s.read(&mut tmp).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&tmp[..n]);
+                if req.windows(9).any(|w| w == b"</s:Body>" || w == b"</Body>") {
+                    break;
+                }
+            }
+            s.write_all(b.as_bytes()).await.unwrap();
+        }
+    });
+
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+        eng.tick(std::time::Instant::now()).await;
+        if eng.session.ip_voter.external_address().is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        eng.session.ip_voter.external_address(),
+        Some(std::net::IpAddr::from([203, 0, 113, 9]))
+    );
+}
