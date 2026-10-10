@@ -471,6 +471,29 @@ impl Torrent {
         })
     }
 
+    /// `files_checked` (upstream `torrent::files_checked`) — verdict
+    /// of `async_check_files` on the fastresume data. Accepted →
+    /// `have` stands and a complete torrent becomes `seeding`
+    /// (`no_error` + `seed_mode`). Rejected (`need_full_check`) →
+    /// the resume-supplied bits are cleared; the caller reschedules
+    /// per-piece `DiskHash` jobs for the real check.
+    pub fn on_files_checked(&mut self, accepted: bool, out: &mut Vec<TorrentEffect>) {
+        if !accepted {
+            // the picker's have-tracking only knows pieces that
+            // passed `piece_verified` — resume bits live solely in
+            // `self.have`, clearing it is sufficient.
+            self.have.clear_all();
+            self.finished = false;
+            self.seeding = false;
+            return;
+        }
+        if self.have.count() as i32 == self.num_pieces && self.num_pieces > 0 {
+            self.finished = true;
+            self.seeding = true;
+            out.push(TorrentEffect::BecameSeed);
+        }
+    }
+
     /// `is_seed`.
     #[must_use]
     pub fn is_seed(&self) -> bool {

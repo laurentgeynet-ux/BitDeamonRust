@@ -102,6 +102,16 @@ pub enum DiskCompleted {
         /// job result.
         err: StorageError,
     },
+    /// `async_check_files` — fastresume validation verdict
+    /// (`ret` = accepted).
+    CheckFiles {
+        /// torrent.
+        ih: Sha1Hash,
+        /// resume accepted (`verify_resume_data` verdict).
+        accepted: bool,
+        /// job result.
+        err: StorageError,
+    },
     /// `async_hash` — SHA-1 of `piece` is `hash` (compare pending
     /// — Torrent does not yet hold `TorrentInfo` piece hashes).
     Hash {
@@ -208,6 +218,25 @@ impl Session {
                             );
                         }
                     }
+                }
+                DiskCompleted::CheckFiles { ih, accepted, err } => {
+                    // `torrent::files_checked`: resume accepted → the
+                    // optimistic `have` bits stand; rejected → drop
+                    // them (upstream `need_full_check` → per-piece
+                    // re-hash, driven by the caller scheduling
+                    // `DiskHash` jobs or `check_files` again).
+                    let mut eff = Vec::new();
+                    if let Some(t) = self.torrents.get_mut(&ih) {
+                        t.on_files_checked(err.is_ok() && accepted, &mut eff);
+                    }
+                    if err.is_err() {
+                        self.alerts.post(Alert::FileError {
+                            ih,
+                            path: String::new(),
+                            error: err.to_string(),
+                        });
+                    }
+                    self.route(ih, eff, out);
                 }
                 DiskCompleted::Hash {
                     ih,
@@ -323,6 +352,36 @@ impl Session {
         let ih = t.info_hash;
         self.torrents.insert(ih, t);
         ih
+    }
+
+    /// `check_files` — upstream `torrent::start_checking`: run
+    /// `async_check_files` on the injected `DiskIo`; the verdict
+    /// arrives as `DiskCompleted::CheckFiles`.
+    pub fn check_files(
+        &self,
+        ih: Sha1Hash,
+        resume_data: Option<Box<bitdaemon_core::add_torrent_params::AddTorrentParams>>,
+    ) {
+        let Some(disk) = self.disk.clone() else {
+            return;
+        };
+        let Some(t) = self.torrents.get(&ih) else {
+            return;
+        };
+        let storage = t.storage;
+        let tx = self.disk_tx.clone();
+        disk.async_check_files(
+            storage,
+            resume_data,
+            Vec::new(),
+            Box::new(move |ret, err| {
+                let _ = tx.send(DiskCompleted::CheckFiles {
+                    ih,
+                    accepted: ret != 0,
+                    err,
+                });
+            }),
+        );
     }
 
     /// `add_torrent` — the real entry point: `AddTorrentParams` →

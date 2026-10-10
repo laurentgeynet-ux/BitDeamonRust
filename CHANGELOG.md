@@ -7,6 +7,13 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — check_files wiring
+
+- `Session::check_files` → `DiskIo::async_check_files` →
+  `DiskCompleted::CheckFiles` → `Torrent::on_files_checked`
+  (`torrent::files_checked` upstream) : resume accepté → seed ;
+  rejeté (`need_full_check`) → `have` réinitialisé.
+
 ### Added — add_torrent entry point
 
 - `Torrent::from_params` + `Session::add_torrent_params` — ctor

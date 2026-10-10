@@ -87,3 +87,29 @@ fn add_torrent_with_metadata_and_resume() {
             .contains(PeerSourceFlags::RESUME_DATA)
     );
 }
+
+#[test]
+fn files_checked_verdict() {
+    let mut t = bitdaemon_session::torrent::Torrent::new(
+        Sha1Hash::from_bytes(&[5; 20]).unwrap(),
+        2,
+        128 * 1024,
+        bitdaemon_common::Bitfield::with_size(2),
+        StorageIndex(0),
+    );
+    t.init_picker(false);
+    let mut eff = Vec::new();
+    // resume accepted, all pieces had → seed
+    t.have.set_bit(0);
+    t.have.set_bit(1);
+    t.on_files_checked(true, &mut eff);
+    assert!(t.seeding && t.finished);
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, bitdaemon_session::torrent::TorrentEffect::BecameSeed))
+    );
+    // rejected → have cleared
+    t.on_files_checked(false, &mut eff);
+    assert_eq!(t.have.count(), 0);
+    assert!(!t.finished && !t.seeding);
+}
