@@ -453,3 +453,129 @@ fn download_queue() {
     assert_eq!(picker.piece_info(p(1)).index, p(1));
     assert!(picker.is_downloading(p(1)));
 }
+
+// ---------- request_a_block (aux_/request_blocks.cpp) ----------
+
+use bitdaemon_session::request_blocks::{PeerRequestCtx, TorrentRequestCtx, request_a_block_out};
+
+fn tctx() -> TorrentRequestCtx {
+    TorrentRequestCtx {
+        is_seed: false,
+        upload_mode: false,
+        valid_metadata: true,
+        files_checked: true,
+        graceful_pause: false,
+        time_critical_mode: false,
+        num_peers: 10,
+        whole_pieces_threshold: 0,
+        strict_end_game_mode: false,
+        piece_length: i64::from(PIECE_SIZE),
+        block_size: 0x4000,
+    }
+}
+
+#[test]
+fn request_block_basic() {
+    let mut picker = PiecePicker::new(i64::from(4 * PIECE_SIZE), PIECE_SIZE);
+    let have = all_have(4);
+    picker.inc_refcount_bitfield(&have);
+    let t = tctx();
+    let outstanding: Vec<PieceBlock> = Vec::new();
+    let c = PeerRequestCtx {
+        no_download: false,
+        disconnecting: false,
+        desired_queue_size: 8,
+        outstanding: &outstanding,
+        prefer_contiguous_blocks: 0,
+        download_payload_rate: 0,
+        peer_choked: false,
+        allowed_fast: &[],
+        peer_pieces: &have,
+        peer_key: Some(1),
+        picker_options: PickerOptions::RAREST_FIRST,
+        suggested_pieces: &[],
+    };
+    let mut stats = Stats([0; 16]);
+    let mut requested = Vec::new();
+    let (invoked, _endgame) = request_a_block_out(&mut picker, &t, &c, &mut stats, |b, _busy| {
+        requested.push(b);
+        true
+    });
+    assert!(invoked);
+    assert_eq!(requested.len(), 8);
+    // upstream's peer_connection::add_request marks blocks in the
+    // picker — do it after the call (borrow rules)
+    for &b in &requested {
+        assert!(picker.mark_as_downloading(b, Some(1), PickerOptions::NONE));
+    }
+    assert!(requested.iter().all(|b| picker.is_requested(*b)));
+}
+
+#[test]
+fn request_block_early_exit() {
+    let mut picker = PiecePicker::new(i64::from(4 * PIECE_SIZE), PIECE_SIZE);
+    let have = all_have(4);
+    let mut t = tctx();
+    t.is_seed = true;
+    let outstanding: Vec<PieceBlock> = Vec::new();
+    let c = PeerRequestCtx {
+        no_download: false,
+        disconnecting: false,
+        desired_queue_size: 8,
+        outstanding: &outstanding,
+        prefer_contiguous_blocks: 0,
+        download_payload_rate: 0,
+        peer_choked: false,
+        allowed_fast: &[],
+        peer_pieces: &have,
+        peer_key: None,
+        picker_options: PickerOptions::NONE,
+        suggested_pieces: &[],
+    };
+    let mut stats = Stats([0; 16]);
+    let (invoked, _) = request_a_block_out(&mut picker, &t, &c, &mut stats, |_, _| true);
+    assert!(!invoked);
+}
+
+#[test]
+fn request_block_endgame() {
+    // single piece fully requested by peer 1 → peer 2 gets a busy
+    // block (end-game)
+    let mut picker = PiecePicker::new(i64::from(PIECE_SIZE), PIECE_SIZE);
+    let have = all_have(1);
+    picker.inc_refcount_bitfield(&have);
+    for b in 0..BLOCKS_PER_PIECE {
+        assert!(picker.mark_as_downloading(pb(0, b), Some(1), PickerOptions::NONE));
+    }
+    let t = tctx();
+    let outstanding: Vec<PieceBlock> = Vec::new();
+    let c = PeerRequestCtx {
+        no_download: false,
+        disconnecting: false,
+        desired_queue_size: 4,
+        outstanding: &outstanding,
+        prefer_contiguous_blocks: 0,
+        download_payload_rate: 0,
+        peer_choked: false,
+        allowed_fast: &[],
+        peer_pieces: &have,
+        peer_key: Some(2),
+        picker_options: PickerOptions::RAREST_FIRST,
+        suggested_pieces: &[],
+    };
+    let mut stats = Stats([0; 16]);
+    let mut busy = Vec::new();
+    let (invoked, endgame) = request_a_block_out(&mut picker, &t, &c, &mut stats, |b, is_busy| {
+        if is_busy {
+            busy.push(b);
+        }
+        true
+    });
+    assert!(invoked);
+    assert_eq!(endgame, Some(true));
+    assert_eq!(busy.len(), 1);
+    for &b in &busy {
+        assert!(picker.mark_as_downloading(b, Some(2), PickerOptions::NONE));
+        assert!(picker.is_requested(b));
+    }
+}

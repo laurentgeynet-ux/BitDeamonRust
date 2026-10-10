@@ -5,11 +5,11 @@
 //! four sorted download queues, and the `pick_pieces` algorithm
 //! (partials, suggested, sequential, rarest-first, random, end-game).
 //!
-//! Upstream identities `aux::torrent_peer*` are replaced by a generic
-//! peer handle `P: Copy + Eq` (e.g. an index into the session's peer
-//! table). Sorted-vec iterators are replaced by `(queue, position)`
-//! pairs — `update_piece_state` may move a piece between queues and
-//! returns its new position.
+//! Upstream `aux::torrent_peer*` identities become `Option<u64>`
+//! peer keys (e.g. an index into the session's peer table). C++
+//! iterators into the sorted `m_downloads` vectors are replaced by
+//! `(queue, position)` pairs — `update_piece_state` may move a piece
+//! between queues and returns its new position.
 //!
 //! `pick_pieces` is `&mut self` where upstream is `const` + `mutable`
 //! members (`update_pieces`, `m_recent_extents`).

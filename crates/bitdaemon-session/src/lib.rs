@@ -30,6 +30,8 @@
 /// mapping, DHT/LSD/UPnP/NAT-PMP toggles.
 /// `aux_/piece_picker` — piece availability, priorities, picking.
 pub mod piece_picker;
+/// `aux_/request_blocks` — `request_a_block` glue picker↔peer.
+pub mod request_blocks;
 
 /// Client session (`libtorrent::session` / `session_handle`).
 pub struct Session;

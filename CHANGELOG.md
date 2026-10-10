@@ -9,6 +9,14 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added — `bitdaemon-session` (piece picking)
 
+- `request_blocks` — port of `aux_/request_blocks.cpp`
+  (`request_a_block`, `source_rank`): torrent/peer state is passed in
+  as `TorrentRequestCtx`/`PeerRequestCtx` snapshots; `add_request` is
+  an injected closure (upstream `peer_connection::add_request`); fast-
+  set masking (BEP-6 choked), `whole_pieces_threshold` contiguous
+  window, `strict_end_game_mode` and the busy-block fallback are
+  faithful.
+
 - `piece_picker` — full port of `aux_/piece_picker.hpp` +
   `piece_picker.cpp`: priority buckets (`prio_factor = 3`, 8 levels),
   four download queues with reverse variants, `BlockInfo` per-block
