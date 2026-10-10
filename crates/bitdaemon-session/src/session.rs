@@ -882,6 +882,79 @@ impl Session {
     pub fn num_peers(&self) -> usize {
         self.torrents.values().map(|t| t.peers.len()).sum()
     }
+    /// `post_session_stats` — `session_stats_alert` payload:
+    /// a `SessionStats` snapshot plus the `session_status` summary.
+    #[must_use]
+    pub fn session_stats(&self) -> crate::counters::SessionStats {
+        let downloading = self
+            .torrents
+            .values()
+            .filter(|t| !t.is_seed() && !t.paused)
+            .count() as i64;
+        let seeding = self.torrents.values().filter(|t| t.is_seed()).count() as i64;
+        self.counters
+            .set(crate::counters::Counter::DownloadingTorrents, downloading);
+        self.counters
+            .set(crate::counters::Counter::SeedingTorrents, seeding);
+        self.counters.set(
+            crate::counters::Counter::PeersConnected,
+            self.num_peers() as i64,
+        );
+        crate::counters::SessionStats::snapshot(&self.counters)
+    }
+    /// `save_state` — the `.session` blob: resume data per torrent
+    /// + merged DHT routing state — v4+v6 live in one dict, like
+    ///   upstream's `session_state::dht` blob.
+    #[must_use]
+    pub fn save_state(&self) -> crate::session_state::SessionState {
+        let mut st = crate::session_state::SessionState::default();
+        for (ih, t) in &self.torrents {
+            let mut atp = bitdaemon_core::AddTorrentParams::default();
+            t.to_resume_data(&mut atp);
+            st.torrents.insert(*ih, atp);
+        }
+        let mut ds = bitdaemon_dht::dht_state::DhtState::default();
+        for v6 in [false, true] {
+            if let Some(n) = self.dht.get_node(v6) {
+                let s = n.dht_state();
+                ds.nodes.extend(s.nodes);
+                ds.nodes6.extend(s.nodes6);
+                ds.nids.extend(s.nids);
+            }
+        }
+        if !ds.nodes.is_empty() || !ds.nodes6.is_empty() {
+            st.dht_state =
+                bitdaemon_bencode::bencode(&bitdaemon_dht::dht_state::save_dht_state(&ds));
+        }
+        st
+    }
+
+    /// `load_state` — parse a `.session` blob: every torrent becomes
+    /// an `add_torrent_params` (resume semantics), DHT endpoints
+    /// seed `router_nodes`. Returns torrents restored.
+    pub fn load_state(&mut self, buf: &[u8], out: &mut Vec<SessionOut>) -> usize {
+        let Some(st) = crate::session_state::load_session_state(buf) else {
+            return 0;
+        };
+        if let Some(ds) = bitdaemon_dht::dht_state::read_dht_state_bytes(&st.dht_state) {
+            for v6 in [false, true] {
+                if let Some(n) = self.dht.get_node_mut(v6) {
+                    n.load_state(&ds);
+                }
+            }
+        }
+        let mut n = 0;
+        for (_, atp) in st.torrents {
+            if self
+                .add_torrent_params(&atp, StorageIndex(0), out)
+                .is_some()
+            {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// `Bitfield` re-export used by tests/callers.
     #[doc(hidden)]
     pub fn _bitfield_marker(_: &Bitfield) {}

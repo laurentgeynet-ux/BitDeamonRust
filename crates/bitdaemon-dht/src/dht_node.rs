@@ -703,6 +703,33 @@ impl DhtNode {
         });
     }
 
+    /// `dht_state` — serialize live-node endpoints for `.session`
+    /// bootstrap (`dht_tracker::dht_state` upstream).
+    #[must_use]
+    pub fn dht_state(&self) -> crate::dht_state::DhtState {
+        let mut st = crate::dht_state::DhtState::default();
+        self.table.for_each_node(
+            |n| {
+                if self.v6 {
+                    st.nodes6.push(n.endpoint);
+                } else {
+                    st.nodes.push(n.endpoint);
+                }
+            },
+            |_| {},
+        );
+        st
+    }
+
+    /// `bootstrap` seeding — state-file endpoints aren't verified
+    /// node ids, so they land in `router_nodes` (the `flag_initial`
+    /// seed list `traversal::start` consumes).
+    pub fn load_state(&mut self, st: &crate::dht_state::DhtState) {
+        for ep in if self.v6 { &st.nodes6 } else { &st.nodes } {
+            self.table.add_router_node(*ep);
+        }
+    }
+
     /// `tick()` — rpc timeouts → traversal failures; storage tick.
     pub fn tick(&mut self) -> Duration {
         let mut expirations = Vec::new();

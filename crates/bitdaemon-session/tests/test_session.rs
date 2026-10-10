@@ -346,3 +346,40 @@ fn idle_peer_times_out() {
         "idle peer should be dropped"
     );
 }
+
+#[test]
+fn session_state_roundtrip_through_session() {
+    // 2-piece info dict (40 hash bytes)
+    let mut info = Vec::new();
+    info.extend(b"d6:lengthi16385e4:name4:test12:piece lengthi16384e6:pieces40:");
+    info.extend([0xAAu8; 40]);
+    info.extend(b"e");
+    let node = bitdaemon_bencode::bdecode_checked(&info).unwrap();
+    let ti = bitdaemon_core::torrent_info::TorrentInfo::from_info_node(
+        &node,
+        &bitdaemon_core::torrent_info::LoadTorrentLimits::default(),
+    )
+    .unwrap();
+    let ih = ti.info_hash_v1().unwrap();
+
+    let mut s = Session::new();
+    let atp = bitdaemon_core::add_torrent_params::AddTorrentParams {
+        ti: Some(std::sync::Arc::new(ti)),
+        info_hashes: bitdaemon_common::info_hash::InfoHash::from_v1(ih),
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    s.add_torrent_params(&atp, StorageIndex(0), &mut out);
+    s.torrents.get_mut(&ih).unwrap().have.set_bit(0);
+
+    let st = s.save_state();
+    assert!(st.torrents.contains_key(&ih));
+    let buf =
+        bitdaemon_bencode::bencode(&bitdaemon_session::session_state::save_session_state(&st));
+
+    let mut s2 = Session::new();
+    assert_eq!(s2.load_state(&buf, &mut Vec::new()), 1);
+    let t2 = &s2.torrents[&ih];
+    assert!(t2.have.get_bit(0) && !t2.have.get_bit(1));
+    assert_eq!(t2.num_pieces, 2);
+}

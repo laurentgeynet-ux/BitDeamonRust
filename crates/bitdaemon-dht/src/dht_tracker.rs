@@ -93,7 +93,8 @@ impl DhtTracker {
         wait
     }
 
-    fn get_node_mut(&mut self, v6: bool) -> Option<&mut DhtNode> {
+    /// mutable access for `load_state` bootstrap seeding.
+    pub fn get_node_mut(&mut self, v6: bool) -> Option<&mut DhtNode> {
         if v6 {
             self.v6.as_mut()
         } else {

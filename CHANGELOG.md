@@ -9,6 +9,15 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `Session::save_state`/`load_state` — le fichier `.session` :
+  resume data par torrent (`to_resume_data` embarque le blob `info`
+  via `metadata_raw`), état DHT v4+v6 fusionné ; `load_state`
+  réinjecte via `add_torrent_params` et sème `router_nodes`
+  (`bootstrap` upstream). `DhtNode::dht_state`/`load_state`,
+  `DhtTracker::get_node_mut`, `Session::session_stats` snapshot.
+
+### Added
+
 - `RateLimiter` (token bucket async partagé, équivalent
   `bandwidth_channel`) câblé sur le chemin d'upload : les writers
   throttlent les payloads `Piece` selon

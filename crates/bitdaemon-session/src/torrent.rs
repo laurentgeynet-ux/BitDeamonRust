@@ -191,6 +191,7 @@ impl Torrent {
                         .map(|i| ti.hash_for_piece(PieceIndex(i)))
                         .collect(),
                 );
+                t.metadata_raw = Some(ti.info_section().to_vec());
                 t.init_picker(false);
                 t.apply_resume_data(atp, out);
                 t
@@ -466,8 +467,19 @@ impl Torrent {
     /// `unfinished_pieces` (downloading pieces with ≥1
     /// finished/writing block → finished-block bitmask).
     pub fn to_resume_data(&self, atp: &mut AddTorrentParams) {
+        atp.info_hashes.v1 = self.info_hash;
         atp.have_pieces = self.have.clone();
         atp.verified_pieces = self.have.clone();
+        // upstream embeds the `info` dict when the torrent has
+        // metadata — rebuild `ti` from our raw copy so
+        // `write_resume_data_buf` emits it and `load` restores
+        // piece count + hashes.
+        if let Some(raw) = &self.metadata_raw {
+            let node = bitdaemon_bencode::bdecode(raw);
+            if let Ok(ti) = TorrentInfo::from_info_node(&node, &LoadTorrentLimits::default()) {
+                atp.ti = Some(std::sync::Arc::new(ti));
+            }
+        }
         if let Some(p) = self.picker.as_ref() {
             atp.piece_priorities = (0..self.num_pieces)
                 .map(|i| p.piece_priority(PieceIndex(i)))
