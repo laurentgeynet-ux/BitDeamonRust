@@ -225,6 +225,81 @@ pub struct Torrent {
 }
 
 impl Torrent {
+    /// `peer_connection::send_allowed_set` — BEP-6: when the peer
+    /// negotiated the FAST extension, advertise a deterministic
+    /// set of pieces it may request even while choked. Seed =
+    /// SHA-1(remote_ip_bytes || info_hash), re-hashed per batch of
+    /// 5 u32 draws — port verbatim.
+    pub fn send_allowed_set(&mut self, peer_id: u64, out: &mut Vec<TorrentEffect>) {
+        use sha1::{Digest, Sha1};
+        const NUM_ALLOWED: usize = 5; // settings.allowed_fast_set_size
+        if self.super_seeding
+            || self.metadata_raw.is_none() && self.picker.is_none()
+            || self.num_pieces <= 0
+        {
+            return;
+        }
+        let Some(c) = self.peers.get(&peer_id) else {
+            return;
+        };
+        if !c.supports_fast || c.remote_upload_only {
+            return;
+        }
+        let Some(remote) = c.remote else { return };
+        // upstream: when the set covers all pieces, allow every
+        // piece the peer lacks (skip hash determinism entirely).
+        if NUM_ALLOWED >= self.num_pieces as usize {
+            for i in 0..self.num_pieces {
+                if !self.have.get_bit(i as usize) || c.has_piece(PieceIndex(i)) {
+                    continue;
+                }
+                out.push(TorrentEffect::SendTo {
+                    peer: peer_id,
+                    msg: PeerMessage::AllowedFast(PieceIndex(i)),
+                });
+            }
+            return;
+        }
+        let mut x = Vec::new();
+        match remote.ip() {
+            std::net::IpAddr::V4(a) => x.extend_from_slice(&a.octets()),
+            std::net::IpAddr::V6(a) => x.extend_from_slice(&a.octets()),
+        }
+        x.extend_from_slice(self.info_hash.as_bytes());
+        let mut hash: [u8; 20] = Sha1::digest(&x).into();
+        let mut accept: Vec<PieceIndex> = Vec::with_capacity(10);
+        let mut attempts = 0usize;
+        let mut loops = 0usize;
+        loop {
+            for i in 0..(hash.len() / 4) {
+                loops += 1;
+                let p = u32::from_be_bytes(hash[i * 4..i * 4 + 4].try_into().expect("4"))
+                    % self.num_pieces as u32;
+                let piece = PieceIndex(p as i32);
+                if accept.contains(&piece) {
+                    if loops > 500 {
+                        return;
+                    }
+                    continue;
+                }
+                // pieces the peer already has are pointless.
+                let has = self.peers.get(&peer_id).is_some_and(|c| c.has_piece(piece));
+                if self.have.get_bit(piece.0 as usize) && !has {
+                    out.push(TorrentEffect::SendTo {
+                        peer: peer_id,
+                        msg: PeerMessage::AllowedFast(piece),
+                    });
+                    accept.push(piece);
+                }
+                attempts += 1;
+                if attempts >= NUM_ALLOWED {
+                    return;
+                }
+            }
+            hash = Sha1::digest(hash).into();
+        }
+    }
+
     /// `peer_connection::has_outstanding_block_requests` — true
     /// while any peer still has blocks in flight (used to lift
     /// `graceful_pause` once the last write lands).

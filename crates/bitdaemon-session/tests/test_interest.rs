@@ -86,3 +86,24 @@ fn piece_verified_sends_not_interested() {
         "{out:?}"
     );
 }
+
+#[test]
+fn allowed_fast_set_on_fast_peer() {
+    let (mut s, ih) = mk();
+    // give ourselves a piece so there is something to allow
+    s.torrents.get_mut(&ih).unwrap().have.set_bit(1);
+    let mut out = Vec::new();
+    let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
+    c.supports_fast = true;
+    s.peer_connected(&ih, 1, c, "127.0.0.1:6881".parse().unwrap(), &mut out);
+    assert!(
+        out.iter().any(|e| matches!(
+            e,
+            SessionOut::ToPeer {
+                msg: PeerMessage::AllowedFast(_),
+                ..
+            }
+        )),
+        "{out:?}"
+    );
+}

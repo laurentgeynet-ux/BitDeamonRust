@@ -929,6 +929,13 @@ impl Session {
                 });
             }
             t.add_peer(peer, conn);
+            // BEP-6: FAST peers get their allowed-fast set right
+            // after connect (upstream `send_allowed_set`).
+            {
+                let mut eff = Vec::new();
+                t.send_allowed_set(peer, &mut eff);
+                self.route(*ih, eff, out);
+            }
             let n = self.torrents.values().map(|t| t.peers.len() as i64).sum();
             self.counters.set(Counter::PeersConnected, n);
         }
