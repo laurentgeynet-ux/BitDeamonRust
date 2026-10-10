@@ -54,7 +54,10 @@ Until `1.0.0`, breaking changes may occur in any release.
   4/5+1/5 average, SYN costs, IP-overhead MTU formula), `BloomFilter<N>`
   (SHA-1-derived dual indices, `size()` estimator), `random`/`random_bytes`/
   `crypto_random_bytes`/`random_shuffle` (`random(m)` inclusive),
-  `crc32c_32`/`crc32c_words` (Castagnoli, LE memory order).
+  `crc32c_32`/`crc32c_words` (Castagnoli, LE memory order),
+  `IndexRange`/`IndexStep` (`index_range`), `TimestampHistory` +
+  `compare_less_wrap` (uTP base-delay estimator, 20-slot ring).
+  `stat_cache` deferred to Phase 3 (wraps `file_storage`/`stat_file`).
 - Tests: 67 conformance cases ported from `test_bdecode.cpp`, 16 from
   `test_bitfield.cpp`, 8 from `test_sliding_average.cpp`, 5 from
   `test_bloom_filter.cpp`, `test_crc32.cpp` vectors (RFC 3720 B.4),

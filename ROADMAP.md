@@ -52,9 +52,10 @@ Everything else depends on these. *~15k LOC C++.*
 (v1/v2/hybrid), `Bitfield`, `PeerId`, `PieceBlock`, `PeerRequest`,
 `DownloadPriority`, `TorrentFlags`/`PexFlags`/`AnnounceFlags`
 (`bitfield_flag!`), `time` helpers, `SlidingAverage`, `Stat`/`StatChannel`,
-`BloomFilter`, `random`/`crypto_random_bytes`, `crc32c`, `error`/`Result`,
-`hex`. *(still to do)*: `index_range`, `stat_cache`,
-`timestamp_history`.
+`BloomFilter`, `random`/`crypto_random_bytes`, `crc32c`, `IndexRange`,
+`TimestampHistory` (+ `compare_less_wrap`), `error`/`Result`, `hex`.
+*(still to do)*: `stat_cache` — blocked on `file_storage` (Phase 2/3),
+not a standalone primitive.
 
 `bitdaemon-bencode` *(done)*: `Entry` (owned, sorted-dict invariant),
 `BdecodeNode` (lazy zero-copy, packed 8-byte tokens, soft errors,
@@ -66,8 +67,9 @@ depth limits, pretty-printer.
 `count_leading_zeroes` vectors), `test_bloom_filter.cpp` ✅ (5),
 `test_sliding_average.cpp` ✅ (8), `test_crc32.cpp` ✅; bencode
 round-trips every `.torrent` in upstream `test/` dir ✅ (107 parsed,
-99 byte-identical). Still needed: `stat_cache`, `index_range`,
-`timestamp_history`.
+99 byte-identical), `test_timestamp_history.cpp` ✅ + step/adjust
+coverage. Phase 1 exit criteria met except `stat_cache` (moved to
+Phase 3 — it wraps `file_storage`/`stat_file`, not a primitive).
 
 ---
 
