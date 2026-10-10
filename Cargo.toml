@@ -36,6 +36,8 @@ bitdaemon-session = { path = "crates/bitdaemon-session", version = "0.1.0" }
 
 # external dependencies — pin minor versions, bump deliberately (see ADR-0007)
 bytes = "1.5"
+num-bigint = "0.4"
+num-traits = "0.2"
 thiserror = "2"
 sha1 = "0.10"
 sha2 = "0.10"

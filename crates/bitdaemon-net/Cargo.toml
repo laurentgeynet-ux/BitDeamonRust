@@ -19,3 +19,6 @@ futures.workspace = true
 tracing.workspace = true
 url.workspace = true
 rand.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+sha1.workspace = true

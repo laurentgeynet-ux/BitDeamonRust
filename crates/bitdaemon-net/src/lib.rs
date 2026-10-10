@@ -20,6 +20,10 @@
 
 #![forbid(unsafe_code)]
 
+/// `ip_filter.hpp` — IPv4/IPv6 + port range access rules.
+pub mod ip_filter;
+/// `pe_crypto` — MSE/PE: DH-768 key exchange + RC4 (`libTomCrypt`).
+pub mod pe_crypto;
 /// Peer wire framing + message codec (`bt_peer_connection` packets).
 pub mod peer_wire;
 /// `aux_/socket_io.hpp` — BE wire helpers + endpoint codec.

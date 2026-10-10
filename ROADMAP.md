@@ -156,9 +156,10 @@ keepalive, `receive_buffer`, `chained_buffer` → `BytesMut`),
 `pe_crypto` (MSE/PE, RC4 via crate), `socket`/`socket_type` →
 `AsyncSocket` trait + `enum Socket`, `instantiate_connection`,
 `socks5_stream`, `http_stream`, `ssl_stream` (rustls — see ADR-0007),
-`i2p_stream` (deferred to Phase 8?), `resolver`, `ip_filter`,
+`i2p_stream` (deferred to Phase 8?), `resolver`, `ip_filter` ✅,
+`pe_crypto` (DH-768 + RC4, MSE constants) ✅,
 `ip_voter`, `ip_notifier`, `enum_net`, `parse_url`, `escape_string`,
-`utf8`, `socket_io`, `bandwidth_limit`/`bandwidth_manager`/
+`utf8`, `socket_io` ✅, `bandwidth_limit`/`bandwidth_manager`/
 `bandwidth_queue_entry` (shared with session crate — decide home).
 
 `bitdaemon-session` (partial): `PiecePicker`, `piece_block_progress`,

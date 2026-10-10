@@ -9,6 +9,17 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `bitdaemon_net` Phase-4 wave 2 (filters + MSE crypto):
+  `ip_filter` — `filter_impl<A>` over `BTreeMap` (implicit range ends,
+  zero/plus_one/minus_one/max_addr carry verbatim), `IpFilter` (v4+v6),
+  `PortFilter`, `export_filter` minimal tiling; `test_ip_filter.cpp`
+  → 9/9. `pe_crypto` — `DhKeyExchange` (768-bit safe prime via
+  `num-bigint`, 96-byte BE export, degenerate-key rejection
+  `[2, p-2]`, `req1/req2/req3` derivation), `Rc4` (libTomCrypt KSA/PRGA
+  byte-exact — RFC 6229 vectors at 1024/4096 pass for all key sizes and
+  every call-split), `Rc4Handler` (1024-byte keystream discard,
+  `keyA/keyB` direction swap verbatim).
+
 - `bitdaemon_net` Phase-4 wave 1 (peer wire codec):
   `peer_wire` — 68-byte handshake (`write_handshake`/`parse_handshake`,
   reserved bits verbatim: DHT r7|0x01, BEP-10 r5|0x10, FAST r7|0x04,
