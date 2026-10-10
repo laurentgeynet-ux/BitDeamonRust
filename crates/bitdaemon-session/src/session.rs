@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bitdaemon_common::types::{PeerRequest, PieceIndex, StorageIndex};
 use bitdaemon_common::{Bitfield, Sha1Hash};
@@ -96,6 +96,10 @@ pub struct Session {
     /// completions pushed by disk-job callbacks (any thread).
     disk_tx: std::sync::mpsc::Sender<DiskCompleted>,
     disk_rx: std::sync::mpsc::Receiver<DiskCompleted>,
+    /// `m_cookie` — filters our own multicast loopback (LSD).
+    pub lsd_cookie: u32,
+    /// last LSD broadcast.
+    last_lsd: Option<Instant>,
 }
 
 /// A disk job's result, delivered back onto the session thread.
@@ -162,6 +166,8 @@ impl Default for Session {
                 use rand::Rng as _;
                 rand::rng().random::<i32>()
             },
+            lsd_cookie: rand::random::<u32>(),
+            last_lsd: None,
             disk_tx,
             disk_rx,
         }
@@ -550,10 +556,61 @@ impl Session {
         self.dht.bind(bind_ip, id, settings);
     }
 
-    /// UDP datagram → dht tracker (any family).
+    /// UDP datagram → dht tracker (any family) — and LSD announces
+    /// (BT-SEARCH isn't a bencoded dict, so the dht drops it first).
     pub fn on_udp(&mut self, from: SocketAddr, buf: &[u8], out: &mut Vec<SessionOut>) {
         if let Some((pkt, to)) = self.dht.incoming(from, buf) {
             out.push(SessionOut::UdpPacket(pkt, to));
+            return;
+        }
+        if let Some(a) = bitdaemon_net::lsd::process_packet(buf, from, self.lsd_cookie) {
+            for ih_raw in a.info_hashes {
+                let Some(ih) = Sha1Hash::from_bytes(&ih_raw) else {
+                    continue;
+                };
+                if let Some(t) = self.torrents.get_mut(&ih) {
+                    if t.private {
+                        continue;
+                    }
+                    let ep = SocketAddr::new(from.ip(), a.port);
+                    t.peer_list
+                        .add_peer(ep, bitdaemon_common::flags::PeerSourceFlags::LSD, true);
+                }
+            }
+        }
+        let _ = out;
+    }
+
+    /// `lsd::announce` cadence — every 5 min per non-private
+    /// torrent, one datagram per multicast group.
+    pub fn lsd_tick(&mut self, now: Instant, out: &mut Vec<SessionOut>) {
+        const LSD_INTERVAL: Duration = Duration::from_secs(300);
+        if self
+            .last_lsd
+            .is_some_and(|t| now.duration_since(t) < LSD_INTERVAL)
+        {
+            return;
+        }
+        self.last_lsd = Some(now);
+        for t in self.torrents.values() {
+            if t.private {
+                continue;
+            }
+            let hex = bitdaemon_common::hex::to_hex(t.info_hash.as_bytes());
+            for v6 in [false, true] {
+                let pkt = bitdaemon_net::lsd::render_lsd_packet(
+                    self.listen_port,
+                    &hex,
+                    self.lsd_cookie,
+                    v6,
+                );
+                let to = if v6 {
+                    SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR6.into(), 6771)
+                } else {
+                    SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR4.into(), 6771)
+                };
+                out.push(SessionOut::UdpPacket(pkt, to));
+            }
         }
     }
 
@@ -564,6 +621,7 @@ impl Session {
         while let Some((pkt, to)) = self.dht.poll() {
             out.push(SessionOut::UdpPacket(pkt, to));
         }
+        self.lsd_tick(Instant::now(), out);
         let ihs: Vec<Sha1Hash> = self
             .torrents
             .iter()

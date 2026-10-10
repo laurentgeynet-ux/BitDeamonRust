@@ -141,3 +141,34 @@ fn hash_mismatch_fails_piece() {
     s.drain_disk_completed(&mut out);
     assert!(!s.torrents[&ih].have.get_bit(0));
 }
+
+#[test]
+fn lsd_emit_and_receive() {
+    use bitdaemon_net::lsd::{LSD_ADDR4, LSD_PORT, render_lsd_packet};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let mut s = Session::new();
+    let ih = Sha1Hash::from_bytes(&[7; 20]).unwrap();
+    s.add_torrent(Torrent::new(
+        ih,
+        1,
+        16384,
+        bitdaemon_common::Bitfield::with_size(1),
+        StorageIndex(0),
+    ));
+    // our announce goes to both multicast groups
+    let mut out = Vec::new();
+    s.lsd_tick(std::time::Instant::now(), &mut out);
+    let v4 = out.iter().find(|e| matches!(e, SessionOut::UdpPacket(_, a) if *a == SocketAddr::new(IpAddr::V4(LSD_ADDR4), LSD_PORT)));
+    assert!(v4.is_some());
+
+    // a remote announces our ih on its own port → swarm learns it
+    let hex = bitdaemon_common::hex::to_hex(ih.as_bytes());
+    let pkt = render_lsd_packet(5555, &hex, 0xBEEF, false);
+    let from = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 7)), 40000);
+    s.on_udp(from, &pkt, &mut Vec::new());
+    let t = &s.torrents[&ih];
+    assert_eq!(t.peer_list.num_peers(), 1);
+    let p = &t.peer_list.peers()[0];
+    assert_eq!(p.ip().map(|a| a.port()), Some(5555));
+}

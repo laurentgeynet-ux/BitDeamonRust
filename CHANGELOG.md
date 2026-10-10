@@ -7,6 +7,14 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added
+
+- LSD (BEP-14) côté session : `Session::lsd_tick` (annonces multicast
+  v4+v6 toutes les 5 min, port d'écoute, cookie) et réception dans
+  `Session::on_udp` → `peer_list.add_peer` avec `PeerSourceFlags::LSD`.
+  `Torrent::private` (BEP-27) désactive l'émission LSD et l'ajout de
+  pairs LSD/PEX — fidèle à `torrent::is_private` upstream.
+
 ### Ajouté
 - `ut_pex` câblé : `PeerConn.remote`/`pex_sent`, `Session::peer_connected` prend l'endpoint, dispatch entrant sur `local_ut_pex`/`local_ut_metadata` (ids qu'on annonce vs ids du remote), `Torrent::on_pex_packet` → `peer_list`, `pex_tick` (diff 60 s vers les pairs ut_pex).
 - Dispatch BEP-10/9/11 dans `PeerConn` : handshake étendu parsé (`ext_ut_metadata`, `ext_ut_pex`, `metadata_size`, `upload_only`, `v`), effets `ExtHandshake`/`MetadataPacket`/`PexPacket`.

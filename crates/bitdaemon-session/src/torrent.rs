@@ -104,6 +104,8 @@ pub struct Torrent {
     pub local_ut_metadata_id: u8,
     /// `m_magnet_link` — added without metadata.
     pub magnet: bool,
+    /// `m_private` (BEP-27) — disables LSD/PEX/DHT peer discovery.
+    pub private: bool,
     /// `smart_ban` plugin state (`extensions/smart_ban.cpp`).
     pub smart_ban: SmartBan,
     /// `m_auto_managed` — queue promotion/demotion is the
@@ -150,6 +152,7 @@ impl Torrent {
             metadata_raw: None,
             local_ut_metadata_id: 1,
             magnet: false,
+            private: false,
             smart_ban: SmartBan::new(),
             auto_managed: true,
             last_pex: None,
