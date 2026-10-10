@@ -70,5 +70,9 @@ pub struct PeerWireCodec;
 pub mod bep10;
 /// `aux_/http_stream` — HTTP CONNECT proxy handshake.
 pub mod http_stream;
+/// `http_tracker_connection` — announce query + response parsing.
+pub mod http_tracker;
 /// `socks5_stream` — SOCKS4/5 handshake over any async stream.
 pub mod socks;
+/// `udp_tracker_connection` — BEP-15 announce/scrape over `DatagramSocket`.
+pub mod udp_tracker;

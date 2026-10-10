@@ -258,3 +258,244 @@ fn bep10_parse_garbage() {
     assert!(ExtendedHandshake::parse(b"not bencode").is_none());
     assert!(ExtendedHandshake::parse(b"i42e").is_none()); // not a dict
 }
+
+// ---------- udp_tracker (BEP-15) ----------
+
+use bitdaemon_net::transport::DatagramSocket;
+use bitdaemon_net::udp_tracker::*;
+use std::sync::Mutex;
+use std::time::Duration;
+
+#[derive(Debug, Default)]
+struct FakeTracker {
+    sent: Mutex<Vec<(Vec<u8>, SocketAddr)>>,
+    replies: Mutex<Vec<Vec<u8>>>,
+}
+
+impl DatagramSocket for FakeTracker {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> bitdaemon_net::transport::BoxFut<'a, usize> {
+        self.sent.lock().unwrap().push((buf.to_vec(), target));
+        Box::pin(async move { Ok(buf.len()) })
+    }
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> bitdaemon_net::transport::BoxFut<'a, (usize, SocketAddr)> {
+        Box::pin(async move {
+            let r = self.replies.lock().unwrap().remove(0);
+            let n = r.len().min(buf.len());
+            buf[..n].copy_from_slice(&r[..n]);
+            Ok((n, SocketAddr::from(([127, 0, 0, 1], 9999))))
+        })
+    }
+    fn local_addr(&self) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 0))
+    }
+}
+
+fn announce_req() -> AnnounceRequest {
+    AnnounceRequest {
+        info_hash: [0xaa; 20],
+        peer_id: [0xbb; 20],
+        downloaded: 0,
+        left: 1_000_000,
+        uploaded: 0,
+        event: 2, // started
+        announce_ip: Ipv4Addr::UNSPECIFIED,
+        key: 0x1234,
+        num_want: 50,
+        listen_port: 6881,
+        request_string: String::new(),
+    }
+}
+
+#[test]
+fn udp_wire_build() {
+    let c = build_connect(0xdeadbeef);
+    assert_eq!(&c[..8], &0x417_2710_1980u64.to_be_bytes());
+    assert_eq!(&c[8..12], &0i32.to_be_bytes());
+    assert_eq!(&c[12..16], &0xdeadbeefu32.to_be_bytes());
+
+    let a = build_announce(0x1122_3344_5566_7788, 0x99, &announce_req());
+    assert_eq!(a.len(), 98);
+    assert_eq!(&a[..8], &0x1122_3344_5566_7788u64.to_be_bytes());
+    assert_eq!(&a[8..12], &1i32.to_be_bytes()); // action announce
+    assert_eq!(&a[12..16], &0x99u32.to_be_bytes());
+    assert_eq!(&a[16..36], &[0xaa; 20]); // info_hash
+    assert_eq!(&a[36..56], &[0xbb; 20]); // peer_id
+    assert_eq!(&a[96..98], &6881u16.to_be_bytes());
+}
+
+#[tokio::test]
+async fn udp_announce_flow() {
+    let tracker = FakeTracker::default();
+    // reply to connect: [0][any tid][conn_id] — tid is random so we
+    // echo back the one in the request: emulate by replying after send
+    // (fake inspects the sent packet)
+    // simpler: pre-program replies — connect reply uses tid 0x0f0f0f0f? we can't
+    // know the random tid. Use a scripted responder instead:
+    let t = tracker.local_addr();
+    let req = announce_req();
+
+    // scripted server that reads the incoming packet tid
+    #[derive(Debug)]
+    struct Echo {
+        local: SocketAddr,
+        sent: Mutex<Vec<Vec<u8>>>,
+        inner: Mutex<Vec<Vec<u8>>>,
+    }
+    impl DatagramSocket for Echo {
+        fn send_to<'a>(
+            &'a self,
+            buf: &'a [u8],
+            _t: SocketAddr,
+        ) -> bitdaemon_net::transport::BoxFut<'a, usize> {
+            let tid = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+            let reply = if i32::from_be_bytes(buf[8..12].try_into().unwrap()) == ACTION_CONNECT {
+                // connect response: [0][tid][conn_id]
+                let mut r = Vec::with_capacity(16);
+                r.extend(ACTION_CONNECT.to_be_bytes());
+                r.extend(tid.to_be_bytes());
+                r.extend(0x7777_8888u64.to_be_bytes());
+                r
+            } else {
+                // announce response: [1][tid][interval][incomplete][complete][peers]
+                let mut r = Vec::new();
+                r.extend(ACTION_ANNOUNCE.to_be_bytes());
+                r.extend(tid.to_be_bytes());
+                r.extend(1800i32.to_be_bytes());
+                r.extend(7i32.to_be_bytes()); // leechers
+                r.extend(3i32.to_be_bytes()); // seeders
+                r.extend([10, 0, 0, 5]); // peer ip
+                r.extend(51413u16.to_be_bytes());
+                r
+            };
+            self.inner.lock().unwrap().push(reply);
+            self.sent.lock().unwrap().push(buf.to_vec());
+            Box::pin(async move { Ok(buf.len()) })
+        }
+        fn recv_from<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> bitdaemon_net::transport::BoxFut<'a, (usize, SocketAddr)> {
+            Box::pin(async move {
+                let r = self.inner.lock().unwrap().remove(0);
+                buf[..r.len()].copy_from_slice(&r);
+                Ok((r.len(), SocketAddr::from(([127, 0, 0, 1], 9999))))
+            })
+        }
+        fn local_addr(&self) -> SocketAddr {
+            self.local
+        }
+    }
+    let echo = Echo {
+        local: t,
+        sent: Mutex::new(vec![]),
+        inner: Mutex::new(vec![]),
+    };
+    let resp = udp_announce(&echo, t, &req, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(resp.interval, 1800);
+    assert_eq!(resp.complete, 3);
+    assert_eq!(resp.incomplete, 7);
+    assert_eq!(resp.peers, vec![SocketAddr::from(([10, 0, 0, 5], 51413))]);
+    // two datagrams sent: connect + announce
+    assert_eq!(echo.sent.lock().unwrap().len(), 2);
+    assert_eq!(
+        echo.sent.lock().unwrap()[1][..8].to_vec(),
+        0x7777_8888u64.to_be_bytes()
+    );
+}
+
+// ---------- http_tracker (announce/response) ----------
+
+use bitdaemon_net::http_tracker::*;
+
+#[test]
+fn announce_query_format() {
+    let q = announce_query(
+        &[0xaa; 20],
+        &[0xbb; 20],
+        6881,
+        0,
+        500,
+        1_000_000,
+        2, // started
+        50,
+        0x1234,
+        true,
+        true,
+        Some(b"tid42"),
+    );
+    assert!(q.contains("port=6881"));
+    assert!(q.contains("downloaded=500"));
+    assert!(q.contains("left=1000000"));
+    assert!(q.contains("event=started"));
+    assert!(q.contains("numwant=50"));
+    assert!(q.contains("key=1234"));
+    assert!(q.contains("compact=1"));
+    assert!(q.contains("no_peer_id=1"));
+    assert!(q.contains("trackerid=tid42"));
+    assert!(q.contains("info_hash=%aa%aa%aa"));
+}
+
+fn dict_resp(body: &[u8]) -> TrackerResponse {
+    parse_response(body, false, None).unwrap()
+}
+
+#[test]
+fn response_compact() {
+    // d8:intervali1800e8:completei3e10:incompletei7e5:peers6:...
+    let mut body = b"d8:intervali1800e8:completei3e10:incompletei7e5:peers6:".to_vec();
+    body.extend([10, 0, 0, 5]);
+    body.extend(51413u16.to_be_bytes());
+    body.push(b'e');
+    let r = dict_resp(&body);
+    assert_eq!(r.interval, 1800);
+    assert_eq!(r.complete, 3);
+    assert_eq!(r.incomplete, 7);
+    assert_eq!(r.peers, vec![SocketAddr::from(([10, 0, 0, 5], 51413))]);
+}
+
+#[test]
+fn response_dict_peers() {
+    let body =
+        b"d8:intervali60e5:peersld2:ip9:127.0.0.17:peer id20:ABCDEFGHIJKLMNOPQRST4:porti6881eeee";
+    let r = dict_resp(body);
+    assert_eq!(r.peers, vec![SocketAddr::from(([127, 0, 0, 1], 6881))]);
+    assert_eq!(r.peer_ids[0].as_deref(), Some(&b"ABCDEFGHIJKLMNOPQRST"[..]));
+}
+
+#[test]
+fn response_failure() {
+    let body = b"d14:failure reason23:not authorized to announcee";
+    let err = parse_response(body, false, None).unwrap_err();
+    assert!(matches!(err, HttpTrackerError::Failure(_)));
+}
+
+#[test]
+fn response_scrape() {
+    let mut body = b"d5:filesd20:".to_vec();
+    body.extend([0xaa; 20]);
+    body.extend(b"d8:completei9e10:downloadedi4e10:incompletei2eeee");
+    let r = parse_response(&body, true, Some(&[0xaa; 20])).unwrap();
+    assert_eq!(r.complete, 9);
+    assert_eq!(r.downloaded, 4);
+    assert_eq!(r.incomplete, 2);
+}
+
+#[test]
+fn response_v6() {
+    let mut body = b"d6:peers618:".to_vec();
+    body.extend([0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    body.extend(6881u16.to_be_bytes());
+    body.push(b'e');
+    let r = dict_resp(&body);
+    assert_eq!(r.peers.len(), 1);
+    assert!(r.peers[0].is_ipv6());
+}

@@ -13,6 +13,13 @@ Until `1.0.0`, breaking changes may occur in any release.
   sub-negotiation, CONNECT/UDP-ASSOCIATE, bound-address drain) as an
   `async fn` over `AsyncRead + AsyncWrite` — identical wire protocol,
   works over injected streams.
+- `udp_tracker` — BEP-15 tracker protocol: `build_connect` /
+  `build_announce` / `build_scrape` wire packets, tid-matched reply
+  parsing (v4/v6 peer strides, tracker errors), and `udp_announce`
+  driving connect→announce over the injectable `DatagramSocket`.
+- `http_tracker` — announce query builder (`announce_query`) and
+  `on_response` parser (compact `peers`/`peers6`, dict-list peers,
+  scrape `files` entries, failure/warning, external ip).
 - `bep10` — BEP-10 extended handshake: `ExtendedHandshake`
   build/parse (extension `m` map, `p`, `v`, `yourip`, `reqq`,
   `complete_ago`, `upload_only`, `share_mode`, `metadata_size`,
