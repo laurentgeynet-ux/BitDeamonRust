@@ -1241,6 +1241,9 @@ impl Torrent {
                 PeerEffect::ExtHandshake => {
                     // peer just advertised ut_metadata — ask right away
                     self.metadata_tick_peer(peer_id, out);
+                    // v2: peers that know `hash_request` can fill
+                    // missing merkle layers (`maybe_send_hash_request`).
+                    self.maybe_send_hash_request(peer_id, out);
                 }
                 PeerEffect::MetadataPacket(body) => {
                     self.on_metadata_packet(peer_id, &body, out);
