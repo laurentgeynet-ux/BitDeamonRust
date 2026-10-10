@@ -46,6 +46,13 @@ pub struct PeerConn {
     pub ext_holepunch: u8,
     /// `lt_donthave` id.
     pub ext_dont_have: u8,
+    /// `ut_metadata` id (BEP-9) — the id the REMOTE expects when we
+    /// send ut_metadata messages.
+    pub ext_ut_metadata: u8,
+    /// `ut_pex` id (BEP-11).
+    pub ext_ut_pex: u8,
+    /// `metadata_size` the remote advertised (its info dict size).
+    pub metadata_size: Option<i64>,
     /// `m_upload_only` — remote told us it's upload-only.
     pub remote_upload_only: bool,
     /// `m_client_version` — remote's `v` string.
@@ -78,6 +85,9 @@ impl PeerConn {
             ext_upload_only: 0,
             ext_holepunch: 0,
             ext_dont_have: 0,
+            ext_ut_metadata: 0,
+            ext_ut_pex: 0,
+            metadata_size: None,
             remote_upload_only: false,
             client_version: Vec::new(),
             upload_queue: Vec::new(),
@@ -305,6 +315,30 @@ impl PeerConn {
             M::AllowedFast(i) => self.on_allowed_fast(i),
             M::SuggestPiece(i) => self.on_suggest(i),
             M::DhtPort(p) => eff.push(PeerEffect::DhtPort(p)),
+            M::Extended { id, ref data } => {
+                if id == 0 {
+                    // BEP-10 handshake — learn the remote's ext ids
+                    if let Some(hs) = bitdaemon_net::bep10::ExtendedHandshake::parse(data) {
+                        let ids = hs.remote_ids();
+                        self.ext_upload_only = ids.upload_only;
+                        self.ext_holepunch = ids.holepunch;
+                        self.ext_dont_have = ids.dont_have;
+                        self.ext_ut_metadata =
+                            hs.messages.get("ut_metadata").copied().unwrap_or(0) as u8;
+                        self.ext_ut_pex = hs.messages.get("ut_pex").copied().unwrap_or(0) as u8;
+                        self.metadata_size = hs.metadata_size;
+                        self.remote_upload_only = hs.upload_only;
+                        if let Some(v) = hs.client_version {
+                            self.client_version = v;
+                        }
+                        eff.push(PeerEffect::ExtHandshake);
+                    }
+                } else if id == self.ext_ut_metadata && self.ext_ut_metadata != 0 {
+                    eff.push(PeerEffect::MetadataPacket(data.to_vec()));
+                } else if id == self.ext_ut_pex && self.ext_ut_pex != 0 {
+                    eff.push(PeerEffect::PexPacket(data.to_vec()));
+                }
+            }
             _ => {}
         }
     }
@@ -487,6 +521,12 @@ pub enum PeerEffect {
     MaybePick,
     /// BEP-5 port announcement.
     DhtPort(u16),
+    /// BEP-10 extended handshake received.
+    ExtHandshake,
+    /// a `ut_metadata` message body (dict + optional payload).
+    MetadataPacket(Vec<u8>),
+    /// a `ut_pex` message body.
+    PexPacket(Vec<u8>),
     /// protocol violation — drop the connection.
     Disconnect(&'static str),
 }

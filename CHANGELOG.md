@@ -8,6 +8,8 @@ Until `1.0.0`, breaking changes may occur in any release.
 ## [Unreleased]
 
 ### Ajouté
+- Dispatch BEP-10/9/11 dans `PeerConn` : handshake étendu parsé (`ext_ut_metadata`, `ext_ut_pex`, `metadata_size`, `upload_only`, `v`), effets `ExtHandshake`/`MetadataPacket`/`PexPacket`.
+- `Torrent` : `on_metadata_packet` (sert notre info dict via `metadata_raw`, rejette sans métadonnées), `metadata_tick`/`metadata_tick_peer` (demande la prochaine pièce aux pairs ayant `ut_metadata`), `set_metadata` conserve le dict brut ; `Session::tick` appelle `metadata_tick`. Magnet résolu e2e (handshake → request → piece → `set_metadata`).
 - `UtpAcceptor` : `PeerAcceptor` uTP — `UtpManager` route les ST_SYN orphelins vers une file d'écoute (`set_listener`), `accept_syn` crée le socket répondeur (`send_id` = conn-id du SYN, `recv_id` +1 — sémantique upstream), pompe dédiée, handshake+echo testés en duplex complet sur datagrammes injectés.
 - `Engine::start_udp_pump` : pompe datagramme → `session.on_udp` (DHT, réponses tracker UDP) ; `Session::enable_dht` (`start_dht` upstream) — round-trip ping DHT testé de bout en bout via socket injectée.
 - `PeerConnector::connect_dest` : connexion par destination texte (`host:port` par défaut ; surchargeable pour les adresses non-IP).

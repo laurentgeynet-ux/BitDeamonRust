@@ -94,6 +94,12 @@ pub struct Torrent {
     pub piece_priority_dirty: bool,
     /// `ut_metadata` download state — magnet-added torrents only.
     pub metadata_tracker: UtMetadataTracker,
+    /// raw info dict (the bytes `ut_metadata` serves). Set by
+    /// `set_metadata`/`from_params`.
+    pub metadata_raw: Option<Vec<u8>>,
+    /// our local extension id for `ut_metadata` (the id WE put in
+    /// our handshake; peers address it back).
+    pub local_ut_metadata_id: u8,
     /// `m_magnet_link` — added without metadata.
     pub magnet: bool,
     /// `smart_ban` plugin state (`extensions/smart_ban.cpp`).
@@ -137,6 +143,8 @@ impl Torrent {
             want_peers: true,
             piece_priority_dirty: false,
             metadata_tracker: UtMetadataTracker::new(),
+            metadata_raw: None,
+            local_ut_metadata_id: 1,
             magnet: false,
             smart_ban: SmartBan::new(),
             auto_managed: true,
@@ -236,6 +244,7 @@ impl Torrent {
                 .map(|i| info.hash_for_piece(PieceIndex(i)))
                 .collect(),
         );
+        self.metadata_raw = Some(metadata.to_vec());
         self.magnet = false;
         self.init_picker(true);
         true
@@ -264,6 +273,100 @@ impl Torrent {
             self.metadata_tracker.set_source(piece, peer);
         }
         r
+    }
+
+    /// `on_metadata` dispatch — a `ut_metadata` body arrived:
+    /// `request` → serve our info dict (or reject); `data` → feed
+    /// the tracker (complete → `set_metadata`, bad hash →
+    /// `reset_on_hash_failure`); `reject` → ignored (the scheduler
+    /// retries per `metadata_request` backoff).
+    fn on_metadata_packet(&mut self, peer: u64, body: &[u8], out: &mut Vec<TorrentEffect>) {
+        let Some((msg, piece, total, data)) = crate::ut_metadata::parse_metadata_packet(body)
+        else {
+            return;
+        };
+        match msg {
+            crate::ut_metadata::MetadataMsg::Request => {
+                let resp = match &self.metadata_raw {
+                    Some(md) => crate::ut_metadata::metadata_packet(
+                        crate::ut_metadata::MetadataMsg::Piece,
+                        piece as i32,
+                        true,
+                        md,
+                    ),
+                    None => crate::ut_metadata::metadata_packet(
+                        crate::ut_metadata::MetadataMsg::Reject,
+                        piece as i32,
+                        false,
+                        &[],
+                    ),
+                };
+                out.push(TorrentEffect::SendTo {
+                    peer,
+                    msg: PeerMessage::Extended {
+                        id: self.local_ut_metadata_id,
+                        data: resp.into(),
+                    },
+                });
+            }
+            crate::ut_metadata::MetadataMsg::Piece => {
+                let r = self.on_ut_metadata_data(data, piece as i32, total, peer, 30 * 1024 * 1024);
+                if matches!(r, MetadataResult::Complete) {
+                    let md = self.metadata_tracker.metadata().to_vec();
+                    if self.set_metadata(&md, &LoadTorrentLimits::default()) {
+                        self.metadata_tracker.clear();
+                    } else {
+                        self.metadata_tracker.reset_on_hash_failure();
+                    }
+                }
+            }
+            crate::ut_metadata::MetadataMsg::Reject => {}
+        }
+    }
+
+    /// `ut_metadata_plugin` tick — while metadata is missing, ask
+    /// peers that advertised `ut_metadata` for the next piece.
+    pub fn metadata_tick(&mut self, out: &mut Vec<TorrentEffect>) {
+        if self.piece_hashes.is_some() {
+            return;
+        }
+        let ids: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|(_, c)| c.ext_ut_metadata != 0 && c.metadata_size.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.metadata_tick_peer(id, out);
+        }
+    }
+
+    /// ask `peer` for the next needed metadata piece.
+    fn metadata_tick_peer(&mut self, peer: u64, out: &mut Vec<TorrentEffect>) {
+        if self.piece_hashes.is_some() {
+            return;
+        }
+        let ext = self.peers.get(&peer).map_or(0, |c| c.ext_ut_metadata);
+        if ext == 0 {
+            return;
+        }
+        let piece = self.metadata_request();
+        if piece < 0 {
+            return;
+        }
+        let body = crate::ut_metadata::metadata_packet(
+            crate::ut_metadata::MetadataMsg::Request,
+            piece,
+            false,
+            &[],
+        );
+        out.push(TorrentEffect::SendTo {
+            peer,
+            msg: PeerMessage::Extended {
+                id: ext,
+                data: body.into(),
+            },
+        });
     }
 
     /// `metadata_request` — which ut_metadata piece to ask for next
@@ -640,6 +743,14 @@ impl Torrent {
                     }
                 }
                 PeerEffect::MaybePick => self.drive_peer(peer_id, out),
+                PeerEffect::ExtHandshake => {
+                    // peer just advertised ut_metadata — ask right away
+                    self.metadata_tick_peer(peer_id, out);
+                }
+                PeerEffect::MetadataPacket(body) => {
+                    self.on_metadata_packet(peer_id, &body, out);
+                }
+                PeerEffect::PexPacket(_body) => {}
                 PeerEffect::DhtPort(_) => {}
                 PeerEffect::Disconnect(r) => {
                     out.push(TorrentEffect::DisconnectPeer {

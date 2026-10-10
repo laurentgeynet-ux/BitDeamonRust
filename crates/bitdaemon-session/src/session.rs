@@ -564,6 +564,7 @@ impl Session {
         for ih in ihs {
             let mut eff = Vec::new();
             if let Some(t) = self.torrents.get_mut(&ih) {
+                t.metadata_tick(&mut eff);
                 for id in t.peers.keys().copied().collect::<Vec<_>>() {
                     t.drive_peer(id, &mut eff);
                 }
