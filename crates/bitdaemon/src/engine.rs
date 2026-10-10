@@ -37,6 +37,8 @@ struct AnnounceDone {
     ih: Sha1Hash,
     url: String,
     result: Result<bitdaemon_net::http_tracker::TrackerResponse, String>,
+    /// `scrape_request` — routes to `on_scrape_response`.
+    scrape: bool,
 }
 
 /// An inbound peer message, tagged with its stream's peer id.
@@ -323,7 +325,11 @@ impl Engine {
             self.session.peer_disconnected(&ih, peer, &mut out);
         }
         while let Ok(a) = self.announce_rx.try_recv() {
-            self.session.on_announce_response(&a.ih, &a.url, a.result);
+            if a.scrape {
+                self.session.on_scrape_response(&a.ih, &a.url, a.result);
+            } else {
+                self.session.on_announce_response(&a.ih, &a.url, a.result);
+            }
         }
         while let Ok((from, buf)) = self.udp_rx.try_recv() {
             // demux: NAT-PMP replies come from the gateway :5351 —
@@ -416,6 +422,9 @@ impl Engine {
                         }
                     }));
                 }
+                SessionOut::TrackerScrape { ih, url } => {
+                    self.spawn_scrape(ih, url);
+                }
                 SessionOut::Torrent(e) => {
                     if let bitdaemon_session::torrent::TorrentEffect::DisconnectPeer {
                         peer,
@@ -452,6 +461,7 @@ impl Engine {
                             ih,
                             url,
                             result: Err("no datagram transport injected".into()),
+                            scrape: false,
                         });
                         return;
                     };
@@ -541,7 +551,110 @@ impl Engine {
                 }
                 Err(e) => Err(format!("bad tracker url {url}: {e}")),
             };
-            let _ = tx.send(AnnounceDone { ih, url, result });
+            let _ = tx.send(AnnounceDone {
+                ih,
+                url,
+                result,
+                scrape: false,
+            });
+        });
+        self.tasks.push(handle);
+    }
+
+    /// `scrape_request` — one scrape exchange (http scrape-url or
+    /// udp action 2), result routed to `on_scrape_response`.
+    fn spawn_scrape(&mut self, ih: Sha1Hash, url: String) {
+        let tx = self.announce_tx.clone();
+        let connector = self.connector.clone();
+        let datagram = self.datagram.clone();
+        let resolver = self.resolver.clone();
+        self.tasks_forget();
+        let handle = tokio::spawn(async move {
+            let result = match bitdaemon_net::parse_url::parse_url_components(&url) {
+                Ok(c) if c.protocol == "udp" => {
+                    let Some(dg) = datagram else {
+                        let _ = tx.send(AnnounceDone {
+                            ih,
+                            url,
+                            result: Err("no datagram transport injected".into()),
+                            scrape: true,
+                        });
+                        return;
+                    };
+                    let port = u16::try_from(c.port).unwrap_or(80);
+                    match resolve(&resolver, &c.hostname, port).await {
+                        Ok(addr) => bitdaemon_net::tracker_client::scrape_udp(
+                            dg.as_ref(),
+                            addr,
+                            ih.as_bytes(),
+                            std::time::Duration::from_secs(15),
+                            2,
+                        )
+                        .await
+                        .map(|r| bitdaemon_net::http_tracker::TrackerResponse {
+                            complete: i64::from(r.complete),
+                            incomplete: i64::from(r.incomplete),
+                            downloaded: i64::from(r.downloaded),
+                            ..Default::default()
+                        })
+                        .map_err(|e: AnnounceError| e.to_string()),
+                        Err(e) => Err(e),
+                    }
+                }
+                Ok(_) => {
+                    // http — derive scrape url (`scrape_not_available`
+                    // upstream → hard fail)
+                    let Some(scrape) = bitdaemon_net::http_tracker::scrape_url(&url) else {
+                        let _ = tx.send(AnnounceDone {
+                            ih,
+                            url,
+                            result: Err("scrape not available".into()),
+                            scrape: true,
+                        });
+                        return;
+                    };
+                    let Ok(c) = bitdaemon_net::parse_url::parse_url_components(&scrape) else {
+                        let _ = tx.send(AnnounceDone {
+                            ih,
+                            url,
+                            result: Err("bad scrape url".into()),
+                            scrape: true,
+                        });
+                        return;
+                    };
+                    let port = u16::try_from(c.port).unwrap_or(80);
+                    match resolve(&resolver, &c.hostname, port).await {
+                        Ok(addr) => match connector.connect(addr).await {
+                            Ok(mut s) => {
+                                let host = if c.port < 0 {
+                                    c.hostname.clone()
+                                } else {
+                                    format!("{}:{}", c.hostname, port)
+                                };
+                                bitdaemon_net::tracker_client::scrape_http(
+                                    &mut s,
+                                    &host,
+                                    &c.path,
+                                    ih.as_bytes(),
+                                    &[],
+                                    1024 * 1024,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                            }
+                            Err(e) => Err(format!("connect: {e}")),
+                        },
+                        Err(e) => Err(e),
+                    }
+                }
+                Err(e) => Err(format!("bad tracker url {url}: {e}")),
+            };
+            let _ = tx.send(AnnounceDone {
+                ih,
+                url,
+                result,
+                scrape: true,
+            });
         });
         self.tasks.push(handle);
     }

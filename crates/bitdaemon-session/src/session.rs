@@ -72,6 +72,16 @@ pub enum SessionOut {
         /// announce parameters (event, counters, key).
         params: bitdaemon_net::tracker_client::AnnounceParams,
     },
+    /// `scrape_tracker` — user-triggered scrape of one tracker
+    /// entry; the driver runs the scrape exchange and reports via
+    /// `Session::on_scrape_response`.
+    TrackerScrape {
+        /// torrent.
+        ih: Sha1Hash,
+        /// tracker URL (announce form — the driver derives the
+        /// scrape URL / udp action).
+        url: String,
+    },
     /// fetch one batch of blocks from a url seed — the async
     /// driver dials the host via the injected connector and
     /// reports through `Session::on_web_seed_block` /
@@ -1063,6 +1073,60 @@ impl Session {
                     url: e.url.clone(),
                     tracker_id: e.tracker_id.clone(),
                     params: t.announce_params(pid, port, event, key),
+                });
+            }
+        }
+    }
+
+    /// `torrent::scrape_tracker` — request an immediate scrape of
+    /// tracker entry `idx` (upstream: user-triggered, outside the
+    /// announce schedule).
+    pub fn scrape_tracker(&mut self, ih: &Sha1Hash, tracker_idx: usize, out: &mut Vec<SessionOut>) {
+        let Some(t) = self.torrents.get(ih) else {
+            return;
+        };
+        if let Some(e) = t.trackers.trackers.get(tracker_idx) {
+            out.push(SessionOut::TrackerScrape {
+                ih: *ih,
+                url: e.url.clone(),
+            });
+        }
+    }
+
+    /// `on_scrape_response` — update seed/leech counts from a
+    /// scrape (`resp.complete`/`incomplete`), post `scrape_reply`.
+    pub fn on_scrape_response(
+        &mut self,
+        ih: &Sha1Hash,
+        url: &str,
+        resp: Result<bitdaemon_net::http_tracker::TrackerResponse, String>,
+    ) {
+        let Some(t) = self.torrents.get_mut(ih) else {
+            return;
+        };
+        match resp {
+            Ok(r) => {
+                if r.complete >= 0 {
+                    t.num_seeds = r.complete as usize;
+                }
+                if let Some(i) = t.trackers.find(url) {
+                    t.trackers.trackers[i].verified = true;
+                    t.trackers.trackers[i].scrape_downloaded = r.downloaded;
+                    t.trackers.trackers[i].scrape_incomplete = r.incomplete;
+                    t.trackers.trackers[i].scrape_complete = r.complete;
+                }
+                self.alerts.post(Alert::ScrapeReply {
+                    ih: *ih,
+                    url: url.to_string(),
+                    complete: r.complete,
+                    incomplete: r.incomplete,
+                });
+            }
+            Err(e) => {
+                self.alerts.post(Alert::ScrapeFailed {
+                    ih: *ih,
+                    url: url.to_string(),
+                    reason: e,
                 });
             }
         }

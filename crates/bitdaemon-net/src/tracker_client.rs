@@ -171,3 +171,76 @@ pub async fn announce_udp(
     }
     Err(UdpTrackerError::Timeout.into())
 }
+
+/// `scrape_udp` — connect then a single scrape datagram (BEP-15
+/// action 2); `max_tries` round-trip retries like `announce_udp`.
+pub async fn scrape_udp(
+    dgram: &dyn DatagramSocket,
+    tracker: SocketAddr,
+    info_hash: &[u8; 20],
+    timeout: Duration,
+    max_tries: u32,
+) -> Result<crate::udp_tracker::ScrapeResponse, AnnounceError> {
+    use crate::udp_tracker::{
+        build_connect, build_scrape, parse_connect_response, parse_scrape_response,
+    };
+    let mut buf = vec![0u8; 2048];
+    let mut conn_id = None;
+    for _ in 0..max_tries.max(1) {
+        let tid = rand::random::<u32>();
+        let _ = dgram.send_to(&build_connect(tid), tracker).await?;
+        let (n, _from) = tokio::time::timeout(timeout, dgram.recv_from(&mut buf))
+            .await
+            .map_err(|_| UdpTrackerError::Timeout)??;
+        match parse_connect_response(&buf[..n], tid) {
+            Ok(id) => {
+                conn_id = Some(id);
+                break;
+            }
+            Err(UdpTrackerError::Tracker(m)) => return Err(AnnounceError::Failure(m)),
+            Err(UdpTrackerError::UnexpectedReply) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let conn_id = conn_id.ok_or(UdpTrackerError::Timeout)?;
+    for _ in 0..max_tries.max(1) {
+        let tid = rand::random::<u32>();
+        let pkt = build_scrape(conn_id, tid, &[*info_hash]);
+        let _ = dgram.send_to(&pkt, tracker).await?;
+        let (n, _from) = tokio::time::timeout(timeout, dgram.recv_from(&mut buf))
+            .await
+            .map_err(|_| UdpTrackerError::Timeout)??;
+        match parse_scrape_response(&buf[..n], tid) {
+            Ok(mut v) => {
+                return v
+                    .pop()
+                    .ok_or(AnnounceError::Udp(UdpTrackerError::BadLength));
+            }
+            Err(UdpTrackerError::Tracker(m)) => return Err(AnnounceError::Failure(m)),
+            Err(UdpTrackerError::UnexpectedReply) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(UdpTrackerError::Timeout.into())
+}
+
+/// `scrape_http` — GET the scrape url with `info_hash`, parse the
+/// `files`/`info_hash` dict (upstream maps it onto the same
+/// `tracker_response` fields).
+pub async fn scrape_http(
+    s: &mut BoxedPeerStream,
+    host: &str,
+    base_path: &str,
+    info_hash: &[u8; 20],
+    extra_headers: &[(String, String)],
+    max_response: usize,
+) -> Result<TrackerResponse, AnnounceError> {
+    let q = crate::http_tracker::scrape_query(info_hash);
+    let sep = if base_path.contains('?') { "&" } else { "?" };
+    let path = format!("{base_path}{sep}{q}");
+    let resp = http_get(s, &path, host, extra_headers, max_response).await?;
+    parse_response(&resp.body(), true, Some(info_hash)).map_err(|e| match e {
+        HttpTrackerError::Failure(m) => AnnounceError::Failure(m),
+        other => AnnounceError::HttpTracker(other),
+    })
+}

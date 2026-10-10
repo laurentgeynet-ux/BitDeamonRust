@@ -93,6 +93,19 @@ pub enum Alert {
         url: String,
         num_peers: usize,
     },
+    /// `scrape_reply_alert`.
+    ScrapeReply {
+        ih: Sha1Hash,
+        url: String,
+        complete: i64,
+        incomplete: i64,
+    },
+    /// `scrape_failed_alert`.
+    ScrapeFailed {
+        ih: Sha1Hash,
+        url: String,
+        reason: String,
+    },
     /// `file_error_alert` — disk error on a file.
     FileError {
         ih: Sha1Hash,
@@ -124,7 +137,10 @@ impl Alert {
             Self::HashFailed { .. } | Self::FileError { .. } => {
                 AlertCategory::ERROR.or(AlertCategory::STORAGE)
             }
-            Self::TrackerError { .. } | Self::TrackerReply { .. } => AlertCategory::TRACKER,
+            Self::TrackerError { .. }
+            | Self::TrackerReply { .. }
+            | Self::ScrapeReply { .. }
+            | Self::ScrapeFailed { .. } => AlertCategory::TRACKER,
             Self::DhtPacket { .. } => AlertCategory::DHT,
             Self::Performance { .. } => AlertCategory::PERFORMANCE,
             Self::SaveResumeData { .. } => AlertCategory::STORAGE,
@@ -149,7 +165,6 @@ impl AlertCategory {
 /// `alert_manager` — the double-buffered queue + mask + notify
 /// callback (upstream uses a condition variable; the posted
 /// `notify` hook wakes the owning actor instead).
-#[derive(Default)]
 pub struct AlertManager {
     /// `m_alert_mask`.
     mask: AlertCategory,
@@ -161,6 +176,20 @@ pub struct AlertManager {
     notify: Option<Box<dyn Fn() + Send>>,
     /// dropped alerts when the queue overflows (`m_num_dropped`).
     dropped: usize,
+}
+
+impl Default for AlertManager {
+    /// Upstream defaults: `m_alert_mask = all_categories`,
+    /// `alert_queue_size = 1000`.
+    fn default() -> Self {
+        Self {
+            mask: AlertCategory::ALL,
+            queue_limit: 1000,
+            pending: Vec::new(),
+            notify: None,
+            dropped: 0,
+        }
+    }
 }
 
 impl AlertManager {

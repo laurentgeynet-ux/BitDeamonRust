@@ -272,3 +272,20 @@ pub fn parse_response(
     }
     Ok(resp)
 }
+
+/// `http_tracker_connection` scrape URL — replace "announce" with
+/// "scrape" (`errors::scrape_not_available` upstream → `None`).
+#[must_use]
+pub fn scrape_url(url: &str) -> Option<String> {
+    let pos = url.rfind("announce")?;
+    let mut s = url.to_string();
+    s.replace_range(pos..pos + 8, "scrape");
+    Some(s)
+}
+
+/// scrape GET query — just `info_hash` (compact binary per BEP-15
+/// semantics for http scrapes too).
+#[must_use]
+pub fn scrape_query(info_hash: &[u8; 20]) -> String {
+    format!("info_hash={}", escape(info_hash))
+}

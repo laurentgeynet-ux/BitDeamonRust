@@ -117,6 +117,13 @@ pub struct AnnounceEntry {
     pub endpoints: Vec<AnnounceEndpoint>,
     /// `verified` — a working response came back once.
     pub verified: bool,
+    /// scrape results (`complete`/`incomplete`/`downloaded` from
+    /// the last scrape response; -1 = never scraped).
+    pub scrape_complete: i64,
+    /// leechers from the last scrape.
+    pub scrape_incomplete: i64,
+    /// completed downloads from the last scrape.
+    pub scrape_downloaded: i64,
 }
 
 impl AnnounceEntry {
@@ -133,6 +140,9 @@ impl AnnounceEntry {
                 ..Default::default()
             }],
             verified: false,
+            scrape_complete: -1,
+            scrape_incomplete: -1,
+            scrape_downloaded: -1,
         }
     }
 

@@ -9,6 +9,15 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **Tracker scrape bout-en-bout** — `Session::scrape_tracker` émet
+  `SessionOut::TrackerScrape`, l'engine `spawn_scrape` fait l'échange
+  (HTTP `scrape_url` + `scrape_http`, UDP BEP-15 action 2 via
+  `scrape_udp`) sur les transports injectés, `on_scrape_response`
+  met à jour `num_seeds` + `scrape_{complete,incomplete,downloaded}`
+  et poste `scrape_reply`/`scrape_failed`. Correction d'un bug :
+  `AlertManager::default()` avait mask=0/queue=0 (tout droppé) —
+  défauts upstream `all_categories`/`1000`.
+
 - `.session` persiste `settings` — `SessionSettings` sérialisé en
   dict bencode (`save_settings`/`read_settings`, durées en ms,
   champs manquants → défauts, compatible avant/arrière) et
