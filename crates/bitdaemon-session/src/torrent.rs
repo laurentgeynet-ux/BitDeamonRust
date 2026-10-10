@@ -38,6 +38,9 @@ pub enum TorrentEffect {
     SendTo { peer: u64, msg: PeerMessage },
     /// issue a read job serving a peer's request.
     DiskRead { peer: u64, req: PeerRequest },
+    /// `dht_tracker::add_node` — a peer announced its DHT port;
+    /// ping the node into the routing table.
+    DhtNode(std::net::SocketAddr),
     /// write a downloaded block.
     DiskWrite { req: PeerRequest, data: Vec<u8> },
     /// verify a piece's hash (`verify_piece` — resume restore and
@@ -1150,7 +1153,18 @@ impl Torrent {
                 PeerEffect::PexPacket(body) => {
                     self.on_pex_packet(&body);
                 }
-                PeerEffect::DhtPort(_) => {}
+                PeerEffect::DhtPort(port) => {
+                    // peer's DHT listen port → add the node to the
+                    // routing table (upstream `session_impl::
+                    // on_dht_port` → `m_dht->add_node`).
+                    if let Some(c) = self.peers.get(&peer_id)
+                        && c.supports_dht
+                        && let Some(mut addr) = c.remote
+                    {
+                        addr.set_port(port);
+                        out.push(TorrentEffect::DhtNode(addr));
+                    }
+                }
                 PeerEffect::YourIp(ip) => {
                     out.push(TorrentEffect::YourIp(ip));
                 }

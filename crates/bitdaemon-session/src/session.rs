@@ -1612,6 +1612,9 @@ impl Session {
                     }
                     out.push(SessionOut::ToPeer { ih, peer, msg });
                 }
+                TorrentEffect::DhtNode(addr) => {
+                    self.dht_add_peer_node(addr);
+                }
                 TorrentEffect::DisconnectPeer { peer, reason } => {
                     self.peer_disconnected(&ih, peer, out);
                     self.alerts.post(Alert::PeerDisconnected {
@@ -1737,6 +1740,17 @@ impl Session {
         let v6 = addr.is_ipv6();
         if let Some(n) = self.dht.get_node_mut(v6) {
             n.table.add_router_node(addr);
+        }
+    }
+
+    /// `dht_tracker::add_node` (peer-discovered) — a `DhtPort`
+    /// message's target gets a `ping_only` node entry, not a
+    /// router entry (upstream keeps router nodes distinct).
+    pub fn dht_add_peer_node(&mut self, addr: SocketAddr) {
+        let v6 = addr.is_ipv6();
+        if let Some(n) = self.dht.get_node_mut(v6) {
+            n.table
+                .add_node(bitdaemon_dht::node_entry::NodeEntry::ping_only(addr));
         }
     }
 
