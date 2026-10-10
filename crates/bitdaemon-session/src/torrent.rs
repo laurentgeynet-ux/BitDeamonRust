@@ -19,11 +19,12 @@ use bitdaemon_common::types::{FileIndex, PieceIndex, StorageIndex};
 use bitdaemon_common::{Bitfield, PeerRequest, Sha1Hash};
 
 use bitdaemon_bencode::bdecode_checked;
+use bitdaemon_core::add_torrent_params::AddTorrentParams;
 use bitdaemon_core::torrent_info::{LoadTorrentLimits, TorrentInfo};
 use bitdaemon_net::peer_wire::PeerMessage;
 
 use crate::peer_conn::{PeerConn, PeerEffect};
-use crate::piece_picker::{PickerOptions, PiecePicker};
+use crate::piece_picker::{BlockState, PickerOptions, PiecePicker};
 use crate::smart_ban::{BanDecision, SmartBan};
 use crate::ut_metadata::{MetadataResult, UtMetadataTracker};
 
@@ -37,6 +38,9 @@ pub enum TorrentEffect {
     DiskRead { peer: u64, req: PeerRequest },
     /// write a downloaded block.
     DiskWrite { req: PeerRequest, data: Vec<u8> },
+    /// verify a piece's hash (`verify_piece` — resume restore and
+    /// post-write verification).
+    DiskHash { piece: PieceIndex },
     /// piece passed verification → `have` broadcast pending.
     PiecePassed(PieceIndex),
     /// piece failed verification → re-download.
@@ -209,6 +213,87 @@ impl Torrent {
                 self.piece_length as i32,
             ));
             let _ = now;
+        }
+    }
+
+    /// `write_resume_data` (upstream `torrent::write_resume_data`) —
+    /// snapshot the picker state into `AddTorrentParams` fields.
+    /// `verified`/`have` bitfields, `piece_priorities`, and
+    /// `unfinished_pieces` (downloading pieces with ≥1
+    /// finished/writing block → finished-block bitmask).
+    pub fn to_resume_data(&self, atp: &mut AddTorrentParams) {
+        atp.have_pieces = self.have.clone();
+        atp.verified_pieces = self.have.clone();
+        if let Some(p) = self.picker.as_ref() {
+            atp.piece_priorities = (0..self.num_pieces)
+                .map(|i| p.piece_priority(PieceIndex(i)))
+                .collect();
+            for dp in p.get_download_queue() {
+                if dp.finished == 0 && dp.writing == 0 {
+                    continue;
+                }
+                let mut mask = Bitfield::with_size(p.blocks_in_piece(dp.index) as usize);
+                for (i, b) in p.blocks_for_piece(&dp).iter().enumerate() {
+                    if b.state == BlockState::Finished {
+                        mask.set_bit(i);
+                    }
+                }
+                atp.unfinished_pieces.insert(dp.index.0, mask);
+            }
+        }
+    }
+
+    /// `check_resume` (upstream `torrent::check_resume`) — apply
+    /// `AddTorrentParams` to a torrent whose picker is initialized:
+    /// seed `have`/`verified` bitfields, `piece_priorities`, and
+    /// `mark_as_finished` every bit set in `unfinished_pieces`.
+    /// Returns effects for pieces that just became complete
+    /// (`verify_piece` upstream → we emit `Hash` requests via
+    /// `PieceReady`-style effect: here `HashPiece` alerts).
+    pub fn apply_resume_data(&mut self, atp: &AddTorrentParams, out: &mut Vec<TorrentEffect>) {
+        self.init_picker(false);
+        let picker = self.picker.as_mut();
+        let Some(picker) = picker else { return };
+
+        for i in 0..self.num_pieces.min(atp.verified_pieces.size() as i32) {
+            if atp.verified_pieces.get_bit(i as usize) && !self.have.get_bit(i as usize) {
+                self.have.set_bit(i as usize);
+            }
+        }
+        for (i, prio) in atp.piece_priorities.iter().enumerate() {
+            if i as i32 >= self.num_pieces {
+                break;
+            }
+            picker.set_piece_priority(PieceIndex(i as i32), *prio);
+        }
+        for (piece, blocks) in &atp.unfinished_pieces {
+            let idx = PieceIndex(*piece);
+            if *piece < 0 || *piece >= self.num_pieces || self.have.get_bit(*piece as usize) {
+                continue;
+            }
+            if picker.have_piece(idx) {
+                picker.we_dont_have(idx);
+            }
+            let nbits = picker.blocks_in_piece(idx).min(blocks.size() as i32);
+            for k in 0..nbits {
+                if blocks.get_bit(k as usize) {
+                    picker.mark_as_finished(
+                        PieceBlock {
+                            piece_index: idx,
+                            block_index: k,
+                        },
+                        None,
+                    );
+                }
+            }
+            if picker.is_piece_finished(idx) {
+                // upstream `verify_piece` — needs a hash pass
+                out.push(TorrentEffect::DiskHash { piece: idx });
+            }
+        }
+        if self.have.count() as i32 == self.num_pieces && self.num_pieces > 0 {
+            self.finished = true;
+            self.seeding = true;
         }
     }
 

@@ -178,14 +178,14 @@ impl PiecePos {
 
 /// `block_info` — per-block record inside a downloading piece.
 #[derive(Debug, Clone, Default)]
-struct BlockInfo {
+pub struct BlockInfo {
     /// `peer` — the peer this block was last requested from
     /// (parole / downloader attribution).
-    peer: Option<u64>,
+    pub peer: Option<u64>,
     /// `num_peers:14` — outstanding request count for this block.
-    num_peers: u16,
+    pub num_peers: u16,
     /// `state:2`.
-    state: BlockState,
+    pub state: BlockState,
 }
 
 /// `block_info::state_*`.
@@ -1388,6 +1388,14 @@ impl PiecePicker {
     fn find_dl_piece(&self, queue: DownloadQueue, index: PieceIndex) -> Option<&DownloadingPiece> {
         self.dl_pos(queue, index)
             .map(|i| &self.downloads[queue as usize][i])
+    }
+
+    /// `blocks_for_piece(dp)` — public resume-data accessor: the
+    /// per-block state window of a downloading piece (upstream
+    /// `write_resume_data` iterates it to build the bitmask).
+    #[must_use]
+    pub fn blocks_for_piece(&self, dp: &DownloadingPiece) -> &[BlockInfo] {
+        self.blocks_for(dp.info_idx, dp.index)
     }
 
     /// `blocks_for_piece(dp)` — the block_info window.

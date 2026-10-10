@@ -285,6 +285,29 @@ impl Session {
                         0,
                     );
                 }
+                TorrentEffect::DiskHash { piece } => {
+                    // `verify_piece` — resume restore or explicit
+                    // re-check of a completed piece.
+                    let Some(t) = self.torrents.get(&ih) else {
+                        continue;
+                    };
+                    let storage = t.storage;
+                    let (piece, tx) = (*piece, self.disk_tx.clone());
+                    disk.async_hash(
+                        storage,
+                        piece,
+                        Vec::new(),
+                        0,
+                        Box::new(move |piece, hash, err| {
+                            let _ = tx.send(DiskCompleted::Hash {
+                                ih,
+                                piece,
+                                hash,
+                                err,
+                            });
+                        }),
+                    );
+                }
                 _ => {}
             }
         }

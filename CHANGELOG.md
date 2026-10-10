@@ -7,6 +7,17 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — fastresume glue
+
+- `Torrent::to_resume_data` / `apply_resume_data` — port fidèle de
+  `write_resume_data`/`check_resume` : bitfields verified/have,
+  `piece_priorities`, `unfinished_pieces` (bitmask des blocs
+  Finished) → `mark_as_finished` par bloc ; pièce complète →
+  `TorrentEffect::DiskHash` (`verify_piece`) routé vers
+  `DiskIo::async_hash`.
+- `PiecePicker::blocks_for_piece` public (accès fenêtre block_info
+  pour le dump).
+
 ### Added — peer_list
 
 - `peer_list.rs` — swarm list fidèle : `add_peer`/`update_peer_port`,
