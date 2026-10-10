@@ -285,6 +285,21 @@ impl PeerConn {
         block
     }
 
+    /// `peer_connection::incoming_piece` — was this block actually
+    /// requested (present in request or download queue)?
+    #[must_use]
+    pub fn was_requested(&self, r: &PeerRequest) -> bool {
+        let block = PieceBlock {
+            piece_index: r.piece,
+            block_index: r.start / 0x4000,
+        };
+        self.pipeline
+            .download_queue
+            .iter()
+            .any(|b| b.block == block)
+            || self.pipeline.request_queue.iter().any(|b| b.block == block)
+    }
+
     /// `dispatch` — route a decoded wire message. Returns the
     /// side-effects the torrent layer must run (picker updates,
     /// disk writes, uploads).
@@ -353,6 +368,12 @@ impl PeerConn {
                     start: offset,
                     length: data.len() as i32,
                 };
+                if !self.was_requested(&r) {
+                    // upstream counts unsolicited blocks as invalid
+                    // and drops the payload — never touches disk.
+                    self.num_invalid_requests += 1;
+                    return;
+                }
                 let block = self.on_piece(&r);
                 eff.push(PeerEffect::MarkDownloaded(block));
                 eff.push(PeerEffect::DiskWrite(r, data.to_vec()));
