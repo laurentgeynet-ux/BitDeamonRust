@@ -13,6 +13,11 @@ Until `1.0.0`, breaking changes may occur in any release.
   sub-negotiation, CONNECT/UDP-ASSOCIATE, bound-address drain) as an
   `async fn` over `AsyncRead + AsyncWrite` — identical wire protocol,
   works over injected streams.
+- `bep10` — BEP-10 extended handshake: `ExtendedHandshake`
+  build/parse (extension `m` map, `p`, `v`, `yourip`, `reqq`,
+  `complete_ago`, `upload_only`, `share_mode`, `metadata_size`,
+  `ipv4`/`ipv6` hints) with `[len][0x14][0x00]` wire framing —
+  `write_extensions`/`on_extended_handshake` ported.
 - `http_stream` — HTTP `CONNECT` proxy handshake (`Host` header,
   `Proxy-Authorization: Basic`, byte-wise header terminator scan,
   200-status check) plus `base64_encode`. 7 tests green.

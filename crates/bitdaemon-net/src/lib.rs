@@ -66,6 +66,8 @@ pub type Result<T> = std::result::Result<T, NetError>;
 /// allowed-fast + extension protocol (BEP-10) handshake.
 /// Shape as a `tokio_util::codec::{Encoder, Decoder}`.
 pub struct PeerWireCodec;
+/// BEP-10 extended handshake build/parse + framing.
+pub mod bep10;
 /// `aux_/http_stream` — HTTP CONNECT proxy handshake.
 pub mod http_stream;
 /// `socks5_stream` — SOCKS4/5 handshake over any async stream.

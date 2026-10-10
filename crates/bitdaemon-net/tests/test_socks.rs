@@ -200,3 +200,61 @@ async fn http_connect_rejected() {
     ));
     server_task.await.unwrap();
 }
+
+// ---------- bep10 (extended handshake) ----------
+
+use bitdaemon_net::bep10::ExtendedHandshake;
+use std::net::{IpAddr, Ipv4Addr};
+
+#[test]
+fn bep10_roundtrip() {
+    let mut hs = ExtendedHandshake {
+        listen_port: Some(6881),
+        client_version: Some(b"BitDaemon 0.1".to_vec()),
+        your_ip: Some(vec![192, 168, 0, 5]),
+        reqq: 250,
+        complete_ago: 42,
+        upload_only: true,
+        ..Default::default()
+    };
+    hs.messages.insert("ut_metadata".into(), 1);
+    hs.messages.insert("ut_pex".into(), 2);
+    hs.messages.insert("upload_only".into(), 3);
+    hs.messages.insert("ut_holepunch".into(), 4);
+    hs.messages.insert("lt_donthave".into(), 5);
+
+    let wire = hs.encode();
+    // framing: len u32 = body+2, 0x14, 0x00
+    let len = u32::from_be_bytes(wire[..4].try_into().unwrap()) as usize;
+    assert_eq!(len + 4, wire.len());
+    assert_eq!(wire[4], 0x14);
+    assert_eq!(wire[5], 0);
+
+    let parsed = ExtendedHandshake::parse(&wire[6..]).unwrap();
+    assert_eq!(parsed.listen_port, Some(6881));
+    assert_eq!(
+        parsed.client_version.as_deref(),
+        Some(&b"BitDaemon 0.1"[..])
+    );
+    assert_eq!(parsed.reqq, 250);
+    assert_eq!(parsed.complete_ago, 42);
+    assert!(parsed.upload_only);
+    assert!(!parsed.share_mode);
+    assert_eq!(parsed.messages.get("ut_metadata"), Some(&1));
+    assert_eq!(parsed.messages.get("lt_donthave"), Some(&5));
+    assert_eq!(
+        parsed.remote_ip(),
+        Some(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 5)))
+    );
+
+    let ids = parsed.remote_ids();
+    assert_eq!(ids.upload_only, 3);
+    assert_eq!(ids.holepunch, 4);
+    assert_eq!(ids.dont_have, 5);
+}
+
+#[test]
+fn bep10_parse_garbage() {
+    assert!(ExtendedHandshake::parse(b"not bencode").is_none());
+    assert!(ExtendedHandshake::parse(b"i42e").is_none()); // not a dict
+}
