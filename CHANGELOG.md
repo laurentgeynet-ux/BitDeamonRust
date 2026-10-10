@@ -337,7 +337,11 @@ Until `1.0.0`, breaking changes may occur in any release.
   v6 literals, LDH check, path `/`-injection — `split_url`,
   `same_origin`, `is_valid_tracker_url`, `is_idna`,
   `has_tracker_query_string`). `socks_udp` (SOCKS5 datagram
-  wrap/unwrap, FRAG rejected, atyp 1/3/4).
+  wrap/unwrap, FRAG rejected, atyp 1/3/4). `ip_helpers` +
+  `ip_voter` (`cast_vote`/`maybe_rotate` verbatim — bloom-keyed
+  voter identity, 40-entry cap with upstream's stable-sort eviction,
+  25-vote provisional / 50-vote or 5-min rotation, 2/3 majority
+  rule).
 - Tests: 67 conformance cases ported from `test_bdecode.cpp`, 16 from
   `test_bitfield.cpp`, 8 from `test_sliding_average.cpp`, 5 from
   `test_bloom_filter.cpp`, `test_crc32.cpp` vectors (RFC 3720 B.4),

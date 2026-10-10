@@ -699,3 +699,34 @@ fn http_content_range() {
     assert_eq!(p.content_range(), (10, 19));
     assert_eq!(p.content_length(), 10);
 }
+
+// ---------- ip_voter ----------
+
+use bitdaemon_net::ip_voter::{IpSourceFlags, IpVoter};
+
+#[test]
+fn ip_voter_majority() {
+    let mut v = IpVoter::new();
+    let ext: std::net::IpAddr = "85.1.2.3".parse().unwrap();
+    let s1: std::net::IpAddr = "9.9.9.1".parse().unwrap();
+    let s2: std::net::IpAddr = "9.9.9.2".parse().unwrap();
+    let s3: std::net::IpAddr = "9.9.9.3".parse().unwrap();
+    // local/loopback/unspecified rejected
+    assert!(!v.cast_vote("10.0.0.1".parse().unwrap(), IpSourceFlags::SOURCE_PEER, &s1));
+    assert!(!v.cast_vote(
+        "127.0.0.1".parse().unwrap(),
+        IpSourceFlags::SOURCE_PEER,
+        &s1
+    ));
+    // first vote installs it
+    assert!(v.cast_vote(ext, IpSourceFlags::SOURCE_PEER, &s1));
+    assert_eq!(v.external_address(), Some(ext));
+    // same voter can't double-vote
+    assert!(!v.cast_vote(ext, IpSourceFlags::SOURCE_PEER, &s1));
+    // af mismatch rejected
+    assert!(!v.cast_vote("2001::1".parse().unwrap(), IpSourceFlags::SOURCE_PEER, &s1));
+    // new distinct voters change nothing while valid
+    v.cast_vote(ext, IpSourceFlags::SOURCE_TRACKER, &s2);
+    v.cast_vote(ext, IpSourceFlags::SOURCE_DHT, &s3);
+    assert_eq!(v.external_address(), Some(ext));
+}

@@ -74,6 +74,10 @@ pub mod http_parser;
 pub mod http_stream;
 /// `http_tracker_connection` — announce query + response parsing.
 pub mod http_tracker;
+/// `ip_helpers.cpp` + `hash_address` — address classification.
+pub mod ip_helpers;
+/// `ip_voter.cpp` — external-IP majority voting.
+pub mod ip_voter;
 /// `lsd` — BEP-14 BT-SEARCH announce parse/render.
 pub mod lsd;
 /// `parse_url.cpp` — URL components/split/validation.
