@@ -1182,6 +1182,11 @@ impl Engine {
     /// applied by the next `tick`. `max_out_request_queue`+ext ids
     /// are snapshotted now.
     pub fn spawn_dial(&mut self, ih: Sha1Hash, remote: SocketAddr, encrypted: bool) {
+        // `ip_filter` gate on outbound too (upstream filters at
+        // `connect_to_peer`).
+        if slock(&self.session).ip_access(remote.ip()) == bitdaemon_net::ip_filter::BLOCKED {
+            return;
+        }
         let connector = self.connector.clone();
         let tx = self.connect_tx.clone();
         let pid = slock(&self.session).peer_id;
@@ -1361,6 +1366,11 @@ impl Engine {
         remote: SocketAddr,
         mut s: BoxedPeerStream,
     ) -> std::io::Result<Option<u64>> {
+        // `session_impl::incoming_connection` → `m_ip_filter` gate
+        // before the handshake even runs (block at TCP level).
+        if slock(&self.session).ip_access(remote.ip()) == bitdaemon_net::ip_filter::BLOCKED {
+            return Ok(None);
+        }
         let pid = slock(&self.session).peer_id;
         let ih_known = {
             // snapshot of known info-hashes for the callback
