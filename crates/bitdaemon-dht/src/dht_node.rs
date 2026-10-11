@@ -98,6 +98,9 @@ pub struct DhtNode {
     /// `external_ip` votes collected from `ip` keys in incoming
     /// messages (drained by the session into `ip_voter`).
     ip_votes: Vec<std::net::IpAddr>,
+    /// `m_blocker` — per-source rate limit, first gate on every
+    /// inbound datagram (ADR-0021).
+    blocker: crate::dos_blocker::DosBlocker,
 }
 
 impl DhtNode {
@@ -121,6 +124,7 @@ impl DhtNode {
             outbox: Vec::new(),
             events: Vec::new(),
             ip_votes: Vec::new(),
+            blocker: crate::dos_blocker::DosBlocker::new(),
         }
     }
 
@@ -247,6 +251,12 @@ impl DhtNode {
     }
 
     pub fn incoming(&mut self, buf: &[u8], from: SocketAddr) -> Option<(Vec<u8>, SocketAddr)> {
+        // `m_blocker.incoming` — drop flood sources before parsing
+        // (upstream calls it in `node::incoming` / `on_udp`, pre-bdecode).
+        if !self.blocker.incoming(from.ip(), std::time::Instant::now()) {
+            tracing::debug!(%from, "dht: dropping datagram from rate-limited source");
+            return None;
+        }
         let root = bdecode_checked(buf).ok()?;
         // upstream `dht::node::on_bdecode` — a top-level `ip` key
         // is the peer's view of our external address; vote on it.

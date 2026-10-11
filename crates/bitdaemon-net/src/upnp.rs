@@ -34,6 +34,74 @@ impl PortmapProtocol {
     }
 }
 
+/// SSDP multicast endpoint (`239.255.255.250:1900`) — upstream
+/// `multicast_ip`/`port` constants.
+pub const SSDP_ADDR: std::net::Ipv4Addr = std::net::Ipv4Addr::new(239, 255, 255, 250);
+/// SSDP port.
+pub const SSDP_PORT: u16 = 1900;
+
+/// `upnp::discover` M-SEARCH payload — search targets are the WAN
+/// connection services `parse_device_description` looks for.
+#[must_use]
+pub fn msearch_request() -> String {
+    "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n".to_string()
+}
+
+/// Extract the `LOCATION:` header from an SSDP reply (`HTTP/1.1 200`)
+/// or a NOTIFY — `None` for non-SSDP datagrams (the UDP demux calls
+/// this on every packet that isn't tracker/NAT-PMP/uTP).
+#[must_use]
+pub fn parse_ssdp_location(buf: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(buf).ok()?;
+    let head = s.split("\r\n\r\n").next()?;
+    let mut lines = head.lines();
+    let first = lines.next()?;
+    if !first.starts_with("HTTP/1.1 200") && !first.starts_with("NOTIFY ") {
+        return None;
+    }
+    let mut location = None;
+    let mut is_igd = false;
+    for l in lines {
+        let Some((k, v)) = l.split_once(':') else {
+            continue;
+        };
+        match k.trim().to_ascii_lowercase().as_str() {
+            "location" => location = Some(v.trim().to_string()),
+            "st" | "nt" => {
+                is_igd = v.to_ascii_lowercase().contains("internetgatewaydevice");
+            }
+            _ => {}
+        }
+    }
+    (location.is_some() && (is_igd || first.starts_with("HTTP"))).then_some(location?)
+}
+
+/// Resolve `control_url`/`url_base` from a parsed device description
+/// against the description's fetch URL (UPnP control URLs are often
+/// relative, e.g. `/ctl/IPConn`).
+pub fn resolve_control_url(dev: &mut RootDevice, description_url: &str) {
+    if dev.control_url.starts_with("http") {
+        return;
+    }
+    let base = if dev.url_base.starts_with("http") {
+        dev.url_base.trim_end_matches('/').to_string()
+    } else {
+        // scheme://authority of the description URL
+        let d = description_url.trim_end_matches('/');
+        match d
+            .find("://")
+            .and_then(|i| d[i + 3..].find('/').map(|j| i + 3 + j))
+        {
+            Some(end) => d[..end].to_string(),
+            None => d.to_string(),
+        }
+    };
+    if !dev.control_url.starts_with('/') && !dev.control_url.is_empty() {
+        dev.control_url = format!("/{}", dev.control_url);
+    }
+    dev.control_url = format!("{base}{}", dev.control_url);
+}
+
 /// `rootdevice` — a discovered UPnP gateway.
 #[derive(Debug, Clone, Default)]
 pub struct RootDevice {

@@ -57,6 +57,29 @@ Until `1.0.0`, breaking changes may occur in any release.
   setting → `FILE_FLAG_WRITE_THROUGH` on data writes (upstream
   `disk_io_write_mode = disable_os_cache`).
 
+### Added — dormant-module wiring (Phase I, ADR-0018..0021)
+
+- **UPnP/SSDP** (ADR-0018): `Engine::start_upnp` emits the M-SEARCH
+  burst on the datagram socket; SSDP `LOCATION` replies are fetched
+  through the injected connector+resolver, parsed into
+  `RootDevice`s (relative `controlURL` resolved against the
+  description URL), and each IGD gets TCP+UDP port mappings via the
+  existing `UpnpDriver` chain. `stop_upnp` sends
+  `DeletePortMapping`; `--no-upnp` disables.
+- **NAT-PMP** (ADR-0019): `enum_net::enum_routes` (new `netroute`
+  dep — safe, cross-platform routing table) +
+  `default_gateway_v4`; `Engine::start_natpmp_auto` maps the listen
+  port on the discovered gateway. NAT-PMP responses were already
+  demuxed.
+- **SOCKS5 UDP lanes** (ADR-0020): `Engine::apply_udp_proxy` wraps
+  the session `DatagramSocket` in `Socks5UdpSocket` when
+  `proxies.dht` is socks5 — DHT/uTP/UDP trackers now ride the
+  proxy; `--proxy host:port` / `--proxy-auth user:pass` CLI flags;
+  no silent direct fallback.
+- **DHT `dos_blocker`** (ADR-0021): instantiated in `DhtNode`,
+  gating `incoming` before bdecode — flood sources drop instead of
+  being processed.
+
 ### Fixed — live Mainline DHT bootstrap
 
 - **DHT never bootstrapped**: `DhtNode::bootstrap()` existed but

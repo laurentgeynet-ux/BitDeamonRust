@@ -238,6 +238,12 @@ pub struct Engine {
     pub upnp_devices: Vec<bitdaemon_net::upnp::UpnpDriver>,
     /// UPnP SOAP response completions.
     upnp_rx: mpsc::UnboundedReceiver<UpnpReply>,
+    /// fetched SSDP device descriptions → `portmap_add_device`
+    /// (ADR-0018); the fetch task runs on the injected connector.
+    upnp_dev_tx: mpsc::UnboundedSender<bitdaemon_net::upnp::RootDevice>,
+    upnp_dev_rx: mpsc::UnboundedReceiver<bitdaemon_net::upnp::RootDevice>,
+    /// SSDP `LOCATION`s already fetched (dedup across M-SEARCH bursts).
+    ssdp_seen: std::collections::HashSet<String>,
     upnp_tx: mpsc::UnboundedSender<UpnpReply>,
     /// spawned task handles (kept for abort on drop).
     tasks: Vec<JoinHandle<()>>,
@@ -305,6 +311,7 @@ impl Engine {
         let (webseed_tx, webseed_rx) = mpsc::unbounded_channel();
         let (dhtnode_tx, dhtnode_rx) = mpsc::unbounded_channel();
         let (upnp_tx, upnp_rx) = mpsc::unbounded_channel();
+        let (upnp_dev_tx, upnp_dev_rx) = mpsc::unbounded_channel();
         Self {
             session: Arc::new(std::sync::Mutex::new(Session::new())),
             connector,
@@ -330,6 +337,9 @@ impl Engine {
             natpmp: None,
             upnp_devices: Vec::new(),
             upnp_rx,
+            upnp_dev_tx,
+            upnp_dev_rx,
+            ssdp_seen: std::collections::HashSet::new(),
             upnp_tx,
             tasks: Vec::new(),
             known_ihs: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
@@ -421,6 +431,48 @@ impl Engine {
         self.resolver = Some(r);
     }
 
+    /// ADR-0020 — `settings.proxy.dht` = socks5/5pw: rebuild the
+    /// session `DatagramSocket` through a SOCKS5 UDP-associate so
+    /// DHT, uTP and UDP trackers ride the proxy. Call after
+    /// `set_resolver`, before `enable_dht`/`enable_utp` start their
+    /// pumps. No silent direct fallback: on failure the previous
+    /// socket stays and the error is logged.
+    pub async fn apply_udp_proxy(&mut self) {
+        let p = slock(&self.session).proxies.dht.clone();
+        use bitdaemon_net::proxy::ProxyType;
+        let Some(dg) = self.datagram.as_ref().map(Arc::clone) else {
+            return;
+        };
+        if !matches!(p.proxy_type, ProxyType::Socks5 | ProxyType::Socks5Password)
+            || p.hostname.is_empty()
+        {
+            return;
+        }
+        let v4 = DatagramSocket::local_addr(dg.as_ref()).is_ipv4();
+        match resolve_for_socket(&self.resolver, &p.hostname, p.port, v4).await {
+            Ok(proxy_addr) => {
+                match bitdaemon_net::socks_udp::Socks5UdpSocket::associate(
+                    Arc::clone(&self.connector),
+                    dg,
+                    proxy_addr,
+                    &p.username,
+                    &p.password,
+                )
+                .await
+                {
+                    Ok(s) => {
+                        tracing::info!(%proxy_addr, "udp lane via socks5 relay");
+                        self.datagram = Some(Arc::new(s));
+                    }
+                    Err(e) => {
+                        tracing::error!(%proxy_addr, error = %e, "socks5 udp-associate failed")
+                    }
+                }
+            }
+            Err(e) => tracing::error!(host = %p.hostname, error = %e, "proxy resolve failed"),
+        }
+    }
+
     /// `on_tick` — pump inbound messages, announce completions,
     /// disconnects, then the session's own `tick` +
     /// `tracker_announce_due`, and fan every effect out.
@@ -462,6 +514,12 @@ impl Engine {
                 if let Some(mgr) = self.utp_manager.clone() {
                     tokio::spawn(async move { mgr.route(from, &buf).await });
                 }
+            } else if let Some(loc) = bitdaemon_net::upnp::parse_ssdp_location(&buf) {
+                // ADR-0018 — SSDP reply: fetch the device description
+                // once, then run the driver chain.
+                if slock(&self.session).services.upnp && self.ssdp_seen.insert(loc.clone()) {
+                    self.spawn_ssdp_fetch(loc);
+                }
             } else {
                 trace!(%from, len = buf.len(), "udp recv -> session");
                 slock(&self.session).on_udp(from, &buf, &mut out);
@@ -486,6 +544,10 @@ impl Engine {
         }
         while let Ok(r) = self.upnp_rx.try_recv() {
             self.on_upnp_reply(r);
+        }
+        while let Ok(dev) = self.upnp_dev_rx.try_recv() {
+            let port = slock(&self.session).listen_port;
+            self.portmap_add_device(dev, port, "bitdaemon".to_string());
         }
 
         // `update_quota` — refill the upload bucket each tick
@@ -1023,6 +1085,24 @@ impl Engine {
             .await;
     }
 
+    /// `natpmp` auto-start (ADR-0019): discover the default IPv4
+    /// gateway via `enum_net` and map the listen port TCP+UDP.
+    /// No-op when the service is off, anonymous mode is on, no
+    /// gateway exists, or the state is already running.
+    pub async fn start_natpmp_auto(&mut self, local_port: u16, ttl: u32) {
+        if self.natpmp.is_some()
+            || !slock(&self.session).services.natpmp
+            || slock(&self.session).settings.anonymous_mode
+        {
+            return;
+        }
+        let Some(gw) = bitdaemon_net::enum_net::default_gateway_v4() else {
+            return;
+        };
+        self.start_natpmp(SocketAddr::new(gw, 5351), local_port, ttl)
+            .await;
+    }
+
     /// `natpmp::on_reply` — update mapping state, feed `ip_voter`
     /// with the router's view of our public IP.
     fn on_natpmp_response(&mut self, buf: &[u8]) {
@@ -1057,6 +1137,85 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// `start_upnp` (ADR-0018) — emit the SSDP M-SEARCH burst on the
+    /// session datagram socket. Unicast replies arrive on the demux;
+    /// `LOCATION` fetches run through the injected connector.
+    /// No-op when the service is off or anonymous mode is on.
+    pub async fn start_upnp(&mut self) {
+        if !slock(&self.session).services.upnp || slock(&self.session).settings.anonymous_mode {
+            return;
+        }
+        let Some(dg) = self.datagram.clone() else {
+            return;
+        };
+        let msearch = bitdaemon_net::upnp::msearch_request();
+        let target = SocketAddr::new(
+            std::net::IpAddr::V4(bitdaemon_net::upnp::SSDP_ADDR),
+            bitdaemon_net::upnp::SSDP_PORT,
+        );
+        // upstream sends the discovery burst 3×, ~250 ms apart.
+        for _ in 0..3 {
+            let _ = dg.send_to(msearch.as_bytes(), target).await;
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    /// fetch the SSDP `LOCATION` device description over the injected
+    /// connector, then hand the parsed `RootDevice` to the tick.
+    fn spawn_ssdp_fetch(&mut self, location: String) {
+        let tx = self.upnp_dev_tx.clone();
+        let connector = self.connector.clone();
+        let resolver = self.resolver.clone();
+        self.tasks_forget();
+        self.tasks.push(tokio::spawn(async move {
+            let Ok(c) = bitdaemon_net::parse_url::parse_url_components(&location) else {
+                return;
+            };
+            let port = u16::try_from(c.port).unwrap_or(80);
+            let Ok(addr) = resolve(&resolver, &c.hostname, port).await else {
+                return;
+            };
+            let Ok(mut s) = connector.connect(addr).await else {
+                return;
+            };
+            let r = async {
+                bitdaemon_net::http_conn::send_request(
+                    &mut s,
+                    "GET",
+                    &c.path,
+                    &c.hostname,
+                    &[],
+                    &[],
+                )
+                .await?;
+                bitdaemon_net::http_conn::recv_response(&mut s, 256 * 1024).await
+            }
+            .await;
+            let Ok(resp) = r else { return };
+            let body = String::from_utf8_lossy(&resp.body()).into_owned();
+            let mut dev = bitdaemon_net::upnp::parse_device_description(&body);
+            if dev.control_url.is_empty() || dev.service_namespace.is_empty() {
+                return;
+            }
+            bitdaemon_net::upnp::resolve_control_url(&mut dev, &location);
+            tracing::info!(model = %dev.model, control = %dev.control_url, "upnp: IGD discovered");
+            let _ = tx.send(dev);
+        }));
+    }
+
+    /// `stop_upnp` — `DeletePortMapping` on every mapped slot, then
+    /// drop the device list (upstream `close` semantics).
+    pub fn stop_upnp(&mut self) {
+        for idx in 0..self.upnp_devices.len() {
+            let outs = (0..self.upnp_devices[idx].mappings.len())
+                .flat_map(|i| self.upnp_devices[idx].delete_mapping(i))
+                .collect::<Vec<_>>();
+            self.drive_upnp_outs(idx, outs);
+        }
+        self.upnp_devices.clear();
+        self.ssdp_seen.clear();
     }
 
     /// `upnp` device registration — a discovered `RootDevice`

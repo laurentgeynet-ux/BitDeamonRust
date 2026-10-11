@@ -2,11 +2,11 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `enum_net` — the OS-free parts: `build_netmask`,
-//! `match_addr_mask`, `get_gateway`, `has_internet_route`,
-//! `has_any_internet_route`, `device_for_address`. Actual
-//! enumeration (`enum_net_interfaces`/`enum_routes`) is injected
-//! as data — OnionBit supplies its own interface table.
+//! `enum_net` — `build_netmask`, `match_addr_mask`, `get_gateway`,
+//! `has_internet_route`, `has_any_internet_route`, `device_for_address`
+//! plus the default OS enumerations: interfaces via `if-addrs`,
+//! routes via `netroute` (ADR-0019). Downstream can still inject its
+//! own table — the helpers take data, not traits.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -170,6 +170,55 @@ pub fn enum_interfaces() -> Vec<IpInterface> {
         });
     }
     out
+}
+
+/// `enum_routes` — the OS routing table. Upstream uses netlink
+/// `RTM_GETROUTE`/`GetIpForwardTable2`; `netroute` wraps both and is
+/// pure safe Rust. `source_hint`/`mtu` aren't surfaced by the crate —
+/// `get_gateway` tolerates `None` hints, `mtu` stays 0.
+#[must_use]
+pub fn enum_routes() -> Vec<IpRoute> {
+    let Ok(routes) = netroute::list_routes() else {
+        return Vec::new();
+    };
+    routes
+        .into_iter()
+        .map(|r| IpRoute {
+            destination: r.destination.addr,
+            netmask: build_netmask(
+                i32::from(r.destination.prefix_len),
+                r.destination.addr.is_ipv4(),
+            ),
+            gateway: r.gateway.unwrap_or_else(|| {
+                if r.destination.addr.is_ipv4() {
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                } else {
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+                }
+            }),
+            source_hint: None,
+            name: r
+                .ifname
+                .or_else(|| r.ifindex.map(|i| i.to_string()))
+                .unwrap_or_default(),
+            mtu: 0,
+        })
+        .collect()
+}
+
+/// Convenience: the default IPv4 gateway — `start_natpmp`'s argument
+/// (ADR-0019). First non-loopback interface with a default route.
+#[must_use]
+pub fn default_gateway_v4() -> Option<IpAddr> {
+    // interface names don't line up with netroute's ifindex names —
+    // find the v4 default route directly (upstream does the same
+    // logical search per-interface then prefers the first hit).
+    enum_routes()
+        .into_iter()
+        .find(|r| {
+            r.destination.is_ipv4() && r.destination.is_unspecified() && !r.gateway.is_unspecified()
+        })
+        .map(|r| r.gateway)
 }
 
 /// `ip_notifier` — interface-change notification. Upstream hooks OS

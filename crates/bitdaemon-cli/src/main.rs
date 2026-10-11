@@ -68,6 +68,20 @@ struct Args {
     #[arg(long)]
     no_os_read_cache: bool,
 
+    /// SOCKS5 proxy `host:port` — routes peer connections and the
+    /// UDP lane (DHT/uTP/UDP trackers) through it (upstream
+    /// `proxy_*` settings; ADR-0020).
+    #[arg(long)]
+    proxy: Option<String>,
+
+    /// SOCKS5 proxy credentials `user:pass`.
+    #[arg(long)]
+    proxy_auth: Option<String>,
+
+    /// Disable UPnP/SSDP port-mapping discovery (ADR-0018).
+    #[arg(long)]
+    no_upnp: bool,
+
     /// SSL-torrent server certificate PEM (upstream
     /// `set_ssl_certificate` cert path).
     #[arg(long)]
@@ -169,6 +183,47 @@ async fn main() -> anyhow::Result<()> {
     if args.limit > 0 {
         slock(&eng.session).settings.download_rate_limit = args.limit;
         eng.download_limiter.set_limit(args.limit);
+    }
+    if let Some(proxy) = &args.proxy {
+        let (host, port) = proxy
+            .rsplit_once(':')
+            .map(|(h, p)| (h.to_string(), p.parse::<u16>().unwrap_or(1080)))
+            .unwrap_or_else(|| (proxy.clone(), 1080));
+        let (user, pass) = args
+            .proxy_auth
+            .as_deref()
+            .and_then(|a| a.split_once(':'))
+            .map(|(u, p)| (u.to_string(), p.to_string()))
+            .unwrap_or_default();
+        let mut ps = bitdaemon::net::proxy::ProxySettings {
+            hostname: host,
+            port,
+            username: user,
+            password: pass,
+            proxy_type: bitdaemon::net::proxy::ProxyType::Socks5Password,
+            proxy_peer_connections: true,
+            proxy_tracker_connections: true,
+            proxy_hostnames: true,
+        };
+        if ps.username.is_empty() {
+            ps.proxy_type = bitdaemon::net::proxy::ProxyType::Socks5;
+        }
+        {
+            let mut s = slock(&eng.session);
+            s.proxies.peer = ps.clone();
+            s.proxies.tracker = ps.clone();
+            s.proxies.dht = ps;
+        }
+        // UDP lane through the proxy (ADR-0020) — before enable_dht.
+        eng.apply_udp_proxy().await;
+    }
+    // NAT-PMP port mapping via the default gateway (ADR-0019);
+    // no-op when the service is off or no gateway is found.
+    eng.start_natpmp_auto(args.port, 3600).await;
+    // UPnP: SSDP M-SEARCH burst (ADR-0018) — IGDs discovered later
+    // get TCP+UDP port mappings for the listen port.
+    if !args.no_upnp {
+        eng.start_upnp().await;
     }
     slock(&eng.session).enable_dht(
         IpAddr::V4(Ipv4Addr::UNSPECIFIED),
