@@ -186,7 +186,7 @@ simulation suite replaces ad-hoc tests for regressions.
 
 ---
 
-## Phase H — Disk cache & orchestration wiring 🟨
+## Phase H — Disk cache & orchestration wiring ✅
 
 Live-swarm diagnosis (2026-10-11): `store_buffer`/`disk_cache` are
 ported but unwired — every 16 KiB block becomes an individual `Write`
@@ -194,26 +194,26 @@ job/syscall; the queue bursts to ~22k jobs (~350 MiB) and Windows
 dirty-page throttling stalls the host. qBittorrent doesn't do this
 because upstream decouples block arrival from syscall rate.
 
-- [ ] **Write coalescing via `store_buffer`** (ADR-0012):
+- [x] **Write coalescing via `store_buffer`** (ADR-0012):
       `async_write` = `store_buffer.insert`; flush emits one `Write`
       job per contiguous region (`writev`), triggered on
       piece-complete boundary, high watermark, `cache_expiry`, and
       fence orderings (`clear_piece`/`move_storage`/`delete_files`).
       `piece_gate` ordering semantics preserved through the gate→cache
       transition.
-- [ ] **Watermarks + flush timer** (ADR-0013): `disk_cache_low_/
+- [x] **Watermarks + flush timer** (ADR-0013): `disk_cache_low_/
       high_watermark` and `cache_expiry` settings; `BackPressure`
       re-based on cached bytes; periodic flush wake in the pool.
-- [ ] **Read path via cache** (ADR-0014): `read`/`hash`/`hash2` jobs
+- [x] **Read path via cache** (ADR-0014): `read`/`hash`/`hash2` jobs
       hit `store_buffer`/`disk_cache` first; retire `piece_gate` after
       equivalence is proven. **Correctness prerequisite for ADR-0012.**
 - [x] **io_buffer_mode wiring** (ADR-0015): `disable_os_write_cache` +
       `--no-os-cache` (write-through) landed; `FILE_FLAG_RANDOM_ACCESS`
-      removed (upstream `file.cpp` KB2549369 comment). Pending: read
-      mode + `posix_fadvise`/`F_NOCACHE` equivalents.
-- [ ] **`piece_hasher` v2** (ADR-0016): per-block SHA-256 at arrival
+      removed (upstream `file.cpp` KB2549369 comment). Read mode wired (`--no-os-read-cache`); `posix_fadvise`/`F_NOCACHE`
+      still pending.
+- [x] **`piece_hasher` v2** (ADR-0016): per-block SHA-256 at arrival
       on hasher workers; `hash2_job` assembles precomputed hashes.
-- [ ] **Disk `performance_counters`** (ADR-0017): upstream
+- [x] **Disk `performance_counters`** (ADR-0017): upstream
       `stats_metric[]` disk group; replaces ad-hoc `queue_stats()`.
 
 **Exit**: sustained ≥ 100 MiB/s download with bounded RSS and no
