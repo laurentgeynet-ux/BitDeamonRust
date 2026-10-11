@@ -222,6 +222,33 @@ not job count.
 
 ---
 
+## Phase I — Dormant-module wiring ⬜
+
+Audit (2026-10-11): several ported modules are never reached by the
+session/engine — the *wiring* is the missing port.
+
+- [ ] **UPnP SSDP** (ADR-0018): M-SEARCH burst on `start_upnp`,
+      `LOCATION` XML fetch via injected resolver/connector, per-IGD
+      TCP+UDP `AddPortMapping`, half-TTL renew, `DeletePortMapping`
+      on `stop_upnp`, `Portmap` alerts.
+- [ ] **NAT-PMP gateway** (ADR-0019): `NetInterfaces`/`RouteEnumerator`
+      injectable trait (default OS impl) → default gateway →
+      `start_natpmp`; existing `natpmp_renew` handles the rest.
+- [ ] **SOCKS5 UDP lanes** (ADR-0020): `Socks5UdpSocket` injected as
+      the session `DatagramSocket` when `proxy_*` says so — DHT, uTP
+      and UDP trackers through the proxy; no silent direct fallback.
+- [ ] **DHT `dos_blocker`** (ADR-0021): instantiate in `dht::node`,
+      `incoming()` gate at the top of the UDP demux.
+- [ ] **Send-path `chained_buffer`**: assemble contiguous `Piece`
+      messages through the chained buffer instead of block-by-block
+      sends (pairs with `send_buffer_watermark` back-pressure).
+
+**Exit**: inbound port mapping works on UPnP/NAT-PMP gateways (verified
+live on a real router), proxied UDP lanes carry DHT/uTP traffic, and
+the DHT drops flood sources.
+
+---
+
 ## Phase G — 1.0 ⬜
 
 - [x] `PORTING.md` = 100% resolved rows (the completion metric) — every upstream file is `ported`/`verified`/`won't port`/`n/a`.

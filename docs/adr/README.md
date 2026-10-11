@@ -37,6 +37,10 @@ and its consequences.
 | [0015](0015-io-buffer-modes.md) | `disk_io_write_mode`/`disk_io_read_mode` wiring | accepted | 2026-10-11 |
 | [0016](0016-piece-hasher-v2.md) | `piece_hasher` — concurrent v2 merkle hashing | accepted | 2026-10-11 |
 | [0017](0017-disk-performance-counters.md) | Disk `performance_counters` wiring | accepted | 2026-10-11 |
+| [0018](0018-upnp-ssdp-wiring.md) | UPnP — SSDP discovery wiring (M-SEARCH → mapping) | accepted | 2026-10-11 |
+| [0019](0019-natpmp-gateway-discovery.md) | NAT-PMP — gateway discovery + `start_natpmp` wiring | accepted | 2026-10-11 |
+| [0020](0020-socks-udp-transport.md) | SOCKS5 UDP-associate as injected `DatagramSocket` | accepted | 2026-10-11 |
+| [0021](0021-dht-dos-blocker.md) | DHT `dos_blocker` instantiation | accepted | 2026-10-11 |
 
 ## Template
 
