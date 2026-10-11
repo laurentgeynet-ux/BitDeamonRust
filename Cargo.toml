@@ -8,9 +8,12 @@ members = [
     "crates/bitdaemon-core",
     "crates/bitdaemon-dht",
     "crates/bitdaemon-disk",
+    "crates/bitdaemon-mmap",
     "crates/bitdaemon-net",
     "crates/bitdaemon-session",
+    "crates/bitdaemon-sim",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -30,6 +33,7 @@ bitdaemon-common = { path = "crates/bitdaemon-common", version = "0.1.0" }
 bitdaemon-bencode = { path = "crates/bitdaemon-bencode", version = "0.1.0" }
 bitdaemon-core = { path = "crates/bitdaemon-core", version = "0.1.0" }
 bitdaemon-disk = { path = "crates/bitdaemon-disk", version = "0.1.0" }
+bitdaemon-mmap = { path = "crates/bitdaemon-mmap", version = "0.1.0" }
 bitdaemon-net = { path = "crates/bitdaemon-net", version = "0.1.0" }
 bitdaemon-dht = { path = "crates/bitdaemon-dht", version = "0.1.0" }
 bitdaemon-session = { path = "crates/bitdaemon-session", version = "0.1.0" }
@@ -56,8 +60,16 @@ url = "2"
 fs2 = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 memmap2 = "0.9"
+# dev-only: Phase F benchmark harness (ADR-0007 note — dev dep, not shipped)
+criterion = "0.5"
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
+if-addrs = "0.13"
+rustls = "0.23"
+tokio-rustls = "0.26"
+# HTTPS trackers need the OS root store (upstream reads the system
+# trust DB) — `rustls-native-certs`, ADR-0007 note.
+rustls-native-certs = "0.8"
 
 [profile.dev.package."*"]
 opt-level = 2

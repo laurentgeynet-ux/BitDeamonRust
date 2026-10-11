@@ -1,0 +1,36 @@
+[package]
+name = "bitdaemon-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bitdaemon-bencode = { path = "../crates/bitdaemon-bencode" }
+bitdaemon-core = { path = "../crates/bitdaemon-core" }
+bitdaemon-net = { path = "../crates/bitdaemon-net" }
+
+# Fuzz targets (run: cargo fuzz run <name>)
+
+[[bin]]
+name = "bdecode"
+path = "fuzz_targets/bdecode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "peer_wire"
+path = "fuzz_targets/peer_wire.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "resume_data"
+path = "fuzz_targets/resume_data.rs"
+test = false
+doc = false
+
+[workspace]

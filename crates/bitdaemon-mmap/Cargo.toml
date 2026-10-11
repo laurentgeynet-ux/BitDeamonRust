@@ -1,0 +1,12 @@
+[package]
+name = "bitdaemon-mmap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "mmap-backed storage for BitDaemon — port of mmap_storage/file_view_pool/mmap_disk_io (ADR-0010 unsafe carve-out)"
+
+[dependencies]
+bitdaemon-common.workspace = true
+bitdaemon-core.workspace = true
+bitdaemon-disk.workspace = true
+memmap2.workspace = true

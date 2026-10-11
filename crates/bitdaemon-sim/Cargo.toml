@@ -1,0 +1,12 @@
+[package]
+name = "bitdaemon-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic network simulation for BitDaemon — port of libtorrent's simulation harness (test/simulation)"
+
+[dependencies]
+bitdaemon-common.workspace = true
+bitdaemon-net.workspace = true
+tokio.workspace = true
+futures.workspace = true
