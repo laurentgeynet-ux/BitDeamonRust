@@ -94,6 +94,13 @@ impl BackPressure {
             std::cmp::min(max_size / 8 * 7, i64::from(i32::MAX / 2));
     }
 
+    /// `m_max_size` getter — the level (in blocks) at which
+    /// back-pressure engages; used by the cache's over-limit flush.
+    #[must_use]
+    pub fn max_size(&self) -> i64 {
+        *self.max_size.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// `should_flush(level)` — `Some(low_watermark)` while above high
     /// watermark or while the sticky exceeded flag is set.
     #[must_use]

@@ -39,8 +39,8 @@ impl FileHandle {
         {
             use std::os::unix::fs::OpenOptionsExt;
             if mode.contains(OpenMode::NO_CACHE) {
-                // upstream maps no_cache → O_DIRECT where supported
-                opts.custom_flags(libc_direct_flag());
+                // upstream maps no_cache → O_SYNC
+                opts.custom_flags(libc_sync_flag());
             }
             if mode.contains(OpenMode::EXECUTABLE) {
                 opts.mode(0o755);
@@ -52,19 +52,19 @@ impl FileHandle {
             // winbase.h constants — avoids a windows-sys dep for 5 values
             const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
             const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
-            const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
-            const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
             const FILE_FLAG_OPEN_NO_RECALL: u32 = 0x0010_0000;
             const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
             const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            // Upstream deliberately avoids FILE_FLAG_RANDOM_ACCESS (see
+            // src/file.cpp): that flag stops the Windows cache manager from
+            // trimming pages, so cached data grows unbounded and stalls the
+            // whole system (KB2549369).
             let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
             if mode.contains(OpenMode::NO_CACHE) {
-                flags |= FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH;
+                flags |= FILE_FLAG_WRITE_THROUGH;
             }
             if mode.contains(OpenMode::SEQUENTIAL_ACCESS) {
                 flags |= FILE_FLAG_SEQUENTIAL_SCAN;
-            } else {
-                flags |= FILE_FLAG_RANDOM_ACCESS;
             }
             if mode.contains(OpenMode::NO_ATIME) {
                 flags |= FILE_FLAG_OPEN_NO_RECALL;
@@ -100,12 +100,18 @@ impl FileHandle {
 }
 
 #[cfg(unix)]
-const fn libc_direct_flag() -> i32 {
+const fn libc_sync_flag() -> i32 {
+    // upstream `no_cache` → O_SYNC (synchronous writes, no dirty
+    // pages) — not O_DIRECT, which would require aligned I/O.
     #[cfg(target_os = "linux")]
     {
-        0o040000 // O_DIRECT
+        0o4010000 // O_SYNC
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        0x0080 // O_SYNC
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         0
     }

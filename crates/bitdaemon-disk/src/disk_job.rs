@@ -205,12 +205,27 @@ pub struct ClearPieceJob {
     pub piece: PieceIndex,
 }
 
+/// Internal flush job — no upstream `job_type` equivalent; upstream
+/// folds this into `disk_io_thread`'s cache flush. Drains a
+/// contiguous `store_buffer` region through one `writev`.
+pub struct FlushJob {
+    /// `piece`.
+    pub piece: PieceIndex,
+    /// index of the first block covered.
+    pub first_block: i32,
+    /// contiguous block buffers (≤ 16 KiB each, last may be short).
+    pub bufs: Vec<Vec<u8>>,
+}
+
 /// The `std::variant<...>` job payload.
 pub enum JobKind {
     /// read.
     Read(ReadJob),
     /// write.
     Write(WriteJob),
+    /// internal cache flush — a coalesced region write; counts as a
+    /// write for fencing/gating purposes.
+    Flush(FlushJob),
     /// hash.
     Hash(HashJob),
     /// hash2.
@@ -258,7 +273,8 @@ impl DiskJob {
     pub fn get_type(&self) -> JobAction {
         match &self.action {
             JobKind::Read(_) => JobAction::Read,
-            JobKind::Write(_) => JobAction::Write,
+            // a flush is a coalesced write — same fence/gate class
+            JobKind::Write(_) | JobKind::Flush(_) => JobAction::Write,
             JobKind::Hash(_) => JobAction::Hash,
             JobKind::Hash2(_) => JobAction::Hash2,
             JobKind::MoveStorage(_) => JobAction::MoveStorage,
@@ -292,6 +308,9 @@ impl DiskJob {
                 std::mem::take(&mut self.error),
             ),
             JobKind::Write(j) => (j.handler)(std::mem::take(&mut self.error)),
+            // internal flush: no user handler — bookkeeping is done in
+            // `add_completed_jobs` before this callback path runs.
+            JobKind::Flush(_) => {}
             JobKind::Hash(mut j) => (j.handler)(
                 j.piece,
                 j.piece_hash,

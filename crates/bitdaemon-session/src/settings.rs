@@ -45,6 +45,12 @@ pub struct SessionSettings {
     pub piece_timeout: Duration,
     /// `max_disk_write_queue` — back-pressure cap.
     pub max_disk_write_queue: i64,
+    /// `settings_pack::disk_io_write_mode` — `disable_os_cache`:
+    /// write-through data files (qBittorrent's "OS cache" toggle).
+    pub disable_os_write_cache: bool,
+    /// `settings_pack::cache_expiry` — seconds a dirty block may sit
+    /// in the write cache before the periodic flush.
+    pub cache_expiry: Duration,
     /// `send_buffer_watermark` — pause reads above this.
     pub send_buffer_watermark: usize,
     /// `alert_queue_size` — alert_manager limit.
@@ -127,6 +133,8 @@ impl Default for SessionSettings {
             download_rate_limit: 0,
             piece_timeout: Duration::from_secs(20),
             max_disk_write_queue: 100 << 20,
+            disable_os_write_cache: false,
+            cache_expiry: Duration::from_secs(60),
             send_buffer_watermark: 500 << 10,
             alert_queue_size: 2000,
             dht_enabled: true,

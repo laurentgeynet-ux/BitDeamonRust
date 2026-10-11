@@ -30,6 +30,13 @@ and its consequences.
 | [0008](0008-injectable-transports.md) | Injectable transports — no subsystem binds OS sockets | accepted | 2026-10-10 |
 | [0009](0009-disk-io-fidelity.md) | Disk I/O — port the full upstream machinery | accepted | 2026-10-10 |
 | [0010](0010-complete-port.md) | Complete-fidelity port — every upstream file ported or reasoned `won't port` | accepted | 2026-10-11 |
+| [0011](0011-webrtc-stack.md) | WebRTC stack — injected `rtc::PeerConnection` seam | accepted | 2026-03-08 |
+| [0012](0012-store-buffer-write-coalescing.md) | `store_buffer` write path + write coalescing | accepted | 2026-10-11 |
+| [0013](0013-disk-cache-watermarks-flush-timer.md) | Disk cache watermarks + periodic flush scheduling | accepted | 2026-10-11 |
+| [0014](0014-read-path-through-cache.md) | Read path consults `store_buffer`/cache before disk | accepted | 2026-10-11 |
+| [0015](0015-io-buffer-modes.md) | `disk_io_write_mode`/`disk_io_read_mode` wiring | accepted | 2026-10-11 |
+| [0016](0016-piece-hasher-v2.md) | `piece_hasher` — concurrent v2 merkle hashing | accepted | 2026-10-11 |
+| [0017](0017-disk-performance-counters.md) | Disk `performance_counters` wiring | accepted | 2026-10-11 |
 
 ## Template
 

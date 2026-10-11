@@ -7,6 +7,43 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — disk cache (`store_buffer`) write path (ADR-0012/0013/0014/0016)
+
+- `PreadDiskIo::async_write` now inserts blocks into a per-storage
+  `DiskCache` instead of enqueueing one `Write` job per 16 KiB
+  block. Dirty blocks flush as **coalesced contiguous runs**
+  (`JobKind::Flush`), matching upstream's `store_buffer` +
+  `disk_cache` model — one syscall per run instead of one per
+  block.
+- Reads and piece hashes (`read`, `hash`, `hash2`) overlay cached
+  dirty blocks before touching disk, so verified data is visible
+  before the flush completes.
+- `cache_expiry` setting: incomplete cached pieces are
+  force-flushed after the deadline, drained from
+  `Session::drain_disk_completed`.
+- Fences force-flush the cache of the fenced piece before
+  arming, preserving `ClearPiece`/`move_storage` ordering.
+- Live validation: Debian ISO swarm at ~115 MiB/s, disk queue
+  depth `w=0` at every sample, `have` progress continuous with
+  no verification plateau.
+
+### Fixed — freeze / unbounded buffering
+
+- **`FILE_FLAG_RANDOM_ACCESS` removed** from every Windows file
+  open — upstream avoids it deliberately (`file.cpp` cites
+  KB2549369: the cache manager cannot trim its working set,
+  RAM grows unbounded → whole-machine stall). `no_cache` now
+  maps to `FILE_FLAG_WRITE_THROUGH` alone (POSIX: `O_SYNC`,
+  not `O_DIRECT` — upstream `file.cpp`).
+- **Inbound peer messages were only drained at the 1 Hz tick**:
+  `Engine::run` pumped `inbound_rx` once per second, so at
+  ~100 MiB/s the unbounded channel accumulated hundreds of MiB
+  (observed 390 MiB → 30 MiB sawtooth, disk/network at zero).
+  The engine now pumps continuously in bounded batches.
+- New `--no-os-cache` CLI flag + `disable_os_write_cache`
+  setting → `FILE_FLAG_WRITE_THROUGH` on data writes (upstream
+  `disk_io_write_mode = disable_os_cache`).
+
 ### Fixed — live Mainline DHT bootstrap
 
 - **DHT never bootstrapped**: `DhtNode::bootstrap()` existed but

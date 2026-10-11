@@ -173,6 +173,21 @@ pub trait DiskIo: Send + Sync {
     /// on backends without a buffer limit.
     fn set_max_queued_bytes(&self, _bytes: i64) {}
 
+    /// `settings_pack::disk_io_write_mode` — `disable_os_cache`
+    /// variant: when true, data files open with write-through
+    /// semantics (`FILE_FLAG_WRITE_THROUGH` on Windows / `O_DIRECT`
+    /// hint on POSIX), so dirty pages can't accumulate and stall the
+    /// host's cache manager.
+    fn set_write_no_cache(&self, _v: bool) {}
+
+    /// `settings_pack::cache_expiry` — seconds a dirty block may sit
+    /// in the write cache before the periodic flush (upstream 60).
+    fn set_cache_expiry(&self, _secs: u64) {}
+
+    /// periodic flush of expired cache regions — called once per
+    /// session tick (upstream's disk-thread flush timer).
+    fn flush_expired(&self) {}
+
     /// `m_cache.exceeded_max_size()` — true while the write queue is
     /// above `max_queued_disk_bytes`. The session gates new block
     /// requests on this so incoming payloads can't grow the job queue
@@ -181,8 +196,33 @@ pub trait DiskIo: Send + Sync {
         false
     }
 
+    /// live job-queue snapshot — diagnostics only (`performance
+    /// counters` cover this upstream). Default: empty.
+    fn queue_stats(&self) -> DiskQueueStats {
+        DiskQueueStats::default()
+    }
+
     /// `settings_updated`.
     fn settings_updated(&self);
+}
+
+/// Snapshot of the disk job queue — diagnostics for download
+/// orchestration (write backlog vs hash starvation).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DiskQueueStats {
+    /// jobs waiting in the pool queue, per kind.
+    pub queued_writes: usize,
+    /// hash jobs waiting in the pool queue.
+    pub queued_hashes: usize,
+    /// other jobs waiting (read, flush, move…).
+    pub queued_other: usize,
+    /// hash jobs parked behind in-flight writes (`piece_gate`).
+    pub parked_hashes: usize,
+    /// `m_blocks` — write blocks queued + in flight (back-pressure
+    /// level against `max_queued_disk_bytes`).
+    pub write_blocks: i64,
+    /// pool worker threads.
+    pub threads: usize,
 }
 
 /// `storage_holder` — RAII ownership of a torrent's storage index;

@@ -33,6 +33,9 @@ pub struct CachedBlockEntry {
     pub flushed: bool,
     /// `get_write_job() != nullptr` — a write job is in flight.
     pub has_write_job: bool,
+    /// `piece_hasher` result — block SHA-256 computed at flush time
+    /// (ADR-0016); `hash2` jobs reuse it instead of re-reading.
+    pub block_hash: Option<bitdaemon_common::Sha256Hash>,
 }
 
 impl CachedBlockEntry {
@@ -109,6 +112,8 @@ pub struct CachedPieceEntry {
     pub v1: bool,
     /// v2 piece.
     pub v2: bool,
+    /// when the first dirty block arrived — drives `cache_expiry`.
+    pub dirty_since: std::time::Instant,
 }
 
 impl CachedPieceEntry {
@@ -175,6 +180,7 @@ impl DiskCache {
                         buf: None,
                         flushed: false,
                         has_write_job: false,
+                        block_hash: None,
                     })
                     .collect(),
                 flushed_cursor: 0,
@@ -184,6 +190,7 @@ impl DiskCache {
                 flags: 0,
                 v1: params.v1,
                 v2: params.v2,
+                dirty_since: std::time::Instant::now(),
             }
         });
         if let Some(b) = piece.blocks.get_mut(block_idx) {
@@ -260,6 +267,141 @@ impl DiskCache {
             p.flushed_cursor = compute_flushed_cursor(&p.blocks);
             p.num_jobs -= 1;
         }
+    }
+
+    /// `try_flush_blocks` — take the first contiguous run of dirty,
+    /// not-in-flight blocks of `loc` for a coalesced write. Buffers
+    /// are moved out; blocks are marked `has_write_job` until
+    /// [`Self::run_flushed`] retires them.
+    pub fn take_flush_run(&mut self, loc: PieceLocation) -> Option<(i32, Vec<Vec<u8>>)> {
+        let p = self.pieces.get_mut(&loc)?;
+        let start = p
+            .blocks
+            .iter()
+            .position(|b| b.buf.is_some() && !b.flushed && !b.has_write_job)?;
+        let mut bufs = Vec::new();
+        for b in &mut p.blocks[start..] {
+            let Some(buf) = b.buf.take() else {
+                break;
+            };
+            if b.flushed {
+                break;
+            }
+            b.has_write_job = true;
+            bufs.push(buf);
+        }
+        (!bufs.is_empty()).then_some((start as i32, bufs))
+    }
+
+    /// All dirty contiguous runs of `loc` (for fence-time full flush).
+    /// Repeatedly drains [`Self::take_flush_run`].
+    pub fn take_all_runs(&mut self, loc: PieceLocation) -> Vec<(i32, Vec<Vec<u8>>)> {
+        let mut runs = Vec::new();
+        while let Some(r) = self.take_flush_run(loc) {
+            runs.push(r);
+        }
+        runs
+    }
+
+    /// Every dirty run across the whole cache — used before a
+    /// storage-level fence (move/delete) raises.
+    pub fn take_all_storage_runs(&mut self) -> Vec<(PieceLocation, i32, Vec<Vec<u8>>)> {
+        let locs: Vec<PieceLocation> = self.pieces.keys().copied().collect();
+        let mut out = Vec::new();
+        for loc in locs {
+            for (first, bufs) in self.take_all_runs(loc) {
+                out.push((loc, first, bufs));
+            }
+        }
+        out
+    }
+
+    /// Mark a flushed region durable — frees the buffers' cache
+    /// slots, advances `flushed_cursor`, drops fully-flushed pieces.
+    pub fn run_flushed(&mut self, loc: PieceLocation, first: usize, len: usize) {
+        let mut free = false;
+        if let Some(p) = self.pieces.get_mut(&loc) {
+            for b in p.blocks.iter_mut().skip(first).take(len) {
+                b.has_write_job = false;
+                b.flushed = true;
+                b.buf = None;
+                self.num_cached_blocks -= 1;
+            }
+            p.flushed_cursor = compute_flushed_cursor(&p.blocks);
+            // the entry leaves the cache once every block is on disk —
+            // except v2 pieces keep their (tiny) entry for the stored
+            // `block_hash`s that `hash2` jobs consume (ADR-0016).
+            free = p.blocks.iter().all(|b| b.flushed)
+                && (!p.v2 || p.flags & piece_flags::PIECE_HASH_RETURNED != 0);
+        }
+        if free {
+            self.pieces.remove(&loc);
+        }
+    }
+
+    /// Store the `piece_hasher` results for a flushed region
+    /// (ADR-0016): `hash2` reads them from the entry instead of
+    /// re-reading the file.
+    pub fn set_block_hashes(
+        &mut self,
+        loc: PieceLocation,
+        first: usize,
+        hashes: &[bitdaemon_common::Sha256Hash],
+    ) {
+        if let Some(p) = self.pieces.get_mut(&loc) {
+            for (i, h) in hashes.iter().enumerate() {
+                if let Some(b) = p.blocks.get_mut(first + i) {
+                    b.block_hash = Some(*h);
+                }
+            }
+        }
+    }
+
+    /// `cached_block_entry.block_hash` accessor for `hash2`.
+    #[must_use]
+    pub fn block_hash(
+        &self,
+        loc: PieceLocation,
+        block_idx: usize,
+    ) -> Option<bitdaemon_common::Sha256Hash> {
+        self.pieces
+            .get(&loc)
+            .and_then(|p| p.blocks.get(block_idx))
+            .and_then(|b| b.block_hash)
+    }
+
+    /// `piece_hash_returned_flag` — the piece hash was delivered;
+    /// frees a fully-flushed v2 entry kept only for its block hashes.
+    pub fn hash_returned(&mut self, loc: PieceLocation) {
+        let mut free = false;
+        if let Some(p) = self.pieces.get_mut(&loc) {
+            p.flags |= piece_flags::PIECE_HASH_RETURNED;
+            free = p.blocks.iter().all(|b| b.flushed);
+        }
+        if free {
+            self.pieces.remove(&loc);
+        }
+    }
+
+    /// `cache_expiry` sweep — every dirty run of pieces whose oldest
+    /// block is older than `max_age` (upstream's periodic flush).
+    pub fn take_expired_runs(
+        &mut self,
+        max_age: std::time::Duration,
+    ) -> Vec<(PieceLocation, i32, Vec<Vec<u8>>)> {
+        let locs: Vec<PieceLocation> = self
+            .pieces
+            .iter()
+            .filter(|(_, p)| p.dirty_since.elapsed() >= max_age)
+            .map(|(l, _)| *l)
+            .collect();
+        let mut out = Vec::new();
+        for loc in locs {
+            for (first, bufs) in self.take_all_runs(loc) {
+                out.push((loc, first, bufs));
+            }
+        }
+        out
     }
 
     /// `hasher_cursor` advance — the v1 hasher consumed `block_idx`.

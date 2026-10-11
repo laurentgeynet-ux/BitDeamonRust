@@ -56,6 +56,13 @@ struct Args {
     #[arg(long)]
     utp: bool,
 
+    /// Disable the OS write cache for data files (upstream
+    /// `settings_pack::disk_io_write_mode = disable_os_cache` —
+    /// qBittorrent's "OS cache" toggle; write-through on Windows,
+    /// O_SYNC on POSIX). Prevents dirty-page storms at high rates.
+    #[arg(long)]
+    no_os_cache: bool,
+
     /// SSL-torrent server certificate PEM (upstream
     /// `set_ssl_certificate` cert path).
     #[arg(long)]
@@ -145,6 +152,9 @@ async fn main() -> anyhow::Result<()> {
     // OS resolver — the default transports' DNS companion (anonymous
     // deployments inject a circuit resolver instead; ADR-0008).
     eng.set_resolver(Arc::new(bitdaemon::net::resolver::SystemResolver));
+    if args.no_os_cache {
+        slock(&eng.session).settings.disable_os_write_cache = true;
+    }
     slock(&eng.session).set_disk(disk);
     slock(&eng.session).set_listen_port(args.port);
     slock(&eng.session).set_dht_port(udp_port);
@@ -240,7 +250,7 @@ async fn main() -> anyhow::Result<()> {
     let ses = eng.session.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let mut guard = slock(&ses);
             for a in guard.pop_alerts() {
                 println!("alert: {a:?}");
@@ -248,6 +258,19 @@ async fn main() -> anyhow::Result<()> {
             let dht_nodes = guard.dht_state().nodes.len() + guard.dht_state().nodes6.len();
             if dht_nodes > 0 {
                 println!("dht: {dht_nodes} nodes in routing table");
+            }
+            if let Some(d) = &guard.disk {
+                let q = d.queue_stats();
+                println!(
+                    "disk queue: w={} h={} other={} parked={} write_blocks={} threads={} bp={}",
+                    q.queued_writes,
+                    q.queued_hashes,
+                    q.queued_other,
+                    q.parked_hashes,
+                    q.write_blocks,
+                    q.threads,
+                    d.write_queue_exceeded(),
+                );
             }
             for (ih, t) in &guard.torrents {
                 let st = t.status(&guard.settings, guard.queue_position(ih));

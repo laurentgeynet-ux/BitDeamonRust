@@ -1688,6 +1688,29 @@ impl Engine {
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
+                m = self.inbound_rx.recv() => {
+                    // upstream's io_context services peer messages as they
+                    // arrive — batching them until the 1 Hz tick would let
+                    // the unbounded queue grow by the whole download rate
+                    // per second (observed: ~360 MiB bursts + system
+                    // stalls at ~100 MiB/s). Drain what is already pending
+                    // (bounded batch keeps `stop` responsive), dispatch
+                    // the resulting effects, and loop back to select.
+                    let mut out = Vec::new();
+                    if let Some(m) = m {
+                        slock(&self.session).on_peer_message(&m.packet, &mut out);
+                    }
+                    for _ in 0..1024 {
+                        match self.inbound_rx.try_recv() {
+                            Ok(m) => {
+                                slock(&self.session).on_peer_message(&m.packet, &mut out);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    self.dispatch(out).await;
+                    continue;
+                }
                 _ = &mut stop => break,
             }
             self.tick(Instant::now()).await;
