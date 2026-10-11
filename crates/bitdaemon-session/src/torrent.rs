@@ -1697,12 +1697,21 @@ impl Torrent {
                 if let Some(c2) = self.peers.get_mut(&peer_id) {
                     c2.add_request(b, busy, false, now_ms);
                 }
+                // upstream
+                // clamp la longueur a  — le
+                // dernier bloc d'une piece partielle n'est jamais
+                // 0x4000 (les pairs stricts droppent une requete
+                // hors limites).
+                let start = b.block_index * 0x4000;
+                let psize = self.files.as_ref().map_or(self.piece_length, |f| {
+                    i64::from(f.piece_size(b.piece_index))
+                });
                 out.push(TorrentEffect::SendTo {
                     peer: peer_id,
                     msg: PeerMessage::Request(PeerRequest {
                         piece: b.piece_index,
-                        start: b.block_index * 0x4000,
-                        length: 0x4000,
+                        start,
+                        length: (psize - i64::from(start)).min(0x4000) as i32,
                     }),
                 });
             }
@@ -2489,12 +2498,18 @@ impl Torrent {
             }
             let key = c.peer_key();
             for b in removed {
+                //  doit miroirer la requete emise — meme
+                // clamp de longueur que .
+                let start = b.block_index * 0x4000;
+                let psize = self.files.as_ref().map_or(self.piece_length, |f| {
+                    i64::from(f.piece_size(b.piece_index))
+                });
                 out.push(TorrentEffect::SendTo {
                     peer: *id,
                     msg: PeerMessage::Cancel(PeerRequest {
                         piece: b.piece_index,
-                        start: b.block_index * 0x4000,
-                        length: 0x4000,
+                        start,
+                        length: (psize - i64::from(start)).min(0x4000) as i32,
                     }),
                 });
                 if let Some(p) = self.picker.as_mut() {

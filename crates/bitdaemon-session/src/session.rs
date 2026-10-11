@@ -1215,16 +1215,20 @@ impl Session {
             return;
         }
         let disk = self.disk.clone().expect("checked");
-        self.remove_torrent(ih, out);
         let tx = self.disk_tx.clone();
-        let ih = *ih;
+        let ih2 = *ih;
+        // upstream `disk_io_thread` ordering: the delete job is
+        // queued *before* the storage teardown — `remove_torrent`
+        // is itself a fence job now, so enqueueing delete first
+        // keeps `async_delete_files` ahead of it.
         disk.async_delete_files(
             storage,
             options,
             Box::new(move |err| {
-                let _ = tx.send(DiskCompleted::DeleteFiles { ih, err });
+                let _ = tx.send(DiskCompleted::DeleteFiles { ih: ih2, err });
             }),
         );
+        self.remove_torrent(ih, out);
     }
 
     /// `flush_cache` — upstream `torrent_handle::flush_cache`

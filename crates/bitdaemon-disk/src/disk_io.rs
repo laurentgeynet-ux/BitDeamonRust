@@ -181,10 +181,12 @@ impl PreadDiskIo {
     /// `remove_torrent(idx)` — drop the storage; its queued jobs fail
     /// fast at execution (`NotFound`) like upstream's aborted path.
     pub fn remove_torrent(&self, idx: StorageIndex) {
-        self.storages
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&idx);
+        self.add_fence_job(
+            idx,
+            self.mk_job(JobKind::RemoveTorrent(crate::disk_job::RemoveTorrentJob {
+                handler: Box::new(|| {}),
+            })),
+        );
     }
 
     /// `abort_jobs(wait)` — stop the pool; queued jobs complete aborted.
@@ -443,6 +445,17 @@ impl PreadDiskIo {
                     }
                     Err(e) => e,
                 }
+            }
+            JobKind::RemoveTorrent(_) => {
+                // upstream `disk_io_thread::remove_torrent` — the
+                // queued teardown: pending jobs already ran behind
+                // the fence, drop the storage entry now so later
+                // submissions fail `NotFound`.
+                self.storages
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&j.storage);
+                StorageError::default()
             }
             JobKind::StopTorrent(_)
             | JobKind::ClearPiece(_)

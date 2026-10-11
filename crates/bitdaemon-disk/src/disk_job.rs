@@ -45,6 +45,9 @@ pub enum JobAction {
     ClearPiece,
     /// `partial_read` — unaligned peer requests.
     PartialRead,
+    /// `remove_torrent` — upstream `disk_io_thread::remove_torrent`,
+    /// a queued fence job (not an inline map erase).
+    RemoveTorrent,
 }
 
 /// `disk_job` flag bits (`fence`, `in_progress`, `aborted`).
@@ -178,6 +181,14 @@ pub struct StopTorrentJob {
     pub handler: Box<dyn FnOnce() + Send>,
 }
 
+/// `disk_io_thread::remove_torrent` — queued behind the fence like
+/// every other job upstream; pending jobs for the storage complete
+/// first, submissions after it fail `NotFound`.
+pub struct RemoveTorrentJob {
+    /// handler.
+    pub handler: Box<dyn FnOnce() + Send>,
+}
+
 /// `job::file_priority`.
 pub struct FilePriorityJob {
     /// handler — `(error, new_priorities)`.
@@ -222,6 +233,8 @@ pub enum JobKind {
     ClearPiece(ClearPieceJob),
     /// partial_read.
     PartialRead(PartialReadJob),
+    /// `remove_torrent`.
+    RemoveTorrent(RemoveTorrentJob),
 }
 
 /// `aux::disk_job` — flags + result + payload.
@@ -257,6 +270,7 @@ impl DiskJob {
             JobKind::FilePriority(_) => JobAction::FilePriority,
             JobKind::ClearPiece(_) => JobAction::ClearPiece,
             JobKind::PartialRead(_) => JobAction::PartialRead,
+            JobKind::RemoveTorrent(_) => JobAction::RemoveTorrent,
         }
     }
 
@@ -304,6 +318,7 @@ impl DiskJob {
                 (j.handler)(std::mem::take(&mut self.error), prio);
             }
             JobKind::ClearPiece(j) => (j.handler)(j.piece),
+            JobKind::RemoveTorrent(j) => (j.handler)(),
         }
     }
 }

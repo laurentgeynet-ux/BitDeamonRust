@@ -56,6 +56,17 @@ Until `1.0.0`, breaking changes may occur in any release.
     200, `active_limit` 500, `max_allowed_in_request_queue` 2000,
     `max_peerlist_size` 3000, `alert_queue_size` 2000,
     `max_queued_disk_bytes` 100 MiB, `connection_speed` 30;
+  - wire `Request`/`Cancel` lengths were always `0x4000` — the last
+    (partial) piece must be clamped to `piece_size - start`
+    (upstream `send_block_request`); strict peers (rqbit) drop the
+    connection on the out-of-range request — this was the repeated
+    disconnect + stall at 80–99 % in loopback transfers;
+  - `delete_files` never ran: `remove_torrent` erased the storage
+    map entry synchronously before `async_delete_files` could reach
+    it — `RemoveTorrent` is now a queued fence job (upstream
+    `disk_io_thread::remove_torrent` semantics), and
+    `Session::delete_files` enqueues the delete job *before* the
+    teardown so pending writes then `delete_files` run in order;
   - CLI: injects `SystemResolver` + DHT bootstrap routers.
 
 ### Added

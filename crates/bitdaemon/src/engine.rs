@@ -1482,7 +1482,10 @@ impl Engine {
                                     return;
                                 }
                             }
-                            Err(_) => break,
+                            Err(e) => {
+                                debug!(peer = peer, remote = ?remote, err = %e, "peer read error, dropping");
+                                break;
+                            }
                         }
                     }
                     w = tokio::time::timeout(
@@ -1506,7 +1509,8 @@ impl Engine {
                                         l.acquire(data.len() as i64).await;
                                     }
                                 }
-                                if write_message(&mut s, &msg).await.is_err() {
+                                if let Err(e) = write_message(&mut s, &msg).await {
+                                    debug!(peer = peer, remote = ?remote, err = %e, "peer write error, dropping");
                                     break;
                                 }
                             }
