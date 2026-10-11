@@ -56,6 +56,19 @@ pub enum DhtEvent {
         lookup: usize,
         tokens: Vec<(NodeId, SocketAddr, Vec<u8>)>,
     },
+    /// `direct_traversal` reply — a `direct_request` got a response;
+    /// `response` is the raw `r`/`e` dict bytes (`data_section`).
+    Direct {
+        /// the tag `direct_request` returned.
+        tag: u64,
+        /// responder id when the reply carries a valid `r.id`.
+        id: Option<NodeId>,
+        /// raw `r`/`e` dict payload.
+        response: Vec<u8>,
+        /// true when the reply was `y == "e"` or the transaction
+        /// timed out (upstream `direct_observer::timeout`).
+        failed: bool,
+    },
 }
 
 /// `dht::node` — one address-family's Kademlia node.
@@ -78,6 +91,8 @@ pub struct DhtNode {
     lookups: Vec<Option<Lookup>>,
     /// `m_last_bucket_refresh`-ish tick state is caller-driven.
     outbox: Outbox,
+    /// `direct_request` tag counter (bit 63 set on every tag).
+    direct_tag: u64,
     /// events drained by the caller (`dht_observer` upstream).
     events: Vec<DhtEvent>,
     /// `external_ip` votes collected from `ip` keys in incoming
@@ -102,6 +117,7 @@ impl DhtNode {
             v6,
             secret,
             lookups: Vec::new(),
+            direct_tag: 0,
             outbox: Vec::new(),
             events: Vec::new(),
             ip_votes: Vec::new(),
@@ -209,7 +225,7 @@ impl DhtNode {
             });
             for (i, ep) in picked {
                 if let Some(entry) = l.algo.results().get(i) {
-                    to_send.push((l.invoke_entry(entry), ep, pack_tag(idx, i)));
+                    to_send.push((l.invoke_entry(entry, our_id), ep, pack_tag(idx, i)));
                 }
             }
         }
@@ -280,6 +296,15 @@ impl DhtNode {
         {
             Incoming::Reply { tag, id } => {
                 self.table.node_seen(id, from, 0);
+                if tag & DIRECT_BIT != 0 {
+                    self.events.push(DhtEvent::Direct {
+                        tag,
+                        id: Some(id),
+                        response: r.data_section().to_vec(),
+                        failed: false,
+                    });
+                    return;
+                }
                 let (li, oi) = unpack_tag(tag);
                 if let Some(data) = self
                     .lookups
@@ -291,6 +316,15 @@ impl DhtNode {
                 }
             }
             Incoming::Error { tag } => {
+                if tag & DIRECT_BIT != 0 {
+                    self.events.push(DhtEvent::Direct {
+                        tag,
+                        id: None,
+                        response: Vec::new(),
+                        failed: true,
+                    });
+                    return;
+                }
                 let (li, oi) = unpack_tag(tag);
                 self.lookup_failed(li, oi, 0);
             }
@@ -321,6 +355,7 @@ impl DhtNode {
 
     fn finish_entry(&mut self, li: usize, oi: usize) {
         let hooks = self.hooks();
+        let our_id = self.id;
         let mut more: Vec<(Entry, SocketAddr, u64)> = Vec::new();
         if let Some(Some(l)) = self.lookups.get_mut(li) {
             let mut picked: Vec<(usize, SocketAddr)> = Vec::new();
@@ -330,11 +365,10 @@ impl DhtNode {
             });
             for (i, ep) in picked {
                 if let Some(entry) = l.algo.results().get(i) {
-                    more.push((l.invoke_entry(entry), ep, pack_tag(li, i)));
+                    more.push((l.invoke_entry(entry, our_id), ep, pack_tag(li, i)));
                 }
             }
         }
-        let our_id = self.id;
         let ro = self.settings.read_only;
         let v6 = self.v6;
         let rpc = &mut self.rpc;
@@ -352,9 +386,7 @@ impl DhtNode {
             .and_then(Option::as_ref)
             .is_some_and(|l| l.algo.is_done())
         {
-            let tokens = self.take_write_tokens(li);
-            self.lookups[li] = None;
-            self.events.push(DhtEvent::Done { lookup: li, tokens });
+            self.finish_lookup(li);
         }
     }
 
@@ -395,10 +427,81 @@ impl DhtNode {
             .and_then(Option::as_ref)
             .is_some_and(|l| l.algo.is_done())
         {
-            let tokens = self.take_write_tokens(li);
-            self.lookups[li] = None;
-            self.events.push(DhtEvent::Done { lookup: li, tokens });
+            self.finish_lookup(li);
         }
+    }
+
+    /// Lookup completion — `bootstrap::done` pings every result we
+    /// never queried (upstream `add_node` per un-queried observer),
+    /// then emits `DhtEvent::Done`.
+    fn finish_lookup(&mut self, li: usize) {
+        let is_bootstrap = self
+            .lookups
+            .get(li)
+            .and_then(Option::as_ref)
+            .is_some_and(|l| l.kind == LookupKind::Bootstrap);
+        if is_bootstrap && let Some(Some(l)) = self.lookups.get(li) {
+            let eps: Vec<SocketAddr> = l
+                .algo
+                .results()
+                .iter()
+                .filter(|o| o.flags & crate::traversal::obs_flags::QUERIED == 0)
+                .map(|o| o.ep)
+                .collect();
+            for ep in eps {
+                self.add_node(ep);
+            }
+        }
+        let tokens = self.take_write_tokens(li);
+        self.lookups[li] = None;
+        self.events.push(DhtEvent::Done { lookup: li, tokens });
+    }
+
+    /// `node::add_node` — verify an unknown endpoint with a `ping`
+    /// before it can enter the routing table. Tags the request in a
+    /// reserved tag space; timeouts decode to `usize::MAX` and are
+    /// ignored by the lookup machinery.
+    pub fn add_node(&mut self, ep: SocketAddr) {
+        let mut e = Entry::Dict(Default::default());
+        e.dict_mut()
+            .expect("dict")
+            .insert("q".into(), Entry::String(b"ping".to_vec()));
+        let our_id = self.id;
+        let ro = self.settings.read_only;
+        let v6 = self.v6;
+        let rpc = &mut self.rpc;
+        let outbox = &mut self.outbox;
+        rpc.invoke(e, ep, PING_TAG, our_id, ro, !v6, |e2, t| {
+            outbox.push((bitdaemon_bencode::bencode(&e2), t));
+            true
+        });
+    }
+
+    /// `node::direct_request` (`kademlia/direct_request`) — send a
+    /// query that isn't a traversal and get the reply back as a
+    /// `DhtEvent::Direct` event. Returns the request tag.
+    pub fn direct_request(&mut self, q: Entry, ep: SocketAddr) -> u64 {
+        let tag = DIRECT_BIT | self.direct_tag;
+        self.direct_tag = self.direct_tag.wrapping_add(1);
+        let our_id = self.id;
+        let ro = self.settings.read_only;
+        let v6 = self.v6;
+        let rpc = &mut self.rpc;
+        let outbox = &mut self.outbox;
+        rpc.invoke(q, ep, tag, our_id, ro, !v6, |e2, t| {
+            outbox.push((bitdaemon_bencode::bencode(&e2), t));
+            true
+        });
+        tag
+    }
+
+    /// `bootstrap` — `refresh.cpp` traversal: get_peers toward our
+    /// own (current) node id; `invoke` re-reads `self.id` via the
+    /// target stored at lookup start, so callers that rotate their
+    /// id should restart the bootstrap (upstream re-reads the live
+    /// id — our `Lookup` target IS `self.id` at call time).
+    pub fn bootstrap(&mut self) -> usize {
+        self.new_lookup(LookupKind::Bootstrap, self.id)
     }
 
     /// Query path — `incoming_request`. Builds `r`/`e` reply.
@@ -783,6 +886,26 @@ impl DhtNode {
         st
     }
 
+    /// `dht::live_nodes` — endpoints that answered (`flag_alive`)
+    /// on the `get_peers` traversal for `ih`.
+    #[must_use]
+    pub fn live_nodes_for(&self, ih: &NodeId) -> Vec<SocketAddr> {
+        let mut out = Vec::new();
+        for l in self.lookups.iter().flatten() {
+            if l.kind != LookupKind::GetPeers || l.algo.target() != ih {
+                continue;
+            }
+            out.extend(
+                l.algo
+                    .results()
+                    .iter()
+                    .filter(|e| e.flags & crate::traversal::obs_flags::ALIVE != 0)
+                    .map(|e| e.ep),
+            );
+        }
+        out
+    }
+
     /// `bootstrap` seeding — state-file endpoints aren't verified
     /// node ids, so they land in `router_nodes` (the `flag_initial`
     /// seed list `traversal::start` consumes).
@@ -797,6 +920,17 @@ impl DhtNode {
         let mut expirations = Vec::new();
         let wait = self.rpc.tick(|tag, ep, ex| expirations.push((tag, ep, ex)));
         for (tag, _ep, ex) in expirations {
+            if tag & DIRECT_BIT != 0 || tag == PING_TAG {
+                if tag & DIRECT_BIT != 0 {
+                    self.events.push(DhtEvent::Direct {
+                        tag,
+                        id: None,
+                        response: Vec::new(),
+                        failed: true,
+                    });
+                }
+                continue;
+            }
             let (li, oi) = unpack_tag(tag);
             match ex {
                 Expiry::ShortTimeout => {
@@ -812,6 +946,13 @@ impl DhtNode {
 
 /// `(pk, seq, sig, salt)` for a mutable `put` (BEP-44).
 pub type MutableFields<'a> = (&'a [u8; 32], i64, &'a [u8; 64], &'a [u8]);
+
+/// Tag space for `add_node` pings — decodes to `usize::MAX` which
+/// never indexes a live lookup.
+const PING_TAG: u64 = u64::MAX;
+/// Bit 63 marks `direct_request` tags — replies route to
+/// `DhtEvent::Direct` instead of the lookup machinery.
+const DIRECT_BIT: u64 = 1 << 63;
 
 fn pack_tag(lookup: usize, entry: usize) -> u64 {
     ((lookup as u64) << 32) | entry as u64

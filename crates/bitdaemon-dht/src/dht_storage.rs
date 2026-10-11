@@ -40,7 +40,7 @@ pub struct PeerEntry {
 }
 
 /// `torrent_entry` — peers split by family.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TorrentEntry {
     /// `name` — optional torrent name (≤100 chars).
     pub name: String,
@@ -51,7 +51,7 @@ pub struct TorrentEntry {
 }
 
 /// `dht_immutable_item`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DhtImmutableItem {
     /// `value` — bencoded payload.
     pub value: Vec<u8>,
@@ -64,7 +64,7 @@ pub struct DhtImmutableItem {
 }
 
 /// `dht_mutable_item`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DhtMutableItem {
     /// `value`.
     pub value: Vec<u8>,
@@ -170,6 +170,7 @@ pub struct PutMutable<'a> {
 }
 
 /// `dht_default_storage`.
+#[derive(Clone)]
 pub struct DhtStorage {
     /// `m_settings`.
     settings: DhtSettings,

@@ -40,7 +40,7 @@ fn get_peers_invoke_shape() {
     l.set_noseed(true);
     let entry =
         bitdaemon_dht::traversal::ObserverEntry::new(id(0xbb), "8.8.8.8:6881".parse().unwrap());
-    let e = l.invoke_entry(&entry);
+    let e = l.invoke_entry(&entry, id(0x99));
     let d = e.dict().unwrap();
     assert_eq!(d[b"q".as_slice()].string().unwrap(), b"get_peers");
     let a = d[b"a".as_slice()].dict().unwrap();
@@ -56,7 +56,7 @@ fn find_node_invoke_shape() {
     let l = Lookup::new(LookupKind::FindData, id(0xcc), false, &hooks(), vec![]);
     let entry =
         bitdaemon_dht::traversal::ObserverEntry::new(id(0xdd), "8.8.8.8:6881".parse().unwrap());
-    let e = l.invoke_entry(&entry);
+    let e = l.invoke_entry(&entry, id(0x99));
     let d = e.dict().unwrap();
     assert_eq!(d[b"q".as_slice()].string().unwrap(), b"find_node");
     assert_eq!(
@@ -137,4 +137,32 @@ fn sample_infohashes_reply() {
     assert_eq!(out.interval, Some(25));
     assert_eq!(out.num, Some(1000));
     assert_eq!(out.samples, vec![id(0x44), id(0x55)]);
+}
+
+#[test]
+fn bootstrap_uses_live_id_and_bs_flag() {
+    // upstream refresh.cpp: bootstrap get_peers targets the node's
+    // *current* id at invoke time and marks router (flag_initial)
+    // entries with a.bs = 1.
+    let stored = id(0xaa);
+    let live = id(0xbb);
+    let l = Lookup::new(LookupKind::Bootstrap, stored, false, &hooks(), vec![]);
+    let mut entry =
+        bitdaemon_dht::traversal::ObserverEntry::new(id(0xcc), "8.8.8.8:6881".parse().unwrap());
+    entry.flags = bitdaemon_dht::traversal::obs_flags::INITIAL;
+    let e = l.invoke_entry(&entry, live);
+    let d = e.dict().unwrap();
+    assert_eq!(d[b"q".as_slice()].string().unwrap(), b"get_peers");
+    let a = d[b"a".as_slice()].dict().unwrap();
+    assert_eq!(
+        a[b"info_hash".as_slice()].string().unwrap(),
+        live.as_bytes()
+    );
+    assert_eq!(a[b"bs".as_slice()].integer().unwrap(), 1);
+    // non-initial entries get no bs
+    let entry2 =
+        bitdaemon_dht::traversal::ObserverEntry::new(id(0xdd), "1.1.1.1:6881".parse().unwrap());
+    let e2 = l.invoke_entry(&entry2, live);
+    let a2 = e2.dict().unwrap()[b"a".as_slice()].dict().unwrap();
+    assert!(a2.get(b"bs".as_slice()).is_none());
 }

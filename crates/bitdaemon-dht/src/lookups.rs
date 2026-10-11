@@ -37,6 +37,11 @@ pub enum LookupKind {
     SampleInfohashes,
     /// `put` — second phase after a `get_item`/`find_data`.
     Put,
+    /// `bootstrap` (upstream `kademlia/refresh.cpp`) — a
+    /// `get_peers` traversal targeted at our own node id; the
+    /// `info_hash` is re-read from the node's *current* id on each
+    /// invoke (id may rotate) and router seeds get `a.bs = 1`.
+    Bootstrap,
 }
 
 /// Data extracted from one `r` reply, per [`LookupKind`].
@@ -115,13 +120,41 @@ impl Lookup {
         &self.write_tokens
     }
 
-    /// `invoke()` — the query dict for `entry`.
+    /// `invoke()` — the query dict for `entry`. `current_id` is the
+    /// node's *live* id — `bootstrap` re-reads it on every invoke
+    /// like upstream `bootstrap::invoke` (the id may rotate mid-
+    /// bootstrap); other kinds ignore it.
     #[must_use]
-    pub fn invoke_entry(&self, entry: &crate::traversal::ObserverEntry) -> Entry {
-        let target = *self.algo_target();
+    pub fn invoke_entry(
+        &self,
+        entry: &crate::traversal::ObserverEntry,
+        current_id: NodeId,
+    ) -> Entry {
+        let target = if self.kind == LookupKind::Bootstrap {
+            current_id
+        } else {
+            *self.algo_target()
+        };
         let mut e = Entry::Dict(Default::default());
         let mut a = Entry::Dict(Default::default());
         match self.kind {
+            LookupKind::Bootstrap => {
+                // upstream: always the *current* node id (it may
+                // change mid-bootstrap), and flag_initial targets
+                // get `a.bs = 1` so the router knows we're
+                // bootstrapping, not collateral traffic.
+                e.dict_mut()
+                    .expect("dict")
+                    .insert("q".into(), Entry::String(b"get_peers".to_vec()));
+                let am = a.dict_mut().expect("dict");
+                am.insert(
+                    "info_hash".into(),
+                    Entry::String(target.as_bytes().to_vec()),
+                );
+                if entry.flags & crate::traversal::obs_flags::INITIAL != 0 {
+                    am.insert("bs".into(), Entry::Int(1));
+                }
+            }
             LookupKind::FindData => {
                 e.dict_mut()
                     .expect("dict")

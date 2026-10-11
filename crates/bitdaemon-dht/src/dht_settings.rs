@@ -172,18 +172,10 @@ pub fn dht_save_state(settings: &DhtSettings) -> Entry {
     i(b"block_ratelimit", i64::from(settings.block_ratelimit));
     i(b"read_only", settings.read_only as i64);
     i(b"item_lifetime", i64::from(settings.item_lifetime));
-    i(b"upload_rate_limit", i64::from(settings.upload_rate_limit));
-    i(
-        b"sample_infohashes_interval",
-        i64::from(settings.sample_infohashes_interval),
-    );
-    i(
-        b"max_infohashes_sample_count",
-        i64::from(settings.max_infohashes_sample_count),
-    );
-    i(
-        b"prefer_verified_node_ids",
-        settings.prefer_verified_node_ids as i64,
-    );
+    // upstream `save_dht_settings` writes only the 18 keys above;
+    // the ABI-3 fields (upload_rate_limit, sample_infohashes_interval,
+    // max_infohashes_sample_count, prefer_verified_node_ids) are read
+    // but never written — `dht_save_state` here is that function, so
+    // keep the output set identical for .session byte-compat.
     e
 }
