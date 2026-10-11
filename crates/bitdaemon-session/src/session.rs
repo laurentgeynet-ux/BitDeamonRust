@@ -1672,6 +1672,7 @@ impl Session {
     /// (BT-SEARCH isn't a bencoded dict, so the dht drops it first).
     pub fn on_udp(&mut self, from: SocketAddr, buf: &[u8], out: &mut Vec<SessionOut>) {
         if let Some((pkt, to)) = self.dht.incoming(from, buf) {
+            tracing::trace!(%from, len = buf.len(), "dht incoming handled");
             out.push(SessionOut::UdpPacket(pkt, to));
         }
         // `ip_voter::cast_vote` — the `ip` key a node echoed back is
@@ -1841,6 +1842,17 @@ impl Session {
         if !self.settings.dht_enabled || !self.services.dht || self.settings.anonymous_mode {
             return;
         }
+        // don't announce into an empty routing table — a `get_peers`
+        // lookup with no nodes finishes instantly and upstream only
+        // announces on a running (bootstrapped) DHT. Retrying every
+        // tick while the table is empty is harmless and matches the
+        // announce-once-bootstrapped behaviour.
+        let bootstrapped = [false, true]
+            .iter()
+            .any(|v6| self.dht.get_node(*v6).is_some_and(|n| n.table.size().0 > 0));
+        if !bootstrapped {
+            return;
+        }
         let ihs: Vec<Sha1Hash> = self
             .torrents
             .iter()
@@ -1870,6 +1882,7 @@ impl Session {
         }
         for v6 in [false, true] {
             if let Some(n) = self.dht.get_node_mut(v6) {
+                tracing::debug!(%ih, v6, nodes = n.table.size().0, "dht get_peers announce");
                 let li = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetPeers, ih);
                 self.dht_lookup_map.insert((v6, li), ih);
             }
@@ -1935,6 +1948,9 @@ impl Session {
                             continue;
                         };
                         if let Some(t) = self.torrents.get_mut(&ih) {
+                            if !data.peers.is_empty() {
+                                tracing::info!(%ih, peers = data.peers.len(), "dht get_peers found peers");
+                            }
                             for ep in data.peers {
                                 t.peer_list.add_peer(
                                     ep,
@@ -2272,11 +2288,21 @@ impl Session {
 
     /// `dht->add_router_node` — a resolved `.torrent` `nodes` host.
     /// Routes on the address family like upstream (`add_node`
-    /// picks the v4/v6 node by the resolved address).
+    /// picks the v4/v6 node by the resolved address). When the
+    /// routing table holds no live nodes yet, the first router node
+    /// kicks off the `bootstrap` traversal — upstream arms it in
+    /// `dht_tracker::new_socket`/`start`.
     pub fn dht_add_node(&mut self, addr: SocketAddr) {
         let v6 = addr.is_ipv6();
+        let bound = self.dht.get_node(v6).is_some();
+        tracing::trace!(%addr, v6, bound, "dht_add_node");
         if let Some(n) = self.dht.get_node_mut(v6) {
+            let needs_bootstrap = n.table.size().0 == 0;
             n.table.add_router_node(addr);
+            if needs_bootstrap {
+                tracing::debug!(%addr, "dht bootstrap on first router node");
+                n.bootstrap();
+            }
         }
     }
 

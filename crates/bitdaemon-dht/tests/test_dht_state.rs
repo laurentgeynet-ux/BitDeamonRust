@@ -113,3 +113,32 @@ fn node_entry_rtt_and_flags() {
     assert!(ne.better_than(&unverified));
     assert!(!unverified.better_than(&ne));
 }
+
+/// `node::bootstrap` — adding a router node then bootstrapping must
+/// emit a well-formed `get_peers` query to that router.
+#[test]
+fn bootstrap_emits_get_peers_to_router() {
+    use bitdaemon_dht::dht_node::DhtNode;
+    use bitdaemon_dht::dht_settings::DhtSettings;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    let router = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 6881);
+    let mut n = DhtNode::new(
+        None,
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        false,
+        DhtSettings::default(),
+    );
+    n.table.add_router_node(router);
+    n.bootstrap();
+    let (pkt, to) = n.poll().expect("a packet");
+    assert_eq!(to, router);
+    let root = bdecode_checked(&pkt).unwrap();
+    assert_eq!(root.dict_find_string_value(b"y", b""), b"q");
+    assert_eq!(root.dict_find_string_value(b"q", b""), b"get_peers");
+    // v4 node querying a v4 router must not set `want`
+    // (cross-family only upstream — a `want: n6` bug made routers
+    // reply `nodes6`, useless to the v4 table).
+    let a = root.dict_find_dict(b"a");
+    assert!(!a.dict_find_string(b"want").is_valid());
+    assert_eq!(a.dict_find_string(b"id").string_length(), 20);
+}

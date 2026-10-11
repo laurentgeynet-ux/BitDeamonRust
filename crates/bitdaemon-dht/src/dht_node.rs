@@ -232,7 +232,8 @@ impl DhtNode {
         let rpc = &mut self.rpc;
         let outbox = &mut self.outbox;
         for (e, ep, tag) in to_send {
-            rpc.invoke(e, ep, tag, our_id, read_only, !v6, |e2, t| {
+            tracing::trace!(%ep, kind = ?self.lookups[idx].as_ref().map(|l| l.kind), "dht invoke");
+            rpc.invoke(e, ep, tag, our_id, read_only, v6, |e2, t| {
                 outbox.push((bitdaemon_bencode::bencode(&e2), t));
                 true
             });
@@ -290,10 +291,20 @@ impl DhtNode {
         } else {
             None
         };
-        match self
+        let inc = self
             .rpc
-            .incoming(from, tid, is_error, resp_id, self.settings.enforce_node_id)
-        {
+            .incoming(from, tid, is_error, resp_id, self.settings.enforce_node_id);
+        tracing::trace!(
+            %from,
+            tid = ?String::from_utf8_lossy(tid),
+            variant = match &inc {
+                Incoming::Reply { .. } => "reply",
+                Incoming::Error { .. } => "error",
+                Incoming::Ignored => "ignored",
+            },
+            "dht reply classified"
+        );
+        match inc {
             Incoming::Reply { tag, id } => {
                 self.table.node_seen(id, from, 0);
                 if tag & DIRECT_BIT != 0 {
@@ -306,13 +317,16 @@ impl DhtNode {
                     return;
                 }
                 let (li, oi) = unpack_tag(tag);
-                if let Some(data) = self
+                match self
                     .lookups
                     .get_mut(li)
                     .and_then(Option::as_mut)
-                    .and_then(|l| l.on_reply(&r))
+                    .map(|l| (l.on_reply(&r), l.kind))
                 {
-                    self.lookup_reply(li, oi, data);
+                    Some((Some(data), _)) => self.lookup_reply(li, oi, data),
+                    other => {
+                        tracing::trace!(li, oi, kind = ?other.map(|t| t.1), "dht reply produced no data")
+                    }
                 }
             }
             Incoming::Error { tag } => {
@@ -343,6 +357,7 @@ impl DhtNode {
         });
         let table = &mut self.table;
         if let Some(Some(l)) = self.lookups.get_mut(li) {
+            tracing::trace!(li, nodes = nodes.len(), "dht traverse nodes");
             for (id, ep) in nodes {
                 l.algo.traverse(id, ep, &hooks, |i2, e2| {
                     table.heard_about(i2, e2);
@@ -363,6 +378,7 @@ impl DhtNode {
                 picked.push((i, entry.ep));
                 true
             });
+            tracing::trace!(li, picked = picked.len(), "dht finish_entry picks");
             for (i, ep) in picked {
                 if let Some(entry) = l.algo.results().get(i) {
                     more.push((l.invoke_entry(entry, our_id), ep, pack_tag(li, i)));
@@ -374,7 +390,7 @@ impl DhtNode {
         let rpc = &mut self.rpc;
         let outbox = &mut self.outbox;
         for (e, ep, tag) in more {
-            rpc.invoke(e, ep, tag, our_id, ro, !v6, |e2, t| {
+            rpc.invoke(e, ep, tag, our_id, ro, v6, |e2, t| {
                 outbox.push((bitdaemon_bencode::bencode(&e2), t));
                 true
             });
@@ -471,7 +487,7 @@ impl DhtNode {
         let v6 = self.v6;
         let rpc = &mut self.rpc;
         let outbox = &mut self.outbox;
-        rpc.invoke(e, ep, PING_TAG, our_id, ro, !v6, |e2, t| {
+        rpc.invoke(e, ep, PING_TAG, our_id, ro, v6, |e2, t| {
             outbox.push((bitdaemon_bencode::bencode(&e2), t));
             true
         });
@@ -488,7 +504,7 @@ impl DhtNode {
         let v6 = self.v6;
         let rpc = &mut self.rpc;
         let outbox = &mut self.outbox;
-        rpc.invoke(q, ep, tag, our_id, ro, !v6, |e2, t| {
+        rpc.invoke(q, ep, tag, our_id, ro, v6, |e2, t| {
             outbox.push((bitdaemon_bencode::bencode(&e2), t));
             true
         });
@@ -862,7 +878,7 @@ impl DhtNode {
         let v6 = self.v6;
         let rpc = &mut self.rpc;
         let outbox = &mut self.outbox;
-        rpc.invoke(e, ep, tag, our_id, ro, !v6, |e2, t| {
+        rpc.invoke(e, ep, tag, our_id, ro, v6, |e2, t| {
             outbox.push((bitdaemon_bencode::bencode(&e2), t));
             true
         });

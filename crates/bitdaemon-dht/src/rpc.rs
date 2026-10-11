@@ -85,7 +85,7 @@ impl RpcManager {
         tag: u64,
         our_id: NodeId,
         read_only: bool,
-        want_v6: bool,
+        native_v6: bool,
         send: impl FnOnce(Entry, SocketAddr) -> bool,
     ) -> Option<u16> {
         let tid: u16 = rand::random();
@@ -97,10 +97,13 @@ impl RpcManager {
             .or_insert_with(|| Entry::Dict(Default::default()));
         let am = a.dict_mut().ok()?;
         am.insert("id".into(), Entry::String(our_id.as_bytes().to_vec()));
-        if want_v6 {
+        // upstream only sets `want` on cross-family queries, asking
+        // for the node's *own* family (v4 node → "n4", v6 → "n6").
+        if ep.is_ipv6() != native_v6 {
+            let family: &[u8] = if native_v6 { b"n6" } else { b"n4" };
             am.insert(
                 "want".into(),
-                Entry::List(vec![Entry::String(b"n6".to_vec())]),
+                Entry::List(vec![Entry::String(family.to_vec())]),
             );
         }
         if read_only {

@@ -223,7 +223,13 @@ async fn main() -> anyhow::Result<()> {
 
     // upstream `dht_bootstrap_nodes` setting — seed the routing
     // table from the well-known public routers.
-    for host in ["router.bittorrent.com", "dht.transmissionbt.com"] {
+    for host in [
+        "router.bittorrent.com",
+        "router.utorrent.com",
+        "router.bitcomet.com",
+        "dht.transmissionbt.com",
+        "dht.aelitis.com",
+    ] {
         eng.dispatch_out(bitdaemon::session::session::SessionOut::DhtAddNode {
             host: host.into(),
             port: 6881,
@@ -238,6 +244,10 @@ async fn main() -> anyhow::Result<()> {
             let mut guard = slock(&ses);
             for a in guard.pop_alerts() {
                 println!("alert: {a:?}");
+            }
+            let dht_nodes = guard.dht_state().nodes.len() + guard.dht_state().nodes6.len();
+            if dht_nodes > 0 {
+                println!("dht: {dht_nodes} nodes in routing table");
             }
             for (ih, t) in &guard.torrents {
                 let st = t.status(&guard.settings, guard.queue_position(ih));

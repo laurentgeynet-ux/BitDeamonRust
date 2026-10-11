@@ -31,7 +31,7 @@ use bitdaemon_session::session::{PeerPacket, Session, SessionOut};
 use bitdaemon_session::session_handle::lock as slock;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 /// `ssl_context::m_ssl_ctx` — tracker-facing rustls config built once
 /// from the OS root store (upstream loads the system trust DB via
@@ -278,10 +278,17 @@ pub struct Engine {
     /// opt-in for now: upstream defaults `enable_*_utp` to true but
     /// our uTP path is newer than the TCP one.
     utp_enabled: bool,
+    /// non-peer `SessionOut`s queued by [`Self::dispatch_out`] —
+    /// dispatched (async) at the start of the next `tick`.
+    pending_out: Vec<SessionOut>,
     /// `m_peer_ssl_ctx` SNI dispatch — per-info-hash `CertifiedKey`
     /// map for SSL-torrent listen sockets (`ssl_server_name_callback`
     /// upstream). Fed by [`Self::refresh_ssl_certs`].
     ssl_resolver: Arc<bitdaemon_net::ssl_stream::SniResolver>,
+    /// per-torrent trust roots for mutual TLS on SSL-torrent peers —
+    /// the acceptor's `ClientCertVerifier` checks the peer chain +
+    /// leaf name against these (`torrent::verify_peer_cert`).
+    ssl_roots: Arc<bitdaemon_net::ssl_stream::SslTorrentRoots>,
 }
 
 impl Engine {
@@ -338,6 +345,8 @@ impl Engine {
             utp_connector: None,
             utp_enabled: false,
             ssl_resolver: Arc::new(bitdaemon_net::ssl_stream::SniResolver::new(None)),
+            ssl_roots: Arc::new(bitdaemon_net::ssl_stream::SslTorrentRoots::new()),
+            pending_out: Vec::new(),
         }
     }
 
@@ -418,6 +427,11 @@ impl Engine {
     /// Returns surfaced `Alert`s.
     pub async fn tick(&mut self, now: Instant) -> Vec<Alert> {
         let mut out = Vec::new();
+        // effects queued by `dispatch_out` from sync contexts
+        if !self.pending_out.is_empty() {
+            let pending = std::mem::take(&mut self.pending_out);
+            self.dispatch(pending).await;
+        }
 
         while let Ok(m) = self.inbound_rx.try_recv() {
             slock(&self.session).on_peer_message(&m.packet, &mut out);
@@ -449,6 +463,7 @@ impl Engine {
                     tokio::spawn(async move { mgr.route(from, &buf).await });
                 }
             } else {
+                trace!(%from, len = buf.len(), "udp recv -> session");
                 slock(&self.session).on_udp(from, &buf, &mut out);
             }
         }
@@ -466,6 +481,7 @@ impl Engine {
             }
         }
         while let Ok(a) = self.dhtnode_rx.try_recv() {
+            trace!(%a, "dht_add_node drain");
             slock(&self.session).dht_add_node(a);
         }
         while let Ok(r) = self.upnp_rx.try_recv() {
@@ -516,8 +532,15 @@ impl Engine {
     /// `session_impl` effect fan-out — public so callers that
     /// mutate `Session` directly (e.g. `add_torrent_params`) can
     /// push the produced `SessionOut`s through the transport layer.
+    /// Non-peer effects (DhtAddNode, TrackerAnnounce, UdpPacket…)
+    /// can't run in a sync context — they queue onto
+    /// `pending_out` and are dispatched on the next [`Self::tick`].
     pub fn dispatch_out(&mut self, o: SessionOut) {
-        self.send_msgs_to_peers(vec![o]);
+        if matches!(o, SessionOut::ToPeer { .. }) {
+            self.send_msgs_to_peers(vec![o]);
+        } else {
+            self.pending_out.push(o);
+        }
     }
 
     fn send_msgs_to_peers(&mut self, out: Vec<SessionOut>) {
@@ -545,7 +568,10 @@ impl Engine {
                 }
                 SessionOut::UdpPacket(buf, to) => {
                     if let Some(d) = &self.datagram {
+                        trace!(%to, len = buf.len(), "udp send");
                         let _ = d.send_to(&buf, to).await;
+                    } else {
+                        trace!(%to, "udp send dropped — no datagram socket");
                     }
                 }
                 SessionOut::TrackerAnnounce {
@@ -574,8 +600,25 @@ impl Engine {
                         let Ok(port) = u16::try_from(port) else {
                             return;
                         };
-                        if let Ok(addr) = resolve(&resolver, &host, port).await {
-                            let _ = dht_tx.send(addr);
+                        // all resolved addresses become router nodes —
+                        // upstream feeds every endpoint from
+                        // `udp::resolver` into `dht.add_node`.
+                        let Some(res) = resolver else { return };
+                        match bitdaemon_net::resolver::resolve_host(
+                            res.as_ref(),
+                            &host,
+                            port,
+                            bitdaemon_net::resolver::ResolveFlags::default(),
+                        )
+                        .await
+                        {
+                            Ok(addrs) => {
+                                for addr in addrs {
+                                    debug!(%addr, "dht bootstrap node resolved");
+                                    let _ = dht_tx.send(addr);
+                                }
+                            }
+                            Err(e) => debug!(%host, err = %e, "dht bootstrap resolve failed"),
                         }
                     }));
                 }
@@ -1344,13 +1387,20 @@ impl Engine {
             None
         };
         let tx = self.connect_tx.clone();
-        let (pid, dht, ssl_torrent) = {
+        let (pid, dht, ssl_params) = {
             let ses = slock(&self.session);
-            (
-                ses.peer_id,
-                ses.settings.dht_enabled,
-                ses.torrents.get(&ih).is_some_and(|t| t.is_ssl_torrent()),
-            )
+            let ssl = ses.torrents.get(&ih).and_then(|t| {
+                if !t.is_ssl_torrent() {
+                    return None;
+                }
+                let ti = t.ti.as_ref()?;
+                let root: Vec<u8> = ti.ssl_cert().to_vec();
+                let name: String = String::from_utf8_lossy(ti.name()).into_owned();
+                let cert: Option<String> = t.ssl_pem_pair().map(|(c, _)| c.to_string());
+                let key: Option<String> = t.ssl_pem_pair().map(|(_, k)| k.to_string());
+                Some((root, name, cert, key))
+            });
+            (ses.peer_id, ses.settings.dht_enabled, ssl)
         };
         let fast = true;
         let ext = self.ext_handshake(&ih);
@@ -1385,20 +1435,26 @@ impl Engine {
             // SSL torrent: every peer connection is TLS-wrapped
             // (upstream `is_ssl_torrent()` → `ssl_stream<T>`) — SNI
             // carries the hex info-hash for the server-side dispatch.
-            // `peer_client_config` is verify-none: upstream checks
-            // the peer cert against the embedded root CA by chain,
-            // which rustls cannot express without a custom webpki
-            // path — documented divergence in PORTING.md.
-            let mut s = if ssl_torrent {
+            // The peer's chain is verified against the torrent's
+            // embedded root and its leaf SAN/CN must equal the
+            // torrent name or "*" (`torrent::verify_peer_cert`);
+            // mutual TLS — we present our `set_ssl_certificate`
+            // cert/key when configured.
+            let mut s = if let Some((root, name, cert, key)) = ssl_params {
                 let sni = crate::common::hex::to_hex(ih.as_bytes());
-                match bitdaemon_net::ssl_stream::ssl_connect(
-                    s,
-                    &sni,
-                    remote,
-                    bitdaemon_net::ssl_stream::peer_client_config(),
-                )
-                .await
-                {
+                let cfg = match bitdaemon_net::ssl_stream::peer_ssl_client_config(
+                    &root,
+                    &name,
+                    cert.as_deref().map(str::as_bytes),
+                    key.as_deref().map(str::as_bytes),
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        send_err(format!("ssl config: {e}"));
+                        return;
+                    }
+                };
+                match bitdaemon_net::ssl_stream::ssl_connect(s, &sni, remote, cfg).await {
                     Ok(tls) => Box::new(tls) as bitdaemon_net::transport::BoxedPeerStream,
                     Err(e) => {
                         send_err(format!("ssl handshake: {e}"));
@@ -1503,7 +1559,11 @@ impl Engine {
     ) {
         let cfg = Arc::new(
             rustls::ServerConfig::builder()
-                .with_no_client_auth()
+                // SSL torrents are mutual-TLS upstream
+                // (`verify_peer | verify_fail_if_no_peer_cert`).
+                .with_client_cert_verifier(Arc::new(
+                    bitdaemon_net::ssl_stream::TorrentClientVerifier::new(self.ssl_roots.clone()),
+                ))
                 .with_cert_resolver(self.ssl_resolver.clone()),
         );
         let tx = self.connect_tx.clone();
@@ -1572,10 +1632,23 @@ impl Engine {
                 continue;
             }
             if let Some((cert, key)) = t.ssl_pem_pair() {
-                match bitdaemon_net::ssl_stream::certified_key(cert, key) {
-                    Ok(ck) => {
-                        res.register(&crate::common::hex::to_hex(ih.as_bytes()), ck);
-                    }
+                let sni = crate::common::hex::to_hex(ih.as_bytes());
+                // the trust root comes from the torrent file's
+                // `ssl-cert` field (`init_ssl` upstream)
+                let (name, root) = t.ti.as_ref().map_or((Vec::new(), Vec::new()), |ti| {
+                    (ti.name().to_vec(), ti.ssl_cert().to_vec())
+                });
+                let name = String::from_utf8_lossy(&name).into_owned();
+                match bitdaemon_net::ssl_stream::register_ssl_torrent(
+                    res,
+                    &self.ssl_roots,
+                    &sni,
+                    &name,
+                    &root,
+                    cert,
+                    key,
+                ) {
+                    Ok(()) => {}
                     Err(e) => warn!(err = %e, "ssl cert load failed"),
                 }
             }
