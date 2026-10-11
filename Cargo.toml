@@ -70,6 +70,8 @@ tokio-rustls = "0.26"
 # HTTPS trackers need the OS root store (upstream reads the system
 # trust DB) — `rustls-native-certs`, ADR-0007 note.
 rustls-native-certs = "0.8"
+rustls-webpki = "0.103"
+x509-parser = "0.16"
 
 [profile.dev.package."*"]
 opt-level = 2

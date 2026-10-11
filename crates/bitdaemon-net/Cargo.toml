@@ -26,10 +26,13 @@ num-traits.workspace = true
 sha1.workspace = true
 if-addrs.workspace = true
 rustls.workspace = true
+rustls-webpki.workspace = true
+x509-parser.workspace = true
 tokio-rustls.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+rcgen = "0.13"
 bytes.workspace = true
 bitdaemon-common.workspace = true
 
