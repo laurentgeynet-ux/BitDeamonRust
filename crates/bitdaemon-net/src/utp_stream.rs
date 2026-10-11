@@ -120,7 +120,7 @@ impl UtpManager {
         let recv_id = sock.recv_id();
         let rx = self.register((from, recv_id)).await;
         let (rd_tx, rd_rx) = mpsc::channel::<Vec<u8>>(64);
-        let (wr_tx, wr_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (wr_tx, wr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (st_tx, st_rx) = mpsc::channel::<UtpState>(1);
 
         let dg2 = dg.clone();
@@ -190,7 +190,7 @@ impl UtpManager {
         let recv_id = sock.recv_id();
         let rx = self.register((remote, recv_id)).await;
         let (rd_tx, rd_rx) = mpsc::channel::<Vec<u8>>(64);
-        let (wr_tx, wr_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (wr_tx, wr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (st_tx, st_rx) = mpsc::channel::<UtpState>(1);
 
         let dg2 = dg.clone();
@@ -228,7 +228,7 @@ async fn socket_pump(
     mut sock: UtpSocket,
     dg: Arc<dyn DatagramSocket>,
     mut inbound_rx: mpsc::Receiver<Inbound>,
-    mut wr_rx: mpsc::Receiver<Vec<u8>>,
+    mut wr_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     rd_tx: mpsc::Sender<Vec<u8>>,
     st_tx: mpsc::Sender<UtpState>,
     key: (SocketAddr, u16),
@@ -240,6 +240,13 @@ async fn socket_pump(
     loop {
         // drain outgoing datagrams
         for d in sock.drain_outbox() {
+            tracing::trace!(
+                "pump {key:?} -> ty={} seq={} ack={} len={}",
+                d.bytes[0] >> 4,
+                u16::from_be_bytes([d.bytes[16], d.bytes[17]]),
+                u16::from_be_bytes([d.bytes[18], d.bytes[19]]),
+                d.bytes.len()
+            );
             let _ = dg.send_to(&d.bytes, d.to).await;
         }
         // push any received payload toward the reader
@@ -261,6 +268,9 @@ async fn socket_pump(
         }
         tokio::select! {
             Some((buf, from)) = inbound_rx.recv() => {
+                tracing::trace!("pump {key:?} <- ty={} seq={} ack={} len={}", buf[0]>>4,
+                    u16::from_be_bytes([buf[16],buf[17]]),
+                    u16::from_be_bytes([buf[18],buf[19]]), buf.len());
                 sock.incoming_packet(&buf, from, Instant::now());
                 sock.send_deferred_ack();
             }
@@ -280,7 +290,7 @@ async fn socket_pump(
 #[derive(Debug)]
 pub struct UtpStream {
     rd_rx: mpsc::Receiver<Vec<u8>>,
-    wr_tx: mpsc::Sender<Vec<u8>>,
+    wr_tx: mpsc::UnboundedSender<Vec<u8>>,
     st_rx: Arc<Mutex<mpsc::Receiver<UtpState>>>,
     read_buf: std::collections::VecDeque<u8>,
 }
@@ -333,12 +343,9 @@ impl AsyncWrite for UtpStream {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.wr_tx.try_send(buf.to_vec()) {
+        match self.wr_tx.send(buf.to_vec()) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(mpsc::error::TrySendError::Full(_)) => Poll::Pending,
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Poll::Ready(Err(io::Error::other("utp closed")))
-            }
+            Err(_) => Poll::Ready(Err(io::Error::other("utp closed"))),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {

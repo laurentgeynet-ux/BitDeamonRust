@@ -3,6 +3,7 @@
 
 use bitdaemon_net::socks::{SocksCommand, SocksError, SocksTarget, socks_connect};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
 #[tokio::test]
@@ -729,4 +730,156 @@ fn ip_voter_majority() {
     v.cast_vote(ext, IpSourceFlags::SOURCE_TRACKER, &s2);
     v.cast_vote(ext, IpSourceFlags::SOURCE_DHT, &s3);
     assert_eq!(v.external_address(), Some(ext));
+}
+
+/// UDP-ASSOCIATE end-to-end: scripted SOCKS5 server hands out a relay
+/// BND address; outbound datagrams arrive wrapped at the relay,
+/// inbound wrapped datagrams unwrap to the original source.
+#[tokio::test]
+async fn socks5_udp_associate_relay() {
+    use bitdaemon_net::socks_udp::{Socks5UdpSocket, socks5_unwrap, socks5_wrap};
+    use bitdaemon_net::transport::{DatagramSocket, PeerConnector};
+    use std::fmt::Debug;
+    use tokio::sync::mpsc;
+
+    // mock PeerConnector — always yields one end of a duplex pair;
+    // the stream crosses a oneshot because `PeerConnector::connect`
+    // requires a `Sync` future while `BoxedPeerStream` is not `Sync`.
+    #[derive(Debug)]
+    struct C {
+        peer: std::sync::Mutex<Option<BoxedPeerStream>>,
+    }
+    use bitdaemon_net::transport::BoxedPeerStream;
+    impl PeerConnector for C {
+        fn connect(
+            self: Arc<Self>,
+            _addr: SocketAddr,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = bitdaemon_net::Result<BoxedPeerStream>>
+                    + Send
+                    + Sync,
+            >,
+        > {
+            let s = self.peer.lock().unwrap().take();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(s);
+            Box::pin(async move {
+                rx.await
+                    .map_err(|_| bitdaemon_net::NetError::NoTransport("no mock"))?
+                    .ok_or(bitdaemon_net::NetError::NoTransport("no mock"))
+            })
+        }
+    }
+
+    // channel "UDP socket" — captures what we send to the relay and
+    // feeds us scripted inbound datagrams
+    let (in_tx, in_rx) = mpsc::unbounded_channel::<(Vec<u8>, SocketAddr)>();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<(Vec<u8>, SocketAddr)>();
+    struct U {
+        rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+        tx: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
+        me: SocketAddr,
+    }
+    impl Debug for U {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("U").finish()
+        }
+    }
+    impl DatagramSocket for U {
+        fn send_to<'a>(
+            &'a self,
+            buf: &'a [u8],
+            to: SocketAddr,
+        ) -> bitdaemon_net::transport::BoxFut<'a, usize> {
+            Box::pin(async move {
+                let _ = self.tx.send((buf.to_vec(), to));
+                Ok(buf.len())
+            })
+        }
+        fn recv_from<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> bitdaemon_net::transport::BoxFut<'a, (usize, SocketAddr)> {
+            Box::pin(async move {
+                let (d, from) = self
+                    .rx
+                    .lock()
+                    .await
+                    .recv()
+                    .await
+                    .ok_or_else(|| std::io::Error::other("closed"))?;
+                let n = d.len().min(buf.len());
+                buf[..n].copy_from_slice(&d[..n]);
+                Ok((n, from))
+            })
+        }
+        fn local_addr(&self) -> SocketAddr {
+            self.me
+        }
+    }
+
+    let (client, mut server) = duplex(4096);
+    let relay = SocketAddr::from(([127, 0, 0, 1], 19000));
+    let server_task = tokio::spawn(async move {
+        // method negotiation
+        let mut m = [0u8; 3];
+        server.read_exact(&mut m).await.unwrap();
+        assert_eq!(m[0], 5);
+        server.write_all(&[5, 0]).await.unwrap();
+        // request: UDP ASSOCIATE (cmd=3), DST 0.0.0.0:0
+        let mut req = [0u8; 10];
+        server.read_exact(&mut req).await.unwrap();
+        assert_eq!(&req[..4], &[5, 3, 0, 1]);
+        assert_eq!(&req[4..], &[0, 0, 0, 0, 0, 0]);
+        // reply: success, BND = relay
+        let mut rep = vec![5u8, 0, 0, 1];
+        rep.extend_from_slice(&[127, 0, 0, 1]);
+        rep.extend_from_slice(&19000u16.to_be_bytes());
+        server.write_all(&rep).await.unwrap();
+        // keep the control connection open — closing ends the
+        // association per RFC 1928
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    });
+
+    let proxy = SocketAddr::from(([127, 0, 0, 1], 1080));
+    let udp = Arc::new(U {
+        rx: tokio::sync::Mutex::new(in_rx),
+        tx: out_tx,
+        me: SocketAddr::from(([10, 0, 0, 9], 5555)),
+    });
+    let sock = Socks5UdpSocket::associate(
+        Arc::new(C {
+            peer: std::sync::Mutex::new(Some(Box::new(client) as BoxedPeerStream)),
+        }),
+        udp,
+        proxy,
+        "",
+        "",
+    )
+    .await
+    .expect("associate");
+    assert_eq!(sock.local_addr(), relay);
+
+    // outbound: wrapped datagram lands at the relay address
+    let target = SocketAddr::from(([192, 168, 5, 7], 51413));
+    sock.send_to(b"dht-ping", target).await.unwrap();
+    let (dgram, to) = out_rx.recv().await.unwrap();
+    assert_eq!(to, relay);
+    assert_eq!(dgram, socks5_wrap(target, b"dht-ping"));
+
+    // inbound: a relayed datagram unwraps to its real source
+    let src = SocketAddr::from(([203, 0, 113, 9], 6881));
+    in_tx.send((socks5_wrap(src, b"dht-pong"), relay)).unwrap();
+    let mut buf = [0u8; 128];
+    let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+    assert_eq!(from, src);
+    assert_eq!(&buf[..n], b"dht-pong");
+
+    // unwrap rejects fragmented datagrams like upstream
+    let mut frag = socks5_wrap(src, b"x");
+    frag[2] = 1;
+    assert!(socks5_unwrap(&frag).is_none());
+
+    server_task.await.unwrap();
 }

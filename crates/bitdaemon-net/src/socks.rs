@@ -82,9 +82,25 @@ pub async fn socks_connect<S: AsyncRead + AsyncWrite + Unpin>(
     target: &SocksTarget,
     command: SocksCommand,
 ) -> Result<(), SocksError> {
+    socks_connect_bound(stream, version, user, password, target, command)
+        .await
+        .map(|_| ())
+}
+
+/// `socks_connect` returning the reply's bound address — needed by
+/// UDP ASSOCIATE (BND.ADDR/BND.PORT is the relay endpoint; CONNECT
+/// callers ignore it).
+pub async fn socks_connect_bound<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    version: u8,
+    user: &str,
+    password: &str,
+    target: &SocksTarget,
+    command: SocksCommand,
+) -> Result<Option<SocketAddr>, SocksError> {
     match version {
         5 => socks5(stream, user, password, target, command).await,
-        4 => socks4(stream, user, target, command).await,
+        4 => socks4(stream, user, target, command).await.map(|_| None),
         _ => Err(SocksError::UnsupportedVersion),
     }
 }
@@ -95,7 +111,7 @@ async fn socks5<S: AsyncRead + AsyncWrite + Unpin>(
     password: &str,
     target: &SocksTarget,
     command: SocksCommand,
-) -> Result<(), SocksError> {
+) -> Result<Option<SocketAddr>, SocksError> {
     // methods advertisement: [5, 1, 0] or [5, 2, 0, 2]
     let mut buf = Vec::with_capacity(4);
     buf.push(5u8);
@@ -182,25 +198,38 @@ async fn socks5<S: AsyncRead + AsyncWrite + Unpin>(
             format!("SOCKS5 reply {}", hdr[1]),
         )));
     }
-    // drain the bound address
-    match hdr[3] {
+    // read the bound address (BND.ADDR/BND.PORT)
+    let bound = match hdr[3] {
         1 => {
             let mut a = [0u8; 4 + 2];
             stream.read_exact(&mut a).await?;
+            Some(SocketAddr::from((
+                Ipv4Addr::new(a[0], a[1], a[2], a[3]),
+                u16::from_be_bytes([a[4], a[5]]),
+            )))
         }
         4 => {
             let mut a = [0u8; 16 + 2];
             stream.read_exact(&mut a).await?;
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&a[..16]);
+            Some(SocketAddr::from((
+                Ipv6Addr::from(o),
+                u16::from_be_bytes([a[16], a[17]]),
+            )))
         }
         3 => {
             let mut l = [0u8; 1];
             stream.read_exact(&mut l).await?;
             let mut a = vec![0u8; usize::from(l[0]) + 2];
             stream.read_exact(&mut a).await?;
+            // a domain BND isn't a numeric endpoint — leave the
+            // relay address to the caller's resolve path
+            None
         }
         _ => return Err(SocksError::UnsupportedVersion),
-    }
-    Ok(())
+    };
+    Ok(bound)
 }
 
 async fn socks4<S: AsyncRead + AsyncWrite + Unpin>(

@@ -188,18 +188,56 @@ where
     })
 }
 
+/// `session_impl::m_peer_ssl_ctx` accept side — a `ServerConfig`
+/// from PEM material (`set_ssl_certificate` upstream). `dh` params
+/// are OpenSSL DHE-specific; rustls is ECDHE-only, so they are
+/// ignored like upstream on LibreSSL builds.
+pub fn ssl_server_config(cert_pem: &str, key_pem: &str) -> io::Result<Arc<rustls::ServerConfig>> {
+    use rustls::pki_types::pem::PemObject;
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .collect::<Result<_, _>>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    if certs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no certificates in PEM",
+        ));
+    }
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    Ok(Arc::new(cfg))
+}
+
+/// per-torrent `CertifiedKey` for the SNI resolver — same PEM pair
+/// as [`ssl_server_config`].
+pub fn certified_key(cert_pem: &str, key_pem: &str) -> io::Result<Arc<rustls::sign::CertifiedKey>> {
+    use rustls::pki_types::pem::PemObject;
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+        .collect::<Result<_, _>>()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    let signer = rustls::crypto::aws_lc_rs::sign::any_supported_type(&key)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+    Ok(Arc::new(rustls::sign::CertifiedKey::new(certs, signer)))
+}
+
 /// `ssl_server_name_callback_impl` — per-info-hash cert selection.
 /// Keys are the SNI names the announce layer used (the SSL torrent
 /// cert name). Returns the `CertifiedKey` for `name`, if known.
 pub struct SniResolver {
-    map: std::collections::HashMap<String, Arc<rustls::sign::CertifiedKey>>,
+    map: std::sync::Mutex<std::collections::HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
     fallback: Option<Arc<rustls::sign::CertifiedKey>>,
 }
 
 impl std::fmt::Debug for SniResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SniResolver")
-            .field("names", &self.map.len())
+            .field("names", &self.map.lock().map(|m| m.len()).unwrap_or(0))
             .finish()
     }
 }
@@ -211,20 +249,27 @@ impl SniResolver {
     #[must_use]
     pub fn new(fallback: Option<Arc<rustls::sign::CertifiedKey>>) -> Self {
         Self {
-            map: std::collections::HashMap::new(),
+            map: std::sync::Mutex::new(std::collections::HashMap::new()),
             fallback,
         }
     }
 
     /// `set_context` registration — `name` is the SNI host (SSL
-    /// torrents use the cert's CN, tracked per torrent).
-    pub fn register(&mut self, name: &str, cert: Arc<rustls::sign::CertifiedKey>) {
-        self.map.insert(name.to_string(), cert);
+    /// torrents use the hex info-hash, upstream
+    /// `ssl_server_name_callback_impl`).
+    pub fn register(&self, name: &str, cert: Arc<rustls::sign::CertifiedKey>) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_string(), cert);
     }
 
     /// remove a torrent's cert when it leaves the session.
-    pub fn unregister(&mut self, name: &str) {
-        self.map.remove(name);
+    pub fn unregister(&self, name: &str) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
     }
 }
 
@@ -235,7 +280,13 @@ impl rustls::server::ResolvesServerCert for SniResolver {
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
         client_hello
             .server_name()
-            .and_then(|n| self.map.get(n).cloned())
+            .and_then(|n| {
+                self.map
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(n)
+                    .cloned()
+            })
             .or_else(|| self.fallback.clone())
     }
 }

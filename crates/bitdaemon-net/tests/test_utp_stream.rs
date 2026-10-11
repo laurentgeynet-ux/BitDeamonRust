@@ -229,3 +229,130 @@ async fn acceptor_handshake_and_echo() {
     assert_eq!(&b[..n], b"ping");
     responder.await.unwrap();
 }
+
+#[tokio::test]
+async fn bulk_transfer_throughput() {
+    // 1 Mio responder → initiator on a channel wire: catches a
+    // stuck/slow ACK path (the live C++ pair crept at ~1 KB/s).
+    use bitdaemon_net::transport::PeerAcceptor;
+    use bitdaemon_net::utp_stream::{UtpAcceptor, UtpConnector};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (a_tx, a_rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, std::net::SocketAddr)>();
+    let (b_tx, b_rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, std::net::SocketAddr)>();
+    let a_ep = std::net::SocketAddr::from(([10, 0, 0, 1], 5000));
+    let b_ep = std::net::SocketAddr::from(([10, 0, 0, 2], 6000));
+
+    #[derive(Debug)]
+    struct C {
+        rx: tokio::sync::Mutex<
+            tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, std::net::SocketAddr)>,
+        >,
+        tx: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, std::net::SocketAddr)>,
+        local: std::net::SocketAddr,
+    }
+    impl bitdaemon_net::transport::DatagramSocket for C {
+        fn send_to<'a>(
+            &'a self,
+            buf: &'a [u8],
+            target: std::net::SocketAddr,
+        ) -> bitdaemon_net::transport::BoxFut<'a, usize> {
+            Box::pin(async move {
+                let n = buf.len();
+                let _ = self.tx.send((buf.to_vec(), target));
+                Ok(n)
+            })
+        }
+        fn recv_from<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> bitdaemon_net::transport::BoxFut<'a, (usize, std::net::SocketAddr)> {
+            Box::pin(async move {
+                let mut rx = self.rx.lock().await;
+                match rx.recv().await {
+                    Some((data, from)) => {
+                        let n = data.len().min(buf.len());
+                        buf[..n].copy_from_slice(&data[..n]);
+                        Ok((n, from))
+                    }
+                    None => Err(std::io::Error::other("closed")),
+                }
+            })
+        }
+        fn local_addr(&self) -> std::net::SocketAddr {
+            self.local
+        }
+    }
+
+    let dg_a = Arc::new(C {
+        rx: tokio::sync::Mutex::new(a_rx),
+        tx: b_tx.clone(),
+        local: a_ep,
+    });
+    let dg_b = Arc::new(C {
+        rx: tokio::sync::Mutex::new(b_rx),
+        tx: a_tx.clone(),
+        local: b_ep,
+    });
+
+    let mgr_b = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
+    let _pb = mgr_b.pump_in(dg_b.clone());
+    let acceptor = Arc::new(
+        UtpAcceptor::new(mgr_b, dg_b, bitdaemon_net::utp_socket::UtpConfig::default()).await,
+    );
+
+    let mgr_a = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
+    let _pa = mgr_a.pump_in(dg_a.clone());
+    let connector = Arc::new(UtpConnector {
+        manager: mgr_a,
+        datagram: dg_a,
+        cfg: bitdaemon_net::utp_socket::UtpConfig::default(),
+    });
+
+    const TOTAL: usize = 1024 * 1024;
+    let acc = acceptor.clone();
+    let responder = tokio::spawn(async move {
+        let (mut s, _from) = acc.accept().await.unwrap();
+        let chunk = vec![0xABu8; 16 * 1024];
+        let mut sent = 0;
+        while sent < TOTAL {
+            if s.write_all(&chunk).await.is_err() {
+                break;
+            }
+            sent += chunk.len();
+        }
+        // keep the wire up while the reader drains
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    });
+
+    let mut s = connector.connect(b_ep).await.unwrap();
+    // like the BitTorrent handshake: the initiator speaks first,
+    // advertising a non-zero window (upstream SYN carries wnd=0).
+    s.write_all(b"\x13BitTorrent handshake-pad").await.unwrap();
+    let start = std::time::Instant::now();
+    let mut got = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    while got < TOTAL {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(30), s.read(&mut buf))
+            .await
+            .expect("read timed out")
+            .expect("read failed");
+        if n == 0 {
+            break;
+        }
+        assert!(buf[..n].iter().all(|&b| b == 0xAB));
+        got += n;
+    }
+    let secs = start.elapsed().as_secs_f64();
+    eprintln!(
+        "{TOTAL} bytes in {secs:.2}s = {:.0} B/s",
+        TOTAL as f64 / secs
+    );
+    assert_eq!(got, TOTAL);
+    assert!(
+        secs < 20.0,
+        "uTP loopback must not take {secs:.0}s for 1 MiB"
+    );
+    responder.abort();
+}

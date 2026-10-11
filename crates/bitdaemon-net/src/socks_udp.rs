@@ -4,6 +4,9 @@
 //! add/remove the relay header (RSV/FRAG/ATYP/DST.ADDR/DST.PORT).
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+
+use crate::transport::{BoxedPeerStream, DatagramSocket, PeerConnector};
 
 /// `udp_socket::wrap(ep, p, …)` — prepend the SOCKS5 UDP header for
 /// an IP destination. Returns `header ‖ payload`.
@@ -100,5 +103,104 @@ pub fn socks5_unwrap(buf: &[u8]) -> Option<(Socks5From<'_>, &[u8])> {
             }
         }
         _ => None,
+    }
+}
+
+/// `udp_socket` en mode proxy : un `DatagramSocket` qui relaie
+/// chaque datagramme via l'endpoint retourné par UDP ASSOCIATE.
+///
+/// La connexion de contrôle TCP vers le proxy doit rester ouverte
+/// pendant la durée de vie de l'association (RFC 1928 : la fermer
+/// termine le relais) — elle est gardée dans `_control`.
+///
+/// ADR-0008 : le TCP de contrôle et l'UDP sous-jacent viennent des
+/// transports injectés, donc ceci fonctionne aussi à travers des
+/// tunnels anonymes.
+#[derive(Debug)]
+pub struct Socks5UdpSocket {
+    /// UDP socket qui porte les datagrammes wrappés vers le relais.
+    inner: Arc<dyn DatagramSocket>,
+    /// endpoint relais retourné par le proxy (BND.ADDR/BND.PORT).
+    relay: SocketAddr,
+    /// la connexion de contrôle — vivante tant que `self` vit.
+    /// `Mutex` car `PeerStream` est `Send` non-`Sync`.
+    _control: std::sync::Mutex<BoxedPeerStream>,
+}
+
+impl Socks5UdpSocket {
+    /// UDP ASSOCIATE : ouvre le TCP de contrôle vers `proxy_addr` via
+    /// `connector`, négocie l'association, retourne le socket relai.
+    /// `udp` = la socket datagramme injectée (vers le relais).
+    pub async fn associate(
+        connector: Arc<dyn PeerConnector>,
+        udp: Arc<dyn DatagramSocket>,
+        proxy_addr: SocketAddr,
+        user: &str,
+        password: &str,
+    ) -> crate::Result<Self> {
+        let mut control = connector.connect(proxy_addr).await?;
+        // upstream envoie DST 0.0.0.0:0 — le proxy choisit le relais
+        let wildcard = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 0);
+        let bound = crate::socks::socks_connect_bound(
+            &mut control,
+            5,
+            user,
+            password,
+            &crate::socks::SocksTarget::Addr(wildcard),
+            crate::socks::SocksCommand::UdpAssociate,
+        )
+        .await
+        .map_err(|e| crate::NetError::Transport(std::io::Error::other(format!("socks5: {e}"))))?;
+        // BND.ADDR=0.0.0.0 → le relais est sur l'hôte du proxy
+        // lui-même (convention usuelle; upstream fait pareil).
+        let relay = match bound {
+            Some(b) if !b.ip().is_unspecified() => b,
+            Some(b) => SocketAddr::new(proxy_addr.ip(), b.port()),
+            None => proxy_addr,
+        };
+        Ok(Self {
+            inner: udp,
+            relay,
+            _control: std::sync::Mutex::new(control),
+        })
+    }
+}
+
+impl DatagramSocket for Socks5UdpSocket {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> crate::transport::BoxFut<'a, usize> {
+        // `udp_socket::send` sous proxy : wrap SOCKS5 puis envoie au
+        // relais ; on rend `buf.len()` (upstream rend la taille utile,
+        // pas la taille wrappée).
+        let wrapped = socks5_wrap(target, buf);
+        let inner = self.inner.clone();
+        let relay = self.relay;
+        Box::pin(async move { inner.send_to(&wrapped, relay).await.map(|_| buf.len()) })
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> crate::transport::BoxFut<'a, (usize, SocketAddr)> {
+        Box::pin(async move {
+            let mut raw = vec![0u8; buf.len() + 64];
+            loop {
+                let (n, _from) = self.inner.recv_from(&mut raw).await?;
+                if let Some((Socks5From::Addr(src), payload)) = socks5_unwrap(&raw[..n]) {
+                    let len = payload.len().min(buf.len());
+                    buf[..len].copy_from_slice(&payload[..len]);
+                    return Ok((len, src));
+                }
+                // Hostname source ou datagramme non-relayé → ignoré
+                // (upstream droppe les paquets non wrappés).
+            }
+        })
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.relay
     }
 }

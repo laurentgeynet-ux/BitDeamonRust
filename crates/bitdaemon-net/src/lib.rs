@@ -24,6 +24,8 @@
 pub mod bandwidth;
 /// `aux_/chained_buffer` — heterogeneous send-buffer chain.
 pub mod chained_buffer;
+/// `close_reason` — `close_reason_t` + `error_to_close_reason`.
+pub mod close_reason;
 /// `ip_filter.hpp` — IPv4/IPv6 + port range access rules.
 pub mod ip_filter;
 pub mod os_transports;
