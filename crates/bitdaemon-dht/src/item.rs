@@ -6,9 +6,8 @@
 //! `4:salt<len>:<salt>3:seqi<seq>e1:v<v>`, `item_target_id`,
 //! `sign_mutable_item`/`verify_mutable_item` via `ed25519-dalek`
 //! (ADR-0007 — the bundled C implementation is not ported).
-
 use bitdaemon_common::hash::Sha1Hash;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+
 use sha1::{Digest as _, Sha1};
 
 /// `public_key` — 32-byte ed25519 verifying key.
@@ -69,11 +68,7 @@ pub fn verify_mutable_item(
         return false;
     }
     let msg = canonical_string(v, seq, salt);
-    let Ok(vk) = VerifyingKey::from_bytes(pk) else {
-        return false;
-    };
-    let sig = Signature::from_bytes(sig);
-    vk.verify(&msg, &sig).is_ok()
+    crate::ed25519::ed25519_verify(sig, &msg, pk)
 }
 
 /// `sign_mutable_item` — `sk` is the upstream 64-byte ed25519
@@ -86,8 +81,7 @@ pub fn sign_mutable_item(
     sk: &SecretKey,
 ) -> Option<Signature64> {
     let msg = canonical_string(v, seq, salt);
-    let sk = SigningKey::from_keypair_bytes(sk).ok()?;
-    Some(sk.sign(&msg).to_bytes())
+    crate::ed25519::ed25519_sign(&msg, sk)
 }
 
 /// `item` — a stored DHT item (immutable or mutable).

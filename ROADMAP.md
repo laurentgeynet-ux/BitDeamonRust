@@ -222,26 +222,38 @@ not job count.
 
 ---
 
-## Phase I — Dormant-module wiring ⬜
+## Phase I — Dormant-module wiring ✅
 
 Audit (2026-10-11): several ported modules are never reached by the
 session/engine — the *wiring* is the missing port.
 
-- [ ] **UPnP SSDP** (ADR-0018): M-SEARCH burst on `start_upnp`,
+- [x] **UPnP SSDP** (ADR-0018): M-SEARCH burst on `start_upnp`,
       `LOCATION` XML fetch via injected resolver/connector, per-IGD
       TCP+UDP `AddPortMapping`, half-TTL renew, `DeletePortMapping`
       on `stop_upnp`, `Portmap` alerts.
-- [ ] **NAT-PMP gateway** (ADR-0019): `NetInterfaces`/`RouteEnumerator`
+- [x] **NAT-PMP gateway** (ADR-0019): `NetInterfaces`/`RouteEnumerator`
       injectable trait (default OS impl) → default gateway →
       `start_natpmp`; existing `natpmp_renew` handles the rest.
-- [ ] **SOCKS5 UDP lanes** (ADR-0020): `Socks5UdpSocket` injected as
+- [x] **SOCKS5 UDP lanes** (ADR-0020): `Socks5UdpSocket` injected as
       the session `DatagramSocket` when `proxy_*` says so — DHT, uTP
       and UDP trackers through the proxy; no silent direct fallback.
-- [ ] **DHT `dos_blocker`** (ADR-0021): instantiate in `dht::node`,
+- [x] **DHT `dos_blocker`** (ADR-0021): instantiate in `dht::node`,
       `incoming()` gate at the top of the UDP demux.
-- [ ] **Send-path `chained_buffer`**: assemble contiguous `Piece`
-      messages through the chained buffer instead of block-by-block
-      sends (pairs with `send_buffer_watermark` back-pressure).
+- [x] **Send-path `chained_buffer`**: `write_messages` batches the
+      peer's outbound queue through `ChainedBuffer` into one
+      `write_vectored` per round (engine send pump drains ≤64 msgs).
+
+Second pass (wiring-completeness audit): `net::peer_alloc` moved from
+session and wired into `PeerList` (alloc/free accounting on
+insert/erase/drop); `disk::precomputed_block_hashes` wired on
+`PreadStorage` (hash-job `store` → `hash2` `take_block` →
+`clear_piece` `drop`); `core::resolve_links` wired into
+`Session::check_files` (similar_torrents/collections → hard links);
+`net::instantiate` wired into `Engine::spawn_dial` (peer proxy
+transport selection); `dht::item` delegates sign/verify to
+`dht::ed25519` helpers; `dht::node_id::distance_exp` routed through
+`common::ffs`. `net::receive_buffer` remains a utility — the engine
+read pump uses an equivalent `BytesMut` arena.
 
 **Exit**: inbound port mapping works on UPnP/NAT-PMP gateways (verified
 live on a real router), proxied UDP lanes carry DHT/uTP traffic, and

@@ -138,6 +138,17 @@ pub struct PeerList {
     /// `m_locked_peer` — peer index locked by a callback (never
     /// erased).
     locked: Option<usize>,
+    /// `m_allocator` — upstream's `torrent_peer_allocator`; only the
+    /// accounting counters survive the by-value `Vec` storage.
+    pub alloc: crate::peer_alloc::TorrentPeerAllocator,
+}
+
+impl Drop for PeerList {
+    fn drop(&mut self) {
+        // `~torrent` releases every remaining `torrent_peer` through
+        // the allocator — keep the live counters honest.
+        self.alloc.account_free_many(self.peers.len());
+    }
 }
 
 impl Default for PeerList {
@@ -159,6 +170,7 @@ impl PeerList {
             max_failcount: state.max_failcount,
             round_robin: 0,
             locked: None,
+            alloc: crate::peer_alloc::TorrentPeerAllocator::default(),
         }
     }
 
@@ -214,10 +226,17 @@ impl PeerList {
             self.update_candidates(was, is);
             return (i, false);
         }
-        let p = match remote {
-            SocketAddr::V4(_) => TorrentPeer::new_v4(remote, connectable, src),
-            SocketAddr::V6(_) => TorrentPeer::new_v6(remote, connectable, src),
+        let (p, ty) = match remote {
+            SocketAddr::V4(_) => (
+                TorrentPeer::new_v4(remote, connectable, src),
+                crate::peer_alloc::PeerEntryType::Ipv4,
+            ),
+            SocketAddr::V6(_) => (
+                TorrentPeer::new_v6(remote, connectable, src),
+                crate::peer_alloc::PeerEntryType::Ipv6,
+            ),
         };
+        self.alloc.account_alloc(ty);
         let is = self.is_connect_candidate(&p);
         self.peers.push(p);
         self.update_candidates(false, is);
@@ -250,6 +269,8 @@ impl PeerList {
             return (i, false);
         }
         let p = TorrentPeer::new_i2p(dest, connectable, src);
+        self.alloc
+            .account_alloc(crate::peer_alloc::PeerEntryType::I2p);
         let is = self.is_connect_candidate(&p);
         self.peers.push(p);
         self.update_candidates(false, is);
@@ -578,6 +599,7 @@ impl PeerList {
         let was = self.is_connect_candidate(&self.peers[index]);
         let was_seed = self.peers[index].seed;
         self.peers.remove(index);
+        self.alloc.account_free();
         self.update_candidates(was, false);
         if was_seed {
             self.num_seeds -= 1;

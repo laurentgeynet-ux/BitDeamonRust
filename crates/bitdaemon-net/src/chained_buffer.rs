@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 /// A buffer that can be chained into a `ChainedBuffer`.
 /// `size()` is the *allocated* length of `data()` — the slack beyond
 /// `used_size` is appendable when this is the last buffer.
-pub trait BufferHolder {
+pub trait BufferHolder: Send {
     /// The full allocated region (send window starts at `offset`).
     fn data(&self) -> &[u8];
     /// Mutable view of the full allocated region.

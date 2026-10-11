@@ -49,8 +49,9 @@ pub mod counters;
 pub mod i2p_pex;
 /// `listen_socket_t`/`listen_socket_handle`/`session_udp_socket`.
 pub mod listen;
-/// `aux_/torrent_peer_allocator` — peer allocation accounting.
-pub mod peer_alloc;
+/// `aux_/torrent_peer_allocator` — peer allocation accounting
+/// (moved to `net::peer_alloc` — it only needs `TorrentPeer`).
+pub use bitdaemon_net::peer_alloc;
 /// `session`/`session_impl` — orchestrator core.
 pub mod session;
 /// `session_handle`/`torrent_handle` — public API.

@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use bitdaemon_common::types::PeerRequest;
 use bitdaemon_common::{PeerId, Sha1Hash};
-use bitdaemon_net::bt_peer_conn::{run_handshake, write_message};
+use bitdaemon_net::bt_peer_conn::{run_handshake, write_messages};
 use bitdaemon_net::peer_wire::PeerMessage;
 use bitdaemon_net::resolver::{BoxedResolver, ResolveFlags, resolve_host};
 use bitdaemon_net::tracker_client::{AnnounceError, announce_http, announce_udp};
@@ -1546,7 +1546,7 @@ impl Engine {
             None
         };
         let tx = self.connect_tx.clone();
-        let (pid, dht, ssl_params) = {
+        let (pid, dht, ssl_params, peer_proxy) = {
             let ses = slock(&self.session);
             let ssl = ses.torrents.get(&ih).and_then(|t| {
                 if !t.is_ssl_torrent() {
@@ -1559,8 +1559,28 @@ impl Engine {
                 let key: Option<String> = t.ssl_pem_pair().map(|(_, k)| k.to_string());
                 Some((root, name, cert, key))
             });
-            (ses.peer_id, ses.settings.dht_enabled, ssl)
+            (
+                ses.peer_id,
+                ses.settings.dht_enabled,
+                ssl,
+                ses.proxies.peer.clone(),
+            )
         };
+        // `instantiate_connection` — upstream's transport decision
+        // table: uTP first, then I2P, then the proxy-wrapped streams
+        // when `proxy_peer_connections`, plain TCP otherwise.
+        let utp_wanted = utp.is_some();
+        let is_ssl = ssl_params.is_some();
+        let kind = match bitdaemon_net::instantiate::instantiate(
+            &peer_proxy,
+            bitdaemon_net::instantiate::ConnKind::Peer,
+            is_ssl,
+            utp_wanted,
+        ) {
+            Some(k) => k,
+            None => return,
+        };
+        let resolver = self.resolver.clone();
         let fast = true;
         let ext = self.ext_handshake(&ih);
         let h = tokio::spawn(async move {
@@ -1574,16 +1594,75 @@ impl Engine {
                     dht: false,
                 });
             };
+            // `instantiate` resolved the socket type — map it back to
+            // a connector. Proxied kinds resolve the proxy hostname
+            // first (anonymous lanes inject their own resolver).
+            use bitdaemon_net::instantiate::TransportKind as TK;
+            let conn: Arc<dyn PeerConnector> = match kind {
+                TK::Utp | TK::SslUtp => match utp.clone() {
+                    Some(u) => u,
+                    None => connector.clone(),
+                },
+                TK::Tcp | TK::SslTcp => connector.clone(),
+                TK::Socks | TK::SslSocks => {
+                    match resolve_for_socket(
+                        &resolver,
+                        &peer_proxy.hostname,
+                        peer_proxy.port,
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(addr) => Arc::new(bitdaemon_net::proxy::SocksConnector::from_settings(
+                            connector.clone(),
+                            addr,
+                            &peer_proxy,
+                        )),
+                        Err(e) => {
+                            send_err(format!("proxy resolve: {e}"));
+                            return;
+                        }
+                    }
+                }
+                TK::HttpStream | TK::SslHttpStream => {
+                    match resolve_for_socket(
+                        &resolver,
+                        &peer_proxy.hostname,
+                        peer_proxy.port,
+                        false,
+                    )
+                    .await
+                    {
+                        Ok(addr) => Arc::new(bitdaemon_net::proxy::HttpConnectConnector::new(
+                            connector.clone(),
+                            addr,
+                            peer_proxy.username.clone(),
+                            peer_proxy.password.clone(),
+                        )),
+                        Err(e) => {
+                            send_err(format!("proxy resolve: {e}"));
+                            return;
+                        }
+                    }
+                }
+                TK::I2p => {
+                    // i2p peers are reached by destination, not
+                    // SocketAddr — the session never puts them in the
+                    // dial queue.
+                    send_err("i2p transport requested for ip peer".to_string());
+                    return;
+                }
+            };
             // `enable_outgoing_utp` — upstream prefers uTP when both
             // transports are available; on dial failure fall back to
             // the TCP connector.
-            let s = match if let Some(u) = utp.clone() {
-                match u.connect(remote).await {
+            let s = match if matches!(kind, TK::Utp | TK::SslUtp) {
+                match conn.connect(remote).await {
                     Ok(s) => Ok(s),
                     Err(_) => connector.connect(remote).await,
                 }
             } else {
-                connector.connect(remote).await
+                conn.connect(remote).await
             } {
                 Ok(s) => s,
                 Err(e) => {
@@ -2050,15 +2129,28 @@ impl Engine {
                         };
                         match w {
                             Some(msg) => {
-                                // throttle bulk payload (upstream
-                                // throttles on the send path)
-                                if let PeerMessage::Piece { data, .. } = &msg {
-                                    ul.acquire(data.len() as i64).await;
-                                    if let Some(l) = &tul {
-                                        l.acquire(data.len() as i64).await;
+                                // `append_to_send_buffer` — upstream
+                                // batches whatever is queued into the
+                                // chained_buffer and issues one
+                                // vectored write; drain what arrived.
+                                let mut batch = vec![msg];
+                                while batch.len() < 64 {
+                                    match rx.try_recv() {
+                                        Ok(m) => batch.push(m),
+                                        Err(_) => break,
                                     }
                                 }
-                                if let Err(e) = write_message(&mut s, &msg).await {
+                                // throttle bulk payload (upstream
+                                // throttles on the send path)
+                                for m in &batch {
+                                    if let PeerMessage::Piece { data, .. } = m {
+                                        ul.acquire(data.len() as i64).await;
+                                        if let Some(l) = &tul {
+                                            l.acquire(data.len() as i64).await;
+                                        }
+                                    }
+                                }
+                                if let Err(e) = write_messages(&mut s, &batch).await {
                                     debug!(peer = peer, remote = ?remote, err = %e, "peer write error, dropping");
                                     break;
                                 }

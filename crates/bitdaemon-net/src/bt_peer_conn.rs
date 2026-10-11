@@ -246,6 +246,48 @@ pub async fn write_message(s: &mut BoxedPeerStream, m: &PeerMessage) -> Result<(
     Ok(())
 }
 
+/// `peer_connection::send_buffer` + `append_to_send_buffer` — chain
+/// the encoded frames into a `ChainedBuffer` and flush them with one
+/// vectored write per round (upstream batches whatever is queued
+/// under `send_buffer_watermark`; here the caller decides the batch).
+/// Non-vectored streams fall back to sequential `write_all`.
+pub async fn write_messages(
+    s: &mut BoxedPeerStream,
+    msgs: &[PeerMessage],
+) -> Result<(), PeerConnError> {
+    if msgs.len() == 1 {
+        return write_message(s, &msgs[0]).await;
+    }
+    let mut chain = crate::chained_buffer::ChainedBuffer::default();
+    for m in msgs {
+        let frame = encode(m);
+        let frame = frame.to_vec();
+        let used = frame.len();
+        chain.append_buffer(frame, used);
+    }
+    while !chain.is_empty() {
+        let iovecs = chain.build_iovec(usize::MAX);
+        if s.is_write_vectored() {
+            let ios: Vec<std::io::IoSlice<'_>> =
+                iovecs.iter().map(|b| std::io::IoSlice::new(b)).collect();
+            let n = s.write_vectored(&ios).await?;
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+            }
+            drop(ios);
+            chain.pop_front(n);
+        } else {
+            for b in &iovecs {
+                s.write_all(b).await?;
+            }
+            let n: usize = iovecs.iter().map(|b| b.len()).sum();
+            drop(iovecs);
+            chain.pop_front(n);
+        }
+    }
+    Ok(())
+}
+
 /// `read_message` + `rc4_decrypt` — post-MSE message read.
 pub async fn read_message_rc4(
     s: &mut BoxedPeerStream,

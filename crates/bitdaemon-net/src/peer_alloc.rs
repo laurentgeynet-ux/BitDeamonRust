@@ -12,7 +12,7 @@
 //! `live_bytes`, `live_allocations` — which `performance_counters`
 //! reports upstream.
 
-use bitdaemon_net::torrent_peer::TorrentPeer;
+use crate::torrent_peer::TorrentPeer;
 
 /// `torrent_peer_allocator_interface::{ipv4,ipv6,i2p,rtc}_peer_type`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +66,31 @@ impl TorrentPeerAllocator {
         self.live_bytes -= b as i64;
         self.live_allocations -= 1;
         drop(p);
+    }
+
+    /// accounting-only alloc — `PeerList` stores `TorrentPeer`s by
+    /// value in a `Vec` (no per-entry heap), so the pool semantics
+    /// reduce to the counters upstream's `m_*` fields carry.
+    pub fn account_alloc(&mut self, _ty: PeerEntryType) {
+        let b = std::mem::size_of::<TorrentPeer>();
+        self.total_bytes += b as u64;
+        self.live_bytes += b as i64;
+        self.live_allocations += 1;
+        self.total_allocations += 1;
+    }
+
+    /// accounting-only free — companion of [`Self::account_alloc`].
+    pub fn account_free(&mut self) {
+        self.account_free_many(1);
+    }
+
+    /// free `n` entries at once — `~torrent_peer_allocator` /
+    /// `torrent::~torrent` release the whole list on teardown.
+    pub fn account_free_many(&mut self, n: usize) {
+        let b = std::mem::size_of::<TorrentPeer>() as i64 * n as i64;
+        debug_assert!(self.live_bytes >= b && self.live_allocations >= n as i64);
+        self.live_bytes -= b;
+        self.live_allocations -= n as i64;
     }
 
     /// `total_bytes`.

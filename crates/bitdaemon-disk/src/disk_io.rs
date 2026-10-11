@@ -797,6 +797,7 @@ impl PreadDiskIo {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .free_piece((j.storage, c.piece));
+                st.drop_precomputed_v2(c.piece);
                 StorageError::default()
             }
             JobKind::StopTorrent(_) | JobKind::RenameFile(_) | JobKind::FilePriority(_) => {
@@ -988,6 +989,16 @@ fn hash_job(
     match r {
         Ok(_) => {
             h.piece_hash = Sha1Hash::from_bytes(&sha1.finalize()).unwrap_or_default();
+            // `store_precomputed_v2` — v2 block hashes are kept on the
+            // storage so later `hash2` piece-layer requests answer
+            // without a re-read (upstream does the same in the hasher).
+            if blocks_wanted {
+                for (i, bh) in h.block_hashes.iter().enumerate() {
+                    if !bh.is_all_zeros() {
+                        st.store_precomputed_v2(h.piece, i as i32, bh);
+                    }
+                }
+            }
             StorageError::default()
         }
         Err(e) => e,
@@ -1018,6 +1029,12 @@ fn hash2_job(
             h.piece_hash2 = Sha256Hash::from_bytes(&sha.finalize()).unwrap_or_default();
             return StorageError::default();
         }
+    }
+    // `take_precomputed_v2_block` — a piece hash already computed
+    // this block's SHA-256; no disk read needed.
+    if let Some(hash) = st.take_precomputed_v2_block(h.piece, i32::try_from(blk).unwrap_or(0)) {
+        h.piece_hash2 = hash;
+        return StorageError::default();
     }
     let r = st.hash_with(
         &mut |d| sha.update(d),

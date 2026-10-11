@@ -133,3 +133,7 @@ pub mod web_seed;
 /// `websocket_stream` — RFC 6455 upgrade + frame codec (wss trackers).
 pub mod websocket;
 pub mod ws_tracker;
+
+/// `aux_/torrent_peer_allocator` — peer allocation accounting
+/// (moved from the session crate; it only needs `TorrentPeer`).
+pub mod peer_alloc;

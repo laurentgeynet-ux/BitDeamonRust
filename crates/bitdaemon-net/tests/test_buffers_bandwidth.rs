@@ -5,6 +5,7 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bitdaemon_net::bandwidth::{BandwidthChannel, BandwidthManager, BandwidthSocket};
 use bitdaemon_net::chained_buffer::{BufferHolder, ChainedBuffer};
@@ -81,7 +82,9 @@ fn chained_buffer_prepend() {
 }
 
 /// Custom holder — stands in for disk-buffer holders upstream.
-struct Shared(Rc<Vec<u8>>);
+/// `BufferHolder` requires `Send` (send buffers cross into the
+/// writer task), so `Arc` replaces upstream's refcounted holder.
+struct Shared(Arc<Vec<u8>>);
 
 impl BufferHolder for Shared {
     fn data(&self) -> &[u8] {
@@ -97,7 +100,7 @@ impl BufferHolder for Shared {
 #[test]
 fn chained_buffer_custom_holder() {
     let mut b = ChainedBuffer::default();
-    b.append_buffer(Shared(Rc::new(vec![7, 8, 9])), 3);
+    b.append_buffer(Shared(Arc::new(vec![7, 8, 9])), 3);
     assert_eq!(b.size(), 3);
     assert_eq!(b.build_iovec(3), vec![&[7, 8, 9][..]]);
 }

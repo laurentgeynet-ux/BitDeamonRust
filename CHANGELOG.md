@@ -7,6 +7,29 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — wiring-completeness audit (Phase I second pass)
+
+- `net::peer_alloc` (moved from `session`): `PeerList` now accounts
+  every peer insert/erase/drop through `TorrentPeerAllocator` —
+  upstream's `torrent_peer_allocator` counters.
+- `disk::precomputed_block_hashes` wired on `PreadStorage`: hash jobs
+  `store` v2 block hashes, `hash2` consumes via `take_precomputed_v2_block`
+  (no re-read), `clear_piece` drops them. `DiskStorage` gained default
+  no-op `store/take/drop` hooks so custom storages are unaffected.
+- `core::resolve_links` wired into `Session::check_files`: mutable
+  torrents (`similar_torrents`/`collections`) match files against
+  seeding torrents; links feed `async_check_files` hard-linking.
+- `net::instantiate` wired into `Engine::spawn_dial`: the upstream
+  transport decision table now picks the connector — peer connections
+  honor `proxies.peer` (`SocksConnector`/`HttpConnectConnector`) and
+  uTP preference falls back to TCP.
+- Send path uses `ChainedBuffer`: `write_messages` batches the peer's
+  outbound queue into one `write_vectored` per round
+  (`peer_connection::send_buffer` semantics).
+- `dht::item` sign/verify now delegates to `dht::ed25519` helpers;
+  `dht::node_id::distance_exp` uses `common::ffs::count_leading_zeros`.
+
+
 ### Added — disk cache (`store_buffer`) write path (ADR-0012/0013/0014/0016)
 
 - `PreadDiskIo::async_write` now inserts blocks into a per-storage

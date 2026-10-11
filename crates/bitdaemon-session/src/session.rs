@@ -831,6 +831,11 @@ impl Session {
         let Some(disk) = self.disk.clone() else {
             return;
         };
+        // upstream `torrent::init` → `resolve_links`: mutable torrents
+        // (`similar_torrents`/`collections`) reuse files already on
+        // disk in seeding torrents — the links go into
+        // `async_check_files` which hard-links them.
+        let links = self.collect_links(&ih);
         let Some(t) = self.torrents.get_mut(&ih) else {
             return;
         };
@@ -840,7 +845,7 @@ impl Session {
         disk.async_check_files(
             storage,
             resume_data,
-            Vec::new(),
+            links,
             Box::new(move |ret, err| {
                 let _ = tx.send(DiskCompleted::CheckFiles {
                     ih,
@@ -849,6 +854,71 @@ impl Session {
                 });
             }),
         );
+    }
+
+    /// `torrent::init`'s `resolve_links` pass — match this torrent's
+    /// files against seeding torrents listed in `similar_torrents` or
+    /// sharing a `collections` tag. Returns per-file link targets
+    /// (empty strings = no link).
+    fn collect_links(&self, ih: &Sha1Hash) -> Vec<String> {
+        let Some(t) = self.torrents.get(ih) else {
+            return Vec::new();
+        };
+        let Some(ti) = t.ti.as_ref() else {
+            return Vec::new();
+        };
+        if ti.similar_torrents().is_empty() && ti.collections().is_empty() {
+            return Vec::new();
+        }
+        let mut res = bitdaemon_core::resolve_links::ResolveLinks::new(ti.clone());
+        // `similar_torrents` — explicit info-hashes.
+        for other_ih in ti.similar_torrents().to_vec() {
+            self.match_link(&mut res, &other_ih, None);
+        }
+        // `collections` — every torrent tagged with the same label.
+        for coll in ti.collections() {
+            for (other_ih, other) in &self.torrents {
+                if other_ih == ih {
+                    continue;
+                }
+                let tagged = other
+                    .ti
+                    .as_ref()
+                    .is_some_and(|o| o.collections().iter().any(|c| c == coll));
+                if tagged {
+                    self.match_link(&mut res, other_ih, Some(other));
+                }
+            }
+        }
+        res.get_links()
+            .iter()
+            .map(|l| String::from_utf8_lossy(l).into_owned())
+            .collect()
+    }
+
+    /// one `resolve_links::match` — seeders only, like upstream.
+    fn match_link(
+        &self,
+        res: &mut bitdaemon_core::resolve_links::ResolveLinks,
+        other_ih: &Sha1Hash,
+        torrent: Option<&crate::torrent::Torrent>,
+    ) {
+        let other = torrent.or_else(|| self.torrents.get(other_ih));
+        let Some(other) = other else { return };
+        // upstream only reuses files from torrents that are seeding.
+        if !other.is_seed() {
+            return;
+        }
+        let Some(oti) = other.ti.as_ref() else { return };
+        let mut renamed = bitdaemon_core::file_storage::RenamedFiles::default();
+        for (&idx, path) in &other.renamed_files {
+            renamed.rename_file(
+                oti.files(),
+                bitdaemon_common::types::FileIndex(idx),
+                path.as_bytes(),
+            );
+        }
+        res.matches(oti, oti.files(), &renamed, other.save_path.as_bytes());
     }
 
     /// `add_torrent` — the real entry point: `AddTorrentParams` →

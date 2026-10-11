@@ -118,6 +118,10 @@ pub struct PreadStorage {
     #[allow(dead_code)]
     file_created: Mutex<Vec<bool>>,
     need_tick: std::sync::atomic::AtomicBool,
+    /// `m_precomputed` — v2 block hashes saved by hash jobs for
+    /// later `hash2` piece-layer replies (upstream
+    /// `pread_storage::m_precomputed_v2`).
+    precomputed: crate::precomputed_block_hashes::PrecomputedBlockHashes,
 }
 
 impl PreadStorage {
@@ -148,6 +152,7 @@ impl PreadStorage {
             storage_index: Mutex::new(StorageIndex(0)),
             file_created: Mutex::new(vec![false; params.files.num_files() as usize]),
             need_tick: std::sync::atomic::AtomicBool::new(false),
+            precomputed: crate::precomputed_block_hashes::PrecomputedBlockHashes::new(),
         }
     }
 
@@ -700,6 +705,26 @@ pub trait DiskStorage: Send + Sync {
         seed_mode: bool,
         links: &[PathBuf],
     ) -> StorageResult<bool>;
+    /// `pread_storage::store_precomputed_v2` — keep a block SHA-256
+    /// computed during piece hashing so later `hash2` requests skip
+    /// the disk read. Default no-op (custom storages may skip it).
+    fn store_precomputed_v2(
+        &self,
+        _piece: PieceIndex,
+        _block: i32,
+        _h: &bitdaemon_common::Sha256Hash,
+    ) {
+    }
+    /// `take_precomputed_v2_block` — consume a stored block hash.
+    fn take_precomputed_v2_block(
+        &self,
+        _piece: PieceIndex,
+        _block: i32,
+    ) -> Option<bitdaemon_common::Sha256Hash> {
+        None
+    }
+    /// `drop_precomputed_v2` — `clear_piece` evicts the stored hashes.
+    fn drop_precomputed_v2(&self, _piece: PieceIndex) {}
 }
 
 impl DiskStorage for PreadStorage {
@@ -764,6 +789,26 @@ impl DiskStorage for PreadStorage {
         links: &[PathBuf],
     ) -> StorageResult<bool> {
         PreadStorage::verify_resume_data(self, have_pieces, seed_mode, links)
+    }
+    fn store_precomputed_v2(
+        &self,
+        piece: PieceIndex,
+        block: i32,
+        h: &bitdaemon_common::Sha256Hash,
+    ) {
+        let bs = crate::disk_cache::DEFAULT_BLOCK_SIZE as i32;
+        let num = (self.files.piece_size2(piece) + bs - 1) / bs;
+        self.precomputed.store(piece, block, num, h);
+    }
+    fn take_precomputed_v2_block(
+        &self,
+        piece: PieceIndex,
+        block: i32,
+    ) -> Option<bitdaemon_common::Sha256Hash> {
+        self.precomputed.take_block(piece, block)
+    }
+    fn drop_precomputed_v2(&self, piece: PieceIndex) {
+        self.precomputed.drop(piece);
     }
 }
 

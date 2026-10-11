@@ -39,10 +39,17 @@ pub fn compare_ref(n1: &NodeId, n2: &NodeId, ref_id: &NodeId) -> bool {
 }
 
 /// `distance_exp` — 159 minus the leading zeroes of the distance
-/// (upstream keeps the off-by-one on purpose).
+/// (upstream keeps the off-by-one on purpose). Routed through
+/// `ffs::count_leading_zeros` like upstream's word-at-a-time scan.
 #[must_use]
 pub fn distance_exp(n1: &NodeId, n2: &NodeId) -> i32 {
-    (159 - distance(n1, n2).count_leading_zeroes() as i32).max(0)
+    let d = distance(n1, n2);
+    let b = d.as_bytes();
+    let mut words = [0u32; 5];
+    for (w, c) in words.iter_mut().zip(b.chunks_exact(4)) {
+        *w = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+    }
+    (159 - bitdaemon_common::ffs::count_leading_zeros(&words)).max(0)
 }
 
 /// `min_distance_exp`.
