@@ -45,7 +45,10 @@ cargo run --release -p bitdaemon-cli -- \
 ```
 
 Supports `.torrent` files and magnets, `--seed`, `--peer host:port`,
-HTTPS/UDP trackers, DHT, uTP and UPnP/NAT-PMP.
+HTTPS/UDP trackers, DHT, uTP, UPnP/NAT-PMP port mapping, SOCKS5/HTTP
+proxies (`--proxy`, `--proxy-auth`, peer + tracker + DHT UDP lanes)
+and OS-cache control (`--no-os-cache`, `--no-os-read-cache`,
+`--no-upnp`).
 
 ## Building
 
