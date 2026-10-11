@@ -7,6 +7,59 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Fixed — live Mainline DHT bootstrap
+
+- **DHT never bootstrapped**: `DhtNode::bootstrap()` existed but
+  nothing called it — upstream's `dht_tracker::start` runs a
+  bootstrap lookup at socket start. The session now bootstraps on
+  `enable_dht` and when the first router node arrives on an empty
+  table.
+- **`SessionOut::DhtAddNode` was silently dropped**:
+  `Engine::dispatch_out` only handled `ToPeer`, discarding the
+  CLI's bootstrap-node events. Non-peer effects now queue onto
+  `pending_out`, drained by `Engine::tick` through the normal
+  async dispatch.
+- **`want: n6` sent on IPv4 queries** (inverted flag at every
+  `rpc.invoke` call site): routers answered with `nodes6`, useless
+  to the v4 table. `RpcManager::invoke` now matches upstream —
+  `want` is only set on cross-family queries, requesting the
+  node's *own* family.
+- **`dht_announce_tick` burned its 15-min slot on an empty table**:
+  `dht_last_announce` was stamped before bootstrap completed, so
+  torrent `get_peers` lookups ran once with zero nodes and never
+  retried. Announces now wait until a bound node family has a
+  non-empty routing table.
+- **DNS returned only the first resolved address** — IPv6-first
+  answers (e.g. `dht.transmissionbt.com`) produced unusable router
+  entries on a v4-only socket. All resolved endpoints are now fed
+  to `dht_add_node`, like upstream `udp::resolver`.
+- The CLI now seeds the full upstream `dht_bootstrap_nodes` list
+  (`router.utorrent.com`, `router.bitcomet.com`, `dht.aelitis.com`
+  added — `router.bittorrent.com` alone was not answering).
+
+Verified live on the public swarm: bootstrap queries got real
+replies, the routing table populated (~135 nodes), and `get_peers`
+traversals for `ubuntu-24.04.4-live-server-amd64.iso` returned
+819 peer endpoints from DHT nodes (7 `found peers` replies).
+
+### Added — strict SSL torrent verification (verified live vs libtorrent v2.1.2+OpenSSL)
+
+- **`TorrentPeerVerifier`** (client side): the peer's chain is
+  webpki-verified against the torrent's embedded `ssl-cert` root
+  and the leaf DNS SAN — falling back to the most-specific CN —
+  must equal the torrent `name` or `"*"` (upstream
+  `torrent::verify_peer_cert`). Replaces the interim verify-none.
+- **`TorrentClientVerifier`** (accept side): mutual TLS is now
+  mandatory (`verify_fail_if_no_peer_cert`) — the connecting
+  peer's chain must verify against a registered torrent's root
+  and match its leaf name. New deps `rustls-webpki` +
+  `x509-parser` (ADR-0007 rationale: byte-exact X.509 semantics).
+- Verified end-to-end against libtorrent v2.1.2 built with
+  OpenSSL: C++ `sslseed` → BitDaemon leech 100 % hash-identical;
+  BitDaemon `--seed --ssl-*` → C++ `sslleech` DONE 32/32
+  hash-identical; a rogue self-signed cert was rejected by the C++
+  peer (`certificate verify failed`).
+
 ### Fixed — uTP engine wiring (verified live vs libtorrent v2.1.2)
 
 - **uTP was routed through the 1 Hz `Engine::tick`**: datagrams

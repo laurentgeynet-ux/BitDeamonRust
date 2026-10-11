@@ -161,8 +161,14 @@ announce + mutable items verified on live Mainline DHT.
       leech AND BitDaemon seed → C++ leech, byte-identical payloads
       both ways (`tools/real_swarm`). uTP pair verified (C++ seed →
       `--utp` leech, hash identical) and magnet resolution verified
-      live. Still open: SSL pair (local C++ build lacks OpenSSL)
-      and a dedicated DHT-bootstrap live pair.
+      live. SSL pair verified against a libtorrent build with
+      OpenSSL (`tools/real_swarm` + `build_ssl`): C++ sslseed → BD
+      leech 100 % hash-identical, BD seed → C++ sslleech DONE
+      (mutual TLS, embedded `ssl-cert` root, SAN=name enforced,
+      rogue-cert rejected by C++). Dedicated DHT-bootstrap live run
+      verified: public routers bootstrapped the v4 routing table
+      (~135 nodes) and `get_peers` traversals returned real swarm
+      peers for the Ubuntu info-hash.
 - [x] Real-swarm validation: `bitdaemon-cli` downloaded
       `ubuntu-24.04.4-live-server-amd64.iso` (3.4 GB, v1) from the
       public swarm — ~32 peers, ~117 MB/s peak, `Finished`,

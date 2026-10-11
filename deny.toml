@@ -8,7 +8,13 @@ all-features = false
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+# RUSTSEC-2026-0009 (`time` ≤0.3.45): stack exhaustion via deeply
+# nested RFC 2822 comments. Not exposed — `time` reaches us only
+# through `x509-parser`, which parses bounded UTCTime/GeneralizedTime
+# fields, never attacker-controlled RFC 2822 strings. The fix
+# (0.3.47) requires Rust 1.88, above our MSRV 1.85 — revisit when
+# the MSRV moves.
+ignore = ["RUSTSEC-2026-0009"]
 
 [licenses]
 # BSD-2-Clause project; allow the standard permissive set.
