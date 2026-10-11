@@ -122,6 +122,11 @@ pub struct PreadStorage {
     /// later `hash2` piece-layer replies (upstream
     /// `pread_storage::m_precomputed_v2`).
     precomputed: crate::precomputed_block_hashes::PrecomputedBlockHashes,
+    /// `settings_interface` flags snapshot — `allow_set_file_valid_data`,
+    /// `no_atime`, applied to every `open_file` (upstream reads the
+    /// settings inside `open_file`; we can't reach them, so the
+    /// `DiskIo` pushes them via `set_open_mode_extra`).
+    open_mode_extra: std::sync::atomic::AtomicU32,
 }
 
 impl PreadStorage {
@@ -153,6 +158,7 @@ impl PreadStorage {
             file_created: Mutex::new(vec![false; params.files.num_files() as usize]),
             need_tick: std::sync::atomic::AtomicBool::new(false),
             precomputed: crate::precomputed_block_hashes::PrecomputedBlockHashes::new(),
+            open_mode_extra: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -219,16 +225,38 @@ impl PreadStorage {
     }
 
     /// `open_file` — pooled open honoring the rename overlay.
+    /// `pread_storage::open_file_impl` (pread_storage.cpp:760-768) —
+    /// resolves the effective `OpenMode` for `index`: sparse for
+    /// every file when `!m_allocate_files`, and for priority-0 files
+    /// unconditionally; `extra_mode` folds in settings-driven flags
+    /// (`allow_set_file_valid_data`, `no_atime`).
     fn open_file(
         &self,
         index: FileIndex,
         mode: OpenMode,
     ) -> Result<Arc<crate::file::FileHandle>, StorageError> {
+        let mut mode = mode | self.extra_mode();
+        if !self.allocate_files
+            || (index.get() < self.file_priority.len()
+                && self.file_priority[index.get()] == DownloadPriority::DONT_DOWNLOAD)
+        {
+            mode |= OpenMode::SPARSE;
+        }
         self.pool.open_file_at(
             (self.storage_index(), index),
             &self.resolve_path(index),
             self.files.file_size(index),
             mode,
+        )
+    }
+
+    /// settings-driven extra open flags (upstream reads
+    /// `settings_interface` inside `open_file` — we snapshot it at
+    /// construction).
+    fn extra_mode(&self) -> OpenMode {
+        OpenMode::from_bits(
+            self.open_mode_extra
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 
@@ -725,6 +753,11 @@ pub trait DiskStorage: Send + Sync {
     }
     /// `drop_precomputed_v2` — `clear_piece` evicts the stored hashes.
     fn drop_precomputed_v2(&self, _piece: PieceIndex) {}
+    /// Settings-driven extra `OpenMode` bits applied on every file
+    /// open (`allow_set_file_valid_data`, `no_atime`) — upstream reads
+    /// them from `settings_interface` inside `open_file`. Default
+    /// no-op keeps injected storages source-compatible.
+    fn set_open_mode_extra(&self, _mode: OpenMode) {}
 }
 
 impl DiskStorage for PreadStorage {
@@ -809,6 +842,10 @@ impl DiskStorage for PreadStorage {
     }
     fn drop_precomputed_v2(&self, piece: PieceIndex) {
         self.precomputed.drop(piece);
+    }
+    fn set_open_mode_extra(&self, mode: OpenMode) {
+        self.open_mode_extra
+            .store(mode.bits(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 

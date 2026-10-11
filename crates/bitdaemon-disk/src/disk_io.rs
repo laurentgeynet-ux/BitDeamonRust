@@ -84,6 +84,10 @@ pub struct PreadDiskIo {
     slots: Mutex<crate::storage_free_list::StorageFreeList>,
     next_index: AtomicU32,
     pool: Arc<DiskIoThreadPool>,
+    /// `m_hash_threads` — dedicated pool for `hash`/`hash2` jobs
+    /// (upstream `hashing_threads`, default 1); 0 threads → hash jobs
+    /// run on the generic pool.
+    hash_pool: Arc<DiskIoThreadPool>,
     completed: Arc<DiskCompletedQueue>,
     fence_counters: FenceCounters,
     /// `m_abort` — after abort, add_job posts straight to completions.
@@ -114,6 +118,11 @@ pub struct PreadDiskIo {
     num_write_ops: std::sync::atomic::AtomicI64,
     /// `counters::num_read_ops`.
     num_read_ops: std::sync::atomic::AtomicI64,
+    /// extra `OpenMode` bits pushed to every storage at
+    /// `new_torrent` (upstream `open_file` reads
+    /// `enable_set_file_valid_data`/`no_atime_storage` from
+    /// `settings_interface` — ADR-0022).
+    open_mode_extra: std::sync::atomic::AtomicU32,
 }
 
 impl PreadDiskIo {
@@ -139,17 +148,21 @@ impl PreadDiskIo {
         // the worker loop needs the orchestrator — two-phase init:
         // pool is created with a worker that captures a Weak we fill in.
         let io_slot: Arc<Mutex<Option<std::sync::Weak<PreadDiskIo>>>> = Arc::new(Mutex::new(None));
-        let io_slot2 = Arc::clone(&io_slot);
-        let pool = DiskIoThreadPool::new(Arc::new(move |pool| {
-            let io = io_slot2
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade);
-            if let Some(io) = io {
-                io.worker_loop(&pool);
-            }
-        }));
+        let mk_worker = |slot: &Arc<Mutex<Option<std::sync::Weak<PreadDiskIo>>>>| {
+            let slot = Arc::clone(slot);
+            Arc::new(move |pool: Arc<DiskIoThreadPool>| {
+                let io = slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade);
+                if let Some(io) = io {
+                    io.worker_loop(&pool);
+                }
+            })
+        };
+        let pool = DiskIoThreadPool::new(mk_worker(&io_slot));
+        let hash_pool = DiskIoThreadPool::new(mk_worker(&io_slot));
         let io = Arc::new(Self {
             storages: Mutex::new(HashMap::new()),
             slots: Mutex::new(crate::storage_free_list::StorageFreeList::default()),
@@ -171,6 +184,8 @@ impl PreadDiskIo {
             write_no_cache: AtomicBool::new(false),
             read_no_cache: AtomicBool::new(false),
             cache_expiry: std::sync::atomic::AtomicU64::new(60),
+            hash_pool,
+            open_mode_extra: std::sync::atomic::AtomicU32::new(0),
         });
         // upstream `pread_disk_io` ctor:
         // `m_cache.set_max_size(max_queued_disk_bytes / 0x4000)` with
@@ -253,6 +268,7 @@ impl PreadDiskIo {
         let mut g = self.storages.lock().unwrap_or_else(|e| e.into_inner());
         let storage = (self.factory)(params, Arc::clone(&self.file_pool));
         storage.set_storage_index(idx);
+        storage.set_open_mode_extra(self.open_mode_extra());
         g.insert(
             idx,
             Arc::new(StorageEntry {
@@ -270,6 +286,7 @@ impl PreadDiskIo {
     /// Register a pre-built storage (tests / custom wiring).
     pub fn insert_storage(&self, idx: StorageIndex, storage: Box<dyn DiskStorage>) {
         storage.set_storage_index(idx);
+        storage.set_open_mode_extra(self.open_mode_extra());
         self.storages
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -297,10 +314,11 @@ impl PreadDiskIo {
         );
     }
 
-    /// `abort_jobs(wait)` — stop the pool; queued jobs complete aborted.
+    /// `abort_jobs(wait)` — stop the pools; queued jobs complete aborted.
     pub fn abort_jobs(&self, wait: bool) {
         self.abort.store(true, Ordering::Relaxed);
         let mut drained = self.pool.drain_jobs();
+        drained.append(&mut self.hash_pool.drain_jobs());
         // hash jobs parked behind the piece gate never reached the
         // pool — drain them too so their completions still post.
         for e in self
@@ -323,6 +341,7 @@ impl PreadDiskIo {
             self.job_done(j);
         }
         self.pool.abort(wait);
+        self.hash_pool.abort(wait);
         self.completed.append(drained);
     }
 
@@ -507,19 +526,33 @@ impl PreadDiskIo {
         }
     }
 
-    fn enqueue(&self, j: Box<DiskJob>) {
-        self.pool.push_back(j);
-        if self.pool.max_threads() == 0 {
-            self.immediate_execute();
+    /// Pool routing — upstream `job::thread_type()`: `hash`/`hash2`
+    /// jobs go to `m_hash_threads` when it has threads, everything
+    /// else to `m_generic_threads`.
+    fn job_pool(&self, j: &DiskJob) -> &Arc<DiskIoThreadPool> {
+        if matches!(j.action, JobKind::Hash(_) | JobKind::Hash2(_))
+            && self.hash_pool.max_threads() > 0
+        {
+            &self.hash_pool
         } else {
-            self.pool.submit_jobs();
+            &self.pool
+        }
+    }
+
+    fn enqueue(&self, j: Box<DiskJob>) {
+        let pool = self.job_pool(&j);
+        pool.push_back(j);
+        if pool.max_threads() == 0 {
+            self.immediate_execute(pool);
+        } else {
+            pool.submit_jobs();
         }
     }
 
     /// `immediate_execute` — 0-thread fallback: run queued jobs inline.
-    fn immediate_execute(&self) {
+    fn immediate_execute(&self, pool: &Arc<DiskIoThreadPool>) {
         loop {
-            let Some(j) = self.pool.pop_front() else {
+            let Some(j) = pool.pop_front() else {
                 break;
             };
             self.execute_and_complete(j);
@@ -590,10 +623,9 @@ impl PreadDiskIo {
                 let mut reposted = Vec::new();
                 e.fence.job_complete(&mut j, &mut |bj| reposted.push(bj));
                 for bj in reposted {
-                    self.pool.push_back(bj);
-                }
-                if self.pool.max_threads() > 0 {
-                    self.pool.submit_jobs();
+                    let pool = self.job_pool(&bj);
+                    pool.push_back(bj);
+                    pool.submit_jobs();
                 }
             }
             self.job_done(&j);
@@ -809,7 +841,7 @@ impl PreadDiskIo {
     /// `update_stats` → pool counters snapshot.
     #[must_use]
     pub fn num_threads(&self) -> usize {
-        self.pool.num_threads()
+        self.pool.num_threads() + self.hash_pool.num_threads()
     }
 }
 
@@ -1079,6 +1111,25 @@ impl PreadDiskIo {
     /// settings snapshot (upstream reads settings_interface).
     pub fn set_max_threads(&self, n: i64) {
         self.pool.set_max_threads(n);
+    }
+
+    /// `settings_pack::hashing_threads` — size of the dedicated
+    /// `hash`/`hash2` pool (upstream `m_hash_threads`, default 1).
+    pub fn set_hash_threads(&self, n: i64) {
+        self.hash_pool.set_max_threads(n);
+    }
+
+    /// `settings_pack::enable_set_file_valid_data` /
+    /// `no_atime_storage` — extra `OpenMode` bits pushed to every
+    /// storage at `new_torrent`/`insert_storage` (ADR-0022).
+    pub fn set_open_mode_extra(&self, mode: crate::open_mode::OpenMode) {
+        self.open_mode_extra.store(mode.bits(), Ordering::Relaxed);
+    }
+
+    /// currently applied extra open flags.
+    #[must_use]
+    pub fn open_mode_extra(&self) -> crate::open_mode::OpenMode {
+        crate::open_mode::OpenMode::from_bits(self.open_mode_extra.load(Ordering::Relaxed))
     }
 }
 
@@ -1397,7 +1448,7 @@ impl DiskIo for PreadDiskIo {
     fn queue_stats(&self) -> crate::disk_interface::DiskQueueStats {
         let mut s = crate::disk_interface::DiskQueueStats {
             write_blocks: self.write_blocks.load(Ordering::Relaxed),
-            threads: self.pool.num_threads(),
+            threads: self.pool.num_threads() + self.hash_pool.num_threads(),
             queued_disk_jobs: self.pool.queue_size(),
             blocked_disk_jobs: self
                 .fence_counters

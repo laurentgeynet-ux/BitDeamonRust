@@ -169,6 +169,51 @@ fn verify_resume_seed_requires_sizes() {
 }
 
 #[test]
+fn sparse_files_grow_organically_allocate_extends() {
+    // ADR-0022: sparse files are NOT extended to final size at open —
+    // upstream leaves them at 0 and writes extend them where data
+    // lands (FSCTL_SET_SPARSE handles zero-fill). Allocate mode still
+    // sizes the file up front.
+    let d = dir("sparse");
+    let fs = make_fs();
+    let prio = vec![DownloadPriority::DEFAULT; 2];
+
+    // sparse: write 24 bytes of b.bin (piece 0 tail) → on-disk size
+    // stays 24, not the declared 1000.
+    let st = storage(&fs, &d, &prio);
+    st.set_storage_index(StorageIndex(0));
+    st.write(&[7u8; 1024], PieceIndex(0), 0, OpenMode::WRITE)
+        .unwrap();
+    let len = stdfs::metadata(d.join("t/b.bin")).unwrap().len();
+    assert_eq!(len, 24, "sparse file must grow organically, got {len}");
+
+    // allocate: same write → file is extended to its declared size.
+    let d2 = dir("alloc");
+    let st2 = PreadStorage::new(
+        StorageParams {
+            files: &fs,
+            renamed: &RenamedFiles::default(),
+            path: d2.to_path_buf(),
+            part_file_dir: PathBuf::new(),
+            mode: bitdaemon_disk::storage::StorageMode::Allocate,
+            priorities: &prio,
+            info_hash: [7u8; 20],
+            v1: true,
+            v2: false,
+        },
+        Arc::new(FilePool::new(40)),
+    );
+    st2.set_storage_index(StorageIndex(0));
+    st2.write(&[7u8; 1024], PieceIndex(0), 0, OpenMode::WRITE)
+        .unwrap();
+    let len2 = stdfs::metadata(d2.join("t/b.bin")).unwrap().len();
+    assert_eq!(len2, 1000, "allocate file must be pre-sized, got {len2}");
+
+    stdfs::remove_dir_all(&d).unwrap();
+    stdfs::remove_dir_all(&d2).unwrap();
+}
+
+#[test]
 fn move_storage_replaces_path() {
     let d = dir("move_src");
     let d2 = dir("move_dst");

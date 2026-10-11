@@ -7,6 +7,32 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — disk file controls & thread parity (Phase J, ADR-0022)
+
+- **Sparse files on Windows**: `PreadStorage::open_file` sets
+  `OpenMode::SPARSE` for every file when `!allocate_files` and for
+  priority-0 files unconditionally (upstream `pread_storage.cpp:764-
+  768`); `FileHandle::open` issues `DeviceIoControl(FSCTL_SET_SPARSE)`
+  and sparse files are no longer pre-extended — they grow at each
+  write, eliminating the synchronous NTFS valid-data-length zero-fill
+  that caused multi-second stalls on HDD.
+- **`SetFileValidData`**: `SessionSettings::enable_set_file_valid_data`
+  (upstream default false) → `ALLOW_SET_FILE_VALID_DATA` flows through
+  `PreadDiskIo::set_open_mode_extra` into a new default no-op
+  `DiskStorage::set_open_mode_extra` hook; `file::set_size`/`open`
+  call `SetFileValidData` after extension on non-sparse files, with a
+  best-effort `SE_MANAGE_VOLUME_NAME` privilege enable. The CLI
+  enables it by default (`--no-set-file-valid-data` to opt out) —
+  qBittorrent parity.
+- **Dedicated hashing pool** (upstream `m_hash_threads`): `PreadDiskIo`
+  gains `hash_pool` + `set_hash_threads(n)`; `hash`/`hash2` jobs route
+  to it when sized > 0. `SessionSettings` gains `aio_threads` (10),
+  `hashing_threads` (1); CLI flags `--aio-threads`/`--hashing-threads`.
+- **`bitdaemon-disk` unsafe carve-out**: `forbid`→`deny(unsafe_code)`
+  with a single `#[cfg(windows)] #[allow(unsafe_code)]` `file::win32`
+  module (second reviewed FFI boundary, cf. ADR-0010 §3); `windows-sys`
+  added as Windows-only dependency.
+
 ### Added — wiring-completeness audit (Phase I second pass)
 
 - `net::peer_alloc` (moved from `session`): `PeerList` now accounts

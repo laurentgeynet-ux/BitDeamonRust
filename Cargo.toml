@@ -66,6 +66,16 @@ libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 if-addrs = "0.13"
 netroute = "0.4"
+# Win32 FFI for NTFS file controls (FSCTL_SET_SPARSE, SetFileValidData)
+# — confined to bitdaemon-disk::file::win32, see ADR-0022.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
 rustls = "0.23"
 tokio-rustls = "0.26"
 # HTTPS trackers need the OS root store (upstream reads the system

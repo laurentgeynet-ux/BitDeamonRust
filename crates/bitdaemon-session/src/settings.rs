@@ -54,6 +54,16 @@ pub struct SessionSettings {
     /// `settings_pack::disk_io_read_mode` — `disable_os_cache`:
     /// `no_cache` open flags on read/hash jobs (ADR-0015).
     pub disable_os_read_cache: bool,
+    /// `settings_pack::aio_threads` — generic disk pool size
+    /// (upstream default 10).
+    pub aio_threads: i64,
+    /// `settings_pack::hashing_threads` — dedicated hash pool size
+    /// (upstream default 1, ADR-0022).
+    pub hashing_threads: i64,
+    /// `settings_pack::enable_set_file_valid_data` — Windows
+    /// `SetFileValidData` on non-sparse extension (upstream default
+    /// false; qBittorrent sets true — ADR-0022).
+    pub enable_set_file_valid_data: bool,
     /// `send_buffer_watermark` — pause reads above this.
     pub send_buffer_watermark: usize,
     /// `alert_queue_size` — alert_manager limit.
@@ -139,6 +149,10 @@ impl Default for SessionSettings {
             disable_os_write_cache: false,
             cache_expiry: Duration::from_secs(60),
             disable_os_read_cache: false,
+            // upstream `settings_pack` defaults (settings_pack.cpp:331-334)
+            aio_threads: 10,
+            hashing_threads: 1,
+            enable_set_file_valid_data: false,
             send_buffer_watermark: 500 << 10,
             alert_queue_size: 2000,
             dht_enabled: true,

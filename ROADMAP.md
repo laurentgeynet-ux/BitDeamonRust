@@ -261,6 +261,43 @@ the DHT drops flood sources.
 
 ---
 
+## Phase J — Disk file controls & thread parity ⬜
+
+Live benchmark (2026-10-11): with the store_buffer wired, C: (SSD)
+sustains ~100 MiB/s, but D: (HDD) oscillates ~20 MiB/s with
+back-pressure plateaus vs qBittorrent's ~58 MiB/s flat. Root cause:
+NTFS non-sparse writes past the Valid Data Length pay synchronous
+zero-fill per out-of-order write; hash jobs also share the write
+pool.
+
+- [ ] **Sparse files** (ADR-0022): `open_mode::sparse` consumed for
+      real — `pread_storage::open_file` sets it when `!allocate_files`
+      and for priority-0 files; `file.cpp`'s
+      `DeviceIoControl(FSCTL_SET_SPARSE)` ported into a scoped
+      `file::win32` module (second reviewed `unsafe` carve-out, cf.
+      ADR-0010 §3).
+- [ ] **`SetFileValidData`** (ADR-0022): `enable_set_file_valid_data`
+      setting → `allow_set_file_valid_data` → `SetFileValidData` on
+      truncate + non-sparse, with best-effort `SE_MANAGE_VOLUME_NAME`.
+      CLI enables it by default (qBittorrent parity — the CLI forces
+      `StorageMode::Allocate`).
+- [ ] **`hashing_threads` pool** (ADR-0022): dedicated
+      `DiskIoThreadPool` for `hash`/`hash2` jobs (upstream
+      `m_hash_threads`, default 1); `aio_threads` default raised to
+      10 (upstream) in the CLI.
+- [ ] Settings parity: `aio_threads`, `hashing_threads`,
+      `enable_set_file_valid_data` in `Settings` with upstream
+      defaults; CLI flags `--aio-threads`/`--hashing-threads`/
+      `--enable-set-file-valid-data`.
+- [ ] Re-benchmark 6 GiB torrent on D: vs qBittorrent baseline
+      (~58 MiB/s, ~2 min).
+
+**Exit**: D: download sustains ≥ qBittorrent-class throughput with no
+zero-fill stalls; `have` progress begins without the ~2 min
+allocation/check plateau.
+
+---
+
 ## Phase G — 1.0 ⬜
 
 - [x] `PORTING.md` = 100% resolved rows (the completion metric) — every upstream file is `ported`/`verified`/`won't port`/`n/a`.

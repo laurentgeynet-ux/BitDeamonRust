@@ -15,7 +15,10 @@
 //! Status: **in progress** — `open_mode`, `file`, `fs`, `stat_cache`,
 //! `part_file` ported.
 
-#![forbid(unsafe_code)]
+// `deny` (not `forbid`) so the single reviewed FFI boundary in
+// `file::win32` can opt back in — ADR-0022 §3. Unsafe anywhere else
+// in this crate remains a hard error.
+#![deny(unsafe_code)]
 
 /// `disk_interface` is in [`disk_interface::DiskIo`].
 /// `aux_/file.hpp` — positioned I/O handle.

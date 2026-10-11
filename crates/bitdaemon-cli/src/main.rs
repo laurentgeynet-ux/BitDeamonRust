@@ -82,6 +82,21 @@ struct Args {
     #[arg(long)]
     no_upnp: bool,
 
+    /// Generic disk I/O threads (upstream `aio_threads`, default 10).
+    #[arg(long, default_value_t = 10)]
+    aio_threads: i64,
+
+    /// Dedicated hashing threads (upstream `hashing_threads`,
+    /// default 1 — ADR-0022).
+    #[arg(long, default_value_t = 1)]
+    hashing_threads: i64,
+
+    /// Disable `SetFileValidData` on non-sparse file extension
+    /// (Windows; enabled by default for qBittorrent parity —
+    /// upstream `enable_set_file_valid_data`, ADR-0022).
+    #[arg(long)]
+    no_set_file_valid_data: bool,
+
     /// SSL-torrent server certificate PEM (upstream
     /// `set_ssl_certificate` cert path).
     #[arg(long)]
@@ -129,9 +144,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // disk io — `pread_disk_io(4, poster)`; the poster is a no-op
-    // here because the engine tick drains the completion queue.
-    let disk = PreadDiskIo::new(4, Arc::new(|| {}));
+    // disk io — `pread_disk_io(aio_threads, poster)`; the poster is a
+    // no-op here because the engine tick drains the completion queue.
+    // Upstream defaults: hashing pool = 1 thread, no_atime = true,
+    // SetFileValidData on for qBittorrent parity (ADR-0022).
+    let disk = PreadDiskIo::new(args.aio_threads, Arc::new(|| {}));
+    disk.set_hash_threads(args.hashing_threads);
+    {
+        use bitdaemon::disk::open_mode::OpenMode;
+        let mut extra = OpenMode::NO_ATIME;
+        if !args.no_set_file_valid_data {
+            extra |= OpenMode::ALLOW_SET_FILE_VALID_DATA;
+        }
+        disk.set_open_mode_extra(extra);
+    }
 
     // storage for the torrent (factory path → StorageIndex)
     let storage = if let Some(ti) = &atp.ti {
