@@ -143,3 +143,72 @@ pub fn device_for_address<'a>(addr: &IpAddr, ifs: &'a [IpInterface]) -> Option<&
         .find(|i| i.interface_address == *addr)
         .map(|i| i.name.as_str())
 }
+
+/// `enum_net_interfaces` — the OS enumeration half. Upstream uses
+/// `GetAdaptersAddresses`/`getifaddrs`; `if-addrs` wraps both and
+/// yields the same (address, netmask, name) tuples.
+/// Loopbacks are dropped (upstream marks them `!preferred` too).
+#[must_use]
+pub fn enum_interfaces() -> Vec<IpInterface> {
+    let mut out = Vec::new();
+    let Ok(ifs) = if_addrs::get_if_addrs() else {
+        return out;
+    };
+    for i in ifs {
+        let (interface_address, netmask) = match i.addr {
+            if_addrs::IfAddr::V4(a) => (IpAddr::V4(a.ip), IpAddr::V4(a.netmask)),
+            if_addrs::IfAddr::V6(a) => (IpAddr::V6(a.ip), IpAddr::V6(a.netmask)),
+        };
+        if interface_address.is_loopback() {
+            continue;
+        }
+        out.push(IpInterface {
+            interface_address,
+            netmask,
+            name: i.name,
+            preferred: false,
+        });
+    }
+    out
+}
+
+/// `ip_notifier` — interface-change notification. Upstream hooks OS
+/// route-notification APIs (netlink `RTMGRP_LINK`, `NotifyRouteChange`);
+/// those can't run behind injected transports, so we poll-diff the
+/// enumerated interface set: same "the set changed → alert" contract.
+pub struct IpNotifier {
+    /// last seen `(name, addr)` set.
+    prev: std::collections::BTreeSet<(String, IpAddr)>,
+}
+
+impl Default for IpNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IpNotifier {
+    /// snapshot the current table as the baseline.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { prev: snapshot() }
+    }
+
+    /// `poll` — re-enumerate; `true` when the set changed (the caller
+    /// posts `network_config_change_alert` upstream).
+    pub fn poll(&mut self) -> bool {
+        let cur = snapshot();
+        let changed = cur != self.prev;
+        if changed {
+            self.prev = cur;
+        }
+        changed
+    }
+}
+
+fn snapshot() -> std::collections::BTreeSet<(String, IpAddr)> {
+    enum_interfaces()
+        .into_iter()
+        .map(|i| (i.name, i.interface_address))
+        .collect()
+}

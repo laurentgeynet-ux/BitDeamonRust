@@ -15,7 +15,7 @@ use std::net::{IpAddr, SocketAddr};
 use bitdaemon_common::PeerSourceFlags;
 
 use crate::ip_helpers::is_local;
-use crate::torrent_peer::TorrentPeer;
+use crate::torrent_peer::{PeerAddr, TorrentPeer};
 
 /// `peer_source` — the *primary* source a peer was added through:
 /// upstream records the first source bit. Used by
@@ -218,6 +218,38 @@ impl PeerList {
             SocketAddr::V4(_) => TorrentPeer::new_v4(remote, connectable, src),
             SocketAddr::V6(_) => TorrentPeer::new_v6(remote, connectable, src),
         };
+        let is = self.is_connect_candidate(&p);
+        self.peers.push(p);
+        self.update_candidates(false, is);
+        (self.peers.len() - 1, true)
+    }
+
+    /// `add_i2p_peer` — an I2P destination learned via `i2p_pex`
+    /// (upstream `torrent::add_i2p_peer` → peer list insert, dedup by
+    /// destination hash). `dest` is the base64 destination or its
+    /// sha256 — stored verbatim in `TorrentPeer`.
+    pub fn add_peer_i2p(
+        &mut self,
+        dest: Vec<u8>,
+        src: PeerSourceFlags,
+        connectable: bool,
+    ) -> (usize, bool) {
+        if let Some(i) = self
+            .peers
+            .iter()
+            .position(|p| matches!(&p.addr, PeerAddr::I2p(d) if *d == dest))
+        {
+            let was = self.is_connect_candidate(&self.peers[i]);
+            let p = &mut self.peers[i];
+            p.source |= src;
+            if connectable {
+                p.connectable = true;
+            }
+            let is = self.is_connect_candidate(&self.peers[i]);
+            self.update_candidates(was, is);
+            return (i, false);
+        }
+        let p = TorrentPeer::new_i2p(dest, connectable, src);
         let is = self.is_connect_candidate(&p);
         self.peers.push(p);
         self.update_candidates(false, is);

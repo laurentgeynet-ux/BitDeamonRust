@@ -218,6 +218,26 @@ pub async fn read_message(s: &mut BoxedPeerStream) -> Result<PeerMessage, PeerCo
     Ok(decode(&buf)?)
 }
 
+/// Cancellation-safe incremental frame decoder: pop one complete
+/// length-prefixed message from `buf`, or `Ok(None)` when more
+/// bytes are needed. Unlike `read_message` this can sit inside a
+/// `select!` loop — no bytes are consumed on partial frames.
+pub fn decode_next(buf: &mut bytes::BytesMut) -> Result<Option<PeerMessage>, PeerConnError> {
+    if buf.len() < 4 {
+        return Ok(None);
+    }
+    let n = u32::from_be_bytes(buf[..4].try_into().unwrap_or_default()) as usize;
+    if n > MAX_MESSAGE_LEN {
+        return Err(PeerConnError::Protocol("message too large"));
+    }
+    if buf.len() < 4 + n {
+        return Ok(None);
+    }
+    let _hdr = buf.split_to(4);
+    let body = buf.split_to(n);
+    Ok(Some(decode(&body)?))
+}
+
 /// `write_*` — serialize one message and send it (keep-alive =
 /// the zero-length frame).
 pub async fn write_message(s: &mut BoxedPeerStream, m: &PeerMessage) -> Result<(), PeerConnError> {

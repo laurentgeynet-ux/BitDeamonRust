@@ -36,6 +36,8 @@ pub mod peer_wire;
 /// `aux_/receive_buffer` — cursor-based recv buffer + crypto wrapper.
 pub mod receive_buffer;
 pub mod resolver;
+pub mod rtc_signaling;
+pub mod rtc_stream;
 /// `aux_/socket_io.hpp` — BE wire helpers + endpoint codec.
 pub mod socket_io;
 /// `aux_/torrent_peer` — per-peer record + BEP-40 `peer_priority`.
@@ -87,6 +89,8 @@ pub mod http_stream;
 pub mod http_tracker;
 /// `i2p_stream` — SAM handshake (HELLO/SESSION/STREAM/NAMING).
 pub mod i2p;
+/// `aux_/peer_list` — swarm list: candidates, ranking, weeding.
+pub mod instantiate;
 /// `ip_helpers.cpp` + `hash_address` — address classification.
 pub mod ip_helpers;
 /// `ip_voter.cpp` — external-IP majority voting.
@@ -101,14 +105,17 @@ pub mod natpmp;
 pub mod parse_url;
 /// `peer_class`/`peer_class_pool`/`peer_class_set`.
 pub mod peer_class;
-/// `aux_/peer_list` — swarm list: candidates, ranking, weeding.
 pub mod peer_list;
 pub mod proxy;
 /// `socks5_stream` — SOCKS4/5 handshake over any async stream.
 pub mod socks;
 /// `udp_socket::wrap`/`socks5_unwrap` — SOCKS5-UDP relay framing.
 pub mod socks_udp;
+pub mod ssl_stream;
+/// `aux_/string_util` — byte-string helpers + `listen_interfaces` parser.
+pub mod string_util;
 /// `udp_tracker_connection` — BEP-15 announce/scrape over `DatagramSocket`.
+pub mod udp_socket;
 pub mod udp_tracker;
 /// `utp_stream` — AsyncRead/Write bridge + PeerConnector over DatagramSocket.
 pub mod utp_stream;

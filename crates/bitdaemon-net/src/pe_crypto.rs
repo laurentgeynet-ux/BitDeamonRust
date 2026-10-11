@@ -270,3 +270,50 @@ pub fn init_pe_rc4_handler(secret: &[u8], stream_key: &Sha1Hash, outgoing: bool)
     ret.set_outgoing_key(local_key.as_bytes());
     ret
 }
+
+/// `pe_settings` (`session_settings.hpp`, deprecated ABI in upstream
+/// but still the handle-level encryption knob).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeSettings {
+    /// `out_enc_policy`.
+    pub out_enc_policy: EncPolicy,
+    /// `in_enc_policy`.
+    pub in_enc_policy: EncPolicy,
+    /// `allowed_enc_level` — bitmask of the [`enc_level`] bits.
+    pub allowed_enc_level: u8,
+    /// `prefer_rc4` — prefer RC4 when `allowed_enc_level == both`.
+    pub prefer_rc4: bool,
+}
+
+/// `pe_settings::enc_policy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncPolicy {
+    /// `forced` — encrypted connections only.
+    Forced,
+    /// `enabled` — encrypted preferred, plaintext allowed.
+    Enabled,
+    /// `disabled` — plaintext only.
+    Disabled,
+}
+
+/// `pe_settings::enc_level` bits.
+pub mod enc_level {
+    /// `plaintext`.
+    pub const PLAINTEXT: u8 = 1;
+    /// `rc4`.
+    pub const RC4: u8 = 2;
+    /// `both`.
+    pub const BOTH: u8 = 3;
+}
+
+impl Default for PeSettings {
+    /// upstream defaults: enabled/enabled/both/false.
+    fn default() -> Self {
+        Self {
+            out_enc_policy: EncPolicy::Enabled,
+            in_enc_policy: EncPolicy::Enabled,
+            allowed_enc_level: enc_level::BOTH,
+            prefer_rc4: false,
+        }
+    }
+}

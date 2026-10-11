@@ -10,6 +10,49 @@
 
 use bitdaemon_common::types::PieceIndex;
 use bitdaemon_core::FileStorage;
+use bitdaemon_core::escape_string::escape_path;
+
+/// `escape_file_path` — percent-encode each path segment while
+/// keeping `/` separators, `\` normalized first (upstream handles
+/// Windows separators before escaping).
+fn escape_file_path(path: &[u8]) -> String {
+    let fixed: Vec<u8> = path
+        .iter()
+        .map(|&c| if c == b'\\' { b'/' } else { c })
+        .collect();
+    String::from_utf8_lossy(&escape_path(&fixed)).into_owned()
+}
+
+/// `web_peer_connection` ctor URL normalization:
+/// multi-file seeds must end with `/` (filenames get appended);
+/// a single-file seed ending in `/` gets the (escaped) file name
+/// appended. `path` is the request path, `url` the absolute form
+/// used when a proxy is in play.
+pub fn normalize_web_seed_url(
+    path: &mut String,
+    url: &mut String,
+    num_files: usize,
+    first_file_path: &[u8],
+) {
+    if num_files != 1 {
+        if !path.is_empty() && !path.ends_with('/') {
+            path.push('/');
+        }
+        if !url.is_empty() && !url.ends_with('/') {
+            url.push('/');
+        }
+    } else {
+        if path.is_empty() {
+            path.push('/');
+        }
+        if path.ends_with('/') {
+            path.push_str(&escape_file_path(first_file_path));
+        }
+        if url.ends_with('/') {
+            url.push_str(&escape_file_path(first_file_path));
+        }
+    }
+}
 
 /// `file_request_t` — one file slice an HTTP GET covers.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,7 +181,7 @@ pub fn build_piece_request(
             if !base.ends_with('/') {
                 request.push('/');
             }
-            request.push_str(&String::from_utf8_lossy(&fs.file_path(sl.file_index, b"")));
+            request.push_str(&escape_file_path(&fs.file_path(sl.file_index, b"")));
             request.push_str(" HTTP/1.1\r\n");
             add_headers(&mut request, headers);
             request.push_str("\r\nRange: bytes=");
@@ -224,4 +267,36 @@ pub async fn fetch_block(
         out.push((f.file_index, f.start, body));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_multi_file() {
+        let mut p = "http://s/dir".to_string();
+        let mut u = "http://s/dir".to_string();
+        normalize_web_seed_url(&mut p, &mut u, 3, b"file.iso");
+        assert_eq!(p, "http://s/dir/");
+        assert_eq!(u, "http://s/dir/");
+    }
+
+    #[test]
+    fn normalize_single_file() {
+        let mut p = "/seed/".to_string();
+        let mut u = String::new();
+        normalize_web_seed_url(&mut p, &mut u, 1, b"my file.iso");
+        assert_eq!(p, "/seed/my%20file.iso");
+        assert_eq!(u, "");
+        let mut p2 = "/seed/my file.iso".to_string();
+        let mut u2 = String::new();
+        normalize_web_seed_url(&mut p2, &mut u2, 1, b"my file.iso");
+        assert_eq!(p2, "/seed/my file.iso");
+    }
+
+    #[test]
+    fn escape_backslash() {
+        assert_eq!(escape_file_path(b"dir\x5cf b.txt"), "dir/f%20b.txt");
+    }
 }
