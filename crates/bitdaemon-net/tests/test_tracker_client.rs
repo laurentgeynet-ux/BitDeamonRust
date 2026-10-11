@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use bitdaemon_net::tracker_client::{AnnounceParams, announce_http, announce_udp};
+use bitdaemon_net::tracker_client::{AnnounceParams, UdpTrackerDemux, announce_http, announce_udp};
 use bitdaemon_net::transport::{BoxFut, BoxedPeerStream, DatagramSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -76,9 +76,16 @@ async fn udp_announce_e2e() {
     let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 6969);
     let udp = ScriptedUdp::default();
     let sock = &udp as &dyn DatagramSocket;
-    let r = announce_udp(sock, target, &params(), Duration::from_secs(5), 3)
-        .await
-        .unwrap();
+    let r = announce_udp(
+        sock,
+        &udp.demux,
+        target,
+        &params(),
+        Duration::from_secs(5),
+        3,
+    )
+    .await
+    .unwrap();
     assert_eq!(r.interval, 1800);
     assert_eq!(r.peers.len(), 1);
     assert_eq!(udp.sent_count(), 2);
@@ -88,6 +95,7 @@ async fn udp_announce_e2e() {
 #[derive(Debug, Default)]
 struct ScriptedUdp {
     sent: Mutex<Vec<Vec<u8>>>,
+    demux: UdpTrackerDemux,
 }
 
 impl ScriptedUdp {
@@ -97,9 +105,29 @@ impl ScriptedUdp {
 }
 
 impl DatagramSocket for ScriptedUdp {
-    fn send_to<'a>(&'a self, buf: &'a [u8], _target: SocketAddr) -> BoxFut<'a, usize> {
+    fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> BoxFut<'a, usize> {
         Box::pin(async move {
             self.sent.lock().unwrap().push(buf.to_vec());
+            let tid = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+            let resp: Vec<u8> = if buf[11] == 0 {
+                let mut v = vec![];
+                v.extend(0u32.to_be_bytes());
+                v.extend(tid.to_be_bytes());
+                v.extend(0x41727101980u64.to_be_bytes());
+                v
+            } else {
+                let mut v = vec![];
+                v.extend(1u32.to_be_bytes());
+                v.extend(tid.to_be_bytes());
+                v.extend(1800i32.to_be_bytes());
+                v.extend(1i32.to_be_bytes());
+                v.extend(2i32.to_be_bytes());
+                v.extend([10, 0, 0, 9, 0x1A, 0xE1]);
+                v
+            };
+            // la pompe UDP route la reponse au waiter par `tid`
+            // (comme `Engine`'s `udp_tracker_demux`).
+            let _ = self.demux.route(target, &resp);
             Ok(buf.len())
         })
     }

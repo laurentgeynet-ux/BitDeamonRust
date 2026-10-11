@@ -195,6 +195,11 @@ pub struct Engine {
     gone_tx: mpsc::UnboundedSender<(Sha1Hash, u64)>,
     /// inbound datagrams (DHT, UDP tracker replies).
     udp_rx: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
+    /// tracker-reply demux on the shared datagram — upstream gives
+    /// each `udp_tracker_connection` its own socket; with one injected
+    /// socket the pump must route replies by `transaction_id` or
+    /// announces never see their answers.
+    udp_tracker_demux: Arc<bitdaemon_net::tracker_client::UdpTrackerDemux>,
     udp_tx: mpsc::UnboundedSender<(SocketAddr, Vec<u8>)>,
     /// outbound dial completions (`connection_attempt` jobs).
     connect_rx: mpsc::UnboundedReceiver<DialDone>,
@@ -275,6 +280,7 @@ impl Engine {
             gone_tx,
             udp_rx,
             udp_tx,
+            udp_tracker_demux: Arc::new(bitdaemon_net::tracker_client::UdpTrackerDemux::default()),
             connect_rx,
             connect_tx,
             webseed_rx,
@@ -358,7 +364,9 @@ impl Engine {
             // demux: NAT-PMP replies come from the gateway :5351 —
             // upstream binds a separate socket; injected transports
             // multiplex on one, so dispatch by sender.
-            if self.natpmp.as_ref().is_some_and(|n| from == n.gateway) {
+            if self.udp_tracker_demux.route(from, &buf) {
+                // reponse tracker consommee par l'annonce en attente
+            } else if self.natpmp.as_ref().is_some_and(|n| from == n.gateway) {
                 self.on_natpmp_response(&buf);
             } else {
                 slock(&self.session).on_udp(from, &buf, &mut out);
@@ -520,6 +528,7 @@ impl Engine {
         let tx = self.announce_tx.clone();
         let connector = self.connector.clone();
         let datagram = self.datagram.clone();
+        let demux = self.udp_tracker_demux.clone();
         let resolver = self.resolver.clone();
         self.tasks_forget();
         let handle = tokio::spawn(async move {
@@ -535,9 +544,11 @@ impl Engine {
                         return;
                     };
                     let port = u16::try_from(c.port).unwrap_or(80);
-                    match resolve(&resolver, &c.hostname, port).await {
+                    let v4 = DatagramSocket::local_addr(dg.as_ref()).is_ipv4();
+                    match resolve_for_socket(&resolver, &c.hostname, port, v4).await {
                         Ok(addr) => announce_udp(
                             dg.as_ref(),
+                            &demux,
                             addr,
                             &params,
                             std::time::Duration::from_secs(15),
@@ -636,6 +647,7 @@ impl Engine {
         let tx = self.announce_tx.clone();
         let connector = self.connector.clone();
         let datagram = self.datagram.clone();
+        let demux = self.udp_tracker_demux.clone();
         let resolver = self.resolver.clone();
         self.tasks_forget();
         let handle = tokio::spawn(async move {
@@ -651,9 +663,11 @@ impl Engine {
                         return;
                     };
                     let port = u16::try_from(c.port).unwrap_or(80);
-                    match resolve(&resolver, &c.hostname, port).await {
+                    let v4 = DatagramSocket::local_addr(dg.as_ref()).is_ipv4();
+                    match resolve_for_socket(&resolver, &c.hostname, port, v4).await {
                         Ok(addr) => bitdaemon_net::tracker_client::scrape_udp(
                             dg.as_ref(),
+                            &demux,
                             addr,
                             ih.as_bytes(),
                             std::time::Duration::from_secs(15),
@@ -1575,6 +1589,36 @@ async fn resolve(
             .into_iter()
             .next()
             .ok_or_else(|| format!("no address for {hostname}")),
+        None => Err(format!("no resolver injected for {hostname}")),
+    }
+}
+
+/// `resolve` + filtre famille : la socket datagramme v4 ne peut pas
+/// envoyer a une cible v6 (`WSAEAFNOSUPPORT`) — upstream garde des
+/// sockets par famille ; on selectionne une adresse compatible.
+async fn resolve_for_socket(
+    r: &Option<BoxedResolver>,
+    hostname: &str,
+    port: u16,
+    v4_only: bool,
+) -> Result<SocketAddr, String> {
+    if !v4_only {
+        return resolve(r, hostname, port).await;
+    }
+    if let Ok(addr) = format!("{hostname}:{port}").parse::<SocketAddr>() {
+        return if addr.is_ipv4() {
+            Ok(addr)
+        } else {
+            Err(format!("{hostname} is v6-only, datagram is v4"))
+        };
+    }
+    match r {
+        Some(r) => resolve_host(r.as_ref(), hostname, port, ResolveFlags::default())
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| format!("no v4 address for {hostname}")),
         None => Err(format!("no resolver injected for {hostname}")),
     }
 }

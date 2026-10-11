@@ -8,6 +8,20 @@ Until `1.0.0`, breaking changes may occur in any release.
 ## [Unreleased]
 
 ### Fixed
+- **UDP tracker replies stolen by the shared socket pump** — the
+  engine's UDP pump (DHT/LSD/NAT-PMP) raced `announce_udp` /
+  `scrape_udp`, which `recv_from`'d the same injected
+  `DatagramSocket`: replies were consumed by the pump and every UDP
+  announce timed out (`udp tracker: tracker timeout`). A
+  transaction-id demux (`UdpTrackerDemux`) now registers a waiter
+  **before** `send_to`; the pump routes matching datagrams to the
+  waiter and passes unmatched ones through to DHT/LSD/NAT-PMP
+  (`engine::udp_pump` mirrors upstream's single-receiver design).
+- IPv6 literals from DNS were attempted on the IPv4 datagram socket
+  (Windows `os error 10047`); resolved tracker addresses are now
+  filtered by socket family.
+
+### Fixed
 - **Real-swarm completion pipeline** (validated end-to-end on a
   public Debian torrent: 100 % at ~12 MiB/s, hash-verified):
   - `peer_list_state` deadlock — a `&slock(session)` borrow

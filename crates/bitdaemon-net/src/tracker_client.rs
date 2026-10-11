@@ -20,6 +20,106 @@ use crate::udp_tracker::{
     parse_connect_response,
 };
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use tokio::sync::mpsc;
+
+/// Demux des reponses UDP tracker sur la socket **partagee**
+/// (ADR-0008) : upstream utilise une socket dediee par connexion
+/// tracker, ici la pompe UDP unique route chaque datagramme entrant
+/// a l'attente ouverte par `transaction_id`. Une reponse BEP-15 est
+/// `u32 action` (0=connect, 1=announce, 2=scrape, 3=error) suivi de
+/// `u32 transaction_id` — les trames DHT (`d...`) et LSD
+/// (`BT-SEARCH`) ne peuvent pas matcher `action <= 3`.
+/// Datagramme entrant route a une attente tracker.
+type UdpReply = (SocketAddr, Vec<u8>);
+
+#[derive(Debug, Default)]
+pub struct UdpTrackerDemux {
+    waiters: Mutex<HashMap<u32, mpsc::UnboundedSender<UdpReply>>>,
+}
+
+impl UdpTrackerDemux {
+    /// Enregistre une attente pour `tid` ; la pompe appellera
+    /// [`Self::route`] sur chaque datagramme.
+    #[must_use]
+    pub fn register(&self, tid: u32) -> mpsc::UnboundedReceiver<UdpReply> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tid, tx);
+        rx
+    }
+
+    /// Libere l'attente `tid` (fin d'echange ou timeout).
+    pub fn unregister(&self, tid: u32) {
+        self.waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&tid);
+    }
+
+    /// `true` si `buf` est une reponse tracker consommee par un
+    /// waiter — a appeler dans la pompe UDP avant le routage
+    /// DHT/LSD/NAT-PMP.
+    #[must_use]
+    pub fn route(&self, from: SocketAddr, buf: &[u8]) -> bool {
+        if buf.len() < 8 {
+            return false;
+        }
+        let action = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        if action > 3 {
+            return false;
+        }
+        let tid = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let tx = self
+            .waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&tid)
+            .cloned();
+        match tx {
+            Some(tx) => {
+                let _ = tx.send((from, buf.to_vec()));
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Attend la reponse `tid` via le demux (remplace le `recv_from`
+/// direct qui se faisait voler les paquets par la pompe UDP).
+struct UdpWaiter {
+    tid: u32,
+    rx: mpsc::UnboundedReceiver<UdpReply>,
+}
+
+/// Enregistre l'attente **avant** l'envoi du datagramme — sinon une
+/// reponse tres rapide arrive avant le `register` et est perdue.
+fn udp_waiter(demux: &UdpTrackerDemux, tid: u32) -> UdpWaiter {
+    UdpWaiter {
+        tid,
+        rx: demux.register(tid),
+    }
+}
+
+async fn wait_reply(
+    demux: &UdpTrackerDemux,
+    waiter: UdpWaiter,
+    timeout: Duration,
+) -> Result<Vec<u8>, UdpTrackerError> {
+    let mut waiter = waiter;
+    let res = tokio::time::timeout(timeout, waiter.rx.recv()).await;
+    drop(waiter.rx);
+    demux.unregister(waiter.tid);
+    res.map_err(|_| UdpTrackerError::Timeout)?
+        .map(|(_from, buf)| buf)
+        .ok_or(UdpTrackerError::Timeout)
+}
+
 /// announce parameters shared by both protocols.
 #[derive(Debug, Clone)]
 pub struct AnnounceParams {
@@ -104,22 +204,20 @@ pub async fn announce_http(
 /// with `timeout` per datagram round-trip.
 pub async fn announce_udp(
     dgram: &dyn DatagramSocket,
+    demux: &UdpTrackerDemux,
     tracker: SocketAddr,
     p: &AnnounceParams,
     timeout: Duration,
     max_tries: u32,
 ) -> Result<TrackerResponse, AnnounceError> {
-    let mut buf = vec![0u8; 2048];
-
     // connect exchange (one retry inside upstream too)
     let mut conn_id = None;
     for _ in 0..max_tries.max(1) {
         let tid = rand::random::<u32>();
+        let w = udp_waiter(demux, tid);
         let _ = dgram.send_to(&build_connect(tid), tracker).await?;
-        let (n, _from) = tokio::time::timeout(timeout, dgram.recv_from(&mut buf))
-            .await
-            .map_err(|_| UdpTrackerError::Timeout)??;
-        match parse_connect_response(&buf[..n], tid) {
+        let buf = wait_reply(demux, w, timeout).await?;
+        match parse_connect_response(&buf, tid) {
             Ok(id) => {
                 conn_id = Some(id);
                 break;
@@ -147,13 +245,12 @@ pub async fn announce_udp(
             listen_port: p.port,
             request_string: String::new(),
         };
+        let w = udp_waiter(demux, tid);
         let _ = dgram
             .send_to(&build_announce(conn_id, tid, &req), tracker)
             .await?;
-        let (n, _from) = tokio::time::timeout(timeout, dgram.recv_from(&mut buf))
-            .await
-            .map_err(|_| UdpTrackerError::Timeout)??;
-        match parse_announce_response(&buf[..n], 1, tid, tracker.is_ipv6()) {
+        let buf = wait_reply(demux, w, timeout).await?;
+        match parse_announce_response(&buf, 1, tid, tracker.is_ipv6()) {
             Ok(r) => {
                 return Ok(TrackerResponse {
                     interval: r.interval,
@@ -176,6 +273,7 @@ pub async fn announce_udp(
 /// action 2); `max_tries` round-trip retries like `announce_udp`.
 pub async fn scrape_udp(
     dgram: &dyn DatagramSocket,
+    demux: &UdpTrackerDemux,
     tracker: SocketAddr,
     info_hash: &[u8; 20],
     timeout: Duration,
@@ -184,15 +282,13 @@ pub async fn scrape_udp(
     use crate::udp_tracker::{
         build_connect, build_scrape, parse_connect_response, parse_scrape_response,
     };
-    let mut buf = vec![0u8; 2048];
     let mut conn_id = None;
     for _ in 0..max_tries.max(1) {
         let tid = rand::random::<u32>();
+        let w = udp_waiter(demux, tid);
         let _ = dgram.send_to(&build_connect(tid), tracker).await?;
-        let (n, _from) = tokio::time::timeout(timeout, dgram.recv_from(&mut buf))
-            .await
-            .map_err(|_| UdpTrackerError::Timeout)??;
-        match parse_connect_response(&buf[..n], tid) {
+        let buf = wait_reply(demux, w, timeout).await?;
+        match parse_connect_response(&buf, tid) {
             Ok(id) => {
                 conn_id = Some(id);
                 break;
@@ -206,11 +302,10 @@ pub async fn scrape_udp(
     for _ in 0..max_tries.max(1) {
         let tid = rand::random::<u32>();
         let pkt = build_scrape(conn_id, tid, &[*info_hash]);
+        let w = udp_waiter(demux, tid);
         let _ = dgram.send_to(&pkt, tracker).await?;
-        let (n, _from) = tokio::time::timeout(timeout, dgram.recv_from(&mut buf))
-            .await
-            .map_err(|_| UdpTrackerError::Timeout)??;
-        match parse_scrape_response(&buf[..n], tid) {
+        let buf = wait_reply(demux, w, timeout).await?;
+        match parse_scrape_response(&buf, tid) {
             Ok(mut v) => {
                 return v
                     .pop()
