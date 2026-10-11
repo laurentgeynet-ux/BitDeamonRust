@@ -14,12 +14,12 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use bitdaemon_common::types::PeerRequest;
 use bitdaemon_common::{PeerId, Sha1Hash};
-use bitdaemon_net::bt_peer_conn::{read_message, run_handshake, write_message};
+use bitdaemon_net::bt_peer_conn::{run_handshake, write_message};
 use bitdaemon_net::peer_wire::PeerMessage;
 use bitdaemon_net::resolver::{BoxedResolver, ResolveFlags, resolve_host};
 use bitdaemon_net::tracker_client::{AnnounceError, announce_http, announce_udp};
@@ -31,7 +31,27 @@ use bitdaemon_session::session::{PeerPacket, Session, SessionOut};
 use bitdaemon_session::session_handle::lock as slock;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+/// `ssl_context::m_ssl_ctx` — tracker-facing rustls config built once
+/// from the OS root store (upstream loads the system trust DB via
+/// OpenSSL defaults). Lazily initialized so non-https setups never
+/// pay for it.
+fn tracker_tls_config() -> Arc<rustls::ClientConfig> {
+    static CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    CFG.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        let loaded = rustls_native_certs::load_native_certs();
+        for e in &loaded.errors {
+            warn!("skipped a native root cert: {e}");
+        }
+        for c in loaded.certs {
+            let _ = roots.add(c);
+        }
+        bitdaemon_net::ssl_stream::tracker_client_config(Arc::new(roots))
+    })
+    .clone()
+}
 
 /// One completed tracker exchange, reported back to the session.
 struct AnnounceDone {
@@ -513,6 +533,11 @@ impl Engine {
                     // routed upstream via alerts already
                 }
                 SessionOut::Alert(_) => {}
+                SessionOut::InterfacesChanged => {
+                    // upstream `on_ip_change` → reopen listeners;
+                    // the engine re-binds at the transport level.
+                    info!("network interfaces changed");
+                }
             }
         }
     }
@@ -597,12 +622,38 @@ impl Engine {
                     }
                 }
                 Ok(c) => {
-                    // http/https — dial a stream and GET
-                    let default_port = if c.protocol == "https" { 443 } else { 80 };
+                    // http/https — dial a stream; https wraps it in
+                    // rustls with the OS root store (upstream's
+                    // `m_ssl_ctx` built from the system trust DB).
+                    let https = c.protocol == "https";
+                    let default_port = if https { 443 } else { 80 };
                     let port = u16::try_from(c.port).unwrap_or(default_port);
                     match resolve(&resolver, &c.hostname, port).await {
                         Ok(addr) => match connector.connect(addr).await {
-                            Ok(mut s) => {
+                            Ok(s) => {
+                                let mut s: BoxedPeerStream = if https {
+                                    match bitdaemon_net::ssl_stream::ssl_connect(
+                                        s,
+                                        &c.hostname,
+                                        addr,
+                                        tracker_tls_config(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(t) => Box::new(t),
+                                        Err(e) => {
+                                            let _ = tx.send(AnnounceDone {
+                                                ih,
+                                                url,
+                                                result: Err(format!("tls: {e}")),
+                                                scrape: false,
+                                            });
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    s
+                                };
                                 let host = if c.port < 0 {
                                     c.hostname.clone()
                                 } else {
@@ -1088,7 +1139,13 @@ impl Engine {
                 return Err(std::io::Error::other(e));
             }
         };
-        let pid = slock(&self.session).peer_id;
+        let (pid, dht) = {
+            let ses = slock(&self.session);
+            (ses.peer_id, ses.settings.dht_enabled)
+        };
+        // upstream `peer_connection` always advertises the FAST
+        // extension (BEP-6); DHT bit follows `enable_dht`.
+        let fast = true;
         // encrypted flag selects the MSE path upstream-style;
         // plaintext default for now (`run_handshake_encrypted_*`
         // available when the caller wants PE)
@@ -1097,8 +1154,8 @@ impl Engine {
                 &mut s,
                 ih,
                 &pid,
-                false,
-                false,
+                dht,
+                fast,
                 bitdaemon_net::mse::CRYPTO_PLAINTEXT | bitdaemon_net::mse::CRYPTO_RC4,
                 0,
             )
@@ -1111,7 +1168,7 @@ impl Engine {
                 }
             }
         } else {
-            match run_handshake(&mut s, ih, &pid, false, false).await {
+            match run_handshake(&mut s, ih, &pid, dht, fast).await {
                 Ok(hs) => hs,
                 Err(e) => {
                     slock(&self.session).peer_connect_failed(ih, remote);
@@ -1220,7 +1277,11 @@ impl Engine {
         }
         let connector = self.connector.clone();
         let tx = self.connect_tx.clone();
-        let pid = slock(&self.session).peer_id;
+        let (pid, dht) = {
+            let ses = slock(&self.session);
+            (ses.peer_id, ses.settings.dht_enabled)
+        };
+        let fast = true;
         let ext = self.ext_handshake(&ih);
         let h = tokio::spawn(async move {
             let send_err = |e: String| {
@@ -1245,15 +1306,15 @@ impl Engine {
                     &mut s,
                     &ih,
                     &pid,
-                    false,
-                    false,
+                    dht,
+                    fast,
                     bitdaemon_net::mse::CRYPTO_PLAINTEXT | bitdaemon_net::mse::CRYPTO_RC4,
                     0,
                 )
                 .await
                 .map(|(hs, _)| hs)
             } else {
-                run_handshake(&mut s, &ih, &pid, false, false).await
+                run_handshake(&mut s, &ih, &pid, dht, fast).await
             };
             if let Err(e) = hs {
                 send_err(e.to_string());
@@ -1283,7 +1344,10 @@ impl Engine {
     pub fn start_acceptor(&mut self, acceptor: Arc<dyn bitdaemon_net::transport::PeerAcceptor>) {
         let tx = self.connect_tx.clone();
         let known = self.known_ihs.clone();
-        let pid = slock(&self.session).peer_id;
+        let (pid, dht) = {
+            let ses = slock(&self.session);
+            (ses.peer_id, ses.settings.dht_enabled)
+        };
         let h = tokio::spawn(async move {
             loop {
                 let acc = acceptor.clone().accept().await;
@@ -1297,8 +1361,8 @@ impl Engine {
                 let hs = bitdaemon_net::bt_peer_conn::run_handshake_responder(
                     &mut s,
                     &pid,
-                    false,
-                    false,
+                    dht,
+                    true,
                     |ih| known.lock().unwrap_or_else(|e| e.into_inner()).contains(ih),
                 )
                 .await;
@@ -1409,17 +1473,19 @@ impl Engine {
         if slock(&self.session).ip_access(remote.ip()) == bitdaemon_net::ip_filter::BLOCKED {
             return Ok(None);
         }
-        let pid = slock(&self.session).peer_id;
+        let (pid, dht) = {
+            let ses = slock(&self.session);
+            (ses.peer_id, ses.settings.dht_enabled)
+        };
         let ih_known = {
             // snapshot of known info-hashes for the callback
             let set: Vec<Sha1Hash> = slock(&self.session).torrents.keys().copied().collect();
             move |ih: &Sha1Hash| set.contains(ih)
         };
-        let hs = bitdaemon_net::bt_peer_conn::run_handshake_responder(
-            &mut s, &pid, false, false, ih_known,
-        )
-        .await
-        .map_err(std::io::Error::other)?;
+        let hs =
+            bitdaemon_net::bt_peer_conn::run_handshake_responder(&mut s, &pid, dht, true, ih_known)
+                .await
+                .map_err(std::io::Error::other)?;
         let num_pieces = slock(&self.session)
             .torrents
             .get(&hs.info_hash)
@@ -1466,36 +1532,54 @@ impl Engine {
         let tul = self.torrent_up_limiters.get(&ih).cloned();
         let tdl = self.torrent_down_limiters.get(&ih).cloned();
         // one task owns the stream: select between inbound decode and
-        // outbound encode (upstream's per-connection pump).
+        // outbound encode (upstream's per-connection pump). Reads go
+        // through `read_buf` + a persistent buffer — `read_message`'s
+        // two-phase `read_exact` is NOT cancellation-safe inside a
+        // `select!`: a losing read leaves the length bytes consumed
+        // and desyncs the frame stream.
         let h = tokio::spawn(async move {
-            loop {
+            let mut buf = bytes::BytesMut::with_capacity(256 * 1024);
+            'pump: loop {
                 tokio::select! {
-                    m = read_message(&mut s) => {
-                        match m {
-                            Ok(msg) => {
-                                // download throttle — hold the
-                                // pump, TCP back-pressure does the
-                                // rest (upstream rate-limits reads)
-                                if let PeerMessage::Piece { data, .. } = &msg {
-                                    dl.acquire(data.len() as i64).await;
-                                    if let Some(l) = &tdl {
-                                        l.acquire(data.len() as i64).await;
+                    r = tokio::io::AsyncReadExt::read_buf(&mut s, &mut buf) => {
+                        match r {
+                            Ok(0) => {
+                                debug!(peer = peer, remote = ?remote, err = %"eof", "peer read error, dropping");
+                                break;
+                            }
+                            Ok(_) => loop {
+                                match bitdaemon_net::bt_peer_conn::decode_next(&mut buf) {
+                                    Ok(Some(msg)) => {
+                                        // download throttle — hold the
+                                        // pump, TCP back-pressure does the
+                                        // rest (upstream rate-limits reads)
+                                        if let PeerMessage::Piece { data, .. } = &msg {
+                                            dl.acquire(data.len() as i64).await;
+                                            if let Some(l) = &tdl {
+                                                l.acquire(data.len() as i64).await;
+                                            }
+                                        }
+                                        if inbound_tx
+                                            .send(InboundPeerMsg {
+                                                packet: PeerPacket {
+                                                    info_hash: ih,
+                                                    peer,
+                                                    remote,
+                                                    msg,
+                                                },
+                                            })
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    Ok(None) => break,
+                                    Err(e) => {
+                                        debug!(peer = peer, remote = ?remote, err = %e, "peer read error, dropping");
+                                        break 'pump;
                                     }
                                 }
-                                if inbound_tx
-                                    .send(InboundPeerMsg {
-                                        packet: PeerPacket {
-                                            info_hash: ih,
-                                            peer,
-                                            remote,
-                                            msg,
-                                        },
-                                    })
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
+                            },
                             Err(e) => {
                                 debug!(peer = peer, remote = ?remote, err = %e, "peer read error, dropping");
                                 break;

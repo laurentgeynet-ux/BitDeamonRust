@@ -951,10 +951,18 @@ impl Torrent {
     /// resume check done). `priorities`/`have` seeded from resume.
     pub fn init_picker(&mut self, now: bool) {
         if self.picker.is_none() {
-            self.picker = Some(PiecePicker::new(
-                i64::from(self.num_pieces) * self.piece_length,
-                self.piece_length as i32,
-            ));
+            // upstream feeds `m_torrent_file->total_size()` — the
+            // real payload size — because `num_pieces * piece_length`
+            // rounds up: for a ragged tail that residue is 0 and the
+            // last piece would wrongly require a full block count
+            // (blocks that can never arrive → piece never finishes).
+            let total = self
+                .files
+                .as_ref()
+                .map_or(i64::from(self.num_pieces) * self.piece_length, |f| {
+                    f.total_size()
+                });
+            self.picker = Some(PiecePicker::new(total, self.piece_length as i32));
             let _ = now;
         }
     }

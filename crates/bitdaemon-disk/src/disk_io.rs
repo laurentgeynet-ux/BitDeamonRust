@@ -18,8 +18,8 @@
 //! No OS sockets, no async runtime dependency: the completion drain is
 //! posted through the injected `DrainPoster` (`disk_completed_queue`).
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bitdaemon_common::types::{FileIndex, PieceIndex, StorageIndex};
@@ -48,11 +48,33 @@ struct StorageEntry {
     /// are fence jobs so exclusive access is already guaranteed.
     storage: RwLock<Box<dyn DiskStorage>>,
     fence: DiskJobFence,
+    /// Per-piece write→hash ordering. Upstream hashes pieces out of
+    /// the disk buffer pool, so a `hash` job can never observe a
+    /// piece whose block writes haven't landed. We hash from the
+    /// file — a hash running concurrently with a write to the same
+    /// piece on another pool thread reads torn data and the piece
+    /// fails verification forever. Write jobs increment the piece's
+    /// in-flight count at submit time; hash jobs posted while the
+    /// count is non-zero queue behind it and are reposted when the
+    /// last write completes.
+    piece_gate: Mutex<HashMap<i32, PieceGate>>,
+}
+
+/// `piece_gate` entry — outstanding write jobs for one piece plus the
+/// hash jobs waiting for them to land.
+#[derive(Default)]
+struct PieceGate {
+    writes: i64,
+    blocked: VecDeque<Box<DiskJob>>,
 }
 
 /// `pread_disk_io` — positioned-I/O disk orchestrator.
 pub struct PreadDiskIo {
     storages: Mutex<HashMap<StorageIndex, Arc<StorageEntry>>>,
+    /// `m_free_slots` (upstream `storage_free_list`) + the high-water
+    /// `next` index — freed slot reuse happens here.
+    slots: Mutex<crate::storage_free_list::StorageFreeList>,
+    next_index: AtomicU32,
     pool: Arc<DiskIoThreadPool>,
     completed: Arc<DiskCompletedQueue>,
     fence_counters: FenceCounters,
@@ -105,6 +127,8 @@ impl PreadDiskIo {
         }));
         let io = Arc::new(Self {
             storages: Mutex::new(HashMap::new()),
+            slots: Mutex::new(crate::storage_free_list::StorageFreeList::default()),
+            next_index: AtomicU32::new(0),
             pool,
             completed,
             fence_counters: FenceCounters::default(),
@@ -146,11 +170,18 @@ impl PreadDiskIo {
     /// the injected `StorageFactory`, register it, return its index
     /// (upstream `storage_holder`).
     pub fn new_torrent(&self, params: &StorageParams<'_>) -> StorageIndex {
+        // `m_free_slots.new_index(m_torrents.size())` upstream —
+        // reuse a freed slot else take the high-water mark.
+        let idx = {
+            let mut free = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            let next = StorageIndex(self.next_index.load(Ordering::Relaxed));
+            let got = free.new_index(next);
+            if got == next {
+                self.next_index.store(next.0 + 1, Ordering::Relaxed);
+            }
+            got
+        };
         let mut g = self.storages.lock().unwrap_or_else(|e| e.into_inner());
-        let mut idx = StorageIndex(0);
-        while g.contains_key(&idx) {
-            idx = StorageIndex(idx.0.wrapping_add(1));
-        }
         let storage = (self.factory)(params, Arc::clone(&self.file_pool));
         storage.set_storage_index(idx);
         g.insert(
@@ -158,6 +189,7 @@ impl PreadDiskIo {
             Arc::new(StorageEntry {
                 storage: RwLock::new(storage),
                 fence: DiskJobFence::new(),
+                piece_gate: Mutex::new(HashMap::new()),
             }),
         );
         idx
@@ -174,6 +206,7 @@ impl PreadDiskIo {
                 Arc::new(StorageEntry {
                     storage: RwLock::new(storage),
                     fence: DiskJobFence::new(),
+                    piece_gate: Mutex::new(HashMap::new()),
                 }),
             );
     }
@@ -193,6 +226,23 @@ impl PreadDiskIo {
     pub fn abort_jobs(&self, wait: bool) {
         self.abort.store(true, Ordering::Relaxed);
         let mut drained = self.pool.drain_jobs();
+        // hash jobs parked behind the piece gate never reached the
+        // pool — drain them too so their completions still post.
+        for e in self
+            .storages
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+        {
+            for g in e
+                .piece_gate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values_mut()
+            {
+                drained.append(&mut g.blocked);
+            }
+        }
         for j in &mut drained {
             crate::disk_completed::abort(j);
             self.job_done(j);
@@ -233,7 +283,7 @@ impl PreadDiskIo {
         j.storage = idx;
         if let Some(entry) = self.storage(idx) {
             if let Some(j) = entry.fence.is_blocked(j, &self.fence_counters) {
-                self.enqueue(j);
+                self.gate_or_enqueue(&entry, j);
             }
         } else {
             // no storage — job is stale; complete it aborted
@@ -270,6 +320,34 @@ impl PreadDiskIo {
                 self.job_done(&j);
                 self.completed.push(j);
             }
+        }
+    }
+
+    /// Piece-gate routing after the fence check: writes register
+    /// against their piece; hash jobs for a piece with in-flight
+    /// writes queue behind them instead of racing the file.
+    fn gate_or_enqueue(&self, entry: &StorageEntry, j: Box<DiskJob>) {
+        let piece = match &j.action {
+            JobKind::Write(w) => Some((w.piece.0, true)),
+            JobKind::Hash(h) => Some((h.piece.0, false)),
+            JobKind::Hash2(h) => Some((h.piece.0, false)),
+            _ => None,
+        };
+        let Some((p, is_write)) = piece else {
+            self.enqueue(j);
+            return;
+        };
+        let mut gate = entry.piece_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if is_write {
+            gate.entry(p).or_default().writes += 1;
+            drop(gate);
+            self.enqueue(j);
+        } else if gate.get(&p).is_some_and(|g| g.writes > 0) {
+            tracing::debug!(piece = p, "piece_gate: hash parked behind writes");
+            gate.entry(p).or_default().blocked.push_back(j);
+        } else {
+            drop(gate);
+            self.enqueue(j);
         }
     }
 
@@ -330,6 +408,24 @@ impl PreadDiskIo {
         let mut done = JobQueue::new();
         for mut j in jobs.drain(..) {
             if let Some(e) = entry {
+                // piece gate: a completed write may release hash jobs
+                // queued behind it.
+                if let JobKind::Write(w) = &j.action {
+                    let mut released = VecDeque::new();
+                    {
+                        let mut gate = e.piece_gate.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(g) = gate.get_mut(&w.piece.0) {
+                            g.writes -= 1;
+                            if g.writes <= 0 {
+                                released.append(&mut g.blocked);
+                                gate.remove(&w.piece.0);
+                            }
+                        }
+                    }
+                    for bj in released {
+                        self.add_job(j.storage, bj);
+                    }
+                }
                 let mut reposted = Vec::new();
                 e.fence.job_complete(&mut j, &mut |bj| reposted.push(bj));
                 for bj in reposted {
@@ -455,6 +551,12 @@ impl PreadDiskIo {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&j.storage);
+                // freed at job-execution time (behind the fence) so a
+                // slot is never handed out while jobs still target it.
+                self.slots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .add(j.storage);
                 StorageError::default()
             }
             JobKind::StopTorrent(_)

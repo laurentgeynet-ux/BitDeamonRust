@@ -35,6 +35,20 @@ struct Args {
     /// Listen port for incoming peer connections.
     #[arg(short, long, default_value_t = 6881)]
     port: u16,
+
+    /// Direct peer to connect to (ip:port), repeatable.
+    #[arg(long = "peer")]
+    peers: Vec<String>,
+
+    /// Seed mode — skip hash-check, assume files complete
+    /// (upstream `add_torrent_params::flag_seed_mode`).
+    #[arg(long)]
+    seed: bool,
+
+    /// Download rate limit in bytes/s (upstream
+    /// `settings_pack::download_rate_limit`; 0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    limit: i64,
 }
 
 fn load_atp(arg: &str, save_path: &std::path::Path) -> anyhow::Result<AddTorrentParams> {
@@ -53,7 +67,17 @@ fn load_atp(arg: &str, save_path: &std::path::Path) -> anyhow::Result<AddTorrent
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    let atp = load_atp(&args.torrent, &args.save_path)?;
+    let mut atp = load_atp(&args.torrent, &args.save_path)?;
+    if args.seed {
+        atp.flags |= bitdaemon::common::flags::TorrentFlags::SEED_MODE;
+        // seed_mode upstream still requires the `have` bits set —
+        // claim every piece (verify is skipped by contract).
+        if let Some(ti) = &atp.ti {
+            let mut bf = bitdaemon::common::Bitfield::with_size(ti.num_pieces() as usize);
+            bf.set_all();
+            atp.have_pieces = bf;
+        }
+    }
 
     // disk io — `pread_disk_io(4, poster)`; the poster is a no-op
     // here because the engine tick drains the completion queue.
@@ -98,8 +122,12 @@ async fn main() -> anyhow::Result<()> {
     // deployments inject a circuit resolver instead; ADR-0008).
     eng.set_resolver(Arc::new(bitdaemon::net::resolver::SystemResolver));
     slock(&eng.session).set_disk(disk);
-    slock(&eng.session).listen_port = args.port;
+    slock(&eng.session).set_listen_port(args.port);
     slock(&eng.session).set_dht_port(udp_port);
+    if args.limit > 0 {
+        slock(&eng.session).settings.download_rate_limit = args.limit;
+        eng.download_limiter.set_limit(args.limit);
+    }
     slock(&eng.session).enable_dht(
         IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         None,
@@ -113,7 +141,24 @@ async fn main() -> anyhow::Result<()> {
             eng.dispatch_out(o);
         }
         match ih {
-            Some(ih) => println!("added {}", bitdaemon::common::hex::to_hex(ih.as_bytes())),
+            Some(ih) => {
+                println!("added {}", bitdaemon::common::hex::to_hex(ih.as_bytes()));
+                let handle = bitdaemon::session::session_handle::SessionHandle::from_shared(
+                    eng.session.clone(),
+                )
+                .find_torrent(&ih);
+                for p in &args.peers {
+                    match p.parse::<std::net::SocketAddr>() {
+                        Ok(addr) => {
+                            println!("connect_peer {addr}");
+                            if let Some(h) = &handle {
+                                h.connect_peer(addr);
+                            }
+                        }
+                        Err(e) => eprintln!("bad --peer {p}: {e}"),
+                    }
+                }
+            }
             None => anyhow::bail!("add_torrent failed"),
         }
     }
@@ -141,14 +186,34 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let guard = slock(&ses);
+            let mut guard = slock(&ses);
+            for a in guard.pop_alerts() {
+                println!("alert: {a:?}");
+            }
             for (ih, t) in &guard.torrents {
-                let st = t.status();
+                let st = t.status(&guard.settings, guard.queue_position(ih));
+                let err = if t.last_error.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | err: {}", t.last_error)
+                };
+                let missing: Vec<u32> = (0..t.num_pieces as usize)
+                    .filter(|i| *i < t.have.size() && !t.have.get_bit(*i))
+                    .map(|i| i as u32)
+                    .take(8)
+                    .collect();
+                let miss = if missing.is_empty() {
+                    String::new()
+                } else {
+                    format!(" | missing {missing:?}")
+                };
                 println!(
-                    "{}: {:.1}% | {} peers | {} down {} up B/s | {:?}",
+                    "{}: {:.1}% | {} peers | have {}/{} | {} down {} up B/s | {:?}{err}{miss}",
                     bitdaemon::common::hex::to_hex(&ih.as_bytes()[..8]),
                     st.progress * 100.0,
                     st.num_peers,
+                    t.have.count(),
+                    t.num_pieces,
                     st.download_rate,
                     st.upload_rate,
                     st.state,

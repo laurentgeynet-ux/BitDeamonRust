@@ -7,6 +7,156 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Fixed — public-swarm interop (verified on a live Ubuntu torrent)
+
+- **HTTPS trackers** dialed plaintext TCP on port 443 — announces
+  failed before any peer was returned. `spawn_announce` now wraps
+  the stream in rustls via `ssl_stream::ssl_connect` with SNI, using
+  the OS root store (`rustls-native-certs`, cached `OnceLock` — the
+  `m_ssl_ctx` analogue). Verified: `torrent.ubuntu.com` returns
+  50 peers over TLS.
+- **Last piece never finished**: `Torrent::init_picker` fed
+  `num_pieces * piece_length` as picker `total_size`; for a ragged
+  tail the residue is 0, so `blocks_in_last_piece` fell back to a
+  full `blocks_per_piece` — the last piece demanded blocks that can
+  never arrive, sat at `have = num_pieces - 1`, and was re-requested
+  forever (infinite re-download loop). Now passes
+  `files().total_size()` like upstream. Verified end-to-end:
+  `ubuntu-24.04.4-live-server-amd64.iso` (3.4 GB) downloaded at
+  ~100 MB/s peak from the public swarm, `have 12991/12991`,
+  `Finished`, and the file SHA-256 matches the official
+  `SHA256SUMS` entry.
+- **`piece_gate` write→hash ordering** (`disk_io.rs`): a `Hash` job
+  could run on a pool thread while a `Write` job for the same piece
+  was still in flight — torn reads failed verification and the
+  piece entered a hash-fail/re-download loop (upstream hashes out
+  of the disk buffer pool, which makes this impossible). Per-piece
+  in-flight write counters now park hash jobs behind pending writes
+  and repost them on the last write's completion; gate-blocked jobs
+  are drained on abort.
+
+### Added
+
+- `bitdaemon-cli --limit <bytes/s>` — `download_rate_limit` wiring
+  (shared `RateLimiter` bucket).
+- `bitdaemon-cli` status line now prints alerts,
+  `have`/`num_pieces`, missing-piece indices and tracker errors.
+
+### Fixed — live-swarm interop (verified against libtorrent v2.1.2)
+
+- **Peer pump desync**: `attach_stream` ran `read_message` inside
+  `tokio::select!`; the two-phase `read_exact` is not
+  cancellation-safe, so a winning write branch ate the 4-byte
+  length and desynced the frame stream (`message too large` after
+  ~a few pieces). Now `read_buf` + `decode_next` on a persistent
+  buffer — verified live C++→Rust at 100%.
+- **FAST extension bit** was never advertised (`run_handshake` got
+  `fast=false`) while `HaveNone`/`AllowedFast` were still sent —
+  upstream disconnects `invalid have-none`. Both handshake paths
+  (initiator + responder) now advertise `DHT`/`FAST` bits like
+  `bt_peer_connection` does (`dht` from `settings.dht_enabled`).
+- **`hash_request` on v1-protocol connections**: `protocol_v2` is
+  now tracked on `PeerConn` (handshake keyed by the v2 info-hash);
+  `maybe_send_hash_request` and all three hash handlers are gated
+  on it — upstream disconnects `invalid message` otherwise.
+- **`HaveAll` refcount**: incoming `have_all` never incremented
+  picker refcounts, so `dec_refcount` on disconnect underflowed
+  `m_seeds` (`debug_assert seeds > 0` panic). Now emits
+  `RefcountBulk` like upstream `peer_has_all`.
+- **`have_pieces` resume bits** were never applied to `self.have`
+  (only `verified_pieces` were) — a `--seed` torrent advertised
+  `have_none`. Now restored like upstream `m_have_pieces`.
+- **Auto `check_files` on add** (upstream `torrent::init` →
+  `start_checking`): non-`seed_mode` adds run `check_fastresume`;
+  a rejected verdict arms `arm_full_recheck` + per-piece
+  `DiskHash` jobs instead of staying at 0% forever.
+- `bitdaemon-cli --seed` now actually sets `SEED_MODE` + full
+  `have_pieces` (flag was parsed but never applied).
+
+### Added
+
+- **`bitdaemon-mmap` crate** — the ADR-0010 `unsafe` carve-out:
+  `FileViewPool` (`file_view_pool.cpp` LRU of `memmap2` mappings),
+  `MmapStorage` (`mmap_storage.cpp` — full `DiskStorage` impl:
+  view read/write/hash, part-file + pad-file semantics, priority
+  export via views, unmap-before-move/delete for Windows),
+  `mmap_storage_constructor` (`mmap_disk_io` factory seam).
+
+
+
+### Added
+
+- `net::rtc_signaling` — full port of `rtc_signaling.cpp`: offer
+  batches, `max_webtorrent_offers` incoming cap, duplicate
+  offer/answer dedup, negotiation timeout — over injected
+  `RtcPeerConnection`/`RtcPeerConnectionFactory` (ADR-0011).
+- `SessionSettings`: `webtorrent_stun_server`,
+  `webtorrent_connection_timeout`, `max_webtorrent_offers` (upstream
+  defaults + sparse `.session` serialization).
+
+
+
+### Ledger & wiring (audit pass)
+
+- `docs/PORTING.md` fully reconciled: every upstream `src/**/*.cpp` and
+  `include/**/*.hpp` file resolves to `ported`, `verified`,
+  `won't port`, or `n/a` — no `started`/`partial`/`in progress` rows
+  remain. Stale statuses corrected for UPnP/NAT-PMP, UDP session
+  sockets/listen socket handles, interface enumeration/`ip_notifier`,
+  `web_seed_entry`, `bt_peer_connection` packet layer, `tracker_event`,
+  and the `peer_connection` state machine (wiring verified in
+  `session::peer_conn` and `bitdaemon::engine`).
+- `rustls-pemfile` (unmaintained, RUSTSEC-2025-0134) replaced by the
+  `rustls-pki-types` `PemObject` API; `cargo deny check` now passes
+  (advisories, bans, licenses, sources). `bitdaemon-sim` carries the
+  workspace license.
+- `fuzz/README.md` documents that libFuzzer campaigns run on
+  Linux/WSL (no MSVC sanitizer runtime).
+- `session_params` uses the project-specific key
+  `web_seed_blocks_per_tick` (no aliasing of upstream
+  `urlseed_wait_retry`).
+
+
+
+### Added
+- Golden-vector conformance pipeline live end-to-end: libtorrent
+  **v2.1.2 release** built on Windows/MSVC (`D:\Projet\libtorrent-v2.1.2`),
+  `tools/golden_vectors/generate.cpp` compiled + run, fixtures committed
+  under `crates/*/tests/data/`, and `tests/test_golden.rs` in
+  `bitdaemon-bencode` + `bitdaemon-core` verify decode + **byte-exact**
+  `write_resume_data_buf` output against upstream bytes.
+- `session::session_params` — full port of `session_params.cpp`:
+  upstream `write_session_params`/`read_session_params` dict layout
+  (`dht`, `dht state`, `settings` sparse/non-default only,
+  `extensions`, `ip_filter4`/`ip_filter6`), byte-exact vs v2.1.2
+  fixtures (`session_default`, `session_custom`). `SessionParams`
+  gains `dht_settings`, `dht_state`, `ip_filter`, `ext_state`;
+  `SessionSettings` gains `user_agent`.
+- Golden-vector suite extended to 12 fixtures (fingerprint, magnet
+  URI, session params, dht_state, resume_rich, v2 torrent) —
+  all byte-compared against upstream release output.
+- `dht::dht_save_state` now writes only the 18 ABI-2 keys upstream
+  `save_dht_settings` emits (ABI-3 fields still read) — required for
+  `.session` byte-compat.
+- `session::i2p_pex` — port of `extensions/i2p_pex.cpp` (BEP-10 id 9):
+  I2P destination-hash exchange (`added`/`added.f`/`dropped`, 32-byte
+  entries), SHA-256 over I2P-base64-decoded destinations, 6-slot
+  60 s flood window (`too_frequent_pex` disconnect), 500 KiB cap,
+  first-send full list; wired into `PeerConn` ext-handshake dispatch
+  and `Torrent::pex_tick`.
+- `common::lt_error` — full `lt::errors` code table + `HttpError`.
+- `common::ffs`, `common::version`, `net::string_util`,
+  `net::peer_class` (15-slot `PeerClassSet`, pool refcounts,
+  `PeerClassTypeFilter` 6 socket types), `session::peer_alloc`
+  (`torrent_peer_allocator` accounting).
+
+### Changed
+- **Project scope**: complete-fidelity port (ADR-0010) — every upstream
+  `src/*.cpp`/`src/kademlia/*.cpp` file gets a Rust module or a
+  reasoned `won't port` row; OnionBit no longer drives phase order.
+  Roadmap rewritten (Phases A–G); new planned crates `bitdaemon-mmap`
+  (feature-gated, sole `unsafe` carve-out) and `bitdaemon-sim`.
+
 ### Fixed
 - **UDP tracker replies stolen by the shared socket pump** — the
   engine's UDP pump (DHT/LSD/NAT-PMP) raced `announce_udp` /
@@ -975,3 +1125,11 @@ Until `1.0.0`, breaking changes may occur in any release.
   clean.
 
 [Unreleased]: https://github.com/laurentgeynet-ux/BitDeamonRust/compare/main...HEAD
+- Phase C networking: `UdpSocket` adapter over `DatagramSocket`, `CachingResolver` (LRU 700, TTL 1200s, failed-DNS TTL/8, single-flight), `ssl_stream` via rustls/tokio-rustls (peer verify-none + tracker root-store + `SniResolver`), `instantiate` transport decision table, `core::xml_parse` byte-level scanner port.
+- Phase B/D: BEP-6 `send_allowed_set` deterministic allowed-fast (SHA-1 addr‖info-hash), `allowed_fast_set_size` setting; DHT `bootstrap` (refresh.cpp) + `add_node` ping + `direct_request`/`DhtEvent::Direct`; `platform_util` (procfs, unsafe-free), `storage_free_list`, web-seed URL normalization (`escape_file_path`, trailing-slash rules).
+- Phase F conformance infrastructure: `bitdaemon-sim` expanded (per-link latency/jitter/loss, seeded RNG, `run_to`/`drain` drivers), `fuzz/` cargo-fuzz scaffold (`bdecode`, `peer_wire`, `resume_data` targets), criterion benches (`bdecode_bench`, `wire_bench`).
+- `Torrent` surface completed vs `torrent.cpp`: `abort`/`disconnect_all`, `attach_peer`, `choke_peer`/`unchoke_peer`, `num_connecting` counters, `need_picker`/`peer_is_interesting`/`ready_for_connections`/`want_tick`, `is_aborted`/`is_upload_only`/`is_ssl_torrent`/`is_predictive_piece`, `announce_dht`/`announce_lsd`/`announce_trackers` + `announcing` gates (wired into tracker/DHT/LSD ticks), `enable_all_trackers`, `announce_with_tracker`, suggest-piece list, predictive bitfield, `initialize_merkle_trees`, `recalc_share_mode`, `request_time_critical_pieces`, `set_state`, `handle_disk_error`, `on_torrent_paused`, `set_file_priority`, `queue_position_*` shortcuts, `post_status`, `get_torrent_copy_with_hashes`, `retry_web_seed`, `maybe_connect_web_seeds`, `update_want_peers`.
+- `SessionHandle` completed to upstream surface: session pause/resume, `get_torrents`/`get_settings`/`session_state`/`write_session_params`, alert mask/queue-limit/notify/`wait_for_alert`, ip/port filters, peer-class CRUD + `PeerClassTypeFilter`, `set_peer_id`/`set_key`, per-purpose proxies (`SessionProxies`), `PeSettings` (new in `net::pe_crypto`), rate-limit and connection setters, `start_*`/`stop_*` service switches, DHT handle ops incl. two-phase `dht_put_item` (`dht_pending_put`) and `dht_stats_alert`, `listen_on`/`use_interfaces`/`reopen_network_sockets`, `session_stats_metrics`. `DhtStorage` now `Clone`.
+- `seed_mode` flag with upstream ctor gating (no dont_download, all have_pieces) + `leave_seed_mode` recheck; `ut_holepunch` BEP-55 codec + relay decisions + `PeerEffect::Holepunch` wiring.
+- `disk::disk_cache` (per-block entries, flushed/hasher cursors, force-flush + hasher-kick flags, `try_clear_piece`); `disk::storage_free_list` wired into `PreadDiskIo` slot reuse (freed at remove-job execution, behind the fence).
+- `rtc_stream` (RtcChannel seam + AsyncRead/Write + `rtc_parse_endpoint`); `bitdaemon-sim` crate: virtual clock, `SimNet` delivery queue, `SimSocket` DatagramSocket; session polls `IpNotifier` → `SessionOut::InterfacesChanged`.
