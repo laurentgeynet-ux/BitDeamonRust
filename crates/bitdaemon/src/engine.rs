@@ -269,6 +269,19 @@ pub struct Engine {
     pub torrent_up_limiters: std::collections::HashMap<Sha1Hash, Arc<RateLimiter>>,
     /// per-torrent download limiters.
     pub torrent_down_limiters: std::collections::HashMap<Sha1Hash, Arc<RateLimiter>>,
+    /// uTP socket manager (`utp_socket_manager`) — demuxes uTP
+    /// datagrams on the shared UDP socket when enabled.
+    pub utp_manager: Option<Arc<bitdaemon_net::utp_stream::UtpManager>>,
+    /// uTP dialer (`enable_outgoing_utp`).
+    utp_connector: Option<Arc<bitdaemon_net::utp_stream::UtpConnector>>,
+    /// when true, `spawn_dial` prefers uTP and falls back to TCP —
+    /// opt-in for now: upstream defaults `enable_*_utp` to true but
+    /// our uTP path is newer than the TCP one.
+    utp_enabled: bool,
+    /// `m_peer_ssl_ctx` SNI dispatch — per-info-hash `CertifiedKey`
+    /// map for SSL-torrent listen sockets (`ssl_server_name_callback`
+    /// upstream). Fed by [`Self::refresh_ssl_certs`].
+    ssl_resolver: Arc<bitdaemon_net::ssl_stream::SniResolver>,
 }
 
 impl Engine {
@@ -321,7 +334,36 @@ impl Engine {
             download_limiter: Arc::new(RateLimiter::new(0)),
             torrent_up_limiters: std::collections::HashMap::new(),
             torrent_down_limiters: std::collections::HashMap::new(),
+            utp_manager: None,
+            utp_connector: None,
+            utp_enabled: false,
+            ssl_resolver: Arc::new(bitdaemon_net::ssl_stream::SniResolver::new(None)),
         }
+    }
+
+    /// `enable_outgoing_utp`/`enable_incoming_utp` wiring — build the
+    /// uTP manager on the injected datagram transport, route uTP
+    /// datagrams in `tick`, and (incoming) accept SYNs through
+    /// [`Self::start_acceptor`]. Call once, before `start_udp_pump`.
+    pub async fn enable_utp(&mut self) {
+        let Some(dg) = self.datagram.clone() else {
+            return;
+        };
+        let cfg = bitdaemon_net::utp_socket::UtpConfig::default();
+        let manager = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
+        if slock(&self.session).settings.enable_outgoing_utp {
+            self.utp_connector = Some(Arc::new(bitdaemon_net::utp_stream::UtpConnector {
+                manager: manager.clone(),
+                datagram: dg.clone(),
+                cfg: cfg.clone(),
+            }));
+        }
+        if slock(&self.session).settings.enable_incoming_utp {
+            let acc = bitdaemon_net::utp_stream::UtpAcceptor::new(manager.clone(), dg, cfg).await;
+            self.start_acceptor(Arc::new(acc));
+        }
+        self.utp_manager = Some(manager);
+        self.utp_enabled = true;
     }
 
     /// start the datagram pump — every received packet is queued
@@ -333,9 +375,20 @@ impl Engine {
             return;
         };
         let tx = self.udp_tx.clone();
+        // uTP datagrams must be routed *immediately* — the session
+        // tick runs at 1 Hz and would add ~1 s of delay per ACK
+        // (upstream's `utp_socket_manager` is fed straight from the
+        // socket's read handler for the same reason).
+        let utp = self.utp_manager.clone();
         self.tasks.push(tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
             while let Ok((n, from)) = dg.recv_from(&mut buf).await {
+                if let Some(mgr) = &utp {
+                    if is_utp_datagram(&buf[..n]) {
+                        mgr.route(from, &buf[..n]).await;
+                        continue;
+                    }
+                }
                 if tx.send((from, buf[..n].to_vec())).is_err() {
                     return;
                 }
@@ -388,6 +441,13 @@ impl Engine {
                 // reponse tracker consommee par l'annonce en attente
             } else if self.natpmp.as_ref().is_some_and(|n| from == n.gateway) {
                 self.on_natpmp_response(&buf);
+            } else if is_utp_datagram(&buf) {
+                // uTP is normally routed in the UDP pump (immediate);
+                // this path only fires if the pump ran before
+                // `enable_utp` installed the manager.
+                if let Some(mgr) = self.utp_manager.clone() {
+                    tokio::spawn(async move { mgr.route(from, &buf).await });
+                }
             } else {
                 slock(&self.session).on_udp(from, &buf, &mut out);
             }
@@ -1276,10 +1336,21 @@ impl Engine {
             return;
         }
         let connector = self.connector.clone();
+        let utp = if self.utp_enabled {
+            self.utp_connector
+                .clone()
+                .map(|c| c as Arc<dyn PeerConnector>)
+        } else {
+            None
+        };
         let tx = self.connect_tx.clone();
-        let (pid, dht) = {
+        let (pid, dht, ssl_torrent) = {
             let ses = slock(&self.session);
-            (ses.peer_id, ses.settings.dht_enabled)
+            (
+                ses.peer_id,
+                ses.settings.dht_enabled,
+                ses.torrents.get(&ih).is_some_and(|t| t.is_ssl_torrent()),
+            )
         };
         let fast = true;
         let ext = self.ext_handshake(&ih);
@@ -1294,12 +1365,48 @@ impl Engine {
                     dht: false,
                 });
             };
-            let mut s = match connector.connect(remote).await {
+            // `enable_outgoing_utp` — upstream prefers uTP when both
+            // transports are available; on dial failure fall back to
+            // the TCP connector.
+            let s = match if let Some(u) = utp.clone() {
+                match u.connect(remote).await {
+                    Ok(s) => Ok(s),
+                    Err(_) => connector.connect(remote).await,
+                }
+            } else {
+                connector.connect(remote).await
+            } {
                 Ok(s) => s,
                 Err(e) => {
                     send_err(e.to_string());
                     return;
                 }
+            };
+            // SSL torrent: every peer connection is TLS-wrapped
+            // (upstream `is_ssl_torrent()` → `ssl_stream<T>`) — SNI
+            // carries the hex info-hash for the server-side dispatch.
+            // `peer_client_config` is verify-none: upstream checks
+            // the peer cert against the embedded root CA by chain,
+            // which rustls cannot express without a custom webpki
+            // path — documented divergence in PORTING.md.
+            let mut s = if ssl_torrent {
+                let sni = crate::common::hex::to_hex(ih.as_bytes());
+                match bitdaemon_net::ssl_stream::ssl_connect(
+                    s,
+                    &sni,
+                    remote,
+                    bitdaemon_net::ssl_stream::peer_client_config(),
+                )
+                .await
+                {
+                    Ok(tls) => Box::new(tls) as bitdaemon_net::transport::BoxedPeerStream,
+                    Err(e) => {
+                        send_err(format!("ssl handshake: {e}"));
+                        return;
+                    }
+                }
+            } else {
+                s
             };
             let hs = if encrypted {
                 bitdaemon_net::bt_peer_conn::run_handshake_encrypted_initiator(
@@ -1384,6 +1491,95 @@ impl Engine {
             }
         });
         self.tasks.push(h);
+    }
+
+    /// SSL-torrent accept pump — same as [`Self::start_acceptor`]
+    /// but every inbound stream is TLS-accepted first
+    /// (`ssl_listen_port` sockets upstream). Cert selection uses the
+    /// per-info-hash SNI resolver fed by [`Self::refresh_ssl_certs`].
+    pub fn start_ssl_acceptor(
+        &mut self,
+        acceptor: Arc<dyn bitdaemon_net::transport::PeerAcceptor>,
+    ) {
+        let cfg = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_cert_resolver(self.ssl_resolver.clone()),
+        );
+        let tx = self.connect_tx.clone();
+        let known = self.known_ihs.clone();
+        let (pid, dht) = {
+            let ses = slock(&self.session);
+            (ses.peer_id, ses.settings.dht_enabled)
+        };
+        let h = tokio::spawn(async move {
+            loop {
+                let acc = acceptor.clone().accept().await;
+                let (s0, remote) = match acc {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        warn!(err = %e, "ssl accept failed");
+                        return;
+                    }
+                };
+                let remote = remote.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+                let tls = match bitdaemon_net::ssl_stream::ssl_accept(s0, remote, cfg.clone()).await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(err = %e, "ssl handshake failed");
+                        continue;
+                    }
+                };
+                let mut s = Box::new(tls) as bitdaemon_net::transport::BoxedPeerStream;
+                let hs = bitdaemon_net::bt_peer_conn::run_handshake_responder(
+                    &mut s,
+                    &pid,
+                    dht,
+                    true,
+                    |ih| known.lock().unwrap_or_else(|e| e.into_inner()).contains(ih),
+                )
+                .await;
+                match hs {
+                    Ok(hs) => {
+                        let _ = tx.send(DialDone {
+                            ih: hs.info_hash,
+                            remote: Some(remote),
+                            stream: Ok(s),
+                            outbound: false,
+                            fast: hs.supports_fast(),
+                            dht: hs.supports_dht(),
+                        });
+                    }
+                    Err(e) => {
+                        warn!(err = %e, "inbound ssl handshake failed");
+                    }
+                }
+            }
+        });
+        self.tasks.push(h);
+    }
+
+    /// `ssl_server_name_callback` setup — register every SSL
+    /// torrent's `CertifiedKey` under its hex info-hash SNI name
+    /// (upstream picks the torrent's `ssl_ctx` by info-hash).
+    /// Call after `set_ssl_certificate` on any SSL torrent.
+    pub fn refresh_ssl_certs(&self) {
+        let ses = slock(&self.session);
+        let res = &*self.ssl_resolver;
+        for (ih, t) in &ses.torrents {
+            if !t.is_ssl_torrent() {
+                continue;
+            }
+            if let Some((cert, key)) = t.ssl_pem_pair() {
+                match bitdaemon_net::ssl_stream::certified_key(cert, key) {
+                    Ok(ck) => {
+                        res.register(&crate::common::hex::to_hex(ih.as_bytes()), ck);
+                    }
+                    Err(e) => warn!(err = %e, "ssl cert load failed"),
+                }
+            }
+        }
     }
 
     /// `PeerListState` snapshot for `connect_pump` from session
@@ -1705,6 +1901,13 @@ async fn resolve_for_socket(
             .ok_or_else(|| format!("no v4 address for {hostname}")),
         None => Err(format!("no resolver injected for {hostname}")),
     }
+}
+
+/// uTP datagram detection — `udp_socket::incoming_packet` does the
+/// same check upstream: 20-byte header, `version == 1`
+/// (low nibble) and `type <= ST_RESET` (high nibble).
+fn is_utp_datagram(buf: &[u8]) -> bool {
+    buf.len() >= 20 && buf[0] & 0x0f == 1 && (buf[0] >> 4) <= 4
 }
 
 impl Drop for Engine {

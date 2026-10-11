@@ -49,6 +49,30 @@ struct Args {
     /// `settings_pack::download_rate_limit`; 0 = unlimited).
     #[arg(long, default_value_t = 0)]
     limit: i64,
+
+    /// Enable uTP on the shared UDP socket (upstream
+    /// `enable_outgoing_utp`/`enable_incoming_utp` — opt-in here
+    /// while the uTP path is newer than TCP).
+    #[arg(long)]
+    utp: bool,
+
+    /// SSL-torrent server certificate PEM (upstream
+    /// `set_ssl_certificate` cert path).
+    #[arg(long)]
+    ssl_cert: Option<PathBuf>,
+
+    /// SSL-torrent private key PEM.
+    #[arg(long)]
+    ssl_key: Option<PathBuf>,
+
+    /// DH params PEM (upstream arg; rustls is ECDHE-only — ignored).
+    #[arg(long)]
+    ssl_dh: Option<PathBuf>,
+
+    /// Extra listen port that expects TLS-wrapped BitTorrent
+    /// handshakes (upstream `listen_interfaces` `…s` suffix).
+    #[arg(long)]
+    ssl_port: Option<u16>,
 }
 
 fn load_atp(arg: &str, save_path: &std::path::Path) -> anyhow::Result<AddTorrentParams> {
@@ -147,6 +171,20 @@ async fn main() -> anyhow::Result<()> {
                     eng.session.clone(),
                 )
                 .find_torrent(&ih);
+                // SSL torrent: our PEM keypair + hex-ih SNI dispatch.
+                if let (Some(cert), Some(key)) = (&args.ssl_cert, &args.ssl_key) {
+                    let cert = std::fs::read_to_string(cert)?;
+                    let key = std::fs::read_to_string(key)?;
+                    let dh = args
+                        .ssl_dh
+                        .as_ref()
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .unwrap_or_default();
+                    if let Some(h) = &handle {
+                        h.set_ssl_certificate(cert, key, dh);
+                    }
+                }
+                eng.refresh_ssl_certs();
                 for p in &args.peers {
                     match p.parse::<std::net::SocketAddr>() {
                         Ok(addr) => {
@@ -170,6 +208,17 @@ async fn main() -> anyhow::Result<()> {
     ))
     .await?;
     eng.start_acceptor(Arc::new(acceptor));
+    if let Some(ssl_port) = args.ssl_port {
+        let ssl_acceptor =
+            TokioTcpAcceptor::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ssl_port))
+                .await?;
+        eng.start_ssl_acceptor(Arc::new(ssl_acceptor));
+        println!("ssl listen on :{ssl_port}");
+    }
+    if args.utp {
+        eng.enable_utp().await;
+        println!("uTP enabled (outgoing + incoming)");
+    }
     eng.start_udp_pump();
 
     // upstream `dht_bootstrap_nodes` setting — seed the routing

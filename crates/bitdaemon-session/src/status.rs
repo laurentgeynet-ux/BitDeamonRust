@@ -32,6 +32,8 @@ pub enum TorrentState {
 pub struct TorrentStatus {
     /// `handle` — identifies the swarm.
     pub info_hash: Sha1Hash,
+    /// `info_hashes` — v1 + v2 (v2 zero for v1-only torrents).
+    pub info_hashes: bitdaemon_common::info_hash::InfoHash,
     /// `state`.
     pub state: TorrentState,
     /// `paused`.
@@ -40,6 +42,8 @@ pub struct TorrentStatus {
     pub auto_managed: bool,
     /// `is_seed`.
     pub is_seed: bool,
+    /// `is_seeding` — finished *and* seeding state.
+    pub is_seeding: bool,
     /// `is_finished` — payload complete (≠ seed flag).
     pub finished: bool,
     /// `current_tracker` — the tracker we're announcing to (or last
@@ -174,4 +178,12 @@ pub struct TorrentStatus {
     pub added_time: i64,
     /// `last_scrape` — seconds since the best scrape (0 = never).
     pub last_scrape: i64,
+    /// `next_announce` — epoch seconds of the earliest tracker retry.
+    pub next_announce: i64,
+    /// `completed_time` — epoch seconds when the download finished
+    /// (0 = unfinished).
+    pub completed_time: i64,
+    /// `last_seen_complete` — epoch seconds of the last tracker
+    /// reply that reported a seed count (-1 = never).
+    pub last_seen_complete: i64,
 }

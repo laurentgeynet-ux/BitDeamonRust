@@ -239,6 +239,16 @@ pub fn save_settings_to_dict(s: &SessionSettings) -> Entry {
         dflt.alert_queue_size as i64
     );
     b!(b"enable_dht", s.dht_enabled, dflt.dht_enabled);
+    b!(
+        b"enable_incoming_utp",
+        s.enable_incoming_utp,
+        dflt.enable_incoming_utp
+    );
+    b!(
+        b"enable_outgoing_utp",
+        s.enable_outgoing_utp,
+        dflt.enable_outgoing_utp
+    );
     b!(b"prefer_rc4", s.prefer_rc4, dflt.prefer_rc4);
     i!(
         b"connection_speed",
@@ -397,6 +407,8 @@ pub fn read_settings_dict(n: &BdecodeNode<'_>) -> SessionSettings {
         s.alert_queue_size = v.max(0) as usize;
     }
     b!(b"enable_dht", &mut s.dht_enabled);
+    b!(b"enable_incoming_utp", &mut s.enable_incoming_utp);
+    b!(b"enable_outgoing_utp", &mut s.enable_outgoing_utp);
     b!(b"prefer_rc4", &mut s.prefer_rc4);
     i!(b"connection_speed", &mut s.connection_speed);
     let v = g!(b"tick_interval");

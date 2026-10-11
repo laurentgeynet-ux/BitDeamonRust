@@ -175,6 +175,50 @@ pub enum Alert {
     CacheFlushed(Sha1Hash),
     /// `session_error_alert`.
     SessionError(String),
+    /// `peer_info_alert` — `torrent_handle::post_peer_info`.
+    PeerInfo {
+        ih: Sha1Hash,
+        /// one `peer_info` per live connection.
+        peers: Vec<crate::peer_info::PeerInfo>,
+    },
+    /// `file_progress_alert` — `post_file_progress`.
+    FileProgress {
+        ih: Sha1Hash,
+        /// bytes downloaded per file.
+        files: Vec<i64>,
+    },
+    /// `piece_info_alert` — `post_download_queue`.
+    PieceInfo {
+        ih: Sha1Hash,
+        /// `partial_piece_info` equivalents.
+        queue: Vec<crate::piece_picker::DownloadingPiece>,
+    },
+    /// `piece_availability_alert` — `post_piece_availability`.
+    PieceAvailability {
+        ih: Sha1Hash,
+        /// swarm availability per piece.
+        availability: Vec<i32>,
+    },
+    /// `tracker_list_alert` — `post_trackers`.
+    TrackerList {
+        ih: Sha1Hash,
+        /// `(url, tier)` announce entries.
+        trackers: Vec<(String, i32)>,
+    },
+    /// `file_priorities_alert` — `post_file_priorities`.
+    FilePriorities {
+        ih: Sha1Hash,
+        /// `download_priority_t` per file.
+        priorities: Vec<bitdaemon_common::types::DownloadPriority>,
+    },
+    /// `file_status_alert` — `post_file_status`. `state` is the
+    /// open-file list (`file_index`, open-mode flags); empty until
+    /// the disk pool exposes per-file open state.
+    FileStatus {
+        ih: Sha1Hash,
+        /// `(file_index, open_mode flags)` per open file.
+        state: Vec<(i32, u8)>,
+    },
     /// `dht_stats_alert` — routing-table snapshot on
     /// `session_handle::post_dht_stats`.
     DhtStats {
@@ -215,6 +259,13 @@ impl Alert {
             | Self::TrackerReply { .. }
             | Self::ScrapeReply { .. }
             | Self::ScrapeFailed { .. } => AlertCategory::TRACKER,
+            Self::PeerInfo { .. } => AlertCategory::PEER,
+            Self::FileProgress { .. } => AlertCategory::FILE_PROGRESS,
+            Self::PieceInfo { .. } => AlertCategory::PIECE_PROGRESS,
+            Self::PieceAvailability { .. }
+            | Self::TrackerList { .. }
+            | Self::FilePriorities { .. }
+            | Self::FileStatus { .. } => AlertCategory::STATUS,
             Self::DhtPacket { .. } | Self::DhtStats { .. } => AlertCategory::DHT,
             Self::Performance { .. } => AlertCategory::PERFORMANCE,
             Self::SaveResumeData { .. } => AlertCategory::STORAGE,

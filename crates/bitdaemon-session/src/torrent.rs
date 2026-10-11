@@ -176,6 +176,14 @@ pub struct Torrent {
     /// `m_file_priority` — per-file `DownloadPriority` (empty =
     /// all default). Drives `piece_priority` upstream-style.
     pub file_priorities: Vec<bitdaemon_common::types::DownloadPriority>,
+    /// `m_renamed_files` — user renames (`filename_mappings`):
+    /// `file_index → new name`.
+    pub renamed_files: std::collections::BTreeMap<i32, String>,
+    /// `client_data_t` — opaque user data (`torrent_handle::userdata`).
+    pub userdata: u64,
+    /// `m_last_seen_complete` — last time a tracker reported a
+    /// positive `complete` count (epoch seconds, -1 = never).
+    pub last_seen_complete: i64,
     /// `m_sequential_download` — sequential pick order (streaming).
     pub sequential: bool,
     /// pieces left in an in-flight `force_recheck` pass
@@ -256,9 +264,12 @@ pub struct Torrent {
     pub http_seeds: Vec<String>,
     /// `m_tracker_login` — `set_tracker_login` user/pass.
     pub tracker_login: Option<(String, String)>,
-    /// `m_ssl_certificate` — `set_ssl_certificate` (SSL torrents,
-    /// consumed once `ssl_stream` lands).
+    /// `m_ssl_certificate` — `set_ssl_certificate` (SSL torrents):
+    /// PEM cert chain + private key (+ unused DH params, kept for
+    /// upstream signature parity; rustls is ECDHE-only).
     pub ssl_cert: Option<String>,
+    /// `set_ssl_certificate` private key PEM.
+    pub ssl_key: Option<String>,
     /// `m_net_interface` — `use_interface` bind override.
     pub net_interface: Option<String>,
     /// `m_apply_ip_filter` — `apply_ip_filter` flag.
@@ -479,6 +490,9 @@ impl Torrent {
             stat_prev_up: 0,
             stat_sample: None,
             file_priorities: Vec::new(),
+            renamed_files: std::collections::BTreeMap::new(),
+            userdata: 0,
+            last_seen_complete: -1,
             sequential: false,
             checking_pieces: 0,
             last_error: String::new(),
@@ -508,6 +522,7 @@ impl Torrent {
             http_seeds: Vec::new(),
             tracker_login: None,
             ssl_cert: None,
+            ssl_key: None,
             net_interface: None,
             apply_ip_filter: false,
             peer_limits: std::collections::HashMap::new(),
@@ -2774,6 +2789,25 @@ impl Torrent {
     /// `set_sequential_download` (upstream `torrent::set_sequential_download`).
     pub fn set_sequential_download(&mut self, yes: bool) {
         self.sequential = yes;
+        // upstream: leaving sequential mode re-opens the picker to
+        // the full range (`set_sequential_range(0, last_piece)`).
+        if !yes {
+            if let Some(p) = self.picker.as_mut() {
+                p.set_sequential_range(PieceIndex(0), PieceIndex(self.num_pieces - 1));
+            }
+        }
+    }
+
+    /// `torrent::set_sequential_range(first, last)` — bound the
+    /// sequential download window (implies sequential mode).
+    pub fn set_sequential_range(&mut self, first_piece: PieceIndex, last_piece: PieceIndex) {
+        if first_piece.0 < 0 || last_piece < first_piece {
+            return;
+        }
+        self.sequential = true;
+        if let Some(p) = self.picker.as_mut() {
+            p.set_sequential_range(first_piece, last_piece);
+        }
     }
 
     /// `start_full_recheck` prep — clear `have`/seed state and arm
@@ -3191,10 +3225,15 @@ impl Torrent {
             .map_or((0, 0), |p| p.distributed_copies());
         TorrentStatus {
             info_hash: self.info_hash,
+            info_hashes: self.ti.as_ref().map_or_else(
+                || bitdaemon_common::info_hash::InfoHash::from_v1(self.info_hash),
+                |ti| *ti.info_hashes(),
+            ),
             state,
             paused: self.paused,
             auto_managed: self.auto_managed,
             is_seed: self.is_seed(),
+            is_seeding: self.seeding,
             finished: self.finished,
             has_metadata: self.ti.is_some() || self.picker.is_some(),
             has_incoming: self.peers.values().any(|c| !c.outgoing),
@@ -3302,6 +3341,9 @@ impl Torrent {
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs() as i64),
             last_scrape,
+            next_announce: epoch(self.trackers.next_announce_time()),
+            completed_time: epoch(self.finished_at),
+            last_seen_complete: self.last_seen_complete,
         }
     }
 
@@ -3532,11 +3574,29 @@ impl Torrent {
         }
     }
 
-    /// `is_ssl_torrent` — the torrent requires SSL peers
-    /// (`ssl_ctx`/`ssl_cert` set).
+    /// `is_ssl_torrent` — upstream: the torrent *info* embeds a
+    /// `ssl-cert` (`torrent_info::ssl_cert()` non-empty), not our
+    /// own keypair.
     #[must_use]
     pub fn is_ssl_torrent(&self) -> bool {
-        self.ssl_cert.is_some()
+        self.ti.as_ref().is_some_and(|ti| ti.is_ssl_torrent())
+    }
+
+    /// `torrent::ssl_ctx` — the PEM keypair this torrent serves on
+    /// inbound SSL handshakes, if `set_ssl_certificate` was called.
+    #[must_use]
+    pub fn ssl_pem_pair(&self) -> Option<(&str, &str)> {
+        match (&self.ssl_cert, &self.ssl_key) {
+            (Some(c), Some(k)) => Some((c.as_str(), k.as_str())),
+            _ => None,
+        }
+    }
+
+    /// `torrent_info::ssl_cert` — the root CA cert embedded in the
+    /// metainfo (peers must present certs chaining to it).
+    #[must_use]
+    pub fn ssl_root_cert(&self) -> Option<&[u8]> {
+        self.ti.as_ref().map(|ti| ti.ssl_cert())
     }
 
     /// `predicted_have_piece` — `m_predictive_pieces` (predictive
@@ -3707,8 +3767,9 @@ impl Torrent {
 
     /// `set_ssl_cert_buffer` — PEM buffer form (`set_ssl_cert` takes
     /// paths upstream; we store the resolved cert string either way).
-    pub fn set_ssl_cert_buffer(&mut self, cert: &str, _key: &str, _dh: &str) {
+    pub fn set_ssl_cert_buffer(&mut self, cert: &str, key: &str, _dh: &str) {
         self.ssl_cert = Some(cert.to_string());
+        self.ssl_key = Some(key.to_string());
     }
 
     /// `set_apply_ip_filter` — `m_apply_ip_filter` flag.

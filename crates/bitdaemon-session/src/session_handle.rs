@@ -1435,18 +1435,19 @@ impl TorrentHandle {
         }
     }
 
-    /// `torrent_handle::set_ssl_certificate` — path form (SSL
-    /// torrents; consumed by `ssl_stream` when it lands).
-    pub fn set_ssl_certificate(&self, cert: String) {
+    /// `torrent_handle::set_ssl_certificate` — SSL torrents: the
+    /// PEM keypair this torrent serves on inbound SSL handshakes
+    /// (`dh` kept for signature parity; rustls is ECDHE-only).
+    pub fn set_ssl_certificate(&self, cert: String, key: String, dh: String) {
         if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.ssl_cert = Some(cert);
+            t.set_ssl_cert_buffer(&cert, &key, &dh);
         }
     }
 
     /// `torrent_handle::set_ssl_certificate_buffer` — PEM buffer
     /// form (same store; the path/buffer distinction is upstream's).
-    pub fn set_ssl_certificate_buffer(&self, pem: String) {
-        self.set_ssl_certificate(pem);
+    pub fn set_ssl_certificate_buffer(&self, cert: String, key: String, dh: String) {
+        self.set_ssl_certificate(cert, key, dh);
     }
 
     /// `torrent_handle::add_http_seed` — BEP-17 endpoint.
@@ -1692,5 +1693,246 @@ impl TorrentHandle {
         if let Some(i) = idx {
             s.force_announce(&self.info_hash, Some(i), out);
         }
+    }
+
+    // ---- `post_*` async getters (upstream async_call → alert) ----
+
+    /// `torrent_handle::post_status` — upstream posts a
+    /// `state_update_alert` containing just this torrent.
+    pub fn post_status(&self) {
+        let mut s = lock(&self.session);
+        if let Some(t) = s.torrents.get(&self.info_hash) {
+            let st = t.status(&s.settings, s.queue_position(&self.info_hash));
+            s.alerts.post(Alert::StateUpdate { statuses: vec![st] });
+        }
+    }
+
+    /// `torrent_handle::post_peer_info` → `peer_info_alert`.
+    pub fn post_peer_info(&self) {
+        let mut s = lock(&self.session);
+        if let Some(t) = s.torrents.get(&self.info_hash) {
+            let peers = t
+                .peers
+                .keys()
+                .copied()
+                .filter_map(|id| t.peer_info(id, None))
+                .collect();
+            s.alerts.post(Alert::PeerInfo {
+                ih: self.info_hash,
+                peers,
+            });
+        }
+    }
+
+    /// `torrent_handle::post_download_queue` → `piece_info_alert`.
+    pub fn post_download_queue(&self) {
+        let mut s = lock(&self.session);
+        if let Some(t) = s.torrents.get(&self.info_hash) {
+            let queue = t.get_download_queue();
+            s.alerts.post(Alert::PieceInfo {
+                ih: self.info_hash,
+                queue,
+            });
+        }
+    }
+
+    /// `torrent_handle::post_piece_availability` →
+    /// `piece_availability_alert`.
+    pub fn post_piece_availability(&self) {
+        let mut s = lock(&self.session);
+        if let Some(t) = s.torrents.get(&self.info_hash) {
+            let availability = t.piece_availability();
+            s.alerts.post(Alert::PieceAvailability {
+                ih: self.info_hash,
+                availability,
+            });
+        }
+    }
+
+    /// `torrent_handle::post_trackers` → `tracker_list_alert`.
+    pub fn post_trackers(&self) {
+        let mut s = lock(&self.session);
+        if let Some(t) = s.torrents.get(&self.info_hash) {
+            let trackers = t
+                .trackers
+                .trackers
+                .iter()
+                .map(|e| (e.url.clone(), e.tier))
+                .collect();
+            s.alerts.post(Alert::TrackerList {
+                ih: self.info_hash,
+                trackers,
+            });
+        }
+    }
+
+    /// `torrent_handle::post_file_priorities` →
+    /// `file_priorities_alert`.
+    pub fn post_file_priorities(&self) {
+        let mut s = lock(&self.session);
+        if let Some(t) = s.torrents.get(&self.info_hash) {
+            let priorities = t.file_priorities.clone();
+            s.alerts.post(Alert::FilePriorities {
+                ih: self.info_hash,
+                priorities,
+            });
+        }
+    }
+
+    /// `torrent_handle::post_file_progress` → `file_progress_alert`.
+    pub fn post_file_progress(&self) {
+        let mut s = lock(&self.session);
+        if let Some(t) = s.torrents.get(&self.info_hash) {
+            let files = t.file_progress();
+            s.alerts.post(Alert::FileProgress {
+                ih: self.info_hash,
+                files,
+            });
+        }
+    }
+
+    /// `torrent_handle::post_file_status` → `file_status_alert`.
+    /// Upstream returns the disk thread's open-file list; our disk
+    /// pool doesn't expose per-file open state yet, so `state` is
+    /// posted empty for now.
+    pub fn post_file_status(&self) {
+        let mut s = lock(&self.session);
+        if s.torrents.contains_key(&self.info_hash) {
+            s.alerts.post(Alert::FileStatus {
+                ih: self.info_hash,
+                state: Vec::new(),
+            });
+        }
+    }
+
+    /// `torrent_handle::get_resume_data` — an `add_torrent_params`
+    /// reconstructed from `write_resume_data` (round-trips through
+    /// the same parser a real `.resume` file would take).
+    #[must_use]
+    pub fn get_resume_data(&self) -> Option<bitdaemon_core::AddTorrentParams> {
+        let buf = self.write_resume_data();
+        if buf.is_empty() {
+            return None;
+        }
+        bitdaemon_core::resume_data::read_resume_data(
+            &buf,
+            &bitdaemon_core::torrent_info::LoadTorrentLimits::default(),
+        )
+        .ok()
+    }
+
+    /// `torrent_handle::write_resume_data_buf` — the bencoded blob
+    /// (alias matching the upstream buffer-returning overload).
+    #[must_use]
+    pub fn write_resume_data_buf(&self) -> Vec<u8> {
+        self.write_resume_data()
+    }
+
+    /// `torrent_handle::set_sequential_range(first, last)`.
+    pub fn set_sequential_range(&self, first_piece: PieceIndex, last_piece: PieceIndex) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.set_sequential_range(first_piece, last_piece);
+        }
+    }
+
+    /// `torrent_handle::get_renamed_files` — `file_index → name`
+    /// user renames (upstream `renamed_files`).
+    #[must_use]
+    pub fn get_renamed_files(&self) -> Vec<(i32, String)> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or_else(Vec::new, |t| {
+                t.renamed_files
+                    .iter()
+                    .map(|(&k, v)| (k, v.clone()))
+                    .collect()
+            })
+    }
+
+    /// `torrent_handle::piece_length`.
+    #[must_use]
+    pub fn piece_length(&self) -> i64 {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or(0, |t| t.piece_length)
+    }
+
+    /// `torrent_handle::userdata` — opaque client data slot
+    /// (upstream `client_data_t`; ours is a `u64` key).
+    pub fn set_userdata(&self, data: u64) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.userdata = data;
+        }
+    }
+
+    /// `userdata`.
+    #[must_use]
+    pub fn userdata(&self) -> u64 {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or(0, |t| t.userdata)
+    }
+
+    /// `torrent_handle::write_torrent_file` — rebuild the `.torrent`
+    /// dict: verbatim `info` section + the live announce list +
+    /// `url-list`. Top-level metadata upstream keeps verbatim
+    /// (`comment`, `created by`, `creation date`, `nodes`) isn't
+    /// retained by our `TorrentInfo`, so it isn't re-emitted.
+    #[must_use]
+    pub fn write_torrent_file(&self) -> Option<Vec<u8>> {
+        use bitdaemon_bencode::Entry;
+        let s = lock(&self.session);
+        let t = s.torrents.get(&self.info_hash)?;
+        let ti = t.ti.as_ref()?;
+        let mut d = bitdaemon_bencode::Dictionary::new();
+        // group trackers into announce-list tiers like upstream
+        // `torrent::write_torrent_file`.
+        let mut tiers: Vec<Vec<Vec<u8>>> = Vec::new();
+        let mut per_tier: std::collections::BTreeMap<i32, Vec<Vec<u8>>> =
+            std::collections::BTreeMap::new();
+        for e in &t.trackers.trackers {
+            per_tier
+                .entry(e.tier)
+                .or_default()
+                .push(e.url.as_bytes().to_vec());
+        }
+        for list in per_tier.into_values() {
+            tiers.push(list);
+        }
+        if let Some(first) = tiers.first().and_then(|t| t.first()) {
+            d.insert(b"announce".to_vec(), Entry::String(first.clone()));
+        }
+        if !tiers.is_empty() {
+            d.insert(
+                b"announce-list".to_vec(),
+                Entry::List(
+                    tiers
+                        .into_iter()
+                        .map(|tier| Entry::List(tier.into_iter().map(Entry::String).collect()))
+                        .collect(),
+                ),
+            );
+        }
+        if !t.url_seeds().is_empty() {
+            d.insert(
+                b"url-list".to_vec(),
+                Entry::List(
+                    t.url_seeds()
+                        .iter()
+                        .map(|u| Entry::String(u.as_bytes().to_vec()))
+                        .collect(),
+                ),
+            );
+        }
+        // verbatim info section — `Entry::Preformatted` emits the
+        // original bytes, preserving the info-hash exactly.
+        d.insert(
+            b"info".to_vec(),
+            Entry::Preformatted(ti.info_section().to_vec()),
+        );
+        Some(bitdaemon_bencode::bencode(&Entry::Dict(d)))
     }
 }

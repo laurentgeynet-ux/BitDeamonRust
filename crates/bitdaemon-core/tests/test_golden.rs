@@ -176,3 +176,39 @@ fn golden_resume_rich() {
     );
     assert_eq!(ours, cpp_bytes, "bytes differ from upstream v2.1.2");
 }
+
+/// Upgrade/downgrade matrix: upstream `.resume` bytes → our ATP
+/// (upgrade) → `write_resume_data_buf` (downgrade) → ATP again must
+/// be field-identical; and re-writing must be byte-stable (upstream
+/// can re-read what we emit — the files it generated parse to equal
+/// dicts).
+#[test]
+fn resume_upgrade_downgrade_matrix() {
+    for name in ["resume_empty", "resume_buf_empty", "resume_rich"] {
+        let cpp = fixture(name);
+        let up1 = read_resume_data(&cpp, &LoadTorrentLimits::default())
+            .unwrap_or_else(|e| panic!("{name}: upstream bytes must parse: {e}"));
+        let our_buf = write_resume_data_buf(&up1);
+        let up2 = read_resume_data(&our_buf, &LoadTorrentLimits::default())
+            .unwrap_or_else(|e| panic!("{name}: own bytes must re-parse: {e}"));
+        // field-level stability across an upgrade→downgrade cycle
+        assert_eq!(up1.name, up2.name, "{name}: name");
+        assert_eq!(up1.trackers, up2.trackers, "{name}: trackers");
+        assert_eq!(up1.tracker_tiers, up2.tracker_tiers, "{name}: tiers");
+        assert_eq!(up1.file_priorities, up2.file_priorities, "{name}: prios");
+        assert_eq!(up1.total_uploaded, up2.total_uploaded, "{name}: uploaded");
+        assert_eq!(
+            up1.total_downloaded, up2.total_downloaded,
+            "{name}: downloaded"
+        );
+        assert_eq!(up1.upload_limit, up2.upload_limit, "{name}: ulimit");
+        assert_eq!(up1.download_limit, up2.download_limit, "{name}: dlimit");
+        assert_eq!(up1.flags, up2.flags, "{name}: flags");
+        // byte-level idempotence: rewriting twice yields identical bytes
+        assert_eq!(
+            write_resume_data_buf(&up2),
+            our_buf,
+            "{name}: unstable write"
+        );
+    }
+}

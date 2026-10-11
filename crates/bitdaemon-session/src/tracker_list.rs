@@ -82,6 +82,12 @@ pub struct AnnounceEndpoint {
     pub v2: AnnounceInfohash,
     /// `enabled` — `enabled` flag per endpoint.
     pub enabled: bool,
+    /// `message` — upstream `announce_endpoint::last_error.message()`:
+    /// texte de la derniere erreur d'announce (vide au succes). La
+    /// `torrent_status::error` ne porte que les erreurs fatales
+    /// (disque, cert) — une erreur tracker transitoire ne doit pas
+    /// y remonter sinon le torrent apparait `stopped_on_error`.
+    pub message: String,
 }
 
 impl AnnounceEndpoint {
@@ -172,6 +178,14 @@ impl AnnounceEntry {
         for e in &mut self.endpoints {
             e.v1.failed(backoff_ratio, retry_interval, now);
             e.v2.failed(backoff_ratio, retry_interval, now);
+        }
+    }
+
+    /// `announce_endpoint::last_error` — mémorise/efface le message
+    /// d'erreur de l'endpoint (mirroir des champs `v1`/`v2`).
+    pub fn set_message(&mut self, msg: &str) {
+        for e in &mut self.endpoints {
+            e.message = msg.to_string();
         }
     }
 }

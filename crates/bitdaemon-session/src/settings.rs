@@ -51,6 +51,10 @@ pub struct SessionSettings {
     pub alert_queue_size: usize,
     /// `dht_upload_rate_limit` — datagrams/s the DHT may send.
     pub dht_enabled: bool,
+    /// `enable_outgoing_utp` — dial uTP to peers that support it.
+    pub enable_outgoing_utp: bool,
+    /// `enable_incoming_utp` — accept inbound uTP SYNs.
+    pub enable_incoming_utp: bool,
     /// `prefer_rc4` — MSE crypto preference.
     pub prefer_rc4: bool,
     /// `connection_speed` — peer connect attempt rate.
@@ -126,6 +130,9 @@ impl Default for SessionSettings {
             send_buffer_watermark: 500 << 10,
             alert_queue_size: 2000,
             dht_enabled: true,
+            // upstream defaults: both true
+            enable_outgoing_utp: true,
+            enable_incoming_utp: true,
             prefer_rc4: false,
             connection_speed: 30,
             tick_interval: Duration::from_secs(1),

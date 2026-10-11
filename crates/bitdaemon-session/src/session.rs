@@ -570,6 +570,12 @@ impl Session {
                 } => {
                     // `file_renamed{,_failed}_alert`
                     if err.is_ok() {
+                        // upstream `m_renamed_files` — persist the
+                        // mapping for `get_renamed_files`/resume data.
+                        if let Some(t) = self.torrents.get_mut(&ih) {
+                            t.renamed_files
+                                .insert(index.0, name.to_string_lossy().into_owned());
+                        }
                         self.alerts.post(Alert::FileRenamed {
                             ih,
                             index: index.0,
@@ -2234,6 +2240,11 @@ impl Session {
             Ok(r) => {
                 if r.complete >= 0 {
                     t.num_seeds = r.complete as usize;
+                    // upstream `m_last_seen_complete` — scrape replies
+                    // count too.
+                    t.last_seen_complete = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .map_or(-1, |d| d.as_secs() as i64);
                 }
                 if let Some(i) = t.trackers.find(url) {
                     t.trackers.trackers[i].verified = true;
@@ -2326,6 +2337,9 @@ impl Session {
         match resp {
             Ok(r) => {
                 t.last_error.clear();
+                if let Some(i) = t.trackers.find(url) {
+                    t.trackers.trackers[i].set_message("");
+                }
                 // `tracker response "external ip"` → ip_voter
                 // (`source_tracker` — upstream `on_announce`).
                 if let Some(ip) = r.external_ip {
@@ -2340,6 +2354,9 @@ impl Session {
                 }
                 if r.complete >= 0 {
                     t.num_seeds = r.complete as usize;
+                    t.last_seen_complete = std::time::SystemTime::now()
+                        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .map_or(-1, |d| d.as_secs() as i64);
                 }
                 if let Some(i) = t.trackers.find(url) {
                     let e = &mut t.trackers.trackers[i];
@@ -2361,10 +2378,12 @@ impl Session {
                 // the entry's own next_announce).
                 if let Some(i) = t.trackers.find(url) {
                     t.trackers.trackers[i].failed(250, std::time::Duration::from_secs(60), now);
+                    // l'erreur va sur l'endpoint (`announce_entry::
+                    // last_error`), pas dans `torrent_status::error`
+                    // — celui-ci est reserve aux erreurs fatales
+                    // (disque) qui pausent le torrent.
+                    t.trackers.trackers[i].set_message(&e);
                 }
-                // `torrent_status::error` — the tracker failure
-                // message is upstream's `m_error` source
-                t.last_error = e.clone();
                 self.alerts.post(Alert::TrackerError {
                     ih: *ih,
                     url: url.to_string(),
