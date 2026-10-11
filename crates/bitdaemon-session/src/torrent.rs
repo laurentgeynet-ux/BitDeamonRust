@@ -167,10 +167,6 @@ pub struct Torrent {
     pub down_rate: i64,
     /// upload payload B/s.
     pub up_rate: i64,
-    /// previous sample totals.
-    pub stat_prev_down: i64,
-    /// previous sample totals (upload).
-    pub stat_prev_up: i64,
     /// last sample instant.
     pub stat_sample: Option<std::time::Instant>,
     /// `m_file_priority` — per-file `DownloadPriority` (empty =
@@ -486,8 +482,6 @@ impl Torrent {
             checking: false,
             down_rate: 0,
             up_rate: 0,
-            stat_prev_down: 0,
-            stat_prev_up: 0,
             stat_sample: None,
             file_priorities: Vec::new(),
             renamed_files: std::collections::BTreeMap::new(),
@@ -3360,13 +3354,25 @@ impl Torrent {
         for c in self.peers.values_mut() {
             c.now_ms = now_ms;
         }
-        let down: i64 = self.peers.values().map(|c| c.stat_down_total).sum();
-        let up: i64 = self.peers.values().map(|c| c.stat_up_total).sum();
+        // Rate from per-peer deltas, not lifetime totals: a peer
+        // that disconnected between ticks must contribute 0 to this
+        // tick, not a negative delta (its total vanishes from the
+        // sum → `down - prev` < 0 → bogus negative rate).
+        let down: i64 = self
+            .peers
+            .values()
+            .map(|c| c.stat_down_total - c.last_down_total)
+            .sum();
+        let up: i64 = self
+            .peers
+            .values()
+            .map(|c| c.stat_up_total - c.last_up_total)
+            .sum();
         if let Some(prev_t) = self.stat_sample {
             let dt = (now - prev_t).as_secs_f64();
             if dt > 0.0 {
-                self.down_rate = ((down - self.stat_prev_down) as f64 / dt) as i64;
-                self.up_rate = ((up - self.stat_prev_up) as f64 / dt) as i64;
+                self.down_rate = (down as f64 / dt) as i64;
+                self.up_rate = (up as f64 / dt) as i64;
                 // per-peer `stat::rate()` — bytes/sec over the tick.
                 for c in self.peers.values_mut() {
                     let down_delta = c.stat_down_total - c.last_down_total;
@@ -3398,8 +3404,6 @@ impl Torrent {
             c.last_down_total = c.stat_down_total;
             c.last_up_total = c.stat_up_total;
         }
-        self.stat_prev_down = down;
-        self.stat_prev_up = up;
         self.stat_sample = Some(now);
     }
 

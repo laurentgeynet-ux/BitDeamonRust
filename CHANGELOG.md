@@ -7,6 +7,66 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Fixed — uTP engine wiring (verified live vs libtorrent v2.1.2)
+
+- **uTP was routed through the 1 Hz `Engine::tick`**: datagrams
+  queued for routing waited ~1 s per round-trip, capping real
+  transfers at ~1 packet/s (seed logged `type: uTP` but throughput
+  stalled). `spawn_udp_pump` now classifies packets directly in the
+  pump — uTP packets are pushed to the `UtpManager` immediately,
+  DHT/tracker datagrams keep the normal queue. Verified end-to-end:
+  `bitdaemon --utp` downloaded the full 8 MiB payload from a C++
+  libtorrent seed over uTP (`uTP` wire type confirmed by the seed),
+  SHA-256 identical.
+- **`write_all` returned `Pending` forever**: `poll_write` drained
+  the internal `write_buf` without waking the caller, so a writer
+  blocked on a full outbox never resumed. The waker is now stored
+  and woken when the pump drains the outbox.
+
+### Added — uTP / SSL / SOCKS5
+
+- `Engine::enable_utp(connector, acceptor)` + `--utp` CLI flag:
+  outgoing dials prefer uTP with automatic TCP fallback; incoming
+  uTP accepts run alongside TCP listeners.
+- `bitdaemon-net::socks_udp`: full SOCKS5 UDP-associate relay —
+  `Socks5UdpSocket` implements `DatagramSocket` over the proxied
+  UDP association (control TCP kept alive, `BND` relay address,
+  request/response header wrapping per RFC 1928 / BEP-29).
+- SSL torrent plumbing: `.torrent` embedded `ssl-cert` detection
+  (`is_ssl_torrent`), per-torrent cert+key storage
+  (`set_ssl_certificate`), `SniResolver`-backed rustls server
+  config on the acceptor, SSL peer streams on dial (`--ssl-cert`
+  / `--ssl-key` CLI flags). Note: outbound dialing currently
+  accepts any certificate (`verify_none`) — upstream additionally
+  verifies the leaf SAN against the torrent name
+  (`torrent.cpp`); that strict check is tracked in
+  `docs/PORTING.md` as not yet ported.
+- `close_reason` module: `CloseReason` enum + upstream
+  `close_reason_t` message strings.
+- `TorrentHandle` additions: `get_resume_data`,
+  `set_sequential_range`, `get_renamed_files`,
+  `write_torrent_file` (rebuilds the `.torrent` from verbatim
+  `info_section` bytes + live announce-list, preserving the
+  info-hash), `post_*` alert helpers.
+- `TorrentStatus` additions: `info_hashes`, `next_announce`,
+  `completed_time`, `last_seen_complete`, `is_seeding`.
+- Session settings now serialize `dht_enabled` and `prefer_rc4`
+  into `.session` state (upgrade→downgrade→upgrade round-trip
+  covered by tests).
+
+### Fixed
+
+- `invalid tracker response` at end of announce: HTTP tracker
+  announces now follow redirects and reject non-200 statuses before
+  attempting bdecode (HTML error bodies previously surfaced as
+  bencode failures).
+- Negative transfer rates on peer disconnect: rates are summed from
+  per-peer deltas, so a vanished peer contributes 0 to the next
+  tick instead of subtracting its lifetime total.
+- Magnet live resolution verified against the public swarm (Ubuntu
+  torrent info-hash via trackers/DHT, metadata fetched, download
+  completed).
+
 ### Fixed — public-swarm interop (verified on a live Ubuntu torrent)
 
 - **HTTPS trackers** dialed plaintext TCP on port 443 — announces

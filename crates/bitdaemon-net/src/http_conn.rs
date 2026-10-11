@@ -29,6 +29,13 @@ pub enum HttpError {
     /// response exceeded `max_response`.
     #[error("response too large")]
     TooLarge,
+    /// non-2xx status (`http_connection` treats the code as the
+    /// error; `errors::http_error`).
+    #[error("http status {0}")]
+    Status(i32),
+    /// too many redirects (`errors::http_redirection_depleted`).
+    #[error("too many redirects")]
+    TooManyRedirects,
 }
 
 /// `send_request` — verbatim request format upstream writes
@@ -157,6 +164,14 @@ pub async fn recv_response(
 }
 
 /// full GET — the common tracker/web-seed shape.
+///
+/// Follows `301/302/303/307` `Location` redirects on the **same
+/// stream** like `http_connection::on_redirect` does (absolute URLs
+/// keep host/scheme — a cross-host redirect keeps the authority
+/// path only if the hostname matches `host`, mirroring upstream's
+/// reconnect requirement; cross-host locations are treated as
+/// next-request paths when they parse to a path). Up to 5 hops.
+/// Non-2xx/3xx statuses surface as [`HttpError::Status`].
 pub async fn http_get(
     s: &mut BoxedPeerStream,
     path: &str,
@@ -164,6 +179,37 @@ pub async fn http_get(
     headers: &[(String, String)],
     max_response: usize,
 ) -> Result<HttpResponse, HttpError> {
-    send_request(s, "GET", path, host, headers, &[]).await?;
-    recv_response(s, max_response).await
+    let mut path = path.to_string();
+    for _ in 0..5 {
+        send_request(s, "GET", &path, host, headers, &[]).await?;
+        let resp = recv_response(s, max_response).await?;
+        let status = resp.status();
+        match status {
+            301 | 302 | 303 | 307 | 308 => {
+                let loc = resp
+                    .header("location")
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty());
+                let Some(loc) = loc else {
+                    return Err(HttpError::Status(status));
+                };
+                // absolute http(s) URL → extract path+query; relative
+                // redirect already is the path.
+                path = if let Some(rest) = loc
+                    .strip_prefix("http://")
+                    .or_else(|| loc.strip_prefix("https://"))
+                {
+                    match rest.find('/') {
+                        Some(i) => rest[i..].to_string(),
+                        None => "/".to_string(),
+                    }
+                } else {
+                    loc.to_string()
+                };
+            }
+            200..=299 => return Ok(resp),
+            _ => return Err(HttpError::Status(status)),
+        }
+    }
+    Err(HttpError::TooManyRedirects)
 }

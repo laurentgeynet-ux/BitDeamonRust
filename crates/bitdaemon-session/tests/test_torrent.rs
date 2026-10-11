@@ -96,6 +96,28 @@ fn all_pieces_makes_seed() {
     assert!(out.iter().any(|e| matches!(e, TorrentEffect::BecameSeed)));
 }
 
+/// regression: rates must never go negative when a peer with
+/// accumulated totals disconnects between ticks (aggregate
+/// subtraction used to produce a negative delta).
+#[test]
+fn rates_stay_nonnegative_on_disconnect() {
+    let mut t = torrent(4);
+    t.init_picker(true);
+    let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
+    c.stat_down_total = 1_000_000;
+    c.stat_up_total = 500_000;
+    t.add_peer(1, c);
+    let t0 = std::time::Instant::now();
+    t.update_rates(t0);
+    // peer leaves between ticks — its totals vanish from the sum
+    let mut eff = Vec::new();
+    t.remove_peer(1, &mut eff);
+    t.update_rates(t0 + std::time::Duration::from_secs(1));
+    assert!(t.down_rate >= 0 && t.up_rate >= 0, "rates went negative");
+    assert_eq!(t.down_rate, 0);
+    assert_eq!(t.up_rate, 0);
+}
+
 #[test]
 fn failed_piece_restores() {
     let mut t = torrent(3);
