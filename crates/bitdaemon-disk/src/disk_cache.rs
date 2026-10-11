@@ -1,0 +1,356 @@
+// This file is part of OnionBit.
+// Copyright (C) 2026 Laurent Geynet
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+//! Port of `aux_/disk_cache.hpp` + `disk_cache.cpp` — the write-cache
+//! bookkeeping: per-piece `cached_piece_entry`, per-block
+//! `cached_block_entry` (buffer / flushed / pending-write-job),
+//! the `flushed_cursor`/`hasher_cursor` pair and the insert flags
+//! (`exceeded_limit`, `need_hasher_kick`).
+//!
+//! The concurrent hash-queue machinery upstream builds on top
+//! (`piece_hasher` workers, `m_v2_hash_queue`, condition-variable
+//! wake-ups) is folded into our single-owner disk thread pool —
+//! the *state machine* and counters are what callers depend on.
+
+use std::collections::HashMap;
+
+use bitdaemon_common::PieceIndex;
+use bitdaemon_common::types::StorageIndex;
+
+/// `default_block_size` — 16 KiB blocks.
+pub const DEFAULT_BLOCK_SIZE: i64 = 0x4000;
+
+/// `piece_location` — the cache key.
+pub type PieceLocation = (StorageIndex, PieceIndex);
+
+/// `cached_block_entry`.
+#[derive(Debug)]
+pub struct CachedBlockEntry {
+    /// `buf` — owned buffer; `None` once the write job took it.
+    pub buf: Option<Vec<u8>>,
+    /// `is_flushed()` — already on disk.
+    pub flushed: bool,
+    /// `get_write_job() != nullptr` — a write job is in flight.
+    pub has_write_job: bool,
+}
+
+impl CachedBlockEntry {
+    /// `data()`/`buf()` — the cached bytes.
+    #[must_use]
+    pub fn data(&self) -> Option<&[u8]> {
+        self.buf.as_deref()
+    }
+}
+
+/// `cached_piece_entry` flag bits.
+pub mod piece_flags {
+    /// `force_flush_flag` — flush on completion regardless.
+    pub const FORCE_FLUSH: u16 = 1 << 0;
+    /// `hashing_flag` — a hasher owns this piece right now.
+    pub const HASHING: u16 = 1 << 1;
+    /// `flushing_flag` — a flush is in flight.
+    pub const FLUSHING: u16 = 1 << 2;
+    /// `piece_hash_returned_flag` — the hash was delivered;
+    /// flushes the remainder (`compute_force_flush`).
+    pub const PIECE_HASH_RETURNED: u16 = 1 << 3;
+    /// `v1_hashes_flag` — v1 hashes available for this piece.
+    pub const V1_HASHES: u16 = 1 << 4;
+}
+
+/// `compute_force_flush` — a piece that hashed or completed its
+/// hasher cursor must flush the tail blocks.
+#[must_use]
+pub fn compute_force_flush(piece: &CachedPieceEntry) -> bool {
+    piece.hasher_cursor == piece.blocks.len() as u16
+        || piece.flags & piece_flags::PIECE_HASH_RETURNED != 0
+}
+
+/// `compute_flushed_cursor` — count of contiguous flushed blocks
+/// from index 0.
+#[must_use]
+pub fn compute_flushed_cursor(blocks: &[CachedBlockEntry]) -> u16 {
+    let mut ret = 0;
+    for b in blocks {
+        if !b.flushed {
+            return ret;
+        }
+        ret += 1;
+    }
+    ret
+}
+
+/// `count_jobs` — blocks with an in-flight write job.
+#[must_use]
+pub fn count_jobs(blocks: &[CachedBlockEntry]) -> u16 {
+    blocks.iter().filter(|b| b.has_write_job).count() as u16
+}
+
+/// `cached_piece_entry`.
+#[derive(Debug)]
+pub struct CachedPieceEntry {
+    /// `piece_size` (v1 view — full piece).
+    pub piece_size: i64,
+    /// `piece_size2` (v2 view — may differ at the tail).
+    pub piece_size2: i64,
+    /// one entry per `DEFAULT_BLOCK_SIZE` block.
+    pub blocks: Vec<CachedBlockEntry>,
+    /// `flushed_cursor` — contiguous blocks already on disk.
+    pub flushed_cursor: u16,
+    /// `hasher_cursor` — blocks the hasher consumed.
+    pub hasher_cursor: u16,
+    /// `num_jobs` — outstanding jobs referencing this piece.
+    pub num_jobs: i32,
+    /// `v2_pending` — blocks sitting in the v2 hash queue.
+    pub v2_pending: u16,
+    /// `cached_piece_flags`.
+    pub flags: u16,
+    /// `v1`/`v2` protocol kinds this piece feeds.
+    pub v1: bool,
+    /// v2 piece.
+    pub v2: bool,
+}
+
+impl CachedPieceEntry {
+    /// `blocks_in_piece`.
+    #[must_use]
+    pub fn blocks_in_piece(&self) -> u16 {
+        self.blocks.len() as u16
+    }
+}
+
+/// `insert_result_flags`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InsertResult {
+    /// `exceeded_limit` — back-pressure watermark hit.
+    pub exceeded_limit: bool,
+    /// `need_hasher_kick` — the hasher can consume this block.
+    pub need_hasher_kick: bool,
+}
+
+/// `disk_cache` — pieces indexed by `(storage, piece)`.
+#[derive(Debug, Default)]
+pub struct DiskCache {
+    pieces: HashMap<PieceLocation, CachedPieceEntry>,
+    /// `m_blocks` — blocks whose buffers the cache (or the v2 queue)
+    /// owns; feeds `back_pressure`.
+    pub num_cached_blocks: i64,
+    /// `m_num_unhashed` — v1 blocks awaiting the hasher.
+    pub num_unhashed: i64,
+}
+
+/// `piece_entry_params` — what `insert` needs to know about a job.
+#[derive(Clone, Copy, Debug)]
+pub struct PieceParams {
+    /// `piece_size`.
+    pub piece_size: i64,
+    /// `piece_size2`.
+    pub piece_size2: i64,
+    /// v1 hash interest.
+    pub v1: bool,
+    /// v2 hash interest.
+    pub v2: bool,
+}
+
+impl DiskCache {
+    /// `insert(loc, block_idx, force_flush, params)` — register a
+    /// write block. `has_buffer` mirrors "the job carried a buffer"
+    /// (upstream moves it into the entry or the v2 queue).
+    pub fn insert(
+        &mut self,
+        loc: PieceLocation,
+        block_idx: usize,
+        buf: Option<Vec<u8>>,
+        force_flush: bool,
+        params: PieceParams,
+    ) -> InsertResult {
+        let piece = self.pieces.entry(loc).or_insert_with(|| {
+            let num_blocks =
+                ((params.piece_size + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE) as usize;
+            CachedPieceEntry {
+                piece_size: params.piece_size,
+                piece_size2: params.piece_size2,
+                blocks: (0..num_blocks)
+                    .map(|_| CachedBlockEntry {
+                        buf: None,
+                        flushed: false,
+                        has_write_job: false,
+                    })
+                    .collect(),
+                flushed_cursor: 0,
+                hasher_cursor: 0,
+                num_jobs: 0,
+                v2_pending: 0,
+                flags: 0,
+                v1: params.v1,
+                v2: params.v2,
+            }
+        });
+        if let Some(b) = piece.blocks.get_mut(block_idx) {
+            b.buf = buf;
+            b.has_write_job = true;
+        }
+        if params.v2 {
+            piece.v2_pending += 1;
+        }
+        self.num_cached_blocks += 1;
+        if params.v1 {
+            self.num_unhashed += 1;
+        }
+        if force_flush || compute_force_flush(piece) {
+            piece.flags |= piece_flags::FORCE_FLUSH;
+        }
+        piece.num_jobs += 1;
+
+        let mut ret = InsertResult::default();
+        if params.v1
+            && piece.hasher_cursor as usize == block_idx
+            && piece.flags & piece_flags::PIECE_HASH_RETURNED == 0
+        {
+            ret.need_hasher_kick = true;
+        }
+        ret
+    }
+
+    /// `try_clear_piece` — refuses while a write job or hashing is
+    /// in flight; on success the piece is dropped and its buffers
+    /// freed (returns the freed entry like upstream counts them).
+    pub fn try_clear_piece(&mut self, loc: PieceLocation) -> bool {
+        let Some(p) = self.pieces.get(&loc) else {
+            return true;
+        };
+        if count_jobs(&p.blocks) > 0 || p.flags & piece_flags::HASHING != 0 {
+            return false;
+        }
+        let freed = p.blocks.iter().filter(|b| b.buf.is_some()).count() as i64;
+        self.num_cached_blocks -= freed;
+        self.pieces.remove(&loc);
+        true
+    }
+
+    /// `free_piece` — bookkeeping when a piece leaves the cache.
+    pub fn free_piece(&mut self, loc: PieceLocation) {
+        if let Some(p) = self.pieces.remove(&loc) {
+            let freed = p.blocks.iter().filter(|b| b.buf.is_some()).count() as i64;
+            self.num_cached_blocks -= freed;
+        }
+    }
+
+    /// read-side lookup — the block's cached bytes.
+    #[must_use]
+    pub fn get(&self, loc: PieceLocation, block_idx: usize) -> Option<&[u8]> {
+        self.pieces
+            .get(&loc)
+            .and_then(|p| p.blocks.get(block_idx))
+            .and_then(|b| b.data())
+    }
+
+    /// mark a write job finished — upstream `blocks[i].write_state`
+    /// bookkeeping + `flushed_cursor` advance.
+    pub fn write_job_done(&mut self, loc: PieceLocation, block_idx: usize, flushed: bool) {
+        if let Some(p) = self.pieces.get_mut(&loc) {
+            if let Some(b) = p.blocks.get_mut(block_idx) {
+                b.has_write_job = false;
+                if flushed {
+                    b.flushed = true;
+                    b.buf = None;
+                    self.num_cached_blocks -= 1;
+                }
+            }
+            p.flushed_cursor = compute_flushed_cursor(&p.blocks);
+            p.num_jobs -= 1;
+        }
+    }
+
+    /// `hasher_cursor` advance — the v1 hasher consumed `block_idx`.
+    pub fn hashed_block(&mut self, loc: PieceLocation, block_idx: usize) {
+        if let Some(p) = self.pieces.get_mut(&loc)
+            && p.hasher_cursor as usize == block_idx
+        {
+            p.hasher_cursor += 1;
+            self.num_unhashed -= 1;
+        }
+    }
+
+    /// piece accessor.
+    #[must_use]
+    pub fn piece(&self, loc: PieceLocation) -> Option<&CachedPieceEntry> {
+        self.pieces.get(&loc)
+    }
+
+    /// `size()`.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.pieces.len()
+    }
+
+    /// empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params() -> PieceParams {
+        PieceParams {
+            piece_size: 3 * DEFAULT_BLOCK_SIZE,
+            piece_size2: 3 * DEFAULT_BLOCK_SIZE,
+            v1: true,
+            v2: false,
+        }
+    }
+
+    #[test]
+    fn insert_and_flags() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        let r = c.insert(loc, 0, Some(vec![1u8; 4]), false, params());
+        assert!(r.need_hasher_kick); // block 0 == hasher_cursor
+        assert_eq!(c.num_cached_blocks, 1);
+        assert_eq!(c.num_unhashed, 1);
+        let r = c.insert(loc, 1, Some(vec![2u8; 4]), false, params());
+        assert!(!r.need_hasher_kick);
+        assert_eq!(c.piece(loc).unwrap().num_jobs, 2);
+    }
+
+    #[test]
+    fn write_done_advances_cursor() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(1));
+        c.insert(loc, 0, Some(vec![0; 4]), false, params());
+        c.insert(loc, 1, Some(vec![0; 4]), false, params());
+        c.write_job_done(loc, 0, true);
+        assert_eq!(c.piece(loc).unwrap().flushed_cursor, 1);
+        assert_eq!(c.num_cached_blocks, 1);
+        // out-of-order flush: cursor stops at the hole
+        c.write_job_done(loc, 2, true);
+        c.write_job_done(loc, 1, true);
+        assert_eq!(c.piece(loc).unwrap().flushed_cursor, 3);
+        assert!(c.try_clear_piece(loc));
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn clear_refuses_pending() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        c.insert(loc, 0, Some(vec![0; 4]), false, params());
+        assert!(!c.try_clear_piece(loc));
+        c.write_job_done(loc, 0, true);
+        assert!(c.try_clear_piece(loc));
+    }
+
+    #[test]
+    fn force_flush_on_hash_returned() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        c.insert(loc, 0, Some(vec![0; 4]), false, params());
+        c.pieces.get_mut(&loc).unwrap().flags |= piece_flags::PIECE_HASH_RETURNED;
+        c.insert(loc, 1, Some(vec![0; 4]), false, params());
+        assert!(c.piece(loc).unwrap().flags & piece_flags::FORCE_FLUSH != 0);
+    }
+}

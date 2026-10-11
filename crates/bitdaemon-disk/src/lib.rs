@@ -39,6 +39,7 @@ pub mod storage_error;
 pub mod back_pressure;
 /// `aux_/disk_buffer_pool.hpp` + `disk_buffer_holder.hpp`.
 pub mod disk_buffer_pool;
+pub mod disk_cache;
 /// `aux_/disk_completed_queue.hpp` — network-thread completion drain.
 pub mod disk_completed;
 /// `disk_interface.hpp` — `DiskIo` trait, `StorageHolder`, `disabled`.
@@ -62,6 +63,7 @@ pub mod readwrite;
 /// `aux_/pread_storage.hpp` — positioned-I/O storage backend.
 pub mod storage;
 /// `aux_/storage_utils.hpp` — check/move/delete helpers.
+pub mod storage_free_list;
 pub mod storage_utils;
 /// `aux_/store_buffer.hpp` — read cache + back-pressure watermarks.
 pub mod store_buffer;
