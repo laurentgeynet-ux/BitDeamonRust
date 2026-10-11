@@ -45,11 +45,18 @@ pub mod alerts;
 pub mod choker;
 /// `performance_counters`/`session_stats`.
 pub mod counters;
+/// `extensions/i2p_pex` — I2P peer exchange (BEP-10 id 9).
+pub mod i2p_pex;
+/// `listen_socket_t`/`listen_socket_handle`/`session_udp_socket`.
+pub mod listen;
+/// `aux_/torrent_peer_allocator` — peer allocation accounting.
+pub mod peer_alloc;
 /// `session`/`session_impl` — orchestrator core.
 pub mod session;
 /// `session_handle`/`torrent_handle` — public API.
 pub mod session_handle;
 /// `.session` state file.
+pub mod session_params;
 pub mod session_state;
 /// `settings_pack`/`session_params`.
 pub mod settings;
@@ -69,5 +76,6 @@ pub struct Session;
 /// TODO: implement — cheap `Clone`able handle sending commands into the
 /// session actor; mirrors the ~90 methods of `torrent_handle`.
 pub struct TorrentHandle;
+pub mod ut_holepunch;
 pub mod ut_metadata;
 pub mod ut_pex;

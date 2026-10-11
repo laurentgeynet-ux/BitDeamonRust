@@ -35,7 +35,9 @@ pub fn metadata_packet(
     metadata: &[u8],
 ) -> Vec<u8> {
     let mut e = Entry::Dict(Default::default());
-    let d = e.dict_mut().expect("dict");
+    let Ok(d) = e.dict_mut() else {
+        return Vec::new();
+    };
     d.insert(b"msg_type".to_vec(), Entry::Int(ty as i64));
     d.insert(b"piece".to_vec(), Entry::Int(i64::from(piece)));
     let mut payload = Vec::new();

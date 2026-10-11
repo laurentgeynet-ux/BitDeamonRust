@@ -1447,8 +1447,10 @@ impl PiecePicker {
                 self.block_info.len() + blocks as usize,
                 BlockInfo::default(),
             );
+        } else if let Some(bi) = self.free_block_infos.pop() {
+            block_index = bi;
         } else {
-            block_index = self.free_block_infos.pop().expect("non-empty");
+            return;
         }
 
         let mut ret = DownloadingPiece::new(piece);
@@ -2096,7 +2098,9 @@ impl PiecePicker {
             // still, resolve the queue from the map
             let q = self.piece_map[block.piece_index.0 as usize].state.queue();
             let _ = state;
-            let pos = self.dl_pos(q, block.piece_index).expect("just added");
+            let Some(pos) = self.dl_pos(q, block.piece_index) else {
+                return false;
+            };
             let info_idx = self.downloads[q as usize][pos].info_idx;
             let base = usize::from(info_idx) * self.blocks_per_piece() as usize
                 + block.block_index as usize;
@@ -2187,7 +2191,9 @@ impl PiecePicker {
             }
             self.add_download_piece(block.piece_index);
             let q = self.piece_map[block.piece_index.0 as usize].state.queue();
-            let pos = self.dl_pos(q, block.piece_index).expect("just added");
+            let Some(pos) = self.dl_pos(q, block.piece_index) else {
+                return false;
+            };
             let info_idx = self.downloads[q as usize][pos].info_idx;
             let base = usize::from(info_idx) * self.blocks_per_piece() as usize
                 + block.block_index as usize;
@@ -2242,7 +2248,9 @@ impl PiecePicker {
             }
             self.add_download_piece(block.piece_index);
             let q = self.piece_map[block.piece_index.0 as usize].state.queue();
-            let pos = self.dl_pos(q, block.piece_index).expect("just added");
+            let Some(pos) = self.dl_pos(q, block.piece_index) else {
+                return;
+            };
             let info_idx = self.downloads[q as usize][pos].info_idx;
             let base = usize::from(info_idx) * self.blocks_per_piece() as usize
                 + block.block_index as usize;

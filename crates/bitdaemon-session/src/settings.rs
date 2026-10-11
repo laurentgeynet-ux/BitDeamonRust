@@ -79,6 +79,30 @@ pub struct SessionSettings {
     /// strips announce `ip`/user-agent — announcing info-hashes to
     /// the LAN would defeat the purpose for Tribler).
     pub anonymous_mode: bool,
+    /// `seed_time_limit` — max seconds a torrent may seed
+    /// (upstream default 24 h); used by `seed_rank`.
+    pub seed_time_limit: i32,
+    /// `share_ratio_limit` — percent (200 = 2.0 ratio) feeding
+    /// `seed_rank`'s `seed_ratio_not_met` flag.
+    pub share_ratio_limit: i32,
+    /// `seed_time_ratio_limit` — percent (700) of seed-vs-download
+    /// time feeding `seed_rank`.
+    pub seed_time_ratio_limit: i32,
+    /// `allowed_fast_set_size` — upstream default 5; pieces we offer
+    /// via BEP-6 `allowed_fast` to choked peers.
+    pub allowed_fast_set_size: i32,
+    /// `user_agent` — client string sent in the extended handshake
+    /// (`settings_pack::user_agent`).
+    pub user_agent: Vec<u8>,
+    /// `webtorrent_stun_server` — STUN for WebRTC signaling
+    /// (upstream default `stun.l.google.com:19302`, empty = none).
+    pub webtorrent_stun_server: Vec<u8>,
+    /// `webtorrent_connection_timeout` — seconds before an
+    /// un-negotiated RTC connection is dropped (upstream 120).
+    pub webtorrent_connection_timeout: i32,
+    /// `max_webtorrent_offers` — cap on incoming RTC offers
+    /// (upstream 10).
+    pub max_webtorrent_offers: i32,
 }
 
 impl Default for SessionSettings {
@@ -113,6 +137,14 @@ impl Default for SessionSettings {
             allow_multiple_connections_per_ip: false,
             auto_manage_interval: 30,
             anonymous_mode: false,
+            seed_time_limit: 24 * 60 * 60,
+            share_ratio_limit: 200,
+            seed_time_ratio_limit: 700,
+            allowed_fast_set_size: 5,
+            user_agent: b"bitdaemon/0.1".to_vec(),
+            webtorrent_stun_server: b"stun.l.google.com:19302".to_vec(),
+            webtorrent_connection_timeout: 120,
+            max_webtorrent_offers: 10,
         }
     }
 }
@@ -124,6 +156,15 @@ impl Default for SessionSettings {
 pub struct SessionParams {
     /// `settings` — typed `settings_pack`.
     pub settings: SessionSettings,
+    /// `dht_settings`.
+    pub dht_settings: bitdaemon_dht::dht_settings::DhtSettings,
+    /// `dht_state` — persisted DHT node-id / bootstrap nodes.
+    pub dht_state: bitdaemon_dht::dht_state::DhtState,
+    /// `ip_filter` — persisted peer-IP ranges.
+    pub ip_filter: bitdaemon_net::ip_filter::IpFilter,
+    /// `ext_state` — opaque per-extension state blobs (upstream
+    /// `session_params::ext_state`).
+    pub ext_state: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
     /// `disk_io_constructor` — `None` → `PreadDiskIo` default.
     pub disk_io: Option<Arc<dyn DiskIo>>,
     /// `extensions` — plugin hooks (alert/session). Each is a
@@ -136,6 +177,10 @@ impl Clone for SessionParams {
     fn clone(&self) -> Self {
         Self {
             settings: self.settings.clone(),
+            dht_settings: self.dht_settings.clone(),
+            dht_state: self.dht_state.clone(),
+            ip_filter: self.ip_filter.clone(),
+            ext_state: self.ext_state.clone(),
             disk_io: self.disk_io.clone(),
             plugins: self.plugins.clone(),
         }

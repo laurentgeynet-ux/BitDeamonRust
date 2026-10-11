@@ -12,6 +12,7 @@
 
 use bitdaemon_common::{Bitfield, PeerId, PeerRequest, PieceBlock, PieceIndex};
 use bitdaemon_net::peer_wire::PeerMessage;
+use sha1::Digest;
 
 use crate::peer_pipeline::{PeerPipeline, PendingBlock};
 use crate::piece_picker::{PickerStats, PiecePicker};
@@ -36,6 +37,12 @@ pub struct PeerConn {
     pub bitfield_received: bool,
     /// `m_allowed_fast` — BEP-6 pieces we may fetch while choked.
     pub allowed_fast: Vec<PieceIndex>,
+    /// `m_accept_fast` — pieces WE offered this peer while it was
+    /// choked (the `send_allowed_set` set).
+    pub accept_fast: Vec<PieceIndex>,
+    /// `m_accept_fast_piece_cnt` — per-entry completion counters
+    /// upstream keeps for accept-fast accounting.
+    pub accept_fast_piece_cnt: Vec<i32>,
     /// `m_suggested_pieces` — BEP-6 suggested pieces.
     pub suggested_pieces: Vec<PieceIndex>,
     /// `m_request_queue`/`m_download_queue` + pipeline state.
@@ -60,12 +67,35 @@ pub struct PeerConn {
     pub local_ut_metadata: u8,
     /// our local `ut_pex` id.
     pub local_ut_pex: u8,
+    /// our local `ut_holepunch` id (BEP-55).
+    pub local_ut_holepunch: u8,
     /// our local `lt_donthave` id — remote sends extended messages
     /// on this id to retract a piece.
     pub local_dont_have: u8,
+    /// `i2p_pex` — remote's message id from its handshake (`m`).
+    pub ext_i2p_pex: u8,
+    /// `local_i2p_pex` — our advertised id (upstream fixes it at 9).
+    pub local_i2p_pex: u8,
+    /// I2P destination (base64 string) when this conn rides an I2P
+    /// socket — `is_i2p(pc.get_socket())` upstream.
+    pub i2p: Option<Vec<u8>>,
+    /// `is_outgoing()` — we dialed this peer.
+    pub outgoing: bool,
+    /// `is_connecting()` — handshake not yet complete.
+    pub connecting: bool,
+    /// `!in_handshake()` — the peer's BitTorrent handshake landed.
+    pub handshake_done: bool,
+    /// `received_listen_port` — peer shared its listen port.
+    pub received_listen_port: bool,
+    /// `i2p_pex_peer_plugin` per-connection state.
+    pub i2p_pex: crate::i2p_pex::I2pPexPeerState,
     /// `m_superseed_piece` — the piece we're currently
     /// super-seeding to this peer (BEP initial-seed).
     pub superseed_piece: Option<PieceIndex>,
+    /// `peer_info::protocol_v2` — the connection was established
+    /// with the v2 info-hash. Hash messages (`hash_request`/
+    /// `hashes`/`hash_reject`) are a protocol violation without it.
+    pub protocol_v2: bool,
     /// `m_upload_only` — remote told us it's upload-only.
     pub remote_upload_only: bool,
     /// `m_client_version` — remote's `v` string.
@@ -135,6 +165,8 @@ impl PeerConn {
             peer_interested: false,
             bitfield_received: false,
             allowed_fast: Vec::new(),
+            accept_fast: Vec::new(),
+            accept_fast_piece_cnt: Vec::new(),
             suggested_pieces: Vec::new(),
             pipeline,
             ext_upload_only: 0,
@@ -145,6 +177,7 @@ impl PeerConn {
             metadata_size: None,
             local_ut_metadata: 1,
             local_ut_pex: 2,
+            local_ut_holepunch: 3,
             superseed_piece: None,
             remote_upload_only: false,
             client_version: Vec::new(),
@@ -167,6 +200,15 @@ impl PeerConn {
             supports_fast: false,
             supports_dht: false,
             local_dont_have: 3,
+            ext_i2p_pex: 0,
+            local_i2p_pex: crate::i2p_pex::I2P_PEX_ID,
+            i2p: None,
+            outgoing: false,
+            connecting: true,
+            handshake_done: false,
+            received_listen_port: false,
+            i2p_pex: crate::i2p_pex::I2pPexPeerState::new(),
+            protocol_v2: false,
             we_sent_interested: false,
             last_unchoke: std::time::Instant::now(),
             now_ms,
@@ -245,6 +287,90 @@ impl PeerConn {
     /// `incoming_allowed_fast` — BEP-6 allowed-fast.
     pub fn on_allowed_fast(&mut self, index: PieceIndex) {
         self.allowed_fast.push(index);
+    }
+
+    /// `send_allowed_set` — deterministic BEP-6 allowed-fast set.
+    /// Upstream hashes `remote-addr-bytes ‖ info-hash` with SHA-1 and
+    /// consumes the digest 32 bits at a time modulo `num_pieces`,
+    /// rehashing on exhaustion; pieces the peer already has are
+    /// skipped (no point offering them). Returns the `AllowedFast`
+    /// messages to write. Callers pass the same gating upstream does:
+    /// `valid_metadata`, `!super_seeding`, `!upload_only`.
+    pub fn send_allowed_set(
+        &mut self,
+        info_hash: &bitdaemon_common::Sha1Hash,
+        num_pieces: i32,
+        set_size: i32,
+        valid_metadata: bool,
+        super_seeding: bool,
+        upload_only: bool,
+    ) -> Vec<PeerMessage> {
+        let mut out = Vec::new();
+        if !valid_metadata || super_seeding || upload_only || set_size <= 0 || num_pieces <= 0 {
+            return out;
+        }
+        if i64::from(set_size) >= i64::from(num_pieces) {
+            // more fast slots than pieces — offer everything the
+            // peer lacks.
+            for i in 0..num_pieces {
+                let idx = PieceIndex(i);
+                if self.has_piece(idx) || self.accept_fast.contains(&idx) {
+                    continue;
+                }
+                self.accept_fast.push(idx);
+                self.accept_fast_piece_cnt.push(0);
+                out.push(PeerMessage::AllowedFast(idx));
+            }
+            return out;
+        }
+
+        let mut x: Vec<u8> = match self.remote {
+            Some(std::net::SocketAddr::V4(a)) => a.ip().octets().to_vec(),
+            Some(std::net::SocketAddr::V6(a)) => a.ip().octets().to_vec(),
+            None => Vec::new(),
+        };
+        x.extend_from_slice(info_hash.as_bytes());
+
+        let mut hash = sha1::Sha1::new();
+        hash.update(&x);
+        let mut digest: [u8; 20] = hash.finalize().into();
+
+        let mut attempts = 0i32;
+        let mut loops = 0i32;
+        loop {
+            let mut off = 0usize;
+            while off + 4 <= digest.len() {
+                loops += 1;
+                let w = u32::from_be_bytes([
+                    digest[off],
+                    digest[off + 1],
+                    digest[off + 2],
+                    digest[off + 3],
+                ]);
+                off += 4;
+                let piece = PieceIndex((w % num_pieces as u32) as i32);
+                if self.accept_fast.contains(&piece) {
+                    // safety-net to terminate under the worst hash
+                    // collisions (upstream `++loops > 500`).
+                    if loops > 500 {
+                        return out;
+                    }
+                    continue;
+                }
+                if !self.has_piece(piece) {
+                    self.accept_fast.push(piece);
+                    self.accept_fast_piece_cnt.push(0);
+                    out.push(PeerMessage::AllowedFast(piece));
+                }
+                attempts += 1;
+                if attempts >= set_size {
+                    return out;
+                }
+            }
+            let mut h = sha1::Sha1::new();
+            h.update(digest);
+            digest = h.finalize().into();
+        }
     }
 
     /// `incoming_dont_have`.
@@ -360,7 +486,16 @@ impl PeerConn {
                 }
                 eff.push(PeerEffect::RefcountInc(i));
             }
-            M::HaveAll => self.on_have_all(),
+            M::HaveAll => {
+                self.on_have_all();
+                // `peer_has_all` → `inc_refcount_all`: the peer is a
+                // seed; skip it in the refcount or `dec_refcount`
+                // underflows `m_seeds` on disconnect.
+                let mut bf = bitdaemon_common::Bitfield::with_size(num_pieces.max(0) as usize);
+                bf.set_all();
+                eff.push(PeerEffect::RefcountBulk(bf, true));
+                eff.push(PeerEffect::MaybePick);
+            }
             M::HaveNone => self.on_have_none(),
             M::Bitfield(ref bits) => {
                 match bitdaemon_common::Bitfield::from_bytes(bits, num_pieces.max(0) as usize) {
@@ -429,6 +564,7 @@ impl PeerConn {
                         self.ext_ut_metadata =
                             hs.messages.get("ut_metadata").copied().unwrap_or(0) as u8;
                         self.ext_ut_pex = hs.messages.get("ut_pex").copied().unwrap_or(0) as u8;
+                        self.ext_i2p_pex = hs.messages.get("i2p_pex").copied().unwrap_or(0) as u8;
                         self.metadata_size = hs.metadata_size;
                         self.remote_upload_only = hs.upload_only;
                         // `reqq` — the peer's max tolerated request
@@ -446,14 +582,14 @@ impl PeerConn {
                         // `source_peer`).
                         match hs.your_ip.as_deref() {
                             Some(ip) if ip.len() == 4 => {
-                                eff.push(PeerEffect::YourIp(std::net::IpAddr::from(
-                                    <[u8; 4]>::try_from(ip).expect("len 4"),
-                                )));
+                                if let Ok(a) = <[u8; 4]>::try_from(ip) {
+                                    eff.push(PeerEffect::YourIp(std::net::IpAddr::from(a)));
+                                }
                             }
                             Some(ip) if ip.len() == 16 => {
-                                eff.push(PeerEffect::YourIp(std::net::IpAddr::from(
-                                    <[u8; 16]>::try_from(ip).expect("len 16"),
-                                )));
+                                if let Ok(a) = <[u8; 16]>::try_from(ip) {
+                                    eff.push(PeerEffect::YourIp(std::net::IpAddr::from(a)));
+                                }
                             }
                             _ => {}
                         }
@@ -463,6 +599,16 @@ impl PeerConn {
                     eff.push(PeerEffect::MetadataPacket(data.to_vec()));
                 } else if id == self.local_ut_pex {
                     eff.push(PeerEffect::PexPacket(data.to_vec()));
+                } else if id == self.local_i2p_pex {
+                    eff.push(PeerEffect::I2pPexPacket(data.to_vec()));
+                } else if id == self.local_ut_holepunch {
+                    // `on_holepunch` — upstream drops the message when
+                    // the remote never advertised the extension.
+                    if self.ext_holepunch != 0
+                        && let Some(hp) = crate::ut_holepunch::decode_hp(data)
+                    {
+                        eff.push(PeerEffect::Holepunch(hp));
+                    }
                 } else if id == self.local_dont_have && data.len() == 4 {
                     // `incoming_dont_have` — peer retracted a piece.
                     let i = PieceIndex(i32::from_be_bytes([data[0], data[1], data[2], data[3]]));
@@ -669,9 +815,87 @@ pub enum PeerEffect {
     MetadataPacket(Vec<u8>),
     /// a `ut_pex` message body.
     PexPacket(Vec<u8>),
+    /// an `i2p_pex` message body (32-byte destination hashes).
+    I2pPexPacket(Vec<u8>),
+    /// `ut_holepunch` message (BEP-55) — caller routes it through
+    /// `ut_holepunch::{rendezvous, connect_allowed}`.
+    Holepunch(crate::ut_holepunch::Hp),
     /// `yourip` from the BEP-10 handshake — the peer's view of our
     /// external address (`ip_voter` `source_peer`).
     YourIp(std::net::IpAddr),
     /// protocol violation — drop the connection.
     Disconnect(&'static str),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitdaemon_common::Sha1Hash;
+    use bitdaemon_net::peer_wire::PeerMessage;
+
+    fn conn(remote: &str) -> PeerConn {
+        let mut c = PeerConn::new(100, PeerPipeline::new(1000, 30, 250), 0);
+        c.remote = Some(remote.parse().unwrap());
+        c
+    }
+
+    #[test]
+    fn allowed_set_deterministic_and_bounded() {
+        let ih = Sha1Hash::from_bytes(&[7u8; 20]).unwrap();
+        let mut a = conn("1.2.3.4:6881");
+        let mut b = conn("1.2.3.4:6881");
+        let sa = a.send_allowed_set(&ih, 100, 5, true, false, false);
+        let sb = b.send_allowed_set(&ih, 100, 5, true, false, false);
+        assert_eq!(sa, sb);
+        assert!(!sa.is_empty());
+        assert!(sa.len() <= 5);
+        // different addr → different set
+        let mut c = conn("5.6.7.8:6881");
+        let sc = c.send_allowed_set(&ih, 100, 5, true, false, false);
+        assert_ne!(sa, sc);
+    }
+
+    #[test]
+    fn allowed_set_skips_peer_pieces_and_gates() {
+        let ih = Sha1Hash::from_bytes(&[9u8; 20]).unwrap();
+        let mut c = conn("1.2.3.4:6881");
+        // no metadata → nothing
+        assert!(
+            c.send_allowed_set(&ih, 100, 5, false, false, false)
+                .is_empty()
+        );
+        // super-seeding → nothing
+        assert!(
+            c.send_allowed_set(&ih, 100, 5, true, true, false)
+                .is_empty()
+        );
+        // upload-only → nothing
+        assert!(
+            c.send_allowed_set(&ih, 100, 5, true, false, true)
+                .is_empty()
+        );
+        // set_size <= 0 → nothing
+        assert!(
+            c.send_allowed_set(&ih, 100, 5, true, false, true)
+                .is_empty()
+        );
+        // peer has every piece → nothing offered
+        c.peer_pieces.set_all();
+        assert!(
+            c.send_allowed_set(&ih, 100, 5, true, false, false)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn allowed_set_larger_than_torrent() {
+        let ih = Sha1Hash::from_bytes(&[1u8; 20]).unwrap();
+        let mut c = conn("9.9.9.9:1");
+        let msgs = c.send_allowed_set(&ih, 3, 10, true, false, false);
+        assert_eq!(msgs.len(), 3);
+        assert!(
+            msgs.iter()
+                .all(|m| matches!(m, PeerMessage::AllowedFast(_)))
+        );
+    }
 }

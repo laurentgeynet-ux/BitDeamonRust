@@ -112,7 +112,7 @@ fn anti_leech_less(a: &ChokePeer, b: &ChokePeer) -> std::cmp::Ordering {
     let s1 = anti_leech_score(a) as f64 * a.priority;
     let s2 = anti_leech_score(b) as f64 * b.priority;
     if (s1 - s2).abs() > f64::EPSILON {
-        return s2.partial_cmp(&s1).unwrap();
+        return s2.partial_cmp(&s1).unwrap_or(std::cmp::Ordering::Equal);
     }
     a.last_unchoke.cmp(&b.last_unchoke)
 }

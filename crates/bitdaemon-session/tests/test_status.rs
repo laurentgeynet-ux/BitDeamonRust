@@ -43,7 +43,11 @@ fn status_snapshot() {
     };
     s.on_scrape_response(&ih, "http://tr/announce", Ok(resp));
 
-    let st = s.torrents.get(&ih).unwrap().status();
+    let st = s
+        .torrents
+        .get(&ih)
+        .unwrap()
+        .status(&s.settings, s.queue_position(&ih));
     assert_eq!(st.state, TorrentState::Downloading);
     assert_eq!(st.name, "swarm-x");
     assert_eq!(st.save_path, "/dl");

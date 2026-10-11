@@ -95,7 +95,9 @@ pub fn build_pex_message(
     }
 
     let mut e = Entry::Dict(Default::default());
-    let d = e.dict_mut().expect("dict");
+    let Ok(d) = e.dict_mut() else {
+        return (Vec::new(), prev_sent.clone());
+    };
     d.insert(b"added".to_vec(), Entry::String(added));
     d.insert(b"added.f".to_vec(), Entry::String(added_f));
     d.insert(b"dropped".to_vec(), Entry::String(dropped));

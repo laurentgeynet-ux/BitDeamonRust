@@ -175,6 +175,14 @@ pub enum Alert {
     CacheFlushed(Sha1Hash),
     /// `session_error_alert`.
     SessionError(String),
+    /// `dht_stats_alert` — routing-table snapshot on
+    /// `session_handle::post_dht_stats`.
+    DhtStats {
+        /// v4 table `(nodes, replacements, confirmed)`.
+        v4: (usize, usize, usize),
+        /// v6 table `(nodes, replacements, confirmed)`.
+        v6: (usize, usize, usize),
+    },
 }
 
 impl Alert {
@@ -207,7 +215,7 @@ impl Alert {
             | Self::TrackerReply { .. }
             | Self::ScrapeReply { .. }
             | Self::ScrapeFailed { .. } => AlertCategory::TRACKER,
-            Self::DhtPacket { .. } => AlertCategory::DHT,
+            Self::DhtPacket { .. } | Self::DhtStats { .. } => AlertCategory::DHT,
             Self::Performance { .. } => AlertCategory::PERFORMANCE,
             Self::SaveResumeData { .. } => AlertCategory::STORAGE,
             Self::SessionError(_) => AlertCategory::ERROR,
@@ -273,6 +281,17 @@ impl AlertManager {
     /// `apply_settings` (upstream `update_alert_queue_size`).
     pub fn set_queue_limit(&mut self, limit: usize) {
         self.queue_limit = limit;
+    }
+
+    /// `set_alert_mask` — which categories get queued.
+    pub fn set_mask(&mut self, mask: AlertCategory) {
+        self.mask = mask;
+    }
+
+    /// `alert_manager::alert_mask`.
+    #[must_use]
+    pub fn mask(&self) -> AlertCategory {
+        self.mask
     }
 
     /// `set_notify_callback`.

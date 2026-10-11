@@ -560,3 +560,28 @@ fn session_state_roundtrip_settings() {
     assert!(set.anonymous_mode);
     assert_eq!(set.connections_limit, 200); // defaults preserved
 }
+
+#[test]
+fn seed_mode_leave_rechecks() {
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.seed_mode = true;
+    t.seed_verified = Bitfield::with_size(4);
+    t.seed_verifying = Bitfield::with_size(4);
+    t.seeding = true;
+    assert!(t.is_seed());
+    t.leave_seed_mode(true);
+    assert!(!t.seed_mode);
+    assert!(!t.is_seed());
+    assert_eq!(t.num_verified, 0);
+    // check_files path armed a full recheck
+    assert!(t.checking);
+    assert_eq!(t.checking_pieces, 4);
+    // skip_checking keeps claimed state
+    let mut t2 = mk_torrent(4);
+    t2.seed_mode = true;
+    t2.seeding = true;
+    t2.leave_seed_mode(false);
+    assert!(!t2.seed_mode);
+    assert!(!t2.checking);
+}

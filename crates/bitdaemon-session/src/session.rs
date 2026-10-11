@@ -72,6 +72,10 @@ pub enum SessionOut {
         /// announce parameters (event, counters, key).
         params: bitdaemon_net::tracker_client::AnnounceParams,
     },
+    /// `network_config_change_alert` — interfaces changed; the
+    /// driver re-runs listen setup (upstream `on_ip_change` →
+    /// `reopen_listen_sockets`).
+    InterfacesChanged,
     /// `scrape_tracker` — user-triggered scrape of one tracker
     /// entry; the driver runs the scrape exchange and reports via
     /// `Session::on_scrape_response`.
@@ -113,6 +117,48 @@ pub enum SessionOut {
 }
 
 /// `session_impl` — all state owned on one thread.
+/// Per-purpose proxy settings (`m_peer_proxy`/`m_tracker_proxy`/
+/// `m_web_seed_proxy`/`m_dht_proxy`/`m_i2p_proxy` upstream).
+#[derive(Clone, Debug, Default)]
+pub struct SessionProxies {
+    /// `settings_pack::proxy_*` — peer connections.
+    pub peer: bitdaemon_net::proxy::ProxySettings,
+    /// `tracker_proxy` — tracker announces.
+    pub tracker: bitdaemon_net::proxy::ProxySettings,
+    /// `web_seed_proxy`.
+    pub web_seed: bitdaemon_net::proxy::ProxySettings,
+    /// `dht_proxy`.
+    pub dht: bitdaemon_net::proxy::ProxySettings,
+    /// `i2p_proxy` — SAM bridge address.
+    pub i2p: bitdaemon_net::proxy::ProxySettings,
+}
+
+/// `start_*`/`stop_*` service switches (upstream tears down and
+/// rebuilds `m_natpmp`/`m_upnp`/`m_lsd` objects; we keep the objects
+/// and gate their ticks — same observable behavior).
+#[derive(Clone, Debug)]
+pub struct ServiceSwitches {
+    /// `start_dht`/`stop_dht`.
+    pub dht: bool,
+    /// `start_lsd`/`stop_lsd` — LSD multicast announces gated.
+    pub lsd: bool,
+    /// `start_natpmp`/`stop_natpmp`.
+    pub natpmp: bool,
+    /// `start_upnp`/`stop_upnp`.
+    pub upnp: bool,
+}
+
+impl Default for ServiceSwitches {
+    fn default() -> Self {
+        Self {
+            dht: true,
+            lsd: true,
+            natpmp: true,
+            upnp: true,
+        }
+    }
+}
+
 pub struct Session {
     /// `m_torrents` by info_hash.
     pub torrents: BTreeMap<Sha1Hash, Torrent>,
@@ -129,6 +175,23 @@ pub struct Session {
     pub peer_id: bitdaemon_common::PeerId,
     /// `m_listen_port` — our listen port (`announce request.port`).
     pub listen_port: u16,
+    /// `m_ssl_listen_port` — advertised SSL listen port
+    /// (`ssl_listen_port` upstream; SSL sockets share the listen set).
+    pub ssl_listen_port: u16,
+    /// `m_listen_sockets` — one per listen interface; the session's
+    /// single-socket default holds the bound port. Handles resolve
+    /// against this vec (`weak_ptr<listen_socket_t>` upstream).
+    pub listen_sockets: Vec<crate::listen::ListenSocket>,
+    /// `m_udp_sockets` — `session_udp_socket` per listen socket.
+    pub udp_sockets: Vec<crate::listen::SessionUdpSocket>,
+    /// `m_ip_notifier` — interface-change detector polled in tick.
+    pub ip_notifier: bitdaemon_net::enum_net::IpNotifier,
+    /// `reopen_network_sockets` pending flag — emitted as
+    /// `SessionOut::InterfacesChanged` on the next `tick`.
+    pub reopen_sockets: bool,
+    /// `settings_pack::half_open_limit` — cap on half-open TCP
+    /// connects (-1 = unlimited, upstream default).
+    pub half_open_limit: i32,
     /// `m_key` — announce key (per-session random, BEP-7).
     pub key: i32,
     /// completions pushed by disk-job callbacks (any thread).
@@ -147,6 +210,29 @@ pub struct Session {
     pub session_time: i32,
     /// `m_ip_filter` — access filter applied to new + existing peers.
     ip_filter: bitdaemon_net::ip_filter::IpFilter,
+    /// `m_paused` — session-wide pause (upstream pauses via
+    /// `session_handle::pause()` → every torrent).
+    pub paused: bool,
+    /// `m_classes` — the session's `peer_class_pool`.
+    pub peer_class_pool: bitdaemon_net::peer_class::PeerClassPool,
+    /// `m_peer_class_filter` — upstream types it as `ip_filter`
+    /// (IP ranges map to peer classes).
+    pub peer_class_filter: bitdaemon_net::ip_filter::IpFilter,
+    /// `m_peer_class_type_filter` — socket-type → class mapping.
+    pub peer_class_type_filter: bitdaemon_net::peer_class::PeerClassTypeFilter,
+    /// `m_port_filter` — `session_handle::set_port_filter`; applied
+    /// to incoming + outgoing peers (`port_filter_updated` upstream).
+    pub port_filter: bitdaemon_net::ip_filter::PortFilter,
+    /// session-level peer class (`peer_class_t` seeding
+    /// `setup_peer_class`) — the class new connections inherit.
+    pub session_class: bitdaemon_net::peer_class::PeerClassIndex,
+    /// per-purpose proxies (`m_peer_proxy`, `m_tracker_proxy`,
+    /// `m_web_seed_proxy`, `m_dht_proxy`, `m_i2p_proxy` upstream).
+    pub proxies: SessionProxies,
+    /// `m_pe_settings` — MSE/PE crypto policy (`pe_settings`).
+    pub pe_settings: bitdaemon_net::pe_crypto::PeSettings,
+    /// `m_natpmp`/`m_upnp`/`m_lsd`/`m_dht` service switches.
+    pub services: ServiceSwitches,
     /// `settings_pack` — typed session knobs (`m_settings` upstream).
     pub settings: crate::settings::SessionSettings,
     /// `m_ip_voter` — external-address voting (DHT `ip`, tracker
@@ -155,6 +241,9 @@ pub struct Session {
     /// `(v6, lookup idx)` → info_hash — maps DHT traversal events
     /// back to the torrent they serve.
     dht_lookup_map: std::collections::BTreeMap<(bool, usize), Sha1Hash>,
+    /// `(v6, lookup idx)` → pending BEP-44 immutable `put` value —
+    /// consumed when the `get` traversal completes (`put_data`).
+    dht_pending_put: std::collections::BTreeMap<(bool, usize), Vec<u8>>,
     /// `external_udp_port()` — the port our DHT socket listens on,
     /// advertised to peers via the `port` message (BEP-5 §port).
     pub dht_port: Option<u16>,
@@ -284,6 +373,34 @@ impl Default for Session {
             counters: Counters::default(),
             peer_id: bitdaemon_common::peer_id::generate_peer_id(b"-OB0001-"),
             listen_port: 6881,
+            ssl_listen_port: 4433,
+            listen_sockets: {
+                // default single IPv4-unspecified listen socket —
+                // `setup_listener` expands `listen_interfaces` into
+                // one per interface; transports bind externally.
+                let s = crate::listen::ListenSocket::new(
+                    std::net::SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        6881,
+                    ),
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    String::new(),
+                );
+                vec![s]
+            },
+            udp_sockets: Vec::new(),
+            paused: false,
+            peer_class_pool: bitdaemon_net::peer_class::PeerClassPool::new(),
+            peer_class_filter: bitdaemon_net::ip_filter::IpFilter::new(),
+            peer_class_type_filter: bitdaemon_net::peer_class::PeerClassTypeFilter::default(),
+            port_filter: bitdaemon_net::ip_filter::PortFilter::new(),
+            session_class: 0,
+            proxies: SessionProxies::default(),
+            pe_settings: bitdaemon_net::pe_crypto::PeSettings::default(),
+            services: ServiceSwitches::default(),
+            ip_notifier: bitdaemon_net::enum_net::IpNotifier::new(),
+            reopen_sockets: false,
+            half_open_limit: -1,
             key: {
                 use rand::Rng as _;
                 rand::rng().random::<i32>()
@@ -296,6 +413,7 @@ impl Default for Session {
             settings: crate::settings::SessionSettings::default(),
             ip_voter: bitdaemon_net::ip_voter::IpVoter::new(),
             dht_lookup_map: std::collections::BTreeMap::new(),
+            dht_pending_put: std::collections::BTreeMap::new(),
             dht_port: None,
             dht_last_announce: std::collections::BTreeMap::new(),
             auto_manage_scaler: 0,
@@ -316,6 +434,26 @@ impl Session {
     #[must_use]
     pub fn disk_completions(&self) -> std::sync::mpsc::Sender<DiskCompleted> {
         self.disk_tx.clone()
+    }
+
+    /// `session_impl::set_listen_port` — keep `listen_port` and the
+    /// primary `listen_socket_t` in lockstep (upstream derives the
+    /// port from the sockets; we keep the flat field too).
+    pub fn set_listen_port(&mut self, port: u16) {
+        self.listen_port = port;
+        if let Some(s) = self.listen_sockets.first_mut() {
+            s.local_endpoint.set_port(port);
+            s.original_port = port;
+        }
+    }
+
+    /// `m_listen_sockets` handles — one per interface.
+    #[must_use]
+    pub fn listen_socket_handles(&self) -> Vec<crate::listen::ListenSocketHandle> {
+        self.listen_sockets
+            .iter()
+            .map(crate::listen::ListenSocketHandle::new)
+            .collect()
     }
 
     /// `on_disk_*` — drain completed disk jobs into swarm effects.
@@ -482,15 +620,22 @@ impl Session {
                     }
                 }
                 DiskCompleted::CheckFiles { ih, accepted, err } => {
-                    self.alerts.post(Alert::TorrentChecked(ih));
                     // `torrent::files_checked`: resume accepted → the
-                    // optimistic `have` bits stand; rejected → drop
-                    // them (upstream `need_full_check` → per-piece
-                    // re-hash, driven by the caller scheduling
-                    // `DiskHash` jobs or `check_files` again).
+                    // optimistic `have` bits stand; rejected →
+                    // `need_full_check`: per-piece `disk_hash` jobs
+                    // re-verify everything (the `TorrentChecked`
+                    // alert fires when `checking_pieces` drains).
                     let mut eff = Vec::new();
+                    let ok = err.is_ok() && accepted;
                     if let Some(t) = self.torrents.get_mut(&ih) {
-                        t.on_files_checked(err.is_ok() && accepted, &mut eff);
+                        t.on_files_checked(ok, &mut eff);
+                        if !ok && t.arm_full_recheck() > 0 {
+                            for p in 0..t.num_pieces {
+                                eff.push(TorrentEffect::DiskHash {
+                                    piece: bitdaemon_common::types::PieceIndex(p),
+                                });
+                            }
+                        }
                     }
                     if err.is_err() {
                         self.alerts.post(Alert::FileError {
@@ -725,6 +870,17 @@ impl Session {
                 });
             }
         }
+        // upstream `torrent::init` → `start_checking`: every add
+        // goes through `check_fastresume`; seed_mode trusts the
+        // resume bits blind, a rejected verdict falls through to
+        // the per-piece full recheck in `DiskCompleted::CheckFiles`.
+        if atp.ti.is_some()
+            && !atp
+                .flags
+                .contains(bitdaemon_common::flags::TorrentFlags::SEED_MODE)
+        {
+            self.check_files(ih, Some(Box::new(atp.clone())));
+        }
         Some(ih)
     }
 
@@ -732,8 +888,8 @@ impl Session {
     /// every tracker that saw a `started` (upstream sends it on
     /// graceful shutdown/removal), then drop the swarm.
     pub fn remove_torrent(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) -> Option<Torrent> {
-        if let Some(t) = self.torrents.get(ih) {
-            self.announce_stopped(t, out);
+        if let Some(t) = self.torrents.get_mut(ih) {
+            Self::announce_stopped(t, self.peer_id, self.listen_port, self.key, out);
         }
         let removed = self.torrents.remove(ih);
         if let Some(t) = &removed {
@@ -759,8 +915,8 @@ impl Session {
             t.paused = paused;
         }
         if paused {
-            if let Some(t) = self.torrents.get(ih) {
-                self.announce_stopped(t, out);
+            if let Some(t) = self.torrents.get_mut(ih) {
+                Self::announce_stopped(t, self.peer_id, self.listen_port, self.key, out);
             }
         }
     }
@@ -780,7 +936,13 @@ impl Session {
 
     /// `torrent::do_pause`/`~torrent` — `stopped` for trackers that
     /// already announced `started`.
-    fn announce_stopped(&self, t: &Torrent, out: &mut Vec<SessionOut>) {
+    fn announce_stopped(
+        t: &mut Torrent,
+        peer_id: bitdaemon_common::PeerId,
+        port: u16,
+        key: i32,
+        out: &mut Vec<SessionOut>,
+    ) {
         for e in &t.trackers.trackers {
             let started = e
                 .endpoints
@@ -791,8 +953,9 @@ impl Session {
                     ih: t.info_hash,
                     url: e.url.clone(),
                     tracker_id: e.tracker_id.clone(),
-                    params: t.announce_params(self.peer_id, self.listen_port, 3, self.key),
+                    params: t.announce_params(peer_id, port, 3, key),
                 });
+                t.outstanding_announces += 1;
             }
         }
     }
@@ -918,15 +1081,15 @@ impl Session {
     pub fn on_peer_message(&mut self, p: &PeerPacket, out: &mut Vec<SessionOut>) {
         // `inc_stats_counter` per incoming message class
         match p.msg {
-            PeerMessage::Bitfield(_) => self.counters.inc(Counter::IncomingBitfield),
-            PeerMessage::Have(_) => self.counters.inc(Counter::IncomingHave),
-            PeerMessage::Request(_) => self.counters.inc(Counter::IncomingRequest),
-            PeerMessage::Piece { .. } => self.counters.inc(Counter::IncomingPiece),
-            PeerMessage::Cancel(_) => self.counters.inc(Counter::IncomingCancel),
-            PeerMessage::Choke => self.counters.inc(Counter::IncomingChoke),
-            PeerMessage::Unchoke => self.counters.inc(Counter::IncomingUnchoke),
-            PeerMessage::Interested => self.counters.inc(Counter::IncomingInterested),
-            PeerMessage::NotInterested => self.counters.inc(Counter::IncomingNotInterested),
+            PeerMessage::Bitfield(_) => self.counters.inc(Counter::NumIncomingBitfield),
+            PeerMessage::Have(_) => self.counters.inc(Counter::NumIncomingHave),
+            PeerMessage::Request(_) => self.counters.inc(Counter::NumIncomingRequest),
+            PeerMessage::Piece { .. } => self.counters.inc(Counter::NumIncomingPiece),
+            PeerMessage::Cancel(_) => self.counters.inc(Counter::NumIncomingCancel),
+            PeerMessage::Choke => self.counters.inc(Counter::NumIncomingChoke),
+            PeerMessage::Unchoke => self.counters.inc(Counter::NumIncomingUnchoke),
+            PeerMessage::Interested => self.counters.inc(Counter::NumIncomingInterested),
+            PeerMessage::NotInterested => self.counters.inc(Counter::NumIncomingNotInterested),
             _ => {}
         }
         let mut eff = Vec::new();
@@ -948,6 +1111,12 @@ impl Session {
         if let Some(t) = self.torrents.get_mut(ih) {
             let mut conn = conn;
             conn.remote = Some(remote);
+            // `peer_info::protocol_v2` — the handshake came in keyed
+            // by the torrent's v2 (SHA-256, truncated) info-hash.
+            conn.protocol_v2 =
+                t.ti.as_ref()
+                    .and_then(|ti| ti.info_hash_v2())
+                    .is_some_and(|v2| v2.as_bytes()[..20] == ih.as_bytes()[..]);
             t.peer_connected_addr(remote);
             // upstream `send_bitfield` on connect — super-seeding
             // hides the real bitfield and `have`s only the leaked
@@ -995,7 +1164,7 @@ impl Session {
                 self.route(*ih, eff, out);
             }
             let n = self.torrents.values().map(|t| t.peers.len() as i64).sum();
-            self.counters.set(Counter::PeersConnected, n);
+            self.counters.set(Counter::NumPeersConnected, n);
         }
     }
 
@@ -1041,7 +1210,7 @@ impl Session {
         if self.settings.anonymous_mode {
             return;
         }
-        let Some(t) = self.torrents.get(ih) else {
+        let Some(t) = self.torrents.get_mut(ih) else {
             return;
         };
         if t.private {
@@ -1058,6 +1227,7 @@ impl Session {
             };
             out.push(SessionOut::UdpPacket(pkt, to));
         }
+        t.lsd_announcing = true;
     }
 
     /// `torrent_handle::add_piece` — inject user-supplied piece
@@ -1129,7 +1299,35 @@ impl Session {
     ) {
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(ih) {
-            t.piece_verified(piece, passed, &mut eff);
+            // `smart_ban` bookkeeping rides the same path as upstream
+            // `on_piece_finished`/`on_piece_failed`: `addr` resolves a
+            // downloader's IP from its live connection; `read_digest`
+            // would re-read the block hash from disk — the disk job is
+            // async here, so we pass `None` (upstream treats a failed
+            // re-read identically: the suspicious peer goes unbanned
+            // until a later piece exposes it).
+            let piece_size = t
+                .files
+                .as_ref()
+                .map_or(t.piece_length, |f| i64::from(f.piece_size(piece)));
+            let addrs: std::collections::HashMap<u64, std::net::IpAddr> = t
+                .peers
+                .iter()
+                .filter_map(|(id, c)| c.remote.map(|a| (*id, a.ip())))
+                .collect();
+            t.piece_verified_ban(
+                piece,
+                piece_size,
+                passed,
+                &mut eff,
+                |peer| {
+                    addrs
+                        .get(&peer)
+                        .copied()
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+                },
+                |_| None,
+            );
             if t.recheck_piece_done() {
                 // `torrent_checked_alert` — last check piece landed.
                 self.alerts.post(Alert::TorrentChecked(*ih));
@@ -1214,7 +1412,9 @@ impl Session {
             self.remove_torrent(ih, out);
             return;
         }
-        let disk = self.disk.clone().expect("checked");
+        let Some(disk) = self.disk.clone() else {
+            return;
+        };
         let tx = self.disk_tx.clone();
         let ih2 = *ih;
         // upstream `disk_io_thread` ordering: the delete job is
@@ -1308,6 +1508,128 @@ impl Session {
         self.ip_filter.access(addr)
     }
 
+    /// `session_impl::get_ip_filter`.
+    #[must_use]
+    pub fn ip_filter(&self) -> &bitdaemon_net::ip_filter::IpFilter {
+        &self.ip_filter
+    }
+
+    /// `session_handle::pause`/`resume` — upstream pauses the whole
+    /// session: every torrent is paused/resumed and the flag is
+    /// remembered for torrents added later.
+    pub fn set_session_paused(&mut self, paused: bool, out: &mut Vec<SessionOut>) {
+        if self.paused == paused {
+            return;
+        }
+        self.paused = paused;
+        let ihs: Vec<Sha1Hash> = self.torrents.keys().copied().collect();
+        for ih in ihs {
+            self.set_paused(&ih, paused, out);
+        }
+    }
+
+    /// `session_impl::is_paused`.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// `session_impl::create_peer_class` — allocate a class in
+    /// `m_classes` (upstream `peer_class_pool::new_peer_class`).
+    pub fn create_peer_class(&mut self, label: &str) -> bitdaemon_net::peer_class::PeerClassIndex {
+        self.peer_class_pool.new_peer_class(label)
+    }
+
+    /// `session_impl::delete_peer_class` — `peer_class_pool::decref`.
+    pub fn delete_peer_class(&mut self, c: bitdaemon_net::peer_class::PeerClassIndex) {
+        self.peer_class_pool.decref(c);
+    }
+
+    /// `session_impl::set_peer_class_filter` (`ip_filter` of ranges
+    /// mapping to classes).
+    pub fn set_peer_class_filter(&mut self, f: bitdaemon_net::ip_filter::IpFilter) {
+        self.peer_class_filter = f;
+    }
+
+    /// `session_impl::get_peer_class_filter`.
+    #[must_use]
+    pub fn peer_class_filter(&self) -> &bitdaemon_net::ip_filter::IpFilter {
+        &self.peer_class_filter
+    }
+
+    /// `session_impl::set_peer_class_type_filter`.
+    pub fn set_peer_class_type_filter(
+        &mut self,
+        f: bitdaemon_net::peer_class::PeerClassTypeFilter,
+    ) {
+        self.peer_class_type_filter = f;
+    }
+
+    /// `session_impl::get_peer_class_type_filter`.
+    #[must_use]
+    pub fn peer_class_type_filter(&self) -> &bitdaemon_net::peer_class::PeerClassTypeFilter {
+        &self.peer_class_type_filter
+    }
+
+    /// `session_impl::set_peer_id` — replaces the announce/handshake
+    /// fingerprint (`m_peer_id`).
+    pub fn set_peer_id(&mut self, id: bitdaemon_common::PeerId) {
+        self.peer_id = id;
+    }
+
+    /// `session_impl::set_key` — the tracker `key` token (upstream
+    /// `m_key`, regenerated when `key` setting changes).
+    pub fn set_key(&mut self, key: i32) {
+        self.key = key;
+    }
+
+    /// `session_handle::dht_put_item` (immutable overload) — BEP-44:
+    /// `target = sha1(value)`, run a `get` lookup, then `put` to the
+    /// token-holding responders when it completes (`put_data`).
+    /// Returns the item target key.
+    pub fn dht_put_item(&mut self, value: &[u8]) -> Sha1Hash {
+        use sha1::Digest as _;
+        let mut h = sha1::Sha1::new();
+        h.update(value);
+        let target = Sha1Hash::from_bytes(&h.finalize()).unwrap_or_default();
+        if let Some(n) = self.dht.get_node_mut(false) {
+            let idx = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetItem, target);
+            self.dht_pending_put.insert((false, idx), value.to_vec());
+        }
+        target
+    }
+
+    /// `session_impl::is_dht_running`.
+    #[must_use]
+    pub fn is_dht_running(&self) -> bool {
+        self.dht.get_node(false).is_some() || self.dht.get_node(true).is_some()
+    }
+
+    /// `session_handle::dht_state` — serialize live DHT state.
+    #[must_use]
+    pub fn dht_state(&self) -> bitdaemon_dht::dht_state::DhtState {
+        let mut st = bitdaemon_dht::dht_state::DhtState::default();
+        for v6 in [false, true] {
+            if let Some(n) = self.dht.get_node(v6) {
+                let s = n.dht_state();
+                st.nodes.extend(s.nodes);
+                st.nodes6.extend(s.nodes6);
+                st.nids.extend(s.nids);
+            }
+        }
+        st
+    }
+
+    /// `session_handle::dht_live_nodes` — nodes that answered us
+    /// recently on the given info-hash lookup.
+    #[must_use]
+    pub fn dht_live_nodes(&self, ih: &Sha1Hash) -> Vec<std::net::SocketAddr> {
+        self.dht
+            .get_node(false)
+            .map(|n| n.live_nodes_for(ih))
+            .unwrap_or_default()
+    }
+
     /// `apply_settings_pack` — hot-swap the settings bag. Upstream
     /// re-reads everything lazily; we mirror that by replacing the
     /// struct (all reads go through `self.settings`).
@@ -1381,7 +1703,7 @@ impl Session {
     /// torrent, one datagram per multicast group.
     pub fn lsd_tick(&mut self, now: Instant, out: &mut Vec<SessionOut>) {
         // anonymous sessions must not broadcast info-hashes to the LAN
-        if self.settings.anonymous_mode {
+        if self.settings.anonymous_mode || !self.services.lsd {
             return;
         }
         const LSD_INTERVAL: Duration = Duration::from_secs(300);
@@ -1392,10 +1714,11 @@ impl Session {
             return;
         }
         self.last_lsd = Some(now);
-        for t in self.torrents.values() {
-            if t.private {
+        for t in self.torrents.values_mut() {
+            if t.private || !t.announce_lsd || t.paused {
                 continue;
             }
+            t.lsd_announcing = true;
             let hex = bitdaemon_common::hex::to_hex(t.info_hash.as_bytes());
             for v6 in [false, true] {
                 let pkt = bitdaemon_net::lsd::render_lsd_packet(
@@ -1427,6 +1750,12 @@ impl Session {
             self.manage_queue(dl, sd);
         }
         self.drain_disk_completed(out);
+        // `session_impl` ip notifier — interface changes re-open
+        // listen sockets upstream; here the driver owns sockets so
+        // we surface the event.
+        if self.ip_notifier.poll() || std::mem::take(&mut self.reopen_sockets) {
+            out.push(SessionOut::InterfacesChanged);
+        }
         let wait = self.dht.tick();
         self.dht_announce_tick();
         self.dht_drain_events();
@@ -1503,7 +1832,7 @@ impl Session {
     /// `get_peers` traversal on each bound node family.
     fn dht_announce_tick(&mut self) {
         const DHT_ANNOUNCE_INTERVAL: i32 = 15 * 60;
-        if !self.settings.dht_enabled || self.settings.anonymous_mode {
+        if !self.settings.dht_enabled || !self.services.dht || self.settings.anonymous_mode {
             return;
         }
         let ihs: Vec<Sha1Hash> = self
@@ -1512,6 +1841,7 @@ impl Session {
             .filter(|(ih, t)| {
                 t.want_peers()
                     && !t.private
+                    && t.announce_dht
                     && self
                         .dht_last_announce
                         .get(ih)
@@ -1529,6 +1859,9 @@ impl Session {
     /// lookup id for reply routing.
     fn dht_announce_one(&mut self, ih: Sha1Hash) {
         self.dht_last_announce.insert(ih, self.session_time);
+        if let Some(t) = self.torrents.get_mut(&ih) {
+            t.dht_announcing = true;
+        }
         for v6 in [false, true] {
             if let Some(n) = self.dht.get_node_mut(v6) {
                 let li = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetPeers, ih);
@@ -1541,6 +1874,7 @@ impl Session {
     /// (private torrents still never touch the DHT).
     pub fn force_dht_announce(&mut self, ih: &Sha1Hash) {
         if !self.settings.dht_enabled
+            || !self.services.dht
             || self.settings.anonymous_mode
             || self.torrents.get(ih).is_none_or(|t| t.private)
         {
@@ -1574,6 +1908,7 @@ impl Session {
                 tracker_id: e.tracker_id.clone(),
                 params: t.announce_params(pid, port, 0, key),
             });
+            t.outstanding_announces += 1;
         }
     }
 
@@ -1604,6 +1939,16 @@ impl Session {
                         }
                     }
                     DhtEvent::Done { lookup, tokens } => {
+                        // `put_data` second phase — a `dht_put_item`
+                        // GetItem finished: write to token-holders.
+                        if let Some(value) = self.dht_pending_put.remove(&(v6, lookup)) {
+                            let targets: Vec<(SocketAddr, Vec<u8>)> =
+                                tokens.iter().map(|(_, ep, t)| (*ep, t.clone())).collect();
+                            if !targets.is_empty() {
+                                n.put(&value, None, targets);
+                            }
+                            continue;
+                        }
                         let Some(ih) = self.dht_lookup_map.remove(&(v6, lookup)) else {
                             continue;
                         };
@@ -1621,7 +1966,17 @@ impl Session {
                         n.announce(&ih, port, seed, false, &addrs, |id| {
                             tok_map.get(id).cloned()
                         });
+                        // no more get_peers lookups for `ih` → the
+                        // announce round is over.
+                        if !self.dht_lookup_map.values().any(|v| *v == ih) {
+                            if let Some(t) = self.torrents.get_mut(&ih) {
+                                t.dht_announcing = false;
+                            }
+                        }
                     }
+                    // `direct_request` replies surface to the
+                    // session owner — nothing consumes them yet.
+                    DhtEvent::Direct { .. } => {}
                 }
             }
         }
@@ -1733,6 +2088,7 @@ impl Session {
                         let n = data.len() as i64;
                         c.stat_up_total += n;
                         c.stat_up_round += n;
+                        t.last_payload_up = Some(std::time::Instant::now());
                     }
                     out.push(SessionOut::ToPeer { ih, peer, msg });
                 }
@@ -1776,7 +2132,7 @@ impl Session {
                     // BEP-21, plus a `completed` announce to
                     // trackers that saw `started`.
                     self.alerts.post(Alert::TorrentFinished(ih));
-                    if let Some(t) = self.torrents.get(&ih) {
+                    if let Some(t) = self.torrents.get_mut(&ih) {
                         for e in &t.trackers.trackers {
                             let started = e
                                 .endpoints
@@ -1794,6 +2150,7 @@ impl Session {
                                         self.key,
                                     ),
                                 });
+                                t.outstanding_announces += 1;
                             }
                         }
                     }
@@ -1830,7 +2187,7 @@ impl Session {
     ) {
         let (pid, port, key) = (self.peer_id, self.listen_port, self.key);
         for (ih, t) in &mut self.torrents {
-            if t.paused {
+            if t.paused || !t.announcing || !t.announce_trackers {
                 continue;
             }
             let is_seed = t.is_seed();
@@ -1842,6 +2199,7 @@ impl Session {
                     tracker_id: e.tracker_id.clone(),
                     params: t.announce_params(pid, port, event, key),
                 });
+                t.outstanding_announces += 1;
             }
         }
     }
@@ -1963,6 +2321,7 @@ impl Session {
         let Some(t) = self.torrents.get_mut(ih) else {
             return;
         };
+        t.outstanding_announces = (t.outstanding_announces - 1).max(0);
         let now = std::time::Instant::now();
         match resp {
             Ok(r) => {
@@ -2057,7 +2416,11 @@ impl Session {
     /// `state_update_alert` with one `torrent_status` per torrent
     /// (the `post_torrent_updates` call sites all want the full set).
     pub fn post_torrent_updates(&mut self) {
-        let statuses = self.torrents.values().map(Torrent::status).collect();
+        let statuses = self
+            .torrents
+            .iter()
+            .map(|(ih, t)| t.status(&self.settings, self.queue_position(ih)))
+            .collect();
         self.alerts.post(Alert::StateUpdate { statuses });
     }
 
@@ -2086,12 +2449,14 @@ impl Session {
             .filter(|t| !t.is_seed() && !t.paused)
             .count() as i64;
         let seeding = self.torrents.values().filter(|t| t.is_seed()).count() as i64;
-        self.counters
-            .set(crate::counters::Counter::DownloadingTorrents, downloading);
-        self.counters
-            .set(crate::counters::Counter::SeedingTorrents, seeding);
         self.counters.set(
-            crate::counters::Counter::PeersConnected,
+            crate::counters::Counter::NumDownloadingTorrents,
+            downloading,
+        );
+        self.counters
+            .set(crate::counters::Counter::NumSeedingTorrents, seeding);
+        self.counters.set(
+            crate::counters::Counter::NumPeersConnected,
             self.num_peers() as i64,
         );
         crate::counters::SessionStats::snapshot(&self.counters)

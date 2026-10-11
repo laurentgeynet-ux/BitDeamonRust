@@ -24,6 +24,72 @@ use crate::torrent::Torrent;
 /// `torrent_status` — re-export of the ported status snapshot.
 pub use crate::status::TorrentStatus;
 
+/// `peer_list_entry` — the value snapshot upstream returns from
+/// `get_full_peer_list` (endpoint + source + flags).
+#[derive(Clone, Debug)]
+pub struct PeerListEntry {
+    /// `ip` — remote endpoint (None for I2p destinations).
+    pub addr: Option<std::net::SocketAddr>,
+    /// `source` — `peer_source_flags_t` (tracker/dht/pex/lsd…).
+    pub source: bitdaemon_common::flags::PeerSourceFlags,
+    /// `peer_list_flags_t` bitfield.
+    pub flags: PeerListFlags,
+}
+
+bitdaemon_common::bitfield_flag! {
+    /// `peer_list_flags_t` — `peer_list_entry::flags`.
+    PeerListFlags, u32
+}
+
+impl PeerListFlags {
+    /// `connecting` — a connection attempt is in flight.
+    pub const CONNECTING: Self = Self::from_bits(0x1);
+    /// `banned`.
+    pub const BANNED: Self = Self::from_bits(0x2);
+    /// `rc4` — encrypted connection.
+    pub const RC4: Self = Self::from_bits(0x8);
+    /// `holepunch`.
+    pub const HOLEPUNCH: Self = Self::from_bits(0x10);
+    /// `i2p` — I2P destination.
+    pub const I2P: Self = Self::from_bits(0x20);
+    /// `utp` — uTP transport.
+    pub const UTP: Self = Self::from_bits(0x40);
+    /// `ssl` — TLS transport.
+    pub const SSL: Self = Self::from_bits(0x80);
+}
+
+impl From<&bitdaemon_net::torrent_peer::TorrentPeer> for PeerListEntry {
+    fn from(p: &bitdaemon_net::torrent_peer::TorrentPeer) -> Self {
+        let mut flags = PeerListFlags::NONE;
+        if p.banned {
+            flags |= PeerListFlags::BANNED;
+        }
+        if p.supports_holepunch {
+            flags |= PeerListFlags::HOLEPUNCH;
+        }
+        if p.supports_utp {
+            flags |= PeerListFlags::UTP;
+        }
+        let (addr, i2p) = match &p.addr {
+            bitdaemon_net::torrent_peer::PeerAddr::V4(a) => {
+                (Some(std::net::SocketAddr::new((*a).into(), p.port)), false)
+            }
+            bitdaemon_net::torrent_peer::PeerAddr::V6(a) => {
+                (Some(std::net::SocketAddr::new((*a).into(), p.port)), false)
+            }
+            bitdaemon_net::torrent_peer::PeerAddr::I2p(_) => (None, true),
+        };
+        if i2p {
+            flags |= PeerListFlags::I2P;
+        }
+        Self {
+            addr,
+            source: p.source,
+            flags,
+        }
+    }
+}
+
 /// lock with poison recovery — upstream has no poison concept; a
 /// panicked caller must not wedge the session actor.
 pub fn lock(s: &Mutex<Session>) -> MutexGuard<'_, Session> {
@@ -121,10 +187,10 @@ impl SessionHandle {
     /// `get_torrents` — one status per swarm.
     #[must_use]
     pub fn torrent_statuses(&self) -> Vec<TorrentStatus> {
-        lock(&self.inner)
-            .torrents
-            .values()
-            .map(Torrent::status)
+        let g = lock(&self.inner);
+        g.torrents
+            .iter()
+            .map(|(ih, t)| t.status(&g.settings, g.queue_position(ih)))
             .collect()
     }
 
@@ -177,6 +243,567 @@ impl SessionHandle {
     pub fn set_paused(&self, ih: &Sha1Hash, paused: bool) {
         lock(&self.inner).set_paused(ih, paused, &mut Vec::new());
     }
+
+    /// `session_handle::pause`/`resume` — session-wide pause.
+    pub fn pause(&self) {
+        lock(&self.inner).set_session_paused(true, &mut Vec::new());
+    }
+
+    /// `session_handle::resume` — unpauses the whole session.
+    pub fn resume(&self) {
+        lock(&self.inner).set_session_paused(false, &mut Vec::new());
+    }
+
+    /// `is_paused` — session-wide flag.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        lock(&self.inner).is_paused()
+    }
+
+    /// `is_listening` — at least one listen socket exists.
+    #[must_use]
+    pub fn is_listening(&self) -> bool {
+        !lock(&self.inner).listen_sockets.is_empty()
+    }
+
+    /// `is_dht_running`.
+    #[must_use]
+    pub fn is_dht_running(&self) -> bool {
+        lock(&self.inner).is_dht_running()
+    }
+
+    /// `get_torrents` — handles for every torrent in the session.
+    #[must_use]
+    pub fn get_torrents(&self) -> Vec<TorrentHandle> {
+        lock(&self.inner)
+            .torrents
+            .keys()
+            .map(|ih| TorrentHandle {
+                session: self.inner.clone(),
+                info_hash: *ih,
+            })
+            .collect()
+    }
+
+    /// `get_settings` — copy of the current `settings_pack`.
+    #[must_use]
+    pub fn get_settings(&self) -> crate::settings::SessionSettings {
+        lock(&self.inner).settings.clone()
+    }
+
+    /// `session_state` — the opaque `.session` blob for `load_state`.
+    #[must_use]
+    pub fn session_state(&self) -> Vec<u8> {
+        self.save_state_buf()
+    }
+
+    /// `write_session_params` — same serialized form (upstream
+    /// `write_session_params` → bencoded `session_state`).
+    #[must_use]
+    pub fn write_session_params(&self) -> Vec<u8> {
+        self.save_state_buf()
+    }
+
+    /// `set_alert_mask` / `get_alert_mask`.
+    pub fn set_alert_mask(&self, mask: crate::alerts::AlertCategory) {
+        lock(&self.inner).alerts.set_mask(mask);
+    }
+
+    /// `get_alert_mask`.
+    #[must_use]
+    pub fn get_alert_mask(&self) -> crate::alerts::AlertCategory {
+        lock(&self.inner).alerts.mask()
+    }
+
+    /// `set_alert_queue_size_limit`.
+    pub fn set_alert_queue_size_limit(&self, limit: usize) {
+        lock(&self.inner).alerts.set_queue_limit(limit);
+    }
+
+    /// `set_alert_notify` — `alert_manager::set_notify_callback`.
+    pub fn set_alert_notify(&self, cb: impl Fn() + Send + 'static) {
+        lock(&self.inner).alerts.set_notify(cb);
+    }
+
+    /// `wait_for_alert` — upstream blocks on the alert condvar. Our
+    /// actor is sync: poll for up to `max_wait` (callers wanting true
+    /// blocking should use [`set_alert_notify`](Self::set_alert_notify)
+    /// with their own waker).
+    #[must_use]
+    pub fn wait_for_alert(&self, max_wait: std::time::Duration) -> Option<crate::alerts::Alert> {
+        let deadline = std::time::Instant::now() + max_wait;
+        loop {
+            {
+                let mut s = lock(&self.inner);
+                let mut v = s.alerts.get_all();
+                if let Some(a) = v.pop() {
+                    return Some(a);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// `set_ip_filter` — swap and apply (disconnects banned peers).
+    pub fn set_ip_filter(&self, f: bitdaemon_net::ip_filter::IpFilter) {
+        lock(&self.inner).set_ip_filter(f, &mut Vec::new());
+    }
+
+    /// `get_ip_filter` — clone of the current filter.
+    #[must_use]
+    pub fn get_ip_filter(&self) -> bitdaemon_net::ip_filter::IpFilter {
+        lock(&self.inner).ip_filter().clone()
+    }
+
+    /// `session_handle` peer-class ops — `create_peer_class`.
+    pub fn create_peer_class(&self, label: &str) -> bitdaemon_net::peer_class::PeerClassIndex {
+        lock(&self.inner).create_peer_class(label)
+    }
+
+    /// `delete_peer_class`.
+    pub fn delete_peer_class(&self, c: bitdaemon_net::peer_class::PeerClassIndex) {
+        lock(&self.inner).delete_peer_class(c);
+    }
+
+    /// `set_peer_class_filter` — `ip_filter` mapping ranges to classes.
+    pub fn set_peer_class_filter(&self, f: bitdaemon_net::ip_filter::IpFilter) {
+        lock(&self.inner).set_peer_class_filter(f);
+    }
+
+    /// `get_peer_class_filter`.
+    #[must_use]
+    pub fn get_peer_class_filter(&self) -> bitdaemon_net::ip_filter::IpFilter {
+        lock(&self.inner).peer_class_filter().clone()
+    }
+
+    /// `set_peer_class_type_filter`.
+    pub fn set_peer_class_type_filter(&self, f: bitdaemon_net::peer_class::PeerClassTypeFilter) {
+        lock(&self.inner).set_peer_class_type_filter(f);
+    }
+
+    /// `get_peer_class_type_filter`.
+    #[must_use]
+    pub fn get_peer_class_type_filter(&self) -> bitdaemon_net::peer_class::PeerClassTypeFilter {
+        lock(&self.inner).peer_class_type_filter().clone()
+    }
+
+    /// `set_peer_id` — session announce/handshake fingerprint.
+    pub fn set_peer_id(&self, id: bitdaemon_common::PeerId) {
+        lock(&self.inner).set_peer_id(id);
+    }
+
+    /// `id()` upstream — current peer id.
+    #[must_use]
+    pub fn peer_id(&self) -> bitdaemon_common::PeerId {
+        lock(&self.inner).peer_id
+    }
+
+    /// `set_key` — tracker `key` token.
+    pub fn set_key(&self, key: i32) {
+        lock(&self.inner).set_key(key);
+    }
+
+    // ---- proxies (`set_proxy` covers `peer`; upstream splits per use)
+
+    /// `set_proxy` — the peer-connection proxy.
+    pub fn set_proxy(&self, p: bitdaemon_net::proxy::ProxySettings) {
+        lock(&self.inner).proxies.peer = p;
+    }
+
+    /// `proxy()`.
+    #[must_use]
+    pub fn proxy(&self) -> bitdaemon_net::proxy::ProxySettings {
+        lock(&self.inner).proxies.peer.clone()
+    }
+
+    /// `set_peer_proxy`.
+    pub fn set_peer_proxy(&self, p: bitdaemon_net::proxy::ProxySettings) {
+        lock(&self.inner).proxies.peer = p;
+    }
+
+    /// `peer_proxy`.
+    #[must_use]
+    pub fn peer_proxy(&self) -> bitdaemon_net::proxy::ProxySettings {
+        lock(&self.inner).proxies.peer.clone()
+    }
+
+    /// `set_tracker_proxy`.
+    pub fn set_tracker_proxy(&self, p: bitdaemon_net::proxy::ProxySettings) {
+        lock(&self.inner).proxies.tracker = p;
+    }
+
+    /// `tracker_proxy`.
+    #[must_use]
+    pub fn tracker_proxy(&self) -> bitdaemon_net::proxy::ProxySettings {
+        lock(&self.inner).proxies.tracker.clone()
+    }
+
+    /// `set_web_seed_proxy`.
+    pub fn set_web_seed_proxy(&self, p: bitdaemon_net::proxy::ProxySettings) {
+        lock(&self.inner).proxies.web_seed = p;
+    }
+
+    /// `web_seed_proxy`.
+    #[must_use]
+    pub fn web_seed_proxy(&self) -> bitdaemon_net::proxy::ProxySettings {
+        lock(&self.inner).proxies.web_seed.clone()
+    }
+
+    /// `set_dht_proxy`.
+    pub fn set_dht_proxy(&self, p: bitdaemon_net::proxy::ProxySettings) {
+        lock(&self.inner).proxies.dht = p;
+    }
+
+    /// `dht_proxy`.
+    #[must_use]
+    pub fn dht_proxy(&self) -> bitdaemon_net::proxy::ProxySettings {
+        lock(&self.inner).proxies.dht.clone()
+    }
+
+    /// `set_i2p_proxy` — SAM bridge endpoint.
+    pub fn set_i2p_proxy(&self, p: bitdaemon_net::proxy::ProxySettings) {
+        lock(&self.inner).proxies.i2p = p;
+    }
+
+    /// `i2p_proxy`.
+    #[must_use]
+    pub fn i2p_proxy(&self) -> bitdaemon_net::proxy::ProxySettings {
+        lock(&self.inner).proxies.i2p.clone()
+    }
+
+    /// `set_pe_settings` — MSE/PE crypto policy.
+    pub fn set_pe_settings(&self, s: bitdaemon_net::pe_crypto::PeSettings) {
+        lock(&self.inner).pe_settings = s;
+    }
+
+    /// `get_pe_settings`.
+    #[must_use]
+    pub fn get_pe_settings(&self) -> bitdaemon_net::pe_crypto::PeSettings {
+        lock(&self.inner).pe_settings
+    }
+
+    // ---- rate limits (`set_*_rate_limit` write the settings_pack fields)
+
+    /// `set_upload_rate_limit` (bytes/s, 0 = unlimited).
+    pub fn set_upload_rate_limit(&self, bytes_per_sec: i64) {
+        lock(&self.inner).settings.upload_rate_limit = bytes_per_sec;
+    }
+
+    /// `upload_rate_limit`.
+    #[must_use]
+    pub fn upload_rate_limit(&self) -> i64 {
+        lock(&self.inner).settings.upload_rate_limit
+    }
+
+    /// `set_download_rate_limit`.
+    pub fn set_download_rate_limit(&self, bytes_per_sec: i64) {
+        lock(&self.inner).settings.download_rate_limit = bytes_per_sec;
+    }
+
+    /// `download_rate_limit`.
+    #[must_use]
+    pub fn download_rate_limit(&self) -> i64 {
+        lock(&self.inner).settings.download_rate_limit
+    }
+
+    /// `set_max_connections` (`connections_limit`).
+    pub fn set_max_connections(&self, limit: i32) {
+        lock(&self.inner).settings.connections_limit = limit;
+    }
+
+    /// `max_connections`.
+    #[must_use]
+    pub fn max_connections(&self) -> i32 {
+        lock(&self.inner).settings.connections_limit
+    }
+
+    /// `set_max_uploads` (`unchoke_slots_limit`).
+    pub fn set_max_uploads(&self, limit: i32) {
+        lock(&self.inner).settings.unchoke_slots = limit;
+    }
+
+    /// `max_uploads`.
+    #[must_use]
+    pub fn max_uploads(&self) -> i32 {
+        lock(&self.inner).settings.unchoke_slots
+    }
+
+    // ---- service switches (`start_*`/`stop_*`)
+
+    /// `start_dht`.
+    pub fn start_dht(&self) {
+        lock(&self.inner).services.dht = true;
+    }
+
+    /// `stop_dht`.
+    pub fn stop_dht(&self) {
+        lock(&self.inner).services.dht = false;
+    }
+
+    /// `start_lsd`.
+    pub fn start_lsd(&self) {
+        lock(&self.inner).services.lsd = true;
+    }
+
+    /// `stop_lsd`.
+    pub fn stop_lsd(&self) {
+        lock(&self.inner).services.lsd = false;
+    }
+
+    /// `start_natpmp`.
+    pub fn start_natpmp(&self) {
+        lock(&self.inner).services.natpmp = true;
+    }
+
+    /// `stop_natpmp`.
+    pub fn stop_natpmp(&self) {
+        lock(&self.inner).services.natpmp = false;
+    }
+
+    /// `start_upnp`.
+    pub fn start_upnp(&self) {
+        lock(&self.inner).services.upnp = true;
+    }
+
+    /// `stop_upnp`.
+    pub fn stop_upnp(&self) {
+        lock(&self.inner).services.upnp = false;
+    }
+
+    // ---- DHT handle ops
+
+    /// `add_dht_node` / `add_dht_router` — seed the routing table.
+    pub fn add_dht_node(&self, addr: std::net::SocketAddr) {
+        lock(&self.inner).dht_add_node(addr);
+    }
+
+    /// `add_dht_router` — upstream treats routers the same as nodes
+    /// plus bootstrap priority; our `add_node` seeds equivalently.
+    pub fn add_dht_router(&self, addr: std::net::SocketAddr) {
+        lock(&self.inner).dht_add_node(addr);
+    }
+
+    /// `dht_get_peers` — start a `get_peers` traversal.
+    pub fn dht_get_peers(&self, ih: Sha1Hash) {
+        let mut s = lock(&self.inner);
+        if let Some(n) = s.dht.get_node_mut(false) {
+            n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetPeers, ih);
+        }
+    }
+
+    /// `dht_get_item` — BEP-44 immutable/mutable lookup (the `target`
+    /// is the item key / pubkey-derived target).
+    pub fn dht_get_item(&self, target: Sha1Hash) {
+        let mut s = lock(&self.inner);
+        if let Some(n) = s.dht.get_node_mut(false) {
+            n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetItem, target);
+        }
+    }
+
+    /// `dht_sample_infohashes` — BEP-51 traversal.
+    pub fn dht_sample_infohashes(&self, target: Sha1Hash) {
+        let mut s = lock(&self.inner);
+        if let Some(n) = s.dht.get_node_mut(false) {
+            n.new_lookup(bitdaemon_dht::lookups::LookupKind::SampleInfohashes, target);
+        }
+    }
+
+    /// `dht_live_nodes` — endpoints that answered the `get_peers`
+    /// lookup for `ih`.
+    #[must_use]
+    pub fn dht_live_nodes(&self, ih: &Sha1Hash) -> Vec<std::net::SocketAddr> {
+        lock(&self.inner).dht_live_nodes(ih)
+    }
+
+    /// `dht_state` — serialized live DHT state.
+    #[must_use]
+    pub fn dht_state(&self) -> bitdaemon_dht::dht_state::DhtState {
+        lock(&self.inner).dht_state()
+    }
+
+    /// `set_dht_state` — feed saved state into the routing table.
+    pub fn set_dht_state(&self, st: bitdaemon_dht::dht_state::DhtState) {
+        let mut s = lock(&self.inner);
+        if let Some(n) = s.dht.get_node_mut(false) {
+            n.load_state(&st);
+        }
+    }
+
+    /// `post_dht_stats` — routing-table snapshot routed as an alert
+    /// (upstream `dht_stats_alert`).
+    pub fn post_dht_stats(&self) {
+        let mut s = lock(&self.inner);
+        let v4 = s
+            .dht
+            .get_node(false)
+            .map(|n| n.table.size())
+            .unwrap_or_default();
+        let v6 = s
+            .dht
+            .get_node(true)
+            .map(|n| n.table.size())
+            .unwrap_or_default();
+        s.alerts.post(crate::alerts::Alert::DhtStats { v4, v6 });
+    }
+
+    /// `reopen_network_sockets` — flags a listener rebind; emitted
+    /// as `SessionOut::InterfacesChanged` on the next `tick`
+    /// (upstream `on_ip_change` → `reopen_listen_sockets`).
+    pub fn reopen_network_sockets(&self) {
+        lock(&self.inner).reopen_sockets = true;
+    }
+
+    /// `set_dht_storage` — upstream takes a `dht_storage_interface`
+    /// (custom DHT item/peer store); here the concrete
+    /// [`bitdaemon_dht::dht_storage::DhtStorage`] is swappable on the
+    /// bound node (same seam, concrete type since behavior is data).
+    pub fn set_dht_storage(&self, storage: bitdaemon_dht::dht_storage::DhtStorage) {
+        let mut s = lock(&self.inner);
+        for v6 in [false, true] {
+            if let Some(n) = s.dht.get_node_mut(v6) {
+                n.storage = storage.clone();
+            }
+        }
+    }
+
+    /// `listen_on` — replace the listen set with a single
+    /// `port_range` on `iface` (`use_interfaces` with one entry).
+    /// `port_range` is `(first, last)`; the first free port wins at
+    /// bind time — the engine owns the actual sockets.
+    pub fn listen_on(&self, port_range: (u16, u16), iface: &str) {
+        let mut s = lock(&self.inner);
+        s.listen_sockets = (port_range.0..=port_range.1.max(port_range.0))
+            .map(|p| {
+                crate::listen::ListenSocket::new(
+                    std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), p),
+                    std::net::Ipv4Addr::UNSPECIFIED.into(),
+                    iface.to_string(),
+                )
+            })
+            .collect();
+        s.listen_port = port_range.0;
+        s.reopen_sockets = true;
+    }
+
+    /// `use_interfaces` — replace the whole listen set
+    /// (`session_impl::update_listen_interfaces`).
+    pub fn use_interfaces(&self, sockets: Vec<crate::listen::ListenSocket>) {
+        let mut s = lock(&self.inner);
+        s.listen_sockets = sockets;
+        s.reopen_sockets = true;
+    }
+
+    /// `listen_port` — the announce `port` field.
+    #[must_use]
+    pub fn listen_port(&self) -> u16 {
+        lock(&self.inner).listen_port
+    }
+
+    /// `ssl_listen_port` — SSL-torrent listen port (upstream
+    /// `m_ssl_listen_sockets`; we multiplex on the same set and keep
+    /// the advertised port separate).
+    #[must_use]
+    pub fn ssl_listen_port(&self) -> u16 {
+        lock(&self.inner).ssl_listen_port
+    }
+
+    /// `num_connections` — live peer connections across torrents.
+    #[must_use]
+    pub fn num_connections(&self) -> usize {
+        lock(&self.inner)
+            .torrents
+            .values()
+            .map(|t| t.peers.len())
+            .sum()
+    }
+
+    /// `num_uploads` — peers currently unchoked by us.
+    #[must_use]
+    pub fn num_uploads(&self) -> usize {
+        lock(&self.inner)
+            .torrents
+            .values()
+            .flat_map(|t| t.peers.values())
+            .filter(|p| !p.choked)
+            .count()
+    }
+
+    /// `delete_port_mapping` — NAT-PMP/UPnP teardown is owned by the
+    /// engine (ports unmap on socket close); this is a no-op marker
+    /// matching upstream's removal bookkeeping.
+    pub fn delete_port_mapping(&self, _handle: i32) {}
+
+    /// `async_add_torrent` — same as [`Self::add_torrent_params`];
+    /// upstream's async split is an artifact of
+    /// its thread hop, our actor is already serialized.
+    #[must_use]
+    pub fn async_add_torrent(
+        &self,
+        atp: &bitdaemon_core::AddTorrentParams,
+    ) -> Option<TorrentHandle> {
+        self.add_torrent_params(atp)
+    }
+
+    /// `set_peer_class` — set a class' `peer_class_info` (limits,
+    /// `ignore_unchoke_slots`…).
+    pub fn set_peer_class(
+        &self,
+        c: bitdaemon_net::peer_class::PeerClassIndex,
+        info: bitdaemon_net::peer_class::PeerClassInfo,
+    ) {
+        let mut s = lock(&self.inner);
+        if let Some(pc) = s.peer_class_pool.at_mut(c) {
+            pc.set_info(&info);
+        }
+    }
+
+    /// `get_peer_class` — the class' current `peer_class_info`.
+    #[must_use]
+    pub fn get_peer_class(
+        &self,
+        c: bitdaemon_net::peer_class::PeerClassIndex,
+    ) -> Option<bitdaemon_net::peer_class::PeerClassInfo> {
+        lock(&self.inner)
+            .peer_class_pool
+            .at(c)
+            .map(|pc| pc.get_info())
+    }
+
+    /// `set_port_filter` — port access filter for peers.
+    pub fn set_port_filter(&self, f: bitdaemon_net::ip_filter::PortFilter) {
+        lock(&self.inner).port_filter = f;
+    }
+
+    /// `session_stats_metrics` — the counter metric table
+    /// (upstream `stats_metric[]`).
+    #[must_use]
+    pub fn session_stats_metrics(&self) -> Vec<crate::counters::StatsMetric> {
+        crate::counters::metrics()
+    }
+
+    /// `dht_put_item` — BEP-44 immutable put; returns the target
+    /// key (`sha1(value)`). The `put` is issued when the `get`
+    /// traversal completes.
+    pub fn dht_put_item(&self, value: &bitdaemon_bencode::Entry) -> Sha1Hash {
+        let bytes = bitdaemon_bencode::bencode(value);
+        lock(&self.inner).dht_put_item(&bytes)
+    }
+
+    /// `set_max_half_open_connections` / `max_half_open_connections`
+    /// (upstream `settings_pack::half_open_limit` — deprecated but
+    /// still honored as the connect-attempt cap).
+    pub fn set_max_half_open_connections(&self, limit: i32) {
+        lock(&self.inner).half_open_limit = limit;
+    }
+
+    /// `max_half_open_connections`.
+    #[must_use]
+    pub fn max_half_open_connections(&self) -> i32 {
+        lock(&self.inner).half_open_limit
+    }
 }
 
 /// `torrent_handle` — per-swarm commands routed to `Session`.
@@ -197,7 +824,9 @@ impl TorrentHandle {
     #[must_use]
     pub fn status(&self) -> Option<TorrentStatus> {
         let g = lock(&self.session);
-        g.torrents.get(&self.info_hash).map(Torrent::status)
+        g.torrents
+            .get(&self.info_hash)
+            .map(|t| t.status(&g.settings, g.queue_position(&self.info_hash)))
     }
 
     /// `prioritize_files` — upstream `torrent_handle::prioritize_files`.
@@ -606,6 +1235,462 @@ impl TorrentHandle {
             if let Some(t) = s.torrents.get_mut(&self.info_hash) {
                 t.max_uploads = max;
             }
+        }
+    }
+
+    /// `torrent_handle::pause` / `resume` (upstream flag-carried
+    /// variants collapse to `set_paused`).
+    pub fn pause(&self) {
+        self.set_paused(true);
+    }
+
+    /// `torrent_handle::resume`.
+    pub fn resume(&self) {
+        self.set_paused(false);
+    }
+
+    /// `torrent_handle::queue_position_up`.
+    pub fn queue_position_up(&self) {
+        self.queue_position_set(crate::session::QueueMove::Up);
+    }
+
+    /// `torrent_handle::queue_position_down`.
+    pub fn queue_position_down(&self) {
+        self.queue_position_set(crate::session::QueueMove::Down);
+    }
+
+    /// `torrent_handle::queue_position_top`.
+    pub fn queue_position_top(&self) {
+        self.queue_position_set(crate::session::QueueMove::Top);
+    }
+
+    /// `torrent_handle::queue_position_bottom`.
+    pub fn queue_position_bottom(&self) {
+        self.queue_position_set(crate::session::QueueMove::Bottom);
+    }
+
+    /// `torrent_handle::upload_limit` — current bytes/s (0 = ∞).
+    #[must_use]
+    pub fn upload_limit(&self) -> i64 {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or(0, |t| t.upload_limit)
+    }
+
+    /// `torrent_handle::download_limit`.
+    #[must_use]
+    pub fn download_limit(&self) -> i64 {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or(0, |t| t.download_limit)
+    }
+
+    /// `torrent_handle::is_seed` — every piece verified.
+    #[must_use]
+    pub fn is_seed(&self) -> bool {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .is_some_and(Torrent::is_seed)
+    }
+
+    /// `torrent_handle::is_finished` — download complete (may still
+    /// be hashing/checking in upstream terms; here = `finished`).
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .is_some_and(|t| t.finished)
+    }
+
+    /// `torrent_handle::is_paused`.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .is_some_and(|t| t.paused)
+    }
+
+    /// `torrent_handle::is_auto_managed`.
+    #[must_use]
+    pub fn is_auto_managed(&self) -> bool {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .is_some_and(|t| t.auto_managed)
+    }
+
+    /// `torrent_handle::is_sequential_download`.
+    #[must_use]
+    pub fn is_sequential_download(&self) -> bool {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .is_some_and(|t| t.sequential)
+    }
+
+    /// `torrent_handle::has_metadata` — `ti` resolved.
+    #[must_use]
+    pub fn has_metadata(&self) -> bool {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .is_some_and(|t| t.ti.is_some())
+    }
+
+    /// `torrent_handle::super_seeding` — getter.
+    #[must_use]
+    pub fn super_seeding(&self) -> bool {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .is_some_and(|t| t.super_seeding)
+    }
+
+    /// `torrent_handle::super_seeding(bool)` — setter. Switching off
+    /// a super-seed re-broadcasts the real bitfield (upstream sends
+    /// HaveNone + Bitfield via the engine drain path).
+    pub fn set_super_seeding(&self, on: bool) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.super_seeding = on;
+        }
+    }
+
+    /// `torrent_handle::set_upload_mode`.
+    pub fn set_upload_mode(&self, on: bool) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.upload_mode = on;
+        }
+    }
+
+    /// `torrent_handle::set_share_mode`.
+    pub fn set_share_mode(&self, on: bool) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.share_mode = on;
+        }
+    }
+
+    /// `torrent_handle::auto_managed`.
+    pub fn set_auto_managed(&self, on: bool) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.auto_managed = on;
+        }
+    }
+
+    /// `torrent_handle::set_pinned`.
+    pub fn set_pinned(&self, on: bool) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.pinned = on;
+        }
+    }
+
+    /// `torrent_handle::stop_when_ready`.
+    pub fn stop_when_ready(&self, on: bool) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.stop_when_ready = on;
+        }
+    }
+
+    /// `torrent_handle::apply_ip_filter`.
+    pub fn apply_ip_filter(&self, on: bool) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.apply_ip_filter = on;
+        }
+    }
+
+    /// `torrent_handle::save_path` — the save path this torrent was
+    /// added with (`m_save_path`).
+    #[must_use]
+    pub fn save_path(&self) -> String {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or_else(String::new, |t| t.save_path.clone())
+    }
+
+    /// `torrent_handle::set_ratio`.
+    pub fn set_ratio(&self, ratio: f32) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.ratio = ratio;
+        }
+    }
+
+    /// `torrent_handle::set_tracker_login` — user/pass sent to
+    /// trackers (`m_tracker_login`).
+    pub fn set_tracker_login(&self, user: String, pass: String) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.tracker_login = Some((user, pass));
+        }
+    }
+
+    /// `torrent_handle::use_interface` — bind outbound connects to a
+    /// named interface (`m_net_interface`).
+    pub fn use_interface(&self, name: String) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.net_interface = Some(name);
+        }
+    }
+
+    /// `torrent_handle::set_ssl_certificate` — path form (SSL
+    /// torrents; consumed by `ssl_stream` when it lands).
+    pub fn set_ssl_certificate(&self, cert: String) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.ssl_cert = Some(cert);
+        }
+    }
+
+    /// `torrent_handle::set_ssl_certificate_buffer` — PEM buffer
+    /// form (same store; the path/buffer distinction is upstream's).
+    pub fn set_ssl_certificate_buffer(&self, pem: String) {
+        self.set_ssl_certificate(pem);
+    }
+
+    /// `torrent_handle::add_http_seed` — BEP-17 endpoint.
+    pub fn add_http_seed(&self, url: String) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.add_http_seed(url);
+        }
+    }
+
+    /// `torrent_handle::remove_http_seed`.
+    pub fn remove_http_seed(&self, url: &str) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.remove_http_seed(url);
+        }
+    }
+
+    /// `torrent_handle::http_seeds` snapshot.
+    #[must_use]
+    pub fn http_seeds(&self) -> Vec<String> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map(|t| t.http_seeds().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// `torrent_handle::set_peer_upload_limit`.
+    pub fn set_peer_upload_limit(&self, remote: std::net::SocketAddr, limit: i64) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.set_peer_upload_limit(remote, limit);
+        }
+    }
+
+    /// `torrent_handle::set_peer_download_limit`.
+    pub fn set_peer_download_limit(&self, remote: std::net::SocketAddr, limit: i64) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.set_peer_download_limit(remote, limit);
+        }
+    }
+
+    /// `torrent_handle::get_peer_upload_limit` (-1 = unset).
+    #[must_use]
+    pub fn get_peer_upload_limit(&self, remote: std::net::SocketAddr) -> i64 {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or(-1, |t| t.peer_upload_limit(remote))
+    }
+
+    /// `torrent_handle::get_peer_download_limit`.
+    #[must_use]
+    pub fn get_peer_download_limit(&self, remote: std::net::SocketAddr) -> i64 {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or(-1, |t| t.peer_download_limit(remote))
+    }
+
+    /// `torrent_handle::clear_peers` — drop every known swarm peer
+    /// (connected or not; upstream `torrent::clear_peers` disconnects
+    /// and clears the peer list).
+    pub fn clear_peers(&self, out: &mut SessionOutVec) {
+        let mut s = lock(&self.session);
+        if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+            for id in t.peers.keys().copied().collect::<Vec<_>>() {
+                out.push(SessionOut::Torrent(
+                    crate::torrent::TorrentEffect::DisconnectPeer {
+                        peer: id,
+                        reason: "clear_peers",
+                    },
+                ));
+            }
+            t.peers.clear();
+        }
+    }
+
+    /// `torrent_handle::max_uploads` / `max_connections` getters.
+    #[must_use]
+    pub fn max_uploads(&self) -> i32 {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or(-1, |t| t.max_uploads)
+    }
+
+    /// `torrent_handle::max_connections`.
+    #[must_use]
+    pub fn max_connections(&self) -> i32 {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or(-1, |t| t.max_connections)
+    }
+
+    /// `torrent_handle::get_piece_priorities` — per-piece priority
+    /// snapshot.
+    #[must_use]
+    pub fn get_piece_priorities(&self) -> Vec<bitdaemon_common::types::DownloadPriority> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or_else(Vec::new, |t| {
+                (0..t.num_pieces)
+                    .map(|i| t.piece_priority(PieceIndex(i)).unwrap_or_default())
+                    .collect()
+            })
+    }
+
+    /// `torrent_handle::get_file_priorities` — alias of
+    /// [`Self::file_priorities`] matching the upstream getter name.
+    #[must_use]
+    pub fn get_file_priorities(&self) -> Vec<bitdaemon_common::types::DownloadPriority> {
+        self.file_priorities()
+    }
+
+    /// `torrent_handle::file_priority` — set one file's priority.
+    pub fn file_priority(
+        &self,
+        index: bitdaemon_common::types::FileIndex,
+        prio: bitdaemon_common::types::DownloadPriority,
+    ) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            let mut prios = t.file_priorities.clone();
+            if let Some(p) = prios.get_mut(index.0 as usize) {
+                *p = prio;
+                t.prioritize_files(&prios);
+            }
+        }
+    }
+
+    /// `torrent_handle::write_resume_data` — bencoded resume blob.
+    #[must_use]
+    pub fn write_resume_data(&self) -> Vec<u8> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or_else(Vec::new, Torrent::write_resume_data)
+    }
+
+    /// `torrent_handle::info_hashes` — v1/v2 pair when metadata is
+    /// present; v1 id otherwise.
+    #[must_use]
+    pub fn info_hashes(&self) -> bitdaemon_common::info_hash::InfoHash {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or_else(
+                || bitdaemon_common::info_hash::InfoHash::from_v1(self.info_hash),
+                |t| {
+                    t.ti.as_ref().map_or_else(
+                        || bitdaemon_common::info_hash::InfoHash::from_v1(self.info_hash),
+                        |ti| *ti.info_hashes(),
+                    )
+                },
+            )
+    }
+
+    /// `torrent_handle::torrent_file_with_hashes` — same `ti` object;
+    /// upstream returns the non-const shared_ptr because it may carry
+    /// later-fetched merkle trees — ours already does.
+    #[must_use]
+    pub fn torrent_file_with_hashes(
+        &self,
+    ) -> Option<std::sync::Arc<bitdaemon_core::torrent_info::TorrentInfo>> {
+        self.torrent_file()
+    }
+
+    /// `torrent_handle::piece_layers` — per-file v2 piece-layer
+    /// hashes (empty for v1/unresolved torrents).
+    #[must_use]
+    pub fn piece_layers(&self) -> Vec<Vec<bitdaemon_common::Sha256Hash>> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or_else(Vec::new, |t| {
+                t.merkle_trees.iter().map(|m| m.get_piece_layer()).collect()
+            })
+    }
+
+    /// `torrent_handle::get_full_peer_list` — every swarm peer,
+    /// connected or not (upstream `peer_list_entry` snapshots).
+    #[must_use]
+    pub fn get_full_peer_list(&self) -> Vec<PeerListEntry> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or_else(Vec::new, |t| {
+                t.full_peer_list().iter().map(PeerListEntry::from).collect()
+            })
+    }
+
+    /// `torrent_handle::add_extension` — register a per-torrent
+    /// plugin factory (`torrent_plugin` upstream; `SessionPlugin` is
+    /// our extension point).
+    pub fn add_extension(&self, ext: crate::torrent::ExtensionFactory) {
+        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+            t.extensions.push(ext);
+        }
+    }
+
+    /// `torrent_handle::set_metadata` — feed raw `info` dict bytes
+    /// (magnet resolution path; upstream validates against info-hash).
+    #[must_use]
+    pub fn set_metadata(&self, metadata: &[u8]) -> bool {
+        lock(&self.session)
+            .torrents
+            .get_mut(&self.info_hash)
+            .is_some_and(|t| {
+                t.set_metadata(
+                    metadata,
+                    &bitdaemon_core::torrent_info::LoadTorrentLimits::default(),
+                )
+            })
+    }
+
+    /// `torrent_handle::scrape_tracker(url)` — scrape by URL
+    /// (resolves to the tracker index; no-op when unknown).
+    pub fn scrape_tracker_url(&self, url: &str, out: &mut SessionOutVec) {
+        let mut s = lock(&self.session);
+        let idx = s
+            .torrents
+            .get(&self.info_hash)
+            .and_then(|t| t.trackers.trackers.iter().position(|e| e.url == url));
+        if let Some(i) = idx {
+            s.scrape_tracker(&self.info_hash, i, out);
+        }
+    }
+
+    /// `torrent_handle::force_reannounce(seconds, idx)` — reannounce
+    /// on tracker `idx` (the delay is approximated as immediate;
+    /// scheduling belongs to the engine tick).
+    pub fn force_reannounce(&self, _seconds: i32, idx: usize, out: &mut SessionOutVec) {
+        lock(&self.session).force_announce(&self.info_hash, Some(idx), out);
+    }
+
+    /// `torrent_handle::force_reannounce(seconds, url)`.
+    pub fn force_reannounce_url(&self, _seconds: i32, url: &str, out: &mut SessionOutVec) {
+        let mut s = lock(&self.session);
+        let idx = s
+            .torrents
+            .get(&self.info_hash)
+            .and_then(|t| t.trackers.trackers.iter().position(|e| e.url == url));
+        if let Some(i) = idx {
+            s.force_announce(&self.info_hash, Some(i), out);
         }
     }
 }
