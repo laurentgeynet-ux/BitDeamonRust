@@ -1,7 +1,9 @@
 # AGENTS.md — Guide for coding agents and contributors
 
-BitDaemon is a **semantically faithful port of libtorrent (Rasterbar, C++)
-to 100% safe Rust**. This file is the working contract for anyone —
+BitDaemon is a **semantically faithful port of *all of* libtorrent
+(Rasterbar, C++) to 100% safe Rust** (ADR-0010: every behavioral
+`src/*.cpp` file gets a Rust module or a reasoned `won't port` row).
+This file is the working contract for anyone —
 human or AI — contributing code. Read it fully before touching anything.
 
 ## 1. Mission and ground truth
@@ -17,10 +19,14 @@ human or AI — contributing code. Read it fully before touching anything.
   BitTorrent clients (libtorrent, qBittorrent, Transmission…) cannot
   distinguish it on the wire, and when it round-trips libtorrent's
   resume data and `.session` files.
+- **Complete-port goal** (ADR-0010): "deferred" is a phase position,
+  never a permanent status. The port is done when `PORTING.md` is 100%
+  resolved rows (`ported`/`verified`/`won't port`+reason).
 - **First downstream consumer**: OnionBit (`D:\Projet\Tribler-Rust-Torrent`)
   — replaces its vendored/patched librqbit. Its anonymous lanes require
-  injectable transports and a storage factory; that shaped ADR-0008 and
-  the milestone ONIONBIT-1 in `ROADMAP.md`.
+  injectable transports and a storage factory; that shaped ADR-0008.
+  It remains a consumer, **not** the ordering driver — phase order is
+  upstream dependency depth.
 
 ## 2. Repository layout
 
@@ -33,6 +39,10 @@ crates/
   bitdaemon-net       peer wire, trackers, uTP, proxies, UPnP/NAT-PMP/LSD
   bitdaemon-dht       Mainline DHT (kademlia)
   bitdaemon-session   session/torrent actors, alerts, settings, choker
+  bitdaemon-mmap      mmap storage backend (feature-gated; sole
+                      unsafe-allowed crate — ADR-0010 §3)
+  bitdaemon-sim       upstream simulation/ harness — deterministic
+                      swarm tests over injected transports
   bitdaemon           facade: re-exports the public API
   bitdaemon-cli       example client (port of examples/client_test.cpp)
 docs/
@@ -61,8 +71,11 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and an MSRV
 
 ## 4. Hard rules
 
-1. **`#![forbid(unsafe_code)]` everywhere.** No `unsafe`, no exceptions.
-   If a dependency uses unsafe internally that's fine — *our* code does not.
+1. **`#![forbid(unsafe_code)]` everywhere.** No `unsafe` — *one
+   exception*: `bitdaemon-mmap` (ADR-0010 §3) may use `unsafe` for
+   `memmap2` inside its reviewed, feature-gated boundary; nothing
+   unsafe leaks into the public API. Dependencies using unsafe
+   internally are fine — *our* other crates do not.
 2. **No new dependency without an ADR note** in `docs/adr/0007-*` or a
    commit-message justification. Prefer crates ≥ 7 days old, pinned to
    minor versions in `[workspace.dependencies]`. See ADR-0007.
@@ -169,12 +182,18 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and an MSRV
 
 - `src/ed25519/*`, `src/puff.cpp`, `src/sha1.cpp`, `src/sha256.cpp`,
   `win_cng`, `win_crypto_provider` → use vetted RustCrypto crates (ADR-0007).
-- `posix_*`/`mmap_*`/`pread_*` storage trio → one `std::fs` positioned-I/O
-  backend + an optional `memmap2` backend; the C++ triplication exists for
-  OS API differences Rust's stdlib abstracts.
-- `bindings/` (python), `Jamfile`/build system, deprecated-API shims,
-  `debug.hpp` invariant-check scaffolding → out of scope.
-- `rtc_stream`/`rtc_signaling` (WebRTC) → deferred, see ROADMAP Phase 8.
+- `posix_*`/`pread_*` storage → `PreadDiskIo` (std::fs positioned I/O)
+  is the default backend; `mmap_*` (`file_view_pool`, `mmap.cpp`,
+  `mmap_storage`, `mmap_disk_io`) → `bitdaemon-mmap` crate
+  (feature-gated, sole `unsafe` carve-out — ADR-0010 §3).
+- `bindings/` (python), `Jamfile`/`CMake` build system, deprecated-API
+  shims, `debug.hpp` invariant-check scaffolding → `won't port`.
+- Vendored C crypto (`src/ed25519/*`, `puff.cpp`, `sha1.cpp`,
+  `sha256.cpp`, `win_cng`) → RustCrypto crates (ADR-0007), never ported.
+- `rtc_stream`/`rtc_signaling` (WebRTC) **are in scope** (ADR-0010 §5)
+  — `webrtc` crate vs. bespoke decided in a follow-up ADR.
+- Everything else deferred → a ROADMAP phase, not a skip. A `won't
+  port` row in PORTING.md requires an explicit reason.
 
 ## 9. Known traps (read before porting!)
 
