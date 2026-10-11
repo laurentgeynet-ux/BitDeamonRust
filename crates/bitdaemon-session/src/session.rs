@@ -804,6 +804,7 @@ impl Session {
     pub fn set_disk(&mut self, io: Arc<dyn DiskIo>) {
         io.set_max_queued_bytes(self.settings.max_disk_write_queue);
         io.set_write_no_cache(self.settings.disable_os_write_cache);
+        io.set_read_no_cache(self.settings.disable_os_read_cache);
         io.set_cache_expiry(self.settings.cache_expiry.as_secs());
         self.disk = Some(io);
     }
@@ -1649,6 +1650,7 @@ impl Session {
         if let Some(d) = &self.disk {
             d.set_max_queued_bytes(s.max_disk_write_queue);
             d.set_write_no_cache(s.disable_os_write_cache);
+            d.set_read_no_cache(s.disable_os_read_cache);
             d.set_cache_expiry(s.cache_expiry.as_secs());
         }
         self.alerts.set_queue_limit(s.alert_queue_size);

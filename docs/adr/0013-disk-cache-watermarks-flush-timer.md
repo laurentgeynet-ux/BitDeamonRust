@@ -1,6 +1,6 @@
 # ADR-0013: Disk cache watermarks + periodic flush scheduling
 
-Status: Partially implemented (cache_expiry flush done; watermarks pending)
+Status: Implemented
 Date: 2026-10-11
 Depends on: ADR-0012 (`store_buffer` write path)
 

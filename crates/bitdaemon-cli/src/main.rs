@@ -63,6 +63,11 @@ struct Args {
     #[arg(long)]
     no_os_cache: bool,
 
+    /// Disable the OS read cache for data files (upstream
+    /// `settings_pack::disk_io_read_mode = disable_os_cache`).
+    #[arg(long)]
+    no_os_read_cache: bool,
+
     /// SSL-torrent server certificate PEM (upstream
     /// `set_ssl_certificate` cert path).
     #[arg(long)]
@@ -154,6 +159,9 @@ async fn main() -> anyhow::Result<()> {
     eng.set_resolver(Arc::new(bitdaemon::net::resolver::SystemResolver));
     if args.no_os_cache {
         slock(&eng.session).settings.disable_os_write_cache = true;
+    }
+    if args.no_os_read_cache {
+        slock(&eng.session).settings.disable_os_read_cache = true;
     }
     slock(&eng.session).set_disk(disk);
     slock(&eng.session).set_listen_port(args.port);
@@ -262,12 +270,15 @@ async fn main() -> anyhow::Result<()> {
             if let Some(d) = &guard.disk {
                 let q = d.queue_stats();
                 println!(
-                    "disk queue: w={} h={} other={} parked={} write_blocks={} threads={} bp={}",
+                    "disk queue: w={} h={} other={} parked={} write_blocks={} cache={} unhashed={} bufs={} threads={} bp={}",
                     q.queued_writes,
                     q.queued_hashes,
                     q.queued_other,
                     q.parked_hashes,
                     q.write_blocks,
+                    q.cached_blocks,
+                    q.num_unhashed,
+                    q.disk_blocks_in_use,
                     q.threads,
                     d.write_queue_exceeded(),
                 );

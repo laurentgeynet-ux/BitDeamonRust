@@ -1,6 +1,6 @@
 # ADR-0015: `disk_io_write_mode`/`disk_io_read_mode` — complete io_buffer_mode wiring
 
-Status: Accepted — write side landed (`disable_os_write_cache` +
+Status: Implemented
 `--no-os-cache`, 2026-10-11); read side pending.
 Date: 2026-10-11
 

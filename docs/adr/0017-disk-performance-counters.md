@@ -1,6 +1,6 @@
 # ADR-0017: Disk `performance_counters` wiring
 
-Status: Accepted (implementation pending)
+Status: Implemented
 Date: 2026-10-11
 Depends on: ADR-0012/0013 (counters must measure the real cache)
 

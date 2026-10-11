@@ -51,6 +51,9 @@ pub struct SessionSettings {
     /// `settings_pack::cache_expiry` — seconds a dirty block may sit
     /// in the write cache before the periodic flush.
     pub cache_expiry: Duration,
+    /// `settings_pack::disk_io_read_mode` — `disable_os_cache`:
+    /// `no_cache` open flags on read/hash jobs (ADR-0015).
+    pub disable_os_read_cache: bool,
     /// `send_buffer_watermark` — pause reads above this.
     pub send_buffer_watermark: usize,
     /// `alert_queue_size` — alert_manager limit.
@@ -135,6 +138,7 @@ impl Default for SessionSettings {
             max_disk_write_queue: 100 << 20,
             disable_os_write_cache: false,
             cache_expiry: Duration::from_secs(60),
+            disable_os_read_cache: false,
             send_buffer_watermark: 500 << 10,
             alert_queue_size: 2000,
             dht_enabled: true,

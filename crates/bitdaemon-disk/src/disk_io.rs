@@ -96,12 +96,24 @@ pub struct PreadDiskIo {
     back_pressure: crate::back_pressure::BackPressure,
     /// `settings_pack::disk_io_write_mode` — `disable_os_cache` on writes.
     write_no_cache: AtomicBool,
+    /// `disk_io_read_mode=disable_os_cache` (ADR-0015).
+    read_no_cache: AtomicBool,
     /// `settings_pack::cache_expiry` — seconds a cached block may sit
     /// dirty before the periodic flush (upstream default 60).
     cache_expiry: std::sync::atomic::AtomicU64,
     /// `m_blocks` — write blocks queued/in flight; the back-pressure
     /// level (upstream `disk_cache::m_blocks`).
     write_blocks: std::sync::atomic::AtomicI64,
+    /// `counters::num_blocks_written` (ADR-0017).
+    num_blocks_written: std::sync::atomic::AtomicI64,
+    /// `counters::num_blocks_read`.
+    num_blocks_read: std::sync::atomic::AtomicI64,
+    /// `counters::num_blocks_hashed`.
+    num_blocks_hashed: std::sync::atomic::AtomicI64,
+    /// `counters::num_write_ops`.
+    num_write_ops: std::sync::atomic::AtomicI64,
+    /// `counters::num_read_ops`.
+    num_read_ops: std::sync::atomic::AtomicI64,
 }
 
 impl PreadDiskIo {
@@ -151,7 +163,13 @@ impl PreadDiskIo {
             file_pool: Arc::new(crate::file_pool::FilePool::new(40)),
             back_pressure: crate::back_pressure::BackPressure::new(),
             write_blocks: std::sync::atomic::AtomicI64::new(0),
+            num_blocks_written: std::sync::atomic::AtomicI64::new(0),
+            num_blocks_read: std::sync::atomic::AtomicI64::new(0),
+            num_blocks_hashed: std::sync::atomic::AtomicI64::new(0),
+            num_write_ops: std::sync::atomic::AtomicI64::new(0),
+            num_read_ops: std::sync::atomic::AtomicI64::new(0),
             write_no_cache: AtomicBool::new(false),
+            read_no_cache: AtomicBool::new(false),
             cache_expiry: std::sync::atomic::AtomicU64::new(60),
         });
         // upstream `pread_disk_io` ctor:
@@ -315,6 +333,8 @@ impl PreadDiskIo {
     fn job_done(&self, j: &DiskJob) {
         match &j.action {
             JobKind::Write(_) => {
+                self.num_blocks_written.fetch_add(1, Ordering::Relaxed);
+                self.num_write_ops.fetch_add(1, Ordering::Relaxed);
                 let level = self.write_blocks.fetch_sub(1, Ordering::Relaxed) - 1;
                 self.back_pressure.check_buffer_level(level);
             }
@@ -331,13 +351,32 @@ impl PreadDiskIo {
                             f.bufs.len(),
                         );
                 }
+                self.num_blocks_written
+                    .fetch_add(f.bufs.len() as i64, Ordering::Relaxed);
+                self.num_write_ops.fetch_add(1, Ordering::Relaxed);
                 let level = self
                     .write_blocks
                     .fetch_sub(f.bufs.len() as i64, Ordering::Relaxed)
                     - f.bufs.len() as i64;
                 self.back_pressure.check_buffer_level(level);
             }
+            JobKind::Read(_) | JobKind::PartialRead(_) => {
+                self.num_blocks_read.fetch_add(1, Ordering::Relaxed);
+                self.num_read_ops.fetch_add(1, Ordering::Relaxed);
+            }
             JobKind::Hash(h) => {
+                let blocks = self
+                    .storage(j.storage)
+                    .map(|e| {
+                        let st = e.storage.read().unwrap_or_else(|p| p.into_inner());
+                        i64::from(
+                            st.files().piece_size(h.piece)
+                                / crate::disk_cache::DEFAULT_BLOCK_SIZE as i32,
+                        )
+                        .max(1)
+                    })
+                    .unwrap_or(1);
+                self.num_blocks_hashed.fetch_add(blocks, Ordering::Relaxed);
                 if let Some(e) = self.storage(j.storage) {
                     e.cache
                         .lock()
@@ -346,6 +385,7 @@ impl PreadDiskIo {
                 }
             }
             JobKind::Hash2(h) => {
+                self.num_blocks_hashed.fetch_add(1, Ordering::Relaxed);
                 if let Some(e) = self.storage(j.storage) {
                     e.cache
                         .lock()
@@ -622,8 +662,16 @@ impl PreadDiskIo {
         let st: &dyn DiskStorage = &**st_guard;
         let cache = &e.cache;
         j.error = match &mut j.action {
-            JobKind::Read(r) => read_job(st, r, j.storage, cache),
-            JobKind::PartialRead(r) => partial_read_job(st, r),
+            JobKind::Read(r) => read_job(
+                st,
+                r,
+                j.storage,
+                cache,
+                self.read_no_cache.load(Ordering::Relaxed),
+            ),
+            JobKind::PartialRead(r) => {
+                partial_read_job(st, r, self.read_no_cache.load(Ordering::Relaxed))
+            }
             JobKind::Write(w) => write_job(st, w, self.write_no_cache.load(Ordering::Relaxed)),
             JobKind::Flush(f) => {
                 // coalesced region write — contiguous `store_buffer`
@@ -673,8 +721,20 @@ impl PreadDiskIo {
                     Err(e) => e,
                 }
             }
-            JobKind::Hash(h) => hash_job(st, h, j.storage, cache),
-            JobKind::Hash2(h) => hash2_job(st, h, j.storage, cache),
+            JobKind::Hash(h) => hash_job(
+                st,
+                h,
+                j.storage,
+                cache,
+                self.read_no_cache.load(Ordering::Relaxed),
+            ),
+            JobKind::Hash2(h) => hash2_job(
+                st,
+                h,
+                j.storage,
+                cache,
+                self.read_no_cache.load(Ordering::Relaxed),
+            ),
             JobKind::MoveStorage(m) => match st.move_storage(m.path.clone(), m.move_flags) {
                 Ok((status, path)) => {
                     j.ret = Status::from(status);
@@ -785,11 +845,22 @@ fn overlay_cached(
     }
 }
 
+/// `disk_io_read_mode=disable_os_cache` → `open_mode::no_cache` on
+/// read opens (ADR-0015); same flag upstream ORs in.
+fn read_mode(no_cache: bool) -> OpenMode {
+    if no_cache {
+        OpenMode::READ_ONLY | OpenMode::NO_CACHE
+    } else {
+        OpenMode::READ_ONLY
+    }
+}
+
 fn read_job(
     st: &dyn DiskStorage,
     r: &mut ReadJob,
     storage: StorageIndex,
     cache: &Mutex<crate::disk_cache::DiskCache>,
+    no_cache: bool,
 ) -> StorageError {
     let Some(buf) = r.buf.data_mut() else {
         return StorageError::new(
@@ -803,7 +874,7 @@ fn read_job(
         &mut buf[..want],
         r.piece,
         i64::from(r.offset),
-        OpenMode::READ_ONLY,
+        read_mode(no_cache),
         r.volatile,
     ) {
         Ok(n) => {
@@ -816,7 +887,7 @@ fn read_job(
     }
 }
 
-fn partial_read_job(st: &dyn DiskStorage, r: &mut PartialReadJob) -> StorageError {
+fn partial_read_job(st: &dyn DiskStorage, r: &mut PartialReadJob, no_cache: bool) -> StorageError {
     // unaligned read into buf at buffer_offset (upstream semantics)
     let Some(buf) = r.buf.data_mut() else {
         return StorageError::new(
@@ -831,7 +902,7 @@ fn partial_read_job(st: &dyn DiskStorage, r: &mut PartialReadJob) -> StorageErro
         &mut buf[off..off + want],
         r.piece,
         i64::from(r.offset),
-        OpenMode::READ_ONLY,
+        read_mode(no_cache),
         false,
     ) {
         Ok(_) => StorageError::default(),
@@ -869,6 +940,7 @@ fn hash_job(
     h: &mut HashJob,
     storage: StorageIndex,
     cache: &Mutex<crate::disk_cache::DiskCache>,
+    no_cache: bool,
 ) -> StorageError {
     // SHA-1 over the whole piece; also fills per-block SHA-256 when the
     // caller provided a block_hashes span (v2) — upstream hash job.
@@ -878,7 +950,7 @@ fn hash_job(
     let len = i64::from(st.files().piece_size(h.piece));
     let mut buf = vec![0u8; usize::try_from(len).unwrap_or(0)];
     let r = st
-        .read(&mut buf, h.piece, 0, OpenMode::READ_ONLY, false)
+        .read(&mut buf, h.piece, 0, read_mode(no_cache), false)
         .map(|_| ());
     if r.is_ok() {
         overlay_cached(cache, storage, h.piece, 0, &mut buf);
@@ -927,6 +999,7 @@ fn hash2_job(
     h: &mut Hash2Job,
     storage: StorageIndex,
     cache: &Mutex<crate::disk_cache::DiskCache>,
+    no_cache: bool,
 ) -> StorageError {
     let mut sha = Sha256::new();
     let blk =
@@ -951,7 +1024,7 @@ fn hash2_job(
         i64::try_from(DEFAULT_BLOCK_SIZE).unwrap_or(0),
         h.piece,
         i64::from(h.offset),
-        OpenMode::READ_ONLY,
+        read_mode(no_cache),
         false,
     );
     match r {
@@ -1062,7 +1135,6 @@ impl DiskIo for PreadDiskIo {
         };
         let level = self.write_blocks.fetch_add(1, Ordering::Relaxed) + 1;
         let pressure = self.back_pressure.has_back_pressure(level, o);
-        let max_blocks = self.back_pressure.max_size();
         let mut cache = entry.cache.lock().unwrap_or_else(|e| e.into_inner());
         let loc = (storage, r.piece);
         cache.insert(
@@ -1086,18 +1158,29 @@ impl DiskIo for PreadDiskIo {
         let piece_full = cache
             .piece(loc)
             .is_some_and(|p| p.blocks.iter().all(|b| b.buf.is_some() || b.flushed));
-        let over_limit = cache.num_cached_blocks > max_blocks;
-        let run = if piece_full || over_limit {
-            cache.take_flush_run(loc)
-        } else {
-            None
-        };
+        // upstream `check_buffer_level`/`try_flush_blocks`: above the
+        // high watermark (or while the exceeded flag is sticky) keep
+        // flushing runs until the cache drains to the low watermark;
+        // a complete piece always flushes as one contiguous run.
+        let mut runs = Vec::new();
+        if piece_full && let Some(run) = cache.take_flush_run(loc) {
+            runs.push((loc, run.0, run.1));
+        }
+        while let Some(low) = self.back_pressure.should_flush(cache.num_cached_blocks) {
+            if cache.num_cached_blocks <= low {
+                break;
+            }
+            let Some(run) = cache.take_oldest_run() else {
+                break;
+            };
+            runs.push(run);
+        }
         drop(cache);
-        if let Some((first, bufs)) = run {
+        for (run_loc, first, bufs) in runs {
             self.add_job(
                 storage,
                 self.mk_job(JobKind::Flush(crate::disk_job::FlushJob {
-                    piece: r.piece,
+                    piece: run_loc.1,
                     first_block: first,
                     bufs,
                 })),
@@ -1273,6 +1356,10 @@ impl DiskIo for PreadDiskIo {
         PreadDiskIo::set_max_queued_bytes(self, bytes);
     }
 
+    fn set_read_no_cache(&self, v: bool) {
+        self.read_no_cache.store(v, Ordering::Relaxed);
+    }
+
     fn set_write_no_cache(&self, v: bool) {
         self.write_no_cache.store(v, Ordering::Relaxed);
     }
@@ -1289,12 +1376,32 @@ impl DiskIo for PreadDiskIo {
         self.back_pressure.exceeded()
     }
 
+    /// `pread_disk_io::update_stats_counters` (ADR-0017).
     fn queue_stats(&self) -> crate::disk_interface::DiskQueueStats {
         let mut s = crate::disk_interface::DiskQueueStats {
             write_blocks: self.write_blocks.load(Ordering::Relaxed),
             threads: self.pool.num_threads(),
+            queued_disk_jobs: self.pool.queue_size(),
+            blocked_disk_jobs: self
+                .fence_counters
+                .blocked_disk_jobs
+                .load(Ordering::Relaxed),
+            disk_blocks_in_use: self.buffer_pool.in_use(),
+            queued_write_bytes: self.write_blocks.load(Ordering::Relaxed)
+                * crate::disk_cache::DEFAULT_BLOCK_SIZE,
+            num_blocks_written: self.num_blocks_written.load(Ordering::Relaxed),
+            num_blocks_read: self.num_blocks_read.load(Ordering::Relaxed),
+            num_blocks_hashed: self.num_blocks_hashed.load(Ordering::Relaxed),
+            num_write_ops: self.num_write_ops.load(Ordering::Relaxed),
+            num_read_ops: self.num_read_ops.load(Ordering::Relaxed),
             ..Default::default()
         };
+        let (hits, misses, stalls, races, num_files) = self.file_pool.stats_counters();
+        s.file_pool_hits = hits;
+        s.file_pool_misses = misses;
+        s.file_pool_thread_stall = stalls;
+        s.file_pool_race = races;
+        s.file_pool_size = num_files;
         self.pool.visit_jobs(|j| match &j.action {
             JobKind::Write(_) => s.queued_writes += 1,
             JobKind::Hash(_) | JobKind::Hash2(_) => s.queued_hashes += 1,
@@ -1308,6 +1415,9 @@ impl DiskIo for PreadDiskIo {
         {
             let gate = e.piece_gate.lock().unwrap_or_else(|g| g.into_inner());
             s.parked_hashes += gate.values().map(|g| g.blocked.len()).sum::<usize>();
+            let cache = e.cache.lock().unwrap_or_else(|c| c.into_inner());
+            s.cached_blocks += cache.num_cached_blocks;
+            s.num_unhashed += cache.num_unhashed;
         }
         s
     }

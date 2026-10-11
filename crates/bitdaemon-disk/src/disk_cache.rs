@@ -303,6 +303,21 @@ impl DiskCache {
         runs
     }
 
+    /// One dirty run from whichever piece holds one — the
+    /// over-limit drain step of `try_flush_blocks` (ADR-0013):
+    /// callers loop until the cache level reaches the low
+    /// watermark.
+    pub fn take_oldest_run(&mut self) -> Option<(PieceLocation, i32, Vec<Vec<u8>>)> {
+        let loc = self.pieces.iter().find_map(|(l, p)| {
+            p.blocks
+                .iter()
+                .any(|b| b.buf.is_some() && !b.flushed && !b.has_write_job)
+                .then_some(*l)
+        })?;
+        let (first, bufs) = self.take_flush_run(loc)?;
+        Some((loc, first, bufs))
+    }
+
     /// Every dirty run across the whole cache — used before a
     /// storage-level fence (move/delete) raises.
     pub fn take_all_storage_runs(&mut self) -> Vec<(PieceLocation, i32, Vec<Vec<u8>>)> {

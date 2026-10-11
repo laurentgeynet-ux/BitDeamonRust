@@ -23,6 +23,19 @@ Until `1.0.0`, breaking changes may occur in any release.
   `Session::drain_disk_completed`.
 - Fences force-flush the cache of the fenced piece before
   arming, preserving `ClearPiece`/`move_storage` ordering.
+- Cache watermarks (ADR-0013): above the high watermark the
+  write path drains runs until the low watermark — upstream
+  `check_buffer_level` hysteresis; back-pressure is measured in
+  cached blocks (`max_queued_disk_bytes` / 16 KiB).
+- `disable_os_read_cache` setting + `--no-os-read-cache` flag:
+  `no_cache` open flags on read/hash jobs (ADR-0015).
+- Disk performance counters (ADR-0017): `queue_stats()` now
+  reports upstream `disk.*` gauges — `cached_blocks`,
+  `num_unhashed`, `disk_blocks_in_use`, `blocked_disk_jobs`,
+  `queued_write_bytes`, cumulative `num_blocks_written/read/
+  hashed`, `num_write_ops/read_ops`, file-pool
+  hits/misses/stalls/races; CLI status line shows
+  `cache=`/`unhashed=`/`bufs=`.
 - Live validation: Debian ISO swarm at ~115 MiB/s, disk queue
   depth `w=0` at every sample, `have` progress continuous with
   no verification plateau.

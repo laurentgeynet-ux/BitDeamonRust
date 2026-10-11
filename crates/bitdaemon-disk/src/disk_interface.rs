@@ -180,6 +180,10 @@ pub trait DiskIo: Send + Sync {
     /// host's cache manager.
     fn set_write_no_cache(&self, _v: bool) {}
 
+    /// `settings_pack::disk_io_read_mode` — `disable_os_cache`:
+    /// read/hash jobs open files with `no_cache` (ADR-0015).
+    fn set_read_no_cache(&self, _v: bool) {}
+
     /// `settings_pack::cache_expiry` — seconds a dirty block may sit
     /// in the write cache before the periodic flush (upstream 60).
     fn set_cache_expiry(&self, _secs: u64) {}
@@ -223,6 +227,38 @@ pub struct DiskQueueStats {
     pub write_blocks: i64,
     /// pool worker threads.
     pub threads: usize,
+    /// `counters::queued_disk_jobs` — total jobs queued.
+    pub queued_disk_jobs: usize,
+    /// `counters::blocked_disk_jobs` — parked behind a raised fence.
+    pub blocked_disk_jobs: usize,
+    /// `counters::disk_blocks_in_use` — buffers checked out.
+    pub disk_blocks_in_use: i64,
+    /// `counters::cached_blocks` — dirty blocks in `store_buffer`.
+    pub cached_blocks: i64,
+    /// `counters::num_unhashed` — cached blocks not yet hashed.
+    pub num_unhashed: i64,
+    /// `counters::queued_write_bytes` — cached+queued write bytes.
+    pub queued_write_bytes: i64,
+    /// `counters::num_blocks_written` — cumulative.
+    pub num_blocks_written: i64,
+    /// `counters::num_blocks_read` — cumulative.
+    pub num_blocks_read: i64,
+    /// `counters::num_blocks_hashed` — cumulative.
+    pub num_blocks_hashed: i64,
+    /// `counters::num_write_ops` — cumulative write syscalls.
+    pub num_write_ops: i64,
+    /// `counters::num_read_ops` — cumulative read syscalls.
+    pub num_read_ops: i64,
+    /// `counters::file_pool_size` + hit/miss/stall/race gauges.
+    pub file_pool_size: i64,
+    /// `counters::file_pool_hits`.
+    pub file_pool_hits: i64,
+    /// `counters::file_pool_misses`.
+    pub file_pool_misses: i64,
+    /// `counters::file_pool_thread_stall`.
+    pub file_pool_thread_stall: i64,
+    /// `counters::file_pool_race`.
+    pub file_pool_race: i64,
 }
 
 /// `storage_holder` — RAII ownership of a torrent's storage index;
