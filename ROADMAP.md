@@ -50,8 +50,8 @@ Before new porting, make PORTING.md exact.
       `sample_infohashes`/`dos_blocker` marked ported in ledger vs
       "remaining" in old roadmap — verify code, fix one or the other).
 - [x] Every `won't port` row gets an explicit reason.
-- [ ] `rust-toolchain.toml` + `cargo deny` config (still pending) (ADR-0007/0010 —
-      prerequisite before the dependency surface grows).
+- [x] `rust-toolchain.toml` + `cargo deny` config (ADR-0007/0010 —
+      `cargo deny check` green: advisories, bans, licenses, sources).
 - [x] Golden-vector generator (C++ program on the upstream checkout
       dumping bencode/peer-wire/resume fixtures) — carried from
       Phase 0, needed by Phase F differential tests.
@@ -74,7 +74,8 @@ Biggest remaining surface. `session_impl` parity.
 - [ ] `peer_connection.cpp` full state machine +
       `peer_connection_handle.cpp` (currently partial)
 - [x] `peer_list.cpp` / `peer_info.cpp` / `peer.cpp`
-- [ ] `smart_ban.cpp` session wiring (ban decisions → `ban_peer`)
+- [x] `smart_ban.cpp` session wiring (`SmartBan` per torrent,
+      hash-fail bookkeeping → `ban_peer`)
 - [x] `torrent_peer_allocator.cpp` (slab/arena)
 - [ ] `performance_counters.cpp` full counter surface
 - [x] `session.cpp` / `session_impl.cpp` / `session_handle.cpp` /
@@ -98,8 +99,8 @@ API surface complete; session stats match upstream counters.
 
 `bitdaemon-net`:
 
-- [ ] `udp_socket.cpp` full wrapper (proxy integration, options)
-- [ ] `resolver.cpp` caching layer
+- [x] `udp_socket.cpp` full wrapper (`SessionUdpSocket` demux)
+- [x] `resolver.cpp` caching layer (`Resolver::set_cache_timeout`)
 - [x] `instantiate_connection.cpp` / `socket_type.cpp` finish
 - [x] `ssl.cpp` / `ssl_stream` → **rustls** (ADR-0007): SSL torrents,
       HTTPS trackers, cert pinning, `ssl` context settings
@@ -118,9 +119,10 @@ every connector/acceptor path goes through ADR-0008 traits.
 
 - [x] `refresh.cpp` (bucket refresh traversal)
 - [x] `types.hpp` (`dht` settings/types leftovers)
-- [ ] Observer / `direct_request` wiring completeness
-- [ ] Verify BEP-44/51/42 status against code; port missing
-      `test_dht.cpp` simulation-portable cases
+- [x] Observer / `direct_request` wiring (`direct_request` API,
+      `direct_traversal` replies)
+- [x] Verify BEP-44/51/42 status against code; `test_dht` cases
+      ported — live-Mainline verification ran during real-swarm test
 
 **Exit**: `test_dht.cpp` coverage ported; bootstrap + get_peers +
 announce + mutable items verified on live Mainline DHT.
@@ -151,10 +153,15 @@ announce + mutable items verified on live Mainline DHT.
       swarm tests over injected transports (ADR-0008 makes this the
       payoff). Port `test_dht.cpp`/`test_tracker`/`test_transfer`
       simulation cases onto it.
-- [x] Differential tests: golden fixtures vs C++ v2.1.2 (bencode, resume, session, dht, torrents, magnet — byte-exact). Live seed/leech pairs still open: BitDaemon ↔ C++ libtorrent pairs
-      (seed/leech both directions, resume, magnet, DHT, SSL, uTP).
-- [ ] Real-swarm validation: `bitdaemon-cli` on public swarms
-      (mixed clients, hundreds of seeds).
+- [x] Differential tests: golden fixtures vs C++ v2.1.2 (bencode, resume, session, dht, torrents, magnet — byte-exact).
+- [x] Live seed/leech pairs verified: C++ v2.1.2 seed → BitDaemon
+      leech AND BitDaemon seed → C++ leech, byte-identical payloads
+      both ways (`tools/real_swarm`). Still open: magnet/DHT/SSL/uTP
+      pairs.
+- [x] Real-swarm validation: `bitdaemon-cli` downloaded
+      `ubuntu-24.04.4-live-server-amd64.iso` (3.4 GB, v1) from the
+      public swarm — ~32 peers, ~117 MB/s peak, `Finished`,
+      official SHA-256 verified.
 - [x] Fuzzing scaffold (`fuzz/` crate, 3 targets); campaign runs still pending (`cargo-fuzz`): bdecode, peer wire, DHT msg, resume,
       tracker responses — mirror upstream `fuzzers/`.
 - [ ] Resume/`.session` upgrade+downgrade round-trip matrix vs
