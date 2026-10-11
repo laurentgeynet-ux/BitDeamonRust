@@ -21,3 +21,15 @@ Thumbs.db
 # Test artifacts / downloaded torrent data
 /test-output/
 *.torrent.local
+
+# Local build artifacts — the C++ test tools compile against the
+# reference libtorrent build; rebuild via tools/*/build_*.bat
+*.exe
+*.obj
+/test-vectors/
+
+# cargo-fuzz working dirs (scaffold is committed; corpus/artifacts
+# and the fuzz target/ build dir stay local)
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/

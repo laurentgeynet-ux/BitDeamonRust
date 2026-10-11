@@ -1,0 +1,5 @@
+# Development toolchain. MSRV is enforced separately by CI
+# (`.github/workflows/ci.yml`, 1.85.0) and `rust-version` in Cargo.toml.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
