@@ -64,3 +64,5 @@ pub use torrent_info::{
 pub use create_torrent::{
     CreateFileEntry, CreateFlags, CreateTorrent, canonicalize, list_files, set_piece_hashes,
 };
+/// `xml_parse.hpp` — RSS/UPnP XML scanner.
+pub mod xml_parse;

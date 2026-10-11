@@ -159,3 +159,48 @@ pub fn parse_decimal(s: &[u8]) -> Option<i64> {
 pub fn string_equal_no_case(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
+
+/// `aux::base64decode_i2p` — I2P alphabet base64 (`-~` instead of
+/// `+/`), used to turn an I2P destination string into its binary form
+/// (`hasher256(dest)` → the peer's pex identity). `None` on invalid
+/// input (upstream throws `invalid_escaped_string`).
+#[must_use]
+pub fn base64decode_i2p(s: &[u8]) -> Option<Vec<u8>> {
+    fn map(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => u32::from(c - b'A'),
+            b'a'..=b'z' => 26 + u32::from(c - b'a'),
+            b'0'..=b'9' => 52 + u32::from(c - b'0'),
+            b'-' => 62,
+            b'~' => 63,
+            _ => return None,
+        })
+    }
+
+    let mut out = Vec::new();
+    let mut acc: u32 = 0;
+    let mut bit_offset: i32 = 18;
+    for &c in s {
+        if c == b'=' {
+            break;
+        }
+        acc |= map(c)? << bit_offset;
+        if bit_offset == 0 {
+            // host_to_network + bytes 1..4 = low 24 bits, BE order
+            out.push((acc >> 16) as u8);
+            out.push((acc >> 8) as u8);
+            out.push(acc as u8);
+            acc = 0;
+            bit_offset = 18;
+        } else {
+            bit_offset -= 6;
+        }
+    }
+    if bit_offset < 18 {
+        out.push((acc >> 16) as u8);
+        if bit_offset < 6 {
+            out.push((acc >> 8) as u8);
+        }
+    }
+    Some(out)
+}

@@ -30,12 +30,14 @@ pub mod bitfield;
 pub mod bloom_filter;
 pub mod crc32c;
 pub mod error;
+pub mod ffs;
 pub mod flags;
 pub mod hash;
 pub mod hex;
 pub mod identify_client;
 pub mod index_range;
 pub mod info_hash;
+pub mod lt_error;
 pub mod peer_id;
 pub mod random;
 pub mod sliding_average;
@@ -43,6 +45,7 @@ pub mod stat;
 pub mod time;
 pub mod timestamp_history;
 pub mod types;
+pub mod version;
 
 pub use bitfield::Bitfield;
 pub use bloom_filter::{BloomFilter, count_zero_bits, has_bits, set_bits};
@@ -59,3 +62,5 @@ pub use sliding_average::SlidingAverage;
 pub use stat::{NUM_CHANNELS, Stat, StatChannel, StatChannelKind};
 pub use timestamp_history::{TimestampHistory, compare_less_wrap};
 pub use types::{DownloadPriority, FileIndex, PeerRequest, PieceBlock, PieceIndex};
+/// `platform_util` — OS process queries (open-file limit, thread naming).
+pub mod platform;
