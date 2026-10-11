@@ -69,8 +69,10 @@ Biggest remaining surface. `session_impl` parity.
 
 - [x] `peer_class.cpp` / `peer_class_set.cpp` /
       `peer_class_type_filter.hpp` — bandwidth classes, filters
-- [ ] `torrent_handle.cpp` full ~90-method surface;
-      `torrent_status.cpp` complete fields; `torrent_list.hpp`
+- [x] `torrent_handle.cpp` full ~90-method surface;
+      `torrent_status.cpp` complete fields (incl. `info_hashes`,
+      `next_announce`, `completed_time`, `last_seen_complete`,
+      `is_seeding`); `torrent_list.hpp`
 - [ ] `peer_connection.cpp` full state machine +
       `peer_connection_handle.cpp` (currently partial)
 - [x] `peer_list.cpp` / `peer_info.cpp` / `peer.cpp`
@@ -86,7 +88,7 @@ Biggest remaining surface. `session_impl` parity.
 - [x] `i2p_pex.cpp`, `extensions.hpp` plugin registry
 - [x] `seed_mode` / `share_mode` corner cases; tracker retry parity
       details; `web_seed_entry` getright/holtb URL types (BEP-17/19)
-- [ ] `error_code.cpp` remaining `lt::errors` categories;
+- [x] `error_code.cpp` remaining `lt::errors` categories;
       `close_reason.cpp`; `version.cpp`; `string_util.cpp`
 - [x] `ffs.cpp` (file-piece spread) if still present upstream at pin
 
@@ -106,7 +108,8 @@ API surface complete; session stats match upstream counters.
       HTTPS trackers, cert pinning, `ssl` context settings
 - [x] `gzip.cpp` → `flate2` cabled outside HTTP too; `xml_parse.cpp`
       (RSS); `web_seed_entry` polish
-- [ ] SOCKS5 UDP-associate (`udp_socket` over SOCKS) completion
+- [x] SOCKS5 UDP-associate (`udp_socket` over SOCKS) completion —
+      `Socks5UdpSocket` relay, mock end-to-end test green
 
 **Exit**: all `test_socks5`/`test_ssl`/tracker-path tests green;
 every connector/acceptor path goes through ADR-0008 traits.
@@ -156,16 +159,19 @@ announce + mutable items verified on live Mainline DHT.
 - [x] Differential tests: golden fixtures vs C++ v2.1.2 (bencode, resume, session, dht, torrents, magnet — byte-exact).
 - [x] Live seed/leech pairs verified: C++ v2.1.2 seed → BitDaemon
       leech AND BitDaemon seed → C++ leech, byte-identical payloads
-      both ways (`tools/real_swarm`). Still open: magnet/DHT/SSL/uTP
-      pairs.
+      both ways (`tools/real_swarm`). uTP pair verified (C++ seed →
+      `--utp` leech, hash identical) and magnet resolution verified
+      live. Still open: SSL pair (local C++ build lacks OpenSSL)
+      and a dedicated DHT-bootstrap live pair.
 - [x] Real-swarm validation: `bitdaemon-cli` downloaded
       `ubuntu-24.04.4-live-server-amd64.iso` (3.4 GB, v1) from the
       public swarm — ~32 peers, ~117 MB/s peak, `Finished`,
       official SHA-256 verified.
 - [x] Fuzzing scaffold (`fuzz/` crate, 3 targets); campaign runs still pending (`cargo-fuzz`): bdecode, peer wire, DHT msg, resume,
       tracker responses — mirror upstream `fuzzers/`.
-- [ ] Resume/`.session` upgrade+downgrade round-trip matrix vs
-      upstream.
+- [x] Resume/`.session` upgrade+downgrade round-trip matrix vs
+      upstream (golden vectors + upgrade→downgrade→upgrade
+      idempotence test).
 - [x] Benchmarks scaffold (criterion: bdecode, peer-wire); vs-C++ numbers still pending (`examples/run_benchmarks` equivalent):
       hashing throughput, churn, memory @1000 torrents.
 
