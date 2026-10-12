@@ -2721,6 +2721,13 @@ impl Torrent {
         let fs = ti.files();
         self.merkle_trees.clear();
         for i in fs.file_range() {
+            // pad files have no content and no merkle tree — keep a
+            // placeholder so merkle_trees stays indexed by file index
+            if fs.pad_file_at(i) {
+                self.merkle_trees
+                    .push(bitdaemon_core::merkle_tree::MerkleTree::default());
+                continue;
+            }
             let mut tree = bitdaemon_core::merkle_tree::MerkleTree::new(
                 fs.file_num_blocks(i) as usize,
                 fs.blocks_per_piece() as usize,

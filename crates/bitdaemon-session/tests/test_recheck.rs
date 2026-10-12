@@ -449,3 +449,74 @@ fn v2_hash_request_serve_and_add() {
     t.on_hashes(&req, &piece_roots, &mut out);
     let _ = out;
 }
+
+#[test]
+fn hybrid_multifile_pad_files_dont_panic() {
+    // real-swarm catch: multi-file hybrid torrents carry `.pad/N`
+    // entries (canonical BEP-52 layout) — build_merkle_trees iterated
+    // file_range() into file_num_blocks()/root() which assert on pads.
+    use bitdaemon_common::Sha256Hash;
+    use bitdaemon_common::types::{FileIndex, PieceIndex, StorageIndex};
+    use bitdaemon_core::create_torrent::{CreateFileEntry, CreateFlags, CreateTorrent};
+    use bitdaemon_core::file_storage::FileFlags;
+    use bitdaemon_core::merkle::merkle_root;
+    use bitdaemon_core::torrent_info::{LoadTorrentLimits, load_torrent_buffer};
+    use bitdaemon_session::torrent::Torrent;
+    use sha2::{Digest as _, Sha256};
+
+    let leaf =
+        |i: usize| Sha256Hash::from_bytes(&Sha256::digest([(i % 251) as u8; 16384])).unwrap();
+
+    // f0 = 20_000 B (2 leafs, 1 piece), f1 = 70_000 B (5 leafs, 2
+    // pieces); canonicalize() pads each to the 64 KiB piece boundary:
+    // layout f0 | .pad | f1 | .pad → 3 pieces total.
+    let entries = [
+        (b"t/f0.bin" as &[u8], 20_000i64),
+        (b"t/f1.bin" as &[u8], 70_000i64),
+    ]
+    .iter()
+    .map(|(name, size)| CreateFileEntry {
+        filename: name.to_vec(),
+        size: *size,
+        flags: FileFlags::NONE,
+        mtime: 0,
+        symlink: Vec::new(),
+    })
+    .collect::<Vec<_>>();
+    let mut ct = CreateTorrent::new(entries, 4 * 16384, CreateFlags::default()).unwrap();
+    for p in 0..3 {
+        // nonzero v1 hashes — all-zero is rejected by validate
+        ct.set_hash(
+            PieceIndex(p),
+            Sha1Hash::from_bytes(&[p as u8 + 1; 20]).unwrap(),
+        )
+        .unwrap();
+    }
+    // file index 0 = f0, 2 = f1 (pads sit at 1 and 3)
+    ct.set_hash2(
+        FileIndex(0),
+        0,
+        merkle_root(&[leaf(0), leaf(1)], Sha256Hash::default()),
+    )
+    .unwrap();
+    ct.set_hash2(
+        FileIndex(2),
+        0,
+        merkle_root(&[leaf(0), leaf(1), leaf(2), leaf(3)], Sha256Hash::default()),
+    )
+    .unwrap();
+    ct.set_hash2(
+        FileIndex(2),
+        1,
+        merkle_root(&[leaf(4)], Sha256Hash::default()),
+    )
+    .unwrap();
+    let buf = ct.generate_buf().unwrap();
+    let atp = load_torrent_buffer(&buf, &LoadTorrentLimits::default()).unwrap();
+    assert_eq!(atp.ti.as_ref().unwrap().files().num_files(), 4);
+
+    // previously: assertion failed !f.pad_file at file_num_blocks
+    let t = Torrent::from_params(&atp, StorageIndex(0), &mut Vec::new()).unwrap();
+    assert_eq!(t.merkle_trees.len(), 4);
+    assert!(!t.is_v2_only());
+}

@@ -9,6 +9,11 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- `torrent::build_merkle_trees`: iterating `file_range()` called
+  `file_num_blocks`/`root` on `.pad/N` pad files (multi-file hybrid
+  torrents), hitting their `!pad_file` debug_assert — pads now get an
+  uninitialized placeholder so `merkle_trees` stays indexed by file
+  index. Found by the real-swarm bench (multi-file hybrid add).
 - `disk_io`: hash jobs parked by `piece_gate` behind in-flight writes
   were re-submitted through `add_job` on release, tripping the fence's
   `IN_PROGRESS` debug_assert (worker panic → stalled downloads) and
