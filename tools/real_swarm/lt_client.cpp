@@ -5,11 +5,14 @@
 //   make  <payload_dir_or_file> <out.torrent> — create a v1 .torrent
 //   makessl <payload_dir_or_file> <out.torrent> <root_ca.pem>
 //         — SSL torrent: embeds the root CA PEM in the info dict
+//   info  <file.torrent> — print name + v1/v2 info-hashes
 //   seed  <file.torrent> <save_path> <port> [seconds] — seed
 //   sslseed <file.torrent> <save_path> <port> <seconds> <cert> <key> <dh>
 //         — seed on an ssl: listen interface
 //   leech <file.torrent> <save_path> <port> <ip:port> [peer2…]
-//         — download, exit when seeding, print stats
+//         — download, exit when seeding, print stats; keeps
+//           <file.torrent>.resume fresh and resumes from it if present
+//   utpleech …— leech with outbound/inbound TCP disabled (uTP-only)
 //   sslleech <file.torrent> <save_path> <port> <ip:port> <cert> <key> <dh>
 //         — download over TLS peer connections
 //
@@ -22,7 +25,9 @@
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/create_torrent.hpp>
+#include <libtorrent/hex.hpp>
 #include <libtorrent/load_torrent.hpp>
+#include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/write_resume_data.hpp>
 #include <libtorrent/magnet_uri.hpp>
 #include <libtorrent/error_code.hpp>
@@ -86,6 +91,10 @@ static session_params base_params(int port)
     sp.set_bool(settings_pack::enable_natpmp, false);
     sp.set_bool(settings_pack::enable_lsd, false);
     sp.set_bool(settings_pack::enable_dht, false);
+    // the whole bench runs on 127.0.0.1 — without this upstream drops
+    // same-IP connections as duplicates (uTP+TCP races, multi-client
+    // PEX topologies)
+    sp.set_bool(settings_pack::allow_multiple_connections_per_ip, true);
     session_params p(sp);
     return p;
 }
@@ -117,11 +126,51 @@ static int seed(char const* torr, char const* save, int port, int seconds)
     return 0;
 }
 
-static int leech(char const* torr, char const* save, int port,
-    std::vector<std::string> const& peers)
+static int info(char const* torr)
 {
     auto atp = load_torrent_file(torr);
-    session ses(base_params(port));
+    auto const& ih = atp.ti->info_hashes();
+    std::printf("name: %s\n", atp.ti->name().c_str());
+    if (ih.has_v1()) std::printf("v1: %s\n", aux::to_hex(ih.v1).c_str());
+    if (ih.has_v2()) std::printf("v2: %s\n", aux::to_hex(ih.v2).c_str());
+    return 0;
+}
+
+static int leech(char const* torr, char const* save, int port,
+    std::vector<std::string> const& peers, bool utp_only)
+{
+    auto atp = load_torrent_file(torr);
+
+    // cross-client resume: if a previous run (either client) left a
+    // `<torrent>.resume` file, continue from it
+    std::string const rpath = std::string(torr) + ".resume";
+    if (std::filesystem::exists(rpath))
+    {
+        std::ifstream rf(rpath, std::ios::binary);
+        std::vector<char> rbuf((std::istreambuf_iterator<char>(rf)),
+            std::istreambuf_iterator<char>());
+        error_code ec;
+        auto ratp = read_resume_data(rbuf, ec);
+        if (!ec)
+        {
+            if (!ratp.ti) ratp.ti = atp.ti;
+            ratp.save_path = save;
+            atp = std::move(ratp);
+            std::printf("resumed from %s\n", rpath.c_str());
+        }
+        else std::fprintf(stderr, "bad resume: %s\n", ec.message().c_str());
+    }
+
+    auto params = base_params(port);
+    if (utp_only)
+    {
+        params.settings.set_bool(settings_pack::enable_outgoing_tcp, false);
+        params.settings.set_bool(settings_pack::enable_incoming_tcp, false);
+        params.settings.set_bool(settings_pack::enable_outgoing_utp, true);
+        params.settings.set_bool(settings_pack::enable_incoming_utp, true);
+        std::printf("utp-only mode (TCP disabled)\n");
+    }
+    session ses(params);
     atp.save_path = save;
     auto h = ses.add_torrent(std::move(atp));
 
@@ -140,11 +189,20 @@ static int leech(char const* torr, char const* save, int port,
     for (;;)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // keep `<torrent>.resume` fresh so a kill mid-download leaves
+        // usable resume state (cross-client interop test)
+        h.save_resume_data(torrent_handle::save_info_dict);
         std::vector<alert*> alerts;
         ses.pop_alerts(&alerts);
         for (alert* a : alerts)
         {
             std::printf("  seed alert[%d]: %s\n", a->type(), a->message().c_str());
+            if (auto* sr = alert_cast<save_resume_data_alert>(a))
+            {
+                auto const buf = write_resume_data_buf(sr->params);
+                std::ofstream rf(rpath, std::ios::binary);
+                rf.write(buf.data(), (std::streamsize)buf.size());
+            }
             if (auto* st = alert_cast<state_update_alert>(a))
             {
                 for (auto const& s : st->status)
@@ -190,6 +248,7 @@ static session_params ssl_params(int port, bool ssl_listen)
     sp.set_bool(settings_pack::enable_natpmp, false);
     sp.set_bool(settings_pack::enable_lsd, false);
     sp.set_bool(settings_pack::enable_dht, false);
+    sp.set_bool(settings_pack::allow_multiple_connections_per_ip, true);
     return session_params(sp);
 }
 
@@ -280,7 +339,7 @@ static int sslleech(char const* torr, char const* save, int port,
 int main(int argc, char** argv)
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    if (argc < 2) { std::fprintf(stderr, "usage: lt_client make|makessl|seed|sslseed|leech|sslleech …\n"); return 1; }
+    if (argc < 2) { std::fprintf(stderr, "usage: lt_client make|makev1|makev2|makessl|info|seed|sslseed|leech|utpleech|sslleech …\n"); return 1; }
     std::string mode = argv[1];
     try
     {
@@ -299,11 +358,13 @@ int main(int argc, char** argv)
                 argv[5], argv[6], argv[7], argv[8]);
         if (mode == "seed" && argc >= 5)
             return seed(argv[2], argv[3], std::atoi(argv[4]), argc > 5 ? std::atoi(argv[5]) : 600);
-        if (mode == "leech" && argc >= 5)
+        if (mode == "info" && argc == 3) return info(argv[2]);
+        if ((mode == "leech" || mode == "utpleech") && argc >= 5)
         {
             std::vector<std::string> peers;
             for (int i = 5; i < argc; ++i) peers.emplace_back(argv[i]);
-            return leech(argv[2], argv[3], std::atoi(argv[4]), peers);
+            return leech(argv[2], argv[3], std::atoi(argv[4]), peers,
+                mode == "utpleech");
         }
     }
     catch (std::exception const& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
