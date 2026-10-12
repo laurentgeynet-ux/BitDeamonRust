@@ -22,6 +22,69 @@ Until `1.0.0`, breaking changes may occur in any release.
   deterministic `hash_parked_behind_inflight_write_is_released`
   regression test.
 
+### Fixed — real-swarm differential findings (vs libtorrent v2.1.2)
+
+- `torrent::want_peers` returned `false` for seeds — a seed never
+  dialed and its peer set never refreshed. Upstream
+  `want_peers_finished` keeps seeds eligible, gated on
+  `seeding_outgoing_connections` (default `true`); the gate is now
+  ported (`update_want_peers` keeps seeds in the want-peers set like
+  upstream).
+- `ut_pex` advertised nothing in production:
+  `PeerConn::{outgoing,connecting,handshake_done}` were never
+  assigned outside tests, inbound connections stored `remote: None`
+  (`0.0.0.0:0` in alerts), and the ext-handshake `p` listen port was
+  parsed but unused. Lifecycle flags are set when the BT handshake
+  completes, inbound remote endpoints are kept, and `p` feeds
+  `peer_listen_port` — inbound peers are advertised with their
+  announced listen port, matching `pex_peer_plugin`. Verified live:
+  upstream parsed our added/dropped diffs and dialed a peer it knew
+  only through our PEX. Regression:
+  `pex_advertises_only_completed_dialable_peers`.
+- Magnet downloads stalled at 0 %: metadata resolution left the
+  torrent on `StorageIndex::INVALID` (new sentinel — upstream
+  `storage_index_t{}`) so disk jobs routed to no storage; real
+  storage is now created at `MetadataReceived`. A `Bitfield`
+  received before metadata (`num_pieces == 0`) also produced an
+  empty `peer_pieces` → never `Interested`; pre-metadata bitfields
+  are kept (`pre_metadata_all`) and reconciled when metadata lands
+  (truncate to `num_pieces`, bump availability refcounts,
+  re-evaluate interest). Regressions:
+  `magnet_metadata_creates_storage` +
+  `pre_metadata_bitfield_reconciled_on_metadata`.
+- `build_merkle_trees`: real 0-byte files hit the `blocks > 0`
+  assert in `merkle` — upstream `merkle.cpp::generate` skips empty
+  files; they now get placeholder roots like pad files.
+- `check_fastresume`: a resume verdict carrying **no resume data**
+  was unconditionally "accepted", so existing files were never
+  hashed (`have 0/N`, full re-download on every plain add). Ported
+  upstream `pread_disk_io` semantics:
+  `contains_resume_data ? verify : (has_any_file ? need_full_check
+  : ok)`; `DiskIo` gained `has_any_file`. Regression:
+  `check_fastresume_no_resume_needs_full_check_when_files_exist`.
+
+### Added — differential bench tooling
+
+- `bitdaemon` CLI: `--resume <file>` loads an upstream-format
+  fastresume (falls back to the positional `.torrent`/magnet for
+  metadata), `--stop-after <s>` graceful bench stop that still
+  writes `.resume`; a fastresume is saved per torrent on shutdown
+  (`<v1-infohash>.resume` in save-path — loadable by libtorrent).
+- `tools/real_swarm/lt_client`: `makessl`/`sslseed`/`sslleech`/`info`
+  modes, `.resume` save+reload, and
+  `allow_multiple_connections_per_ip` for multi-client loopback
+  benches.
+
+### Verified — live interop vs libtorrent v2.1.2 (real_swarm bench)
+
+- uTP both directions; magnet `ut_metadata` retrieval + full
+  download; `.resume` round-trip both ways (incl. upstream detecting
+  a truncated tail and re-fetching only the bad pieces); `ut_pex`
+  driving upstream's dialer; boundary file layouts both ways
+  (0-byte, tiny, deep paths, UTF-8/space names, pad files, hybrid
+  v1+v2); SSL torrents both directions with mutual TLS (embedded
+  torrent root CA, leaf CN == torrent name).
+
 ### Added — full `settings_pack` surface
 
 - `SessionSettings` now exposes **every upstream `settings_pack`

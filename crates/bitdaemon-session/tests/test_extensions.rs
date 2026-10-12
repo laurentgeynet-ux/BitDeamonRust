@@ -196,10 +196,12 @@ fn metadata_verdict_distinguishes_retry_from_fatal() {
     let mut t = torrent(ih);
     // wrong hash → HashMismatch (upstream penalizes the source
     // and keeps trying other peers).
+    let mut out = Vec::new();
     assert_eq!(
         t.set_metadata_verdict(
             b"d3:foo3:barde",
-            &bitdaemon_core::torrent_info::LoadTorrentLimits::default()
+            &bitdaemon_core::torrent_info::LoadTorrentLimits::default(),
+            &mut out
         ),
         MetadataVerdict::HashMismatch
     );

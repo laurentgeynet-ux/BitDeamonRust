@@ -38,6 +38,16 @@ fn tracker_feed_gives_candidates() {
 }
 
 #[test]
+fn seed_still_wants_peers_for_upload() {
+    let mut t = t();
+    t.finished = true;
+    // upstream `want_peers_finished`: seeds keep dialing (to serve
+    // upload and feed ut_pex) unless seeding_outgoing_connections off
+    assert!(t.want_peers(true));
+    assert!(!t.want_peers(false));
+}
+
+#[test]
 fn seed_skips_seed_candidates() {
     let mut t = t();
     t.add_swarm_peer(ep(1), PeerSourceFlags::TRACKER, true);

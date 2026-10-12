@@ -733,6 +733,12 @@ pub trait DiskStorage: Send + Sync {
         seed_mode: bool,
         links: &[PathBuf],
     ) -> StorageResult<bool>;
+    /// `has_any_file` — true if any non-pad file exists on disk;
+    /// drives `need_full_check` when there is no resume data.
+    /// Default `false` keeps injected storages source-compatible.
+    fn has_any_file(&self) -> StorageResult<bool> {
+        Ok(false)
+    }
     /// `storage_holder::initialize` — deferred storage setup
     /// (upstream calls it on the first job that touches files).
     /// Returns `disk_status` bits (`oversized_file` among them).
@@ -829,6 +835,9 @@ impl DiskStorage for PreadStorage {
         links: &[PathBuf],
     ) -> StorageResult<bool> {
         PreadStorage::verify_resume_data(self, have_pieces, seed_mode, links)
+    }
+    fn has_any_file(&self) -> StorageResult<bool> {
+        PreadStorage::has_any_file(self)
     }
     fn initialize(&mut self) -> StorageResult<u8> {
         PreadStorage::initialize(self)

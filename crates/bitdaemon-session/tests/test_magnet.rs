@@ -194,3 +194,210 @@ fn pex_feeds_swarm_and_broadcasts() {
         }
     )));
 }
+
+/// `send_peer` filter (upstream `ut_pex_peer_plugin::tick` →
+/// `torrent::send_peer`): pex must advertise only connections that
+/// dialed out OR shared their listen port (`p`), are past the
+/// handshake, and inbound endpoints must carry the advertised `p`
+/// port — not the ephemeral source port. Regression: the lifecycle
+/// fields were never set in production, so the filter emptied the
+/// list and live swarms never received usable `added` entries.
+#[test]
+fn pex_advertises_only_completed_dialable_peers() {
+    use bitdaemon_net::bep10::ExtendedHandshake;
+    use bitdaemon_net::peer_wire::PeerMessage;
+    use bitdaemon_session::peer_conn::PeerConn;
+    use bitdaemon_session::peer_pipeline::PeerPipeline;
+    use bitdaemon_session::torrent::TorrentEffect;
+    use bitdaemon_session::ut_pex::parse_pex_message;
+    use std::collections::BTreeMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let ih = Sha1Hash::from_bytes(&[4; 20]).unwrap();
+    let mut t = Torrent::new(ih, 4, 16384, Bitfield::with_size(4), StorageIndex(0));
+
+    // recipient conn — speaks ut_pex but stays "connecting" so it is
+    // not itself advertised
+    t.add_peer(7, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
+    let mut m = BTreeMap::new();
+    m.insert("ut_pex".to_string(), 2);
+    let hs = ExtendedHandshake {
+        messages: m,
+        ..Default::default()
+    };
+    let mut scratch = Vec::new();
+    t.on_peer_message(
+        7,
+        &PeerMessage::Extended {
+            id: 0,
+            data: bitdaemon_bencode::bencode(&hs.build()).into(),
+        },
+        0,
+        &mut scratch,
+    );
+
+    let mk = |remote: SocketAddr| {
+        let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
+        c.remote = Some(remote);
+        c.connecting = false;
+        c.handshake_done = true;
+        c.num_pieces = 4; // post-handshake conns have seen a bitfield
+        c
+    };
+    let seed_ep = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 1)), 6881);
+    let mut seed = mk(seed_ep);
+    seed.outgoing = true;
+    seed.num_pieces = 4;
+    seed.peer_pieces.set_all(); // seed → pex_seed flag
+    t.add_peer(8, seed);
+
+    // inbound conn that shared `p` — advertised at the listen port,
+    // not the ephemeral source port
+    let inbound_src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 2)), 55000);
+    let mut inbound = mk(inbound_src);
+    inbound.received_listen_port = true;
+    inbound.peer_listen_port = Some(6883);
+    t.add_peer(9, inbound);
+
+    // inbound without `p` — never advertised
+    let mut nop = mk(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(10, 9, 9, 3)),
+        55001,
+    ));
+    nop.outgoing = false;
+    t.add_peer(10, nop);
+
+    // outgoing but pre-handshake — never advertised (the prod bug:
+    // these fields stayed false forever)
+    let mut hs_pending = mk(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(10, 9, 9, 4)),
+        6884,
+    ));
+    hs_pending.outgoing = true;
+    hs_pending.handshake_done = false;
+    t.add_peer(11, hs_pending);
+
+    let mut out = Vec::new();
+    t.pex_tick(std::time::Instant::now(), &mut out);
+    let body = out
+        .iter()
+        .find_map(|e| match e {
+            TorrentEffect::SendTo {
+                peer: 7,
+                msg: PeerMessage::Extended { id: 2, data },
+            } => Some(data.clone()),
+            _ => None,
+        })
+        .expect("pex message to peer 7");
+    let (added, dropped) = parse_pex_message(&body, 50, 0).expect("valid pex");
+    let eps: Vec<SocketAddr> = added.iter().map(|p| p.addr).collect();
+    assert_eq!(
+        eps,
+        vec![
+            seed_ep,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 2)), 6883)
+        ]
+    );
+    assert_eq!(added[0].flags, bitdaemon_session::ut_pex::flags::PEX_SEED);
+    assert_eq!(added[1].flags, 0);
+    assert!(dropped.is_empty());
+}
+
+/// session-level: a magnet added with `StorageIndex::INVALID` must get
+/// real storage when metadata resolves (`torrent::init` upstream) —
+/// regression for magnet downloads stalling at 0% after the info dict
+/// arrived (every disk job routed to a nonexistent index).
+#[test]
+fn magnet_metadata_creates_storage() {
+    use bitdaemon_common::info_hash::InfoHash;
+    use bitdaemon_core::add_torrent_params::AddTorrentParams;
+    use bitdaemon_disk::disk_io::PreadDiskIo;
+    use bitdaemon_net::peer_wire::PeerMessage;
+    use bitdaemon_session::peer_conn::PeerConn;
+    use bitdaemon_session::peer_pipeline::PeerPipeline;
+    use bitdaemon_session::session::{PeerPacket, Session};
+    use bitdaemon_session::ut_metadata::{MetadataMsg, metadata_packet};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    let info = info_bytes(&[0x55; 20]);
+    let ih = {
+        use sha1::Digest as _;
+        let mut h = sha1::Sha1::new();
+        h.update(&info);
+        Sha1Hash::from_bytes(&h.finalize()).unwrap()
+    };
+
+    let dir = std::env::temp_dir().join(format!("bd-mag-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut s = Session::new();
+    s.set_disk(PreadDiskIo::new(1, Arc::new(|| {})));
+
+    // magnet add — no `ti`, storage must stay INVALID for now
+    let atp = AddTorrentParams {
+        info_hashes: InfoHash::from_v1(ih),
+        save_path: dir.as_os_str().as_encoded_bytes().to_vec(),
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    assert_eq!(
+        s.add_torrent_params(&atp, StorageIndex::INVALID, &mut out),
+        Some(ih)
+    );
+    assert!(s.torrents[&ih].magnet);
+    assert_eq!(s.torrents[&ih].storage, StorageIndex::INVALID);
+
+    // peer 1 connects BEFORE metadata and sends its bitfield while
+    // our num_pieces is still unknown — it must be stored raw, not
+    // truncated to zero bits
+    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6881);
+    s.peer_connected(
+        &ih,
+        1,
+        PeerConn::new(1, PeerPipeline::new(1000, 30, 250), 0),
+        remote,
+        &mut out,
+    );
+    s.on_peer_message(
+        &PeerPacket {
+            info_hash: ih,
+            peer: 1,
+            remote,
+            msg: PeerMessage::Bitfield(vec![0x80].into()),
+        },
+        &mut out,
+    );
+
+    // peer 1 then serves the single ut_metadata piece → MetadataReceived
+    let packet = metadata_packet(MetadataMsg::Piece, 0, true, &info);
+    s.on_peer_message(
+        &PeerPacket {
+            info_hash: ih,
+            peer: 1,
+            remote,
+            msg: PeerMessage::Extended {
+                id: 1,
+                data: packet.into(),
+            },
+        },
+        &mut out,
+    );
+
+    let t = &s.torrents[&ih];
+    assert!(t.ti.is_some());
+    assert!(!t.magnet);
+    // deferred storage exists now — first real slot is index 0
+    assert_eq!(t.storage, StorageIndex(0));
+    // and the pre-metadata bitfield made the peer interesting →
+    // `Interested` was emitted on the wire (peers stay choked
+    // otherwise — this was the real 0%-forever failure)
+    assert!(out.iter().any(|o| matches!(
+        o,
+        bitdaemon_session::session::SessionOut::ToPeer {
+            msg: PeerMessage::Interested,
+            ..
+        }
+    )));
+}

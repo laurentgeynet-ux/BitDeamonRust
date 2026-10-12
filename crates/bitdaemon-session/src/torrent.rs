@@ -167,6 +167,12 @@ pub struct Torrent {
     pub added_time: std::time::SystemTime,
     /// `m_save_path`.
     pub save_path: String,
+    /// `m_storage_mode` — `atp.storage_mode` kept so deferred storage
+    /// creation (magnets) honors the caller's Sparse/Allocate choice.
+    pub storage_mode: bitdaemon_core::StorageMode,
+    /// `atp.part_file_dir` — `.parts` override dir ("" = under
+    /// `save_path`), kept for deferred storage creation.
+    pub part_file_dir: String,
     /// display name (`ti->name()` or `atp.name`).
     pub name: String,
     /// a `check_files` job is in flight (`m_checking_piece` coarse).
@@ -502,6 +508,8 @@ impl Torrent {
             queued: false,
             added_time: std::time::SystemTime::now(),
             save_path: String::new(),
+            storage_mode: bitdaemon_core::StorageMode::default(),
+            part_file_dir: String::new(),
             name: String::new(),
             checking: false,
             down_rate: 0,
@@ -697,6 +705,8 @@ impl Torrent {
             t.seed_verifying = Bitfield::with_size(t.num_pieces.max(0) as usize);
         }
         t.save_path = String::from_utf8_lossy(&atp.save_path).into_owned();
+        t.storage_mode = atp.storage_mode;
+        t.part_file_dir = String::from_utf8_lossy(&atp.part_file_dir).into_owned();
         if !atp.name.is_empty() {
             t.name = String::from_utf8_lossy(&atp.name).into_owned();
         } else if let Some(ti) = &atp.ti {
@@ -719,8 +729,12 @@ impl Torrent {
     /// upstream — caller penalizes sources via
     /// `metadata_tracker.reset_on_hash_failure`).
     pub fn set_metadata(&mut self, metadata: &[u8], cfg: &LoadTorrentLimits) -> bool {
+        // effect-less callers (tests, handle APIs routed by the
+        // session) get the verdict; the `SendTo` effects it produces
+        // are discarded here
+        let mut scratch = Vec::new();
         matches!(
-            self.set_metadata_verdict(metadata, cfg),
+            self.set_metadata_verdict(metadata, cfg, &mut scratch),
             MetadataVerdict::Ok
         )
     }
@@ -734,6 +748,7 @@ impl Torrent {
         &mut self,
         metadata: &[u8],
         cfg: &LoadTorrentLimits,
+        out: &mut Vec<TorrentEffect>,
     ) -> MetadataVerdict {
         use sha1::Digest as _;
         let mut h = sha1::Sha1::new();
@@ -768,6 +783,34 @@ impl Torrent {
         self.magnet = false;
         self.init_picker(true);
         self.need_save_resume = true;
+        // peers that connected pre-metadata: their bitfields were
+        // stored at whatever size arrived (`RefcountBulk` was a no-op
+        // without a picker) — reconcile sizes and replay availability
+        // into the fresh picker, then re-evaluate interest.
+        let npieces = self.num_pieces.max(0) as usize;
+        let mut peer_bits = Vec::new();
+        for c in self.peers.values_mut() {
+            if c.pre_metadata_all {
+                let mut bf = Bitfield::with_size(npieces);
+                bf.set_all();
+                c.peer_pieces = bf.clone();
+                c.pre_metadata_all = false;
+            } else if c.peer_pieces.size() > npieces {
+                c.peer_pieces.resize_with(npieces, false);
+            }
+            if !c.peer_pieces.none_set() {
+                peer_bits.push(c.peer_pieces.clone());
+            }
+        }
+        if let Some(p) = self.picker.as_mut() {
+            for bits in &peer_bits {
+                p.inc_refcount_bitfield(bits);
+            }
+        }
+        // `torrent::init`/`start` — interested was never sent (our
+        // `have` only materialized now): tell whoever holds pieces
+        // we want, else the swarm keeps us choked forever.
+        self.update_interest_all(out);
         MetadataVerdict::Ok
     }
 
@@ -839,7 +882,7 @@ impl Torrent {
                     // `torrent::on_metadata`/`set_metadata`). A
                     // hash-valid but unparseable payload sets
                     // `invalid_swarm_metadata` and pauses upstream.
-                    match self.set_metadata_verdict(&md, &LoadTorrentLimits::default()) {
+                    match self.set_metadata_verdict(&md, &LoadTorrentLimits::default(), out) {
                         MetadataVerdict::Ok => {
                             self.metadata_tracker.clear();
                             out.push(TorrentEffect::MetadataReceived);
@@ -946,14 +989,29 @@ impl Torrent {
             return;
         }
         self.last_pex = Some(now);
-        // the connected set we advertise (endpoints we dialed or
-        // accepted — pex excludes peers without a listen address,
-        // which `remote` approximates)
+        // upstream `send_peer`: advertise only bittorrent conns that
+        // either we dialed or that shared their listen port — and are
+        // past the handshake. Inbound endpoints get their advertised
+        // `p` port (the source port is ephemeral); flags carry
+        // `pex_seed` for seeds.
         let connected: Vec<(SocketAddr, u8)> = self
             .peers
             .values()
-            .filter_map(|c| c.remote)
-            .map(|ep| (ep, 0u8))
+            .filter(|c| (c.outgoing || c.received_listen_port) && !c.connecting && c.handshake_done)
+            .filter_map(|c| {
+                let mut ep = c.remote?;
+                if !c.outgoing
+                    && let Some(p) = c.peer_listen_port
+                {
+                    ep.set_port(p);
+                }
+                let flags = if c.peer_pieces.count() == c.num_pieces as usize {
+                    crate::ut_pex::flags::PEX_SEED
+                } else {
+                    0
+                };
+                Some((ep, flags))
+            })
             .collect();
         let ids: Vec<(u64, u8)> = self
             .peers
@@ -2721,9 +2779,11 @@ impl Torrent {
         let fs = ti.files();
         self.merkle_trees.clear();
         for i in fs.file_range() {
-            // pad files have no content and no merkle tree — keep a
-            // placeholder so merkle_trees stays indexed by file index
-            if fs.pad_file_at(i) {
+            // pad and empty files have no content and no merkle tree —
+            // upstream `generate()` emits no `pieces root` for them.
+            // Keep a placeholder so merkle_trees stays indexed by file
+            // index.
+            if fs.pad_file_at(i) || fs.file_size(i) == 0 {
                 self.merkle_trees
                     .push(bitdaemon_core::merkle_tree::MerkleTree::default());
                 continue;
@@ -3693,11 +3753,21 @@ impl Torrent {
 
     /// `want_more_peers` — downstream connect decisions.
     #[must_use]
-    pub fn want_peers(&self) -> bool {
-        // upstream `torrent::want_peers_download` also checks the
-        // per-torrent connection cap (`m_max_connections`, -1 = inf).
+    /// upstream `torrent::want_peers` — true for downloading torrents
+    /// *and* seeds (upstream `want_peers_finished`: a seed keeps
+    /// dialing to serve upload and feed PEX), unless
+    /// `seeding_outgoing_connections` is disabled.
+    pub fn want_peers(&self, seeding_outgoing: bool) -> bool {
+        // upstream `torrent::want_peers` also checks the
+        // per-torrent connection cap (`m_max_connections`, -1 = inf)
+        // and gates seeds on `seeding_outgoing_connections`
+        // (default true — a finished torrent still dials candidates).
         let conn_ok = self.max_connections < 0 || (self.peers.len() as i32) < self.max_connections;
-        self.want_peers && !self.paused && !self.queued && !self.is_seed() && conn_ok
+        self.want_peers
+            && !self.paused
+            && !self.queued
+            && (seeding_outgoing || !self.is_seed())
+            && conn_ok
     }
 
     // ---- remaining `torrent.cpp` surface (upstream method names kept
@@ -3944,7 +4014,9 @@ impl Torrent {
     /// `update_want_peers` — recompute `m_want_peers` (paused,
     /// finished, abort and connection cap all feed it).
     pub fn update_want_peers(&mut self) {
-        self.want_peers = !self.paused && !self.aborted && !self.upload_only && !self.is_seed();
+        // upstream seeds stay in `want_peers_finished` — the
+        // `seeding_outgoing_connections` gate lives in `want_peers()`.
+        self.want_peers = !self.paused && !self.aborted && !self.upload_only;
     }
 
     /// `update_tracker_timer` — upstream nudges the next announce

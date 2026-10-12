@@ -1735,6 +1735,11 @@ impl Engine {
         let mut conn = conn;
         conn.supports_fast = d.fast;
         conn.supports_dht = d.dht;
+        // DialDone only fires after the BT handshake — the conn is
+        // established; direction drives ut_pex send_peer semantics.
+        conn.outgoing = d.outbound;
+        conn.connecting = false;
+        conn.handshake_done = true;
         let mut out = Vec::new();
         slock(&self.session).peer_connected(&d.ih, peer, conn, remote, &mut out);
         self.attach_stream(d.ih, peer, remote, s);
@@ -2018,7 +2023,9 @@ impl Engine {
                     Ok(hs) => {
                         let _ = tx.send(DialDone {
                             ih: hs.info_hash,
-                            remote: None,
+                            // the accepted source endpoint — needed for
+                            // ut_pex advertising and alert accuracy
+                            remote,
                             stream: Ok(s),
                             outbound: false,
                             fast: hs.supports_fast(),
@@ -2472,9 +2479,10 @@ impl Engine {
         state: &bitdaemon_net::peer_list::PeerListState,
         max_peers: usize,
     ) -> Vec<(Sha1Hash, SocketAddr)> {
+        let seeding_outgoing = slock(&self.session).settings.seeding_outgoing_connections;
         let mut dialing = Vec::new();
         for (ih, t) in &mut slock(&self.session).torrents {
-            if dialing.len() >= max_peers || !t.want_peers() {
+            if dialing.len() >= max_peers || !t.want_peers(seeding_outgoing) {
                 continue;
             }
             for ep in t.connect_candidates(session_time, state) {

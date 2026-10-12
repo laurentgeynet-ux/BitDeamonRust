@@ -72,6 +72,18 @@ impl From<FileIndex> for i32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct StorageIndex(pub u32);
 
+impl StorageIndex {
+    /// `storage_index_t{}` upstream — "no storage bound" sentinel for
+    /// deferred adds (unresolved magnets, `.session` restores). Must
+    /// NOT collide with a real slot: `new_torrent` hands out 0,1,2…
+    pub const INVALID: StorageIndex = StorageIndex(u32::MAX);
+
+    /// `true` when the index names a real storage slot.
+    pub fn is_valid(self) -> bool {
+        self != Self::INVALID
+    }
+}
+
 /// `libtorrent::peer_request` — a byte range within a piece, used for
 /// incoming piece requests (`peer_request.hpp`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

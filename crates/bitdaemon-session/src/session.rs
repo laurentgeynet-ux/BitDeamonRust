@@ -13,14 +13,17 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bitdaemon_common::types::{PeerRequest, PieceIndex, StorageIndex};
+use bitdaemon_common::types::{FileIndex, PeerRequest, PieceIndex, StorageIndex};
 use bitdaemon_common::{Bitfield, Sha1Hash};
+use bitdaemon_core::file_storage::RenamedFiles;
 use bitdaemon_dht::dht_tracker::DhtTracker;
 use bitdaemon_disk::disk_buffer_pool::DiskBufferHolder;
 use bitdaemon_disk::disk_interface::DiskIo;
+use bitdaemon_disk::storage::StorageParams;
 use bitdaemon_disk::storage_error::StorageError;
 use bitdaemon_net::peer_wire::PeerMessage;
 
@@ -1115,6 +1118,86 @@ impl Session {
         res.matches(oti, oti.files(), &renamed, other.save_path.as_bytes());
     }
 
+    /// `torrent::init`'s storage creation — build a `StorageParams`
+    /// from the add-torrent params and register it with the disk.
+    /// Callers may pass `StorageIndex::INVALID` to `add_torrent_params`
+    /// to defer this here (SessionHandle API, `.session` restores).
+    fn create_storage_atp(
+        &self,
+        atp: &bitdaemon_core::add_torrent_params::AddTorrentParams,
+    ) -> Option<StorageIndex> {
+        let disk = self.disk.as_ref()?;
+        let ti = atp.ti.as_ref()?;
+        let mut renamed = RenamedFiles::default();
+        for (&idx, path) in &atp.renamed_files {
+            renamed.rename_file(ti.files(), FileIndex(idx), path);
+        }
+        // `info_hash` names the `.parts` file — use the swarm id
+        // (v1, or truncated v2 for v2-only torrents).
+        let info_hash = if atp.info_hashes.has_v1() {
+            *atp.info_hashes.v1.as_bytes()
+        } else {
+            *atp.info_hashes
+                .get(bitdaemon_common::info_hash::ProtocolVersion::V2)
+                .as_bytes()
+        };
+        let params = StorageParams {
+            files: ti.files(),
+            renamed: &renamed,
+            path: PathBuf::from(String::from_utf8_lossy(&atp.save_path).into_owned()),
+            part_file_dir: PathBuf::from(String::from_utf8_lossy(&atp.part_file_dir).into_owned()),
+            mode: match atp.storage_mode {
+                bitdaemon_core::StorageMode::Allocate => {
+                    bitdaemon_disk::storage::StorageMode::Allocate
+                }
+                bitdaemon_core::StorageMode::Sparse => bitdaemon_disk::storage::StorageMode::Sparse,
+            },
+            priorities: &atp.file_priorities,
+            info_hash,
+            v1: atp.info_hashes.has_v1(),
+            v2: atp.info_hashes.has_v2(),
+        };
+        // `torrent` lifetime token — Torrent lives in `self.torrents`,
+        // PreadDiskIo ignores it; a unit Arc satisfies the trait.
+        Some(disk.new_torrent(&params, Arc::new(())))
+    }
+
+    /// Same as `create_storage_atp` but sourced from the `Torrent`
+    /// itself — used when a magnet resolves (`MetadataReceived`).
+    /// Returns the new index, `None` when storage already exists,
+    /// metadata is still missing, or no disk is set.
+    fn create_storage_torrent(&mut self, ih: &Sha1Hash) -> Option<StorageIndex> {
+        let disk = self.disk.clone()?;
+        let t = self.torrents.get(ih)?;
+        if t.storage.is_valid() || t.ti.is_none() {
+            return None;
+        }
+        let ti = t.ti.clone()?;
+        let mut renamed = RenamedFiles::default();
+        for (&idx, path) in &t.renamed_files {
+            renamed.rename_file(ti.files(), FileIndex(idx), path.as_bytes());
+        }
+        let params = StorageParams {
+            files: ti.files(),
+            renamed: &renamed,
+            path: PathBuf::from(&t.save_path),
+            part_file_dir: PathBuf::from(&t.part_file_dir),
+            mode: match t.storage_mode {
+                bitdaemon_core::StorageMode::Allocate => {
+                    bitdaemon_disk::storage::StorageMode::Allocate
+                }
+                bitdaemon_core::StorageMode::Sparse => bitdaemon_disk::storage::StorageMode::Sparse,
+            },
+            priorities: &t.file_priorities,
+            info_hash: *t.info_hash.as_bytes(),
+            v1: ti.v1(),
+            v2: ti.v2(),
+        };
+        let idx = disk.new_torrent(&params, Arc::new(()));
+        self.torrents.get_mut(ih)?.storage = idx;
+        Some(idx)
+    }
+
     /// `add_torrent` — the real entry point: `AddTorrentParams` →
     /// `Torrent::from_params`, resume effects are dispatched
     /// (disk verify jobs for restored unfinished pieces).
@@ -1124,6 +1207,15 @@ impl Session {
         storage: StorageIndex,
         out: &mut Vec<SessionOut>,
     ) -> Option<Sha1Hash> {
+        // `torrent::init` creates the storage from the atp — a caller
+        // passing INVALID means "session, do it" (public handle API,
+        // session restores). Unresolved magnets keep INVALID until
+        // `MetadataReceived`.
+        let storage = if storage == StorageIndex::INVALID {
+            self.create_storage_atp(atp).unwrap_or(storage)
+        } else {
+            storage
+        };
         let mut eff = Vec::new();
         let t = Torrent::from_params(atp, storage, &mut eff)?;
         let ih = t.info_hash;
@@ -1433,6 +1525,15 @@ impl Session {
             t.on_peer_message(p.peer, &p.msg, self.session_time, &mut eff);
         }
         self.route(p.info_hash, eff, out);
+    }
+
+    /// `route` for call sites that don't own a `SessionOut` vec
+    /// (handle APIs): effects land in `pending_out` and drain on the
+    /// next tick.
+    pub fn route_into_pending(&mut self, ih: Sha1Hash, eff: Vec<TorrentEffect>) {
+        let mut tmp = std::mem::take(&mut self.pending_out);
+        self.route(ih, eff, &mut tmp);
+        self.pending_out = tmp;
     }
 
     /// a peer connected — register it on the torrent.
@@ -2363,7 +2464,7 @@ impl Session {
         let ihs: Vec<Sha1Hash> = self
             .torrents
             .iter()
-            .filter(|(_, t)| !t.paused && t.want_peers())
+            .filter(|(_, t)| !t.paused && t.want_peers(self.settings.seeding_outgoing_connections))
             .map(|(ih, _)| *ih)
             .collect();
         let peer_timeout = self.settings.peer_timeout.as_secs() as i32;
@@ -2486,7 +2587,7 @@ impl Session {
             .torrents
             .iter()
             .filter(|(ih, t)| {
-                t.want_peers()
+                t.want_peers(self.settings.seeding_outgoing_connections)
                     && !t.private
                     && t.announce_dht
                     && self
@@ -3168,6 +3269,15 @@ impl Session {
                     out.push(SessionOut::Torrent(TorrentEffect::FileCompleted(index)));
                 }
                 TorrentEffect::MetadataReceived => {
+                    // `torrent::init` — magnets defer storage creation
+                    // until the info dict arrives (file layout was
+                    // unknown). Without this the picker runs but every
+                    // disk job routes to a nonexistent index and the
+                    // download stalls at 0%.
+                    if let Some(idx) = self.create_storage_torrent(&ih) {
+                        self.check_files(ih, None);
+                        tracing::debug!(storage = idx.0, "magnet storage initialized");
+                    }
                     self.alerts.post(Alert::MetadataReceived { ih });
                 }
                 TorrentEffect::MetadataFailed => {
@@ -3660,7 +3770,7 @@ impl Session {
         let mut n = 0;
         for (_, atp) in st.torrents {
             if self
-                .add_torrent_params(&atp, StorageIndex(0), out)
+                .add_torrent_params(&atp, StorageIndex::INVALID, out)
                 .is_some()
             {
                 n += 1;

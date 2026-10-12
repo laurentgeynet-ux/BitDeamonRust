@@ -720,7 +720,23 @@ impl PreadDiskIo {
                             .collect::<Vec<_>>(),
                     ) {
                         Ok(ok) => {
-                            j.ret = Status::from(ok) | (Status::from(init_status) << 8);
+                            // upstream `do_job(check_fastresume)`: without
+                            // resume data (`contains_resume_data`) the verdict
+                            // is `need_full_check` whenever files exist on
+                            // disk — an empty `have` bitfield is not a
+                            // trustworthy "accepted" answer, it just means
+                            // "nothing to verify".
+                            let has_resume = c.resume_data.as_ref().is_some_and(|r| {
+                                r.have_pieces.size() > 0
+                                    || r.flags
+                                        .contains(bitdaemon_common::flags::TorrentFlags::SEED_MODE)
+                            });
+                            let accepted = if has_resume {
+                                ok
+                            } else {
+                                !st.has_any_file().unwrap_or(false)
+                            };
+                            j.ret = Status::from(accepted) | (Status::from(init_status) << 8);
                             StorageError::default()
                         }
                         Err(e) => e,

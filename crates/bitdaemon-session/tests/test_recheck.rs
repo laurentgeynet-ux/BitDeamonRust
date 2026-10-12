@@ -468,11 +468,14 @@ fn hybrid_multifile_pad_files_dont_panic() {
         |i: usize| Sha256Hash::from_bytes(&Sha256::digest([(i % 251) as u8; 16384])).unwrap();
 
     // f0 = 20_000 B (2 leafs, 1 piece), f1 = 70_000 B (5 leafs, 2
-    // pieces); canonicalize() pads each to the 64 KiB piece boundary:
-    // layout f0 | .pad | f1 | .pad → 3 pieces total.
+    // pieces), empty = 0 B; canonicalize() pads each non-empty file to
+    // the 64 KiB piece boundary. Empty files get no `pieces root`
+    // upstream — build_merkle_trees must skip them like pads
+    // (merkle_num_leafs(0) asserts).
     let entries = [
         (b"t/f0.bin" as &[u8], 20_000i64),
         (b"t/f1.bin" as &[u8], 70_000i64),
+        (b"t/empty.bin" as &[u8], 0i64),
     ]
     .iter()
     .map(|(name, size)| CreateFileEntry {
@@ -492,31 +495,33 @@ fn hybrid_multifile_pad_files_dont_panic() {
         )
         .unwrap();
     }
-    // file index 0 = f0, 2 = f1 (pads sit at 1 and 3)
+    // canonicalize sorts by path: t/empty.bin < t/f0.bin < t/f1.bin →
+    // file indices 0=empty, 1=f0, 2=pad, 3=f1, 4=pad
     ct.set_hash2(
-        FileIndex(0),
+        FileIndex(1),
         0,
         merkle_root(&[leaf(0), leaf(1)], Sha256Hash::default()),
     )
     .unwrap();
     ct.set_hash2(
-        FileIndex(2),
+        FileIndex(3),
         0,
         merkle_root(&[leaf(0), leaf(1), leaf(2), leaf(3)], Sha256Hash::default()),
     )
     .unwrap();
     ct.set_hash2(
-        FileIndex(2),
+        FileIndex(3),
         1,
         merkle_root(&[leaf(4)], Sha256Hash::default()),
     )
     .unwrap();
     let buf = ct.generate_buf().unwrap();
     let atp = load_torrent_buffer(&buf, &LoadTorrentLimits::default()).unwrap();
-    assert_eq!(atp.ti.as_ref().unwrap().files().num_files(), 4);
+    let num_files = atp.ti.as_ref().unwrap().files().num_files();
 
-    // previously: assertion failed !f.pad_file at file_num_blocks
+    // previously: assertion failed !f.pad_file at file_num_blocks,
+    // then blocks > 0 at merkle_num_leafs for the empty file
     let t = Torrent::from_params(&atp, StorageIndex(0), &mut Vec::new()).unwrap();
-    assert_eq!(t.merkle_trees.len(), 4);
+    assert_eq!(t.merkle_trees.len(), num_files as usize);
     assert!(!t.is_v2_only());
 }

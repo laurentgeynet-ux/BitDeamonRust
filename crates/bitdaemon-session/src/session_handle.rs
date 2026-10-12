@@ -167,9 +167,11 @@ impl SessionHandle {
         atp: &bitdaemon_core::AddTorrentParams,
     ) -> Option<TorrentHandle> {
         let mut out = Vec::new();
+        // INVALID = "session builds the storage from the atp"
+        // (`torrent::init`); magnet adds stay INVALID until metadata.
         let ih = lock(&self.inner).add_torrent_params(
             atp,
-            bitdaemon_common::types::StorageIndex(0),
+            bitdaemon_common::types::StorageIndex::INVALID,
             &mut out,
         )?;
         Some(TorrentHandle {
@@ -1742,15 +1744,26 @@ impl TorrentHandle {
     /// (magnet resolution path; upstream validates against info-hash).
     #[must_use]
     pub fn set_metadata(&self, metadata: &[u8]) -> bool {
-        lock(&self.session)
-            .torrents
-            .get_mut(&self.info_hash)
-            .is_some_and(|t| {
-                t.set_metadata(
-                    metadata,
-                    &bitdaemon_core::torrent_info::LoadTorrentLimits::default(),
-                )
-            })
+        let mut s = lock(&self.session);
+        let Some(t) = s.torrents.get_mut(&self.info_hash) else {
+            return false;
+        };
+        let mut eff = Vec::new();
+        let ok = matches!(
+            t.set_metadata_verdict(
+                metadata,
+                &bitdaemon_core::torrent_info::LoadTorrentLimits::default(),
+                &mut eff,
+            ),
+            crate::torrent::MetadataVerdict::Ok
+        );
+        if ok {
+            // deferred storage + Interested effects — same as the
+            // ut_metadata path
+            eff.push(crate::torrent::TorrentEffect::MetadataReceived);
+            s.route_into_pending(self.info_hash, eff);
+        }
+        ok
     }
 
     /// `torrent_handle::scrape_tracker(url)` — scrape by URL

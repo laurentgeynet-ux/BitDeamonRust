@@ -87,6 +87,10 @@ pub struct PeerConn {
     pub handshake_done: bool,
     /// `received_listen_port` — peer shared its listen port.
     pub received_listen_port: bool,
+    /// the listen port the peer advertised via ext-handshake `p`
+    /// (upstream `peer_info::port`) — ut_pex rewrites inbound
+    /// endpoints to this port, the source port being ephemeral.
+    pub peer_listen_port: Option<u16>,
     /// `i2p_pex_peer_plugin` per-connection state.
     pub i2p_pex: crate::i2p_pex::I2pPexPeerState,
     /// `m_superseed_piece` — the piece we're currently
@@ -123,6 +127,11 @@ pub struct PeerConn {
     pub supports_fast: bool,
     /// `m_supports_dht_port` — remote advertised a DHT port bit.
     pub supports_dht: bool,
+    /// `HaveAll`/`Have` semantics arrived while the torrent had no
+    /// metadata (magnet): the peer claims every piece but
+    /// `peer_pieces` could not represent it yet — replayed into a
+    /// full bitfield when `num_pieces` becomes known.
+    pub pre_metadata_all: bool,
     /// `m_interested` — WE sent `interested` (upstream tracks the
     /// wire state to avoid duplicate sends).
     pub we_sent_interested: bool,
@@ -201,6 +210,7 @@ impl PeerConn {
             stat_down_round: 0,
             down_delta_prev: -1,
             supports_fast: false,
+            pre_metadata_all: false,
             supports_dht: false,
             local_dont_have: 3,
             ext_i2p_pex: 0,
@@ -210,6 +220,7 @@ impl PeerConn {
             connecting: true,
             handshake_done: false,
             received_listen_port: false,
+            peer_listen_port: None,
             i2p_pex: crate::i2p_pex::I2pPexPeerState::new(),
             protocol_v2: false,
             we_sent_interested: false,
@@ -492,6 +503,12 @@ impl PeerConn {
             }
             M::HaveAll => {
                 self.on_have_all();
+                if num_pieces <= 0 {
+                    // magnet with no metadata yet: a full bitfield
+                    // can't be represented — flag it for the replay
+                    // in `Torrent::set_metadata`
+                    self.pre_metadata_all = true;
+                }
                 // `peer_has_all` → `inc_refcount_all`: the peer is a
                 // seed; skip it in the refcount or `dec_refcount`
                 // underflows `m_seeds` on disconnect.
@@ -502,7 +519,17 @@ impl PeerConn {
             }
             M::HaveNone => self.on_have_none(),
             M::Bitfield(ref bits) => {
-                match bitdaemon_common::Bitfield::from_bytes(bits, num_pieces.max(0) as usize) {
+                // metadata still missing (magnet): `num_pieces` is 0
+                // and upstream has nowhere to put the bits — we store
+                // them raw and reconcile sizes in `set_metadata`,
+                // which is strictly better than disconnecting a
+                // well-formed peer.
+                let expected = if num_pieces > 0 {
+                    num_pieces as usize
+                } else {
+                    bits.len() * 8
+                };
+                match bitdaemon_common::Bitfield::from_bytes(bits, expected) {
                     Some(bf) => {
                         self.on_bitfield(&bf);
                         eff.push(PeerEffect::RefcountBulk(bf, true));
@@ -591,6 +618,16 @@ impl PeerConn {
                         self.ext_i2p_pex = hs.messages.get("i2p_pex").copied().unwrap_or(0) as u8;
                         self.metadata_size = hs.metadata_size;
                         self.remote_upload_only = hs.upload_only;
+                        // ext-handshake `p` — the peer's listen port
+                        // (upstream `update_peer_port` +
+                        // `received_listen_port`); ut_pex uses it for
+                        // inbound conns whose source port is ephemeral.
+                        if let Some(p) = hs.listen_port
+                            && let Ok(p) = u16::try_from(p)
+                        {
+                            self.received_listen_port = true;
+                            self.peer_listen_port = Some(p);
+                        }
                         // `reqq` — the peer's max tolerated request
                         // queue (upstream `max_out_request_queue(reqq)`);
                         // exceeding it floods the peer → disconnect.

@@ -112,6 +112,72 @@ fn read_job(piece: i32, got: Arc<Mutex<Vec<u8>>>, done: Arc<AtomicUsize>) -> Box
     })
 }
 
+/// real-swarm catch: `check_fastresume` with **no resume data** must
+/// return `need_full_check` (ret bit0 = 0) when files exist on disk,
+/// and `accepted` only when the directory is empty — upstream
+/// `pread_disk_io::do_job(check_fastresume)`:
+/// `!contains_resume_data → has_any_file ? need_full_check : ok`.
+/// Previously the empty `have` bitfield made `verify_resume_data`
+/// answer "ok", so existing data was never re-hashed.
+#[test]
+fn check_fastresume_no_resume_needs_full_check_when_files_exist() {
+    use bitdaemon_disk::disk_interface::DiskIo;
+
+    let wait = |io: &PreadDiskIo, done: &AtomicUsize| {
+        for _ in 0..200 {
+            io.completed().call_job_handlers();
+            if done.load(Ordering::Relaxed) > 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("check_fastresume never completed");
+    };
+
+    // files on disk, no resume data → need_full_check
+    let d = dir("nocheck_full");
+    let (io, _drained) = make_io(1);
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs(), &d)));
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    std::fs::write(d.join("t/a.bin"), vec![7u8; 1000]).unwrap();
+    let done = Arc::new(AtomicUsize::new(0));
+    let ret = Arc::new(AtomicUsize::new(usize::MAX));
+    let (d2, r2) = (Arc::clone(&done), Arc::clone(&ret));
+    io.async_check_files(
+        StorageIndex(0),
+        None,
+        Vec::new(),
+        Box::new(move |st, _err| {
+            r2.store(st as usize, Ordering::Relaxed);
+            d2.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    wait(&io, &done);
+    assert_eq!(
+        ret.load(Ordering::Relaxed) & 0xff,
+        0,
+        "must need_full_check"
+    );
+
+    // empty directory, no resume data → accepted (nothing to check)
+    let d2 = dir("nocheck_empty");
+    io.insert_storage(StorageIndex(1), Box::new(storage(&make_fs(), &d2)));
+    let done2 = Arc::new(AtomicUsize::new(0));
+    let ret2 = Arc::new(AtomicUsize::new(usize::MAX));
+    let (dd, rr) = (Arc::clone(&done2), Arc::clone(&ret2));
+    io.async_check_files(
+        StorageIndex(1),
+        None,
+        Vec::new(),
+        Box::new(move |st, _err| {
+            rr.store(st as usize, Ordering::Relaxed);
+            dd.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    wait(&io, &done2);
+    assert_eq!(ret2.load(Ordering::Relaxed) & 0xff, 1, "must accept");
+}
+
 #[test]
 fn immediate_execute_round_trip() {
     let d = dir("imm");
