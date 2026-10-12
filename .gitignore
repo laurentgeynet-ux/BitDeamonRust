@@ -33,3 +33,7 @@ Thumbs.db
 fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
+
+# Local benchmark artifacts
+bench*.log
+tmp_*/

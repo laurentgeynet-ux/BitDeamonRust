@@ -4,13 +4,21 @@ A BitTorrent client library ported from
 [libtorrent](https://github.com/arvidn/libtorrent) (Rasterbar, C++) to
 **100% safe Rust** — no C++ bindings, no FFI, no `unsafe`.
 
-> **Status: port complete — every upstream C++ file is `ported`,
-> `verified` or explicitly `won't port`** in
+> **Status: protocol port complete — every upstream C++ file is
+> `ported`, `verified` or explicitly `won't port`** in
 > [`docs/PORTING.md`](docs/PORTING.md). Interoperability verified
 > live: BitDaemon downloads from and seeds to official libtorrent
-> C++ peers (byte-identical output), and downloads real public
-> torrents from the global swarm (Ubuntu 24.04.4 ISO, 3.4 GB,
-> ~117 MB/s peak, official SHA-256 verified).
+> C++ peers (byte-identical output), does the same over uTP and
+> mutual-TLS SSL torrents, boots a real Mainline DHT table, and
+> downloads real public torrents from the global swarm (Ubuntu
+> 24.04.4 ISO, 3.4 GB, ~117 MB/s peak, official SHA-256 verified).
+>
+> **Remaining for 1.0** is *surface* work, not protocol work:
+> expand the `Alert` event surface to upstream parity, deliver DHT
+> query results to API consumers, finish BEP-17 web seeds and a
+> WebRTC backend — see
+> [`docs/adr/0023`](docs/adr/0023-alert-surface-and-api-completion.md)
+> and ROADMAP phases K–N.
 
 ## Reference implementation
 

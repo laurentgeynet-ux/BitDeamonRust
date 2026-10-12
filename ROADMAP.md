@@ -73,13 +73,14 @@ Biggest remaining surface. `session_impl` parity.
       `torrent_status.cpp` complete fields (incl. `info_hashes`,
       `next_announce`, `completed_time`, `last_seen_complete`,
       `is_seeding`); `torrent_list.hpp`
-- [ ] `peer_connection.cpp` full state machine +
-      `peer_connection_handle.cpp` (currently partial)
+- [x] `peer_connection.cpp` full state machine +
+      `peer_connection_handle.cpp` (verified on wire — PORTING.md)
 - [x] `peer_list.cpp` / `peer_info.cpp` / `peer.cpp`
 - [x] `smart_ban.cpp` session wiring (`SmartBan` per torrent,
       hash-fail bookkeeping → `ban_peer`)
 - [x] `torrent_peer_allocator.cpp` (slab/arena)
-- [ ] `performance_counters.cpp` full counter surface
+- [x] `performance_counters.cpp` full counter surface (318-entry
+      `stats_counter_t`/`stats_gauge_t` index set verbatim)
 - [x] `session.cpp` / `session_impl.cpp` / `session_handle.cpp` /
       `session_call.cpp` / `session_params.cpp` — finish: listen
       sockets, `listen_socket_handle.cpp`, `session_udp_sockets`
@@ -261,7 +262,7 @@ the DHT drops flood sources.
 
 ---
 
-## Phase J — Disk file controls & thread parity ⬜
+## Phase J — Disk file controls & thread parity 🟨
 
 Live benchmark (2026-10-11): with the store_buffer wired, C: (SSD)
 sustains ~100 MiB/s, but D: (HDD) oscillates ~20 MiB/s with
@@ -270,27 +271,28 @@ NTFS non-sparse writes past the Valid Data Length pay synchronous
 zero-fill per out-of-order write; hash jobs also share the write
 pool.
 
-- [ ] **Sparse files** (ADR-0022): `open_mode::sparse` consumed for
+- [x] **Sparse files** (ADR-0022): `open_mode::sparse` consumed for
       real — `pread_storage::open_file` sets it when `!allocate_files`
       and for priority-0 files; `file.cpp`'s
       `DeviceIoControl(FSCTL_SET_SPARSE)` ported into a scoped
       `file::win32` module (second reviewed `unsafe` carve-out, cf.
-      ADR-0010 §3).
-- [ ] **`SetFileValidData`** (ADR-0022): `enable_set_file_valid_data`
+      ADR-0010 §3). Landed: `disk/file.rs` `win32` module,
+      `open_mode::SPARSE` in `PreadStorage::open_file`.
+- [x] **`SetFileValidData`** (ADR-0022): `enable_set_file_valid_data`
       setting → `allow_set_file_valid_data` → `SetFileValidData` on
       truncate + non-sparse, with best-effort `SE_MANAGE_VOLUME_NAME`.
       CLI enables it by default (qBittorrent parity — the CLI forces
       `StorageMode::Allocate`).
-- [ ] **`hashing_threads` pool** (ADR-0022): dedicated
+- [x] **`hashing_threads` pool** (ADR-0022): dedicated
       `DiskIoThreadPool` for `hash`/`hash2` jobs (upstream
       `m_hash_threads`, default 1); `aio_threads` default raised to
       10 (upstream) in the CLI.
-- [ ] Settings parity: `aio_threads`, `hashing_threads`,
+- [x] Settings parity: `aio_threads`, `hashing_threads`,
       `enable_set_file_valid_data` in `Settings` with upstream
       defaults; CLI flags `--aio-threads`/`--hashing-threads`/
       `--enable-set-file-valid-data`.
 - [ ] Re-benchmark 6 GiB torrent on D: vs qBittorrent baseline
-      (~58 MiB/s, ~2 min).
+      (~58 MiB/s, ~2 min). *Code landed — validation run pending.*
 
 **Exit**: D: download sustains ≥ qBittorrent-class throughput with no
 zero-fill stalls; `have` progress begins without the ~2 min
@@ -298,9 +300,151 @@ allocation/check plateau.
 
 ---
 
+## Phase K — Asynchronous result delivery (ADR-0023) ⬜
+
+Upstream delivers every async query result through the alert stream;
+our session currently drops several (`DhtEvent::Data` non-get_peers
+payloads, `DhtEvent::Direct`, `ip_voter` winner changes, portmap
+outcomes, `session_stats`). This is the only place where a handle call
+returns `()` and the answer is *unreachable* — a GUI cannot work
+around it.
+
+- [ ] `dht_lookup_map` → `dht_result_map: BTreeMap<(bool, usize),
+      DhtResult>` typed sinks (`GetPeers`, `GetPeersQuery`, `GetItem`,
+      `GetItemMutable{pk,salt}`, `Sample`, `Put`, `Announce`) —
+      replaces `dht_pending_put`.
+- [ ] `dht_get_peers`/`dht_get_item`/`dht_sample_infohashes` register
+      user lookups; `dht_drain_events` routes `Data`/`Done` per sink:
+      peers → `peer_list` + `DhtGetPeersReply`; item →
+      `DhtImmutableItem`/`DhtMutableItem`; samples →
+      `DhtSampleInfohashes`; `Done+Put` → `put` + `DhtPut`;
+      `Done+Announce` → announce phase + `DhtAnnounce`;
+      `Direct` → `DhtDirectResponse`; errors → `DhtError`.
+- [ ] Mutable BEP-44: `dht_put_item(pk, sk, salt, entry)` and
+      `dht_get_item(pk, salt)` overloads (target =
+      `item::canonical_target(pk, salt)`; sign via `dht::ed25519`).
+- [ ] Portmap: `Engine::portmap_handles: BTreeMap<i32, PortmapSlot>`
+      (upstream `m_portmap_handles`) → real `delete_port_mapping`;
+      `Portmap`/`PortmapError`/`PortmapLog` alerts posted from UPnP
+      driver actions and NAT-PMP `on_reply`.
+- [ ] `ListenSucceeded`/`ListenFailed` on `start_acceptor`/
+      `start_ssl_acceptor`/uTP/I2P bind results.
+- [ ] `ip_voter.external_address()` change detection (in `cast_vote`
+      call sites or tick) → `ExternalIp` alert.
+- [ ] `SessionHandle::post_session_stats` → `SessionStatsHeader`
+      (once) + `SessionStats` (upstream `session_stats_alert`
+      semantics; `session_stats_metrics()` names already verbatim).
+
+**Exit**: every handle call that produces an async result upstream
+delivers it; DHT `get`/`put`/`sample`/`live_nodes`/`direct` round-trip
+to the consumer; `delete_port_mapping` actually deletes.
+
+---
+
+## Phase L — Alert surface completion (ADR-0023) ⬜
+
+`Alert`: 38 variants → full `alert_types.hpp` coverage (~105 types;
+~60 to add). `AlertCategory` re-aligned to upstream
+`alert_category_t` bit positions — `settings_pack::alert_mask` is
+persisted in `.session`/`session_params`, so current compacted bits
+are an **interop bug**, not a style issue. Pure surfacing work on
+existing machinery (`alerts.post`, category mask, notify hook).
+
+- [ ] **Category fix**: `AlertCategory` consts = upstream bits 0–24
+      verbatim (add `progress`, `session_log`, `torrent_log`,
+      `peer_log`, `incoming_request`, `dht_log`, `dht_operation`,
+      `port_mapping_log`, `picker_log`, `block_progress`,
+      `debug`=`connect` alias); `Alert::category()` = upstream
+      `static_category` table per variant, doc-commented.
+      Breaking-change note in CHANGELOG.
+- [ ] **Torrent lifecycle**: `MetadataReceived`/`MetadataFailed`
+      (`on_metadata_packet` → `set_metadata` ok/fail +
+      reject-exhaustion), `TorrentPaused`/`TorrentResumed`,
+      `TorrentError`, `TorrentConflict` (duplicate info-hash),
+      `TorrentNeedCert` (SSL torrent without cert),
+      `AddTorrent` (params+error payload), `FastresumeRejected`,
+      `OversizedFile`, `Trackerid`, `TorrentLog`.
+- [ ] **Progress/pipeline**: `FileCompleted` (wire
+      `file_progress::update`'s existing `completed_cb`),
+      `BlockDownloading`/`BlockTimeout`/`BlockUploaded`,
+      `UnwantedBlock`/`RequestDropped`/`InvalidRequest`,
+      `PeerSnubbed`/`PeerUnsnubbed`, `PeerBlocked`, `PeerError`.
+- [ ] **Connection**: `IncomingConnection`, `IpBan`, `Socks5`.
+- [ ] **Tracker**: `TrackerAnnounce`, `TrackerWarning`, `UdpError`.
+- [ ] **LSD**: `LsdPeer` (accepted info-hash), `LsdError`.
+- [ ] **Web seed**: `UrlSeed` (connect/EOF/failure).
+- [ ] **Session**: `Log`, `I2p`, `FilePrio`, `SaveResumeDataFailed`,
+      `AlertsDropped` (`AlertManager::post` overflow → synthesize on
+      next accepted post).
+- [ ] **DHT family** (plumbing from Phase K): `dht_announce`,
+      `dht_bootstrap`, `dht_direct_response`, `dht_error`,
+      `dht_get_peers`, `dht_get_peers_reply`, `dht_immutable_item`,
+      `dht_live_nodes`, `dht_log`, `dht_mutable_item`,
+      `dht_outgoing_get_peers`, `dht_put`, `dht_reply`,
+      `dht_sample_infohashes` (+ `DhtPkt` → full `dht_pkt_alert`
+      payload: dir, addr, message).
+- [ ] **Log family**: `TorrentLog`/`PeerLog`/`PickerLog`/`PortmapLog`/
+      `DhtLog` emitted at upstream sites where the machinery exists —
+      cheap no-ops when their category is masked off.
+- [ ] Payload-heavy alerts become `pub struct XxxAlert` in
+      `alerts.rs` (split to `alerts/` submodules if needed); every
+      torrent-scoped alert carries `ih`.
+
+**Exit**: `test_alert_types.cpp`-equivalent table green (each variant
+→ upstream `category()` value); `alert_mask` round-trips byte-exact
+through upstream-written `session_params` fixtures; a GUI can observe
+every state transition without polling internals.
+
+---
+
+## Phase M — Functional completions ⬜
+
+- [ ] **BEP-17 `http_seed` (GetRight)**: `net::web_seed` gains the
+      http_seed endpoint kind — URL join `base + file_path` (no
+      `?piece=` query), redirect→seed-URL update, 4xx/503 →
+      `retry_web_seed` backoff (upstream `http_seed_connection.cpp`
+      semantics). `add_http_seed`/`remove_http_seed`/`http_seeds`
+      already manage endpoints.
+- [ ] **Extension factories invoked** (ADR-0023 D8): `ExtensionFactory`
+      vec applied at torrent start + late `add_extension`;
+      `SessionPlugin::new_peer_connection(&PeerInfo)` seam + minimal
+      `PeerPlugin` trait (`on_message`, `on_tick`). Full
+      `torrent_plugin`/`peer_plugin` surface stays deferred-with-reason
+      until a consumer needs it.
+- [ ] `delete_port_mapping(handle)` — real impl per Phase K table.
+- [ ] `MetadataFailed` on ut_metadata source-penalty exhaustion.
+- [ ] **GUI parity matrix** (`docs/gui-parity.md`): alert/handle →
+      widget checklist (add/remove/pause/queue/priorities/deadlines/
+      trackers/peers/DHT/portmap/stats graphs) — acceptance doc for
+      "GUI complet".
+
+**Exit**: BEP-17 web seeds actually fetch; `add_extension` factories
+run and receive peer connections; a consumer needs no internal access
+for anything a qBittorrent-class UI shows.
+
+---
+
+## Phase N — Edge transports & POSIX perf (optional) ⬜
+
+- [ ] **`bitdaemon-webrtc` leaf crate** (ADR-0011): concrete
+      `RtcPeerConnectionFactory`/`RtcChannel` over `str0m` (preferred:
+      safe Rust) or `webrtc`; offer/answer wired to the ported
+      `rtc_signaling` state machine. Only affects WebTorrent peers —
+      nothing in core depends on it.
+- [ ] **`posix_fadvise`/`F_NOCACHE`** read hints — completes
+      `io_buffer_mode` read-mode parity on Linux/macOS.
+- [ ] I2P `i2p_stream` beyond SAM handshake if required by consumers
+      (currently ported to upstream's scope).
+
+**Exit**: optional; no functional blocker for TCP/uTP/SSL swarms.
+
+---
+
 ## Phase G — 1.0 ⬜
 
 - [x] `PORTING.md` = 100% resolved rows (the completion metric) — every upstream file is `ported`/`verified`/`won't port`/`n/a`.
+- [ ] Alert/API surface = upstream parity (Phases K/L — ADR-0023);
+      `session_params` `alert_mask` interop fixture green.
 - [ ] Public API freeze on `bitdaemon` facade (semver).
 - [ ] Crates.io publish order: common → bencode → core → disk →
       (mmap, opt) → net → dht → session → sim → bitdaemon → cli.

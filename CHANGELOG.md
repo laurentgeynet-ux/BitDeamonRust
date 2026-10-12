@@ -7,6 +7,21 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — docs: 1.0 API-surface program (ADR-0023)
+
+- New `docs/adr/0023-alert-surface-and-api-completion.md`: full
+  upstream alert coverage plan (~60 missing variants), `AlertCategory`
+  re-aligned to upstream `alert_category_t` bit positions (fixes
+  `alert_mask` interop in persisted `session_params`), DHT
+  user-query result delivery via typed sinks (`dht_result_map`),
+  mutable BEP-44 overloads, portmap handle table + real
+  `delete_port_mapping`, BEP-17 `http_seed` fetch, extension-factory
+  invocation.
+- `ROADMAP.md`: Phase J code items verified-done (sparse files,
+  `SetFileValidData`, `hashing_threads` — re-benchmark still pending);
+  new phases K (async result delivery), L (alert surface), M
+  (functional completions), N (edge transports/POSIX perf).
+
 ### Added — disk file controls & thread parity (Phase J, ADR-0022)
 
 - **Sparse files on Windows**: `PreadStorage::open_file` sets
