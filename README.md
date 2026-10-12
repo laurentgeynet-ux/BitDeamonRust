@@ -25,11 +25,9 @@ A BitTorrent client library ported from
 > bench — see [Conformance testing](#conformance-testing).
 >
 > **Remaining for 1.0** is hardening, not features: promote `ported`
-> → `verified` across the remaining modules (live trackers, web
-> seeds, UPnP/NAT-PMP, multi-torrent soak), run the `cargo-fuzz`
-> campaigns, finish benchmarks vs C++, then release engineering
-> (API freeze, `cargo deny`, crates.io) — see [`ROADMAP.md`](ROADMAP.md)
-> Phase G.
+> → `verified` across the remaining modules, then release
+> engineering (API freeze, `cargo deny`, crates.io) — see
+> [`ROADMAP.md`](ROADMAP.md) Phase G.
 
 ## Reference implementation
 
@@ -63,13 +61,16 @@ cargo run --release -p bitdaemon-cli -- \
     -d <download-dir> [-p 6881] [--limit <bytes/s>] <TORRENT>
 ```
 
-Supports `.torrent` files and magnets, `--seed`, `--peer host:port`,
-HTTPS/UDP trackers, DHT, uTP, UPnP/NAT-PMP port mapping, SOCKS5/HTTP
-proxies (`--proxy`, `--proxy-auth`, peer + tracker + DHT UDP lanes)
-and OS-cache control (`--no-os-cache`, `--no-os-read-cache`,
-`--no-upnp`). It also loads upstream-format fastresume files
-(`--resume`) and writes `<infohash>.resume` on shutdown — both
-directions round-trip with libtorrent.
+Supports multiple `.torrent` files and magnets in one session,
+`--seed`, `--super-seed`, `--upload-only`, `--file-priority`,
+`--peer host:port`, IPv6 (`--port6`), HTTPS/UDP trackers, DHT, uTP,
+UPnP/NAT-PMP port mapping, SOCKS5/HTTP proxies (`--proxy`,
+`--proxy-auth`, peer + tracker + DHT UDP lanes) and OS-cache
+control (`--no-os-cache`, `--no-os-read-cache`, `--no-upnp`). It
+loads upstream-format fastresume files (`--resume`), writes
+`<infohash>.resume` on shutdown — both directions round-trip with
+libtorrent — and restores a full session from `--session <file>`
+(torrents, embedded peers, DHT routing, settings).
 
 ## Conformance testing
 
@@ -92,6 +93,22 @@ re-implementations:
   upstream's dialer, and boundary file layouts (0-byte, tiny, deep
   paths, UTF-8/space names, pad files). All transfers verified
   byte-identical.
+
+  The extended campaign additionally covered, live against
+  libtorrent v2.1.2 and local harnesses: MSE/PE encrypted
+  handshakes (forced, both directions), SSL over uTP, UDP+HTTP
+  tracker announces, DHT-only peer discovery, LSD multicast both
+  directions, IPv6 `[::1]` both directions, BEP-19 web-seed
+  `Range` GETs, SOCKS5-tunneled peers/trackers, UPnP port mapping
+  on a real IGD, multi-peer swarms and multi-torrent soak,
+  super-seeding and BEP-21 `upload_only` (observed on the wire),
+  file priorities, and `.session` save/restore continuing a
+  partial download to completion. Throughput check: 128 MiB in
+  ~40 s seeding to C++ leeches, ~14 s leeching from a C++ seed.
+- **Decode-surface fuzzing** (`fuzz/`) — `cargo-fuzz` targets for
+  `bdecode`, `peer_wire` and `resume_data`; on Windows (no sancov
+  link) a deterministic mutation driver hammers the same decoders
+  — 92.7 M inputs, zero panics.
 
 ## Building
 
