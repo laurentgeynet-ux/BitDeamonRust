@@ -34,9 +34,11 @@ pub enum PeerConnError {
     /// wire codec.
     #[error("wire: {0}")]
     Wire(#[from] WireError),
-    /// info_hash mismatch on the remote handshake.
+    /// info_hash mismatch on the remote handshake — carries the
+    /// offending hash (upstream inspects it for the DHT
+    /// secret-id-fishing check).
     #[error("info_hash mismatch")]
-    WrongInfoHash,
+    WrongInfoHash(Sha1Hash),
     /// reserved/protocol violation → disconnect.
     #[error("protocol: {0}")]
     Protocol(&'static str),
@@ -62,7 +64,7 @@ pub async fn run_handshake(
     s.read_exact(&mut theirs).await?;
     let hs = parse_handshake(&theirs).map_err(|_| PeerConnError::Protocol("bad handshake"))?;
     if hs.info_hash != *info_hash {
-        return Err(PeerConnError::WrongInfoHash);
+        return Err(PeerConnError::WrongInfoHash(hs.info_hash));
     }
     Ok(hs)
 }
@@ -82,7 +84,7 @@ pub async fn run_handshake_responder(
     s.read_exact(&mut theirs).await?;
     let hs = parse_handshake(&theirs).map_err(|_| PeerConnError::Protocol("bad handshake"))?;
     if !known(&hs.info_hash) {
-        return Err(PeerConnError::WrongInfoHash);
+        return Err(PeerConnError::WrongInfoHash(hs.info_hash));
     }
     let ours = write_handshake(&hs.info_hash, our_peer_id, dht, true, fast, false);
     s.write_all(&ours).await?;
@@ -176,7 +178,7 @@ async fn exchange_handshake(
     }
     let hs = parse_handshake(&theirs).map_err(|_| PeerConnError::Protocol("bad handshake"))?;
     if check_ih && hs.info_hash != *info_hash {
-        return Err(PeerConnError::WrongInfoHash);
+        return Err(PeerConnError::WrongInfoHash(hs.info_hash));
     }
     Ok(hs)
 }

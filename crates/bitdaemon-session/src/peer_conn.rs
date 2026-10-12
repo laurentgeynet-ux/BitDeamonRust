@@ -511,7 +511,15 @@ impl PeerConn {
                     self.upload_queue.push(r);
                     eff.push(PeerEffect::ReadRequest(r));
                 } else {
-                    eff.push(PeerEffect::Disconnect("invalid request"));
+                    // upstream `incoming_request` rejects + posts
+                    // `invalid_request_alert` for out-of-range
+                    // piece/start/length — it does not disconnect
+                    // (only >300 invalid requests while choked do).
+                    eff.push(PeerEffect::RejectRequest(r));
+                    eff.push(PeerEffect::InvalidRequest(format!(
+                        "out of range: piece {} start {} length {}",
+                        r.piece.0, r.start, r.length
+                    )));
                 }
             }
             M::Cancel(r) => {
@@ -534,14 +542,26 @@ impl PeerConn {
                     start: offset,
                     length: data.len() as i32,
                 };
+                let block = PieceBlock {
+                    piece_index: r.piece,
+                    block_index: r.start / 0x4000,
+                };
                 if !self.was_requested(&r) {
                     // upstream counts unsolicited blocks as invalid
-                    // and drops the payload — never touches disk.
+                    // and drops the payload — never touches disk
+                    // (`unwanted_block_alert` in `incoming_piece`).
                     self.num_invalid_requests += 1;
+                    eff.push(PeerEffect::UnwantedBlock(block));
                     return;
+                }
+                // `incoming_piece` clears snub on data arrival.
+                if self.pipeline.snubbed {
+                    self.pipeline.snubbed = false;
+                    eff.push(PeerEffect::Unsnub);
                 }
                 let block = self.on_piece(&r);
                 eff.push(PeerEffect::MarkDownloaded(block));
+                eff.push(PeerEffect::BlockFinished(block));
                 eff.push(PeerEffect::DiskWrite(r, data.to_vec()));
                 eff.push(PeerEffect::MaybePick);
             }
@@ -823,6 +843,23 @@ pub enum PeerEffect {
     /// `yourip` from the BEP-10 handshake — the peer's view of our
     /// external address (`ip_voter` `source_peer`).
     YourIp(std::net::IpAddr),
+    /// `unwanted_block_alert` — a `piece` message arrived for a
+    /// block that is not in either request queue.
+    UnwantedBlock(PieceBlock),
+    /// `block_finished_alert` — a `piece` message completed a
+    /// requested block.
+    BlockFinished(PieceBlock),
+    /// `peer_unsnubbed_alert` — data arrived from a snubbed peer
+    /// (upstream clears `m_snubbed` in `incoming_piece`).
+    Unsnub,
+    /// `write_reject_request` — send a BEP-6 `reject_request` for a
+    /// malformed/unservable request. The torrent layer gates the
+    /// actual send on `supports_fast`.
+    RejectRequest(bitdaemon_common::PeerRequest),
+    /// `invalid_request_alert` — a request we rejected (malformed
+    /// range, super-seed mismatch, choked + not allowed-fast). The
+    /// `msg` mirrors upstream's peer_log reason text.
+    InvalidRequest(String),
     /// protocol violation — drop the connection.
     Disconnect(&'static str),
 }

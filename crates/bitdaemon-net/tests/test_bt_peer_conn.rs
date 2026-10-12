@@ -48,7 +48,7 @@ async fn wrong_info_hash_rejected() {
         run_handshake(&mut a, &IH, &P1, false, false),
         run_handshake(&mut b, &other, &P2, false, false),
     );
-    assert!(matches!(h.0, Err(PeerConnError::WrongInfoHash)));
+    assert!(matches!(h.0, Err(PeerConnError::WrongInfoHash(_))));
 }
 
 #[tokio::test]

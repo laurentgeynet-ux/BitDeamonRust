@@ -29,6 +29,7 @@ fn natpmp_parse_map_reply() {
             public_port,
             lifetime,
             result,
+            protocol: _,
         }) => {
             assert_eq!(private_port, 1111);
             assert_eq!(public_port, 2222);

@@ -27,6 +27,23 @@ pub enum TorrentState {
     Seeding,
 }
 
+impl TorrentState {
+    /// upstream `torrent_status::state_t` name (as printed by
+    /// `state_str` / serialized in `state_changed_alert` messages).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::CheckingResumeData => "checking_resume_data",
+            Self::CheckingFiles => "checking_files",
+            Self::QueuedForChecking => "queued_for_checking",
+            Self::DownloadingMetadata => "downloading_metadata",
+            Self::Downloading => "downloading",
+            Self::Finished => "finished",
+            Self::Seeding => "seeding",
+        }
+    }
+}
+
 /// `torrent_status` — an immutable snapshot of one torrent.
 #[derive(Clone, Debug)]
 pub struct TorrentStatus {

@@ -241,6 +241,12 @@ impl SessionHandle {
         lock(&self.inner).session_stats()
     }
 
+    /// `session::post_session_stats` — posts
+    /// `session_stats_header_alert` (once) + `session_stats_alert`.
+    pub fn post_session_stats(&self) {
+        lock(&self.inner).post_session_stats();
+    }
+
     /// `torrent::pause`/`resume` by info-hash.
     /// `apply_settings_pack` on the shared session.
     pub fn apply_settings(&self, s: crate::settings::SessionSettings) {
@@ -597,33 +603,54 @@ impl SessionHandle {
         lock(&self.inner).dht_add_node(addr);
     }
 
-    /// `dht_get_peers` — start a `get_peers` traversal.
+    /// `dht_get_peers` — start a `get_peers` traversal; replies
+    /// post `dht_get_peers_reply_alert`.
     pub fn dht_get_peers(&self, ih: Sha1Hash) {
-        let mut s = lock(&self.inner);
-        if let Some(n) = s.dht.get_node_mut(false) {
-            n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetPeers, ih);
-        }
+        lock(&self.inner).dht_get_peers(ih);
     }
 
-    /// `dht_get_item` — BEP-44 immutable/mutable lookup (the `target`
-    /// is the item key / pubkey-derived target).
+    /// `dht_announce` — user-level announce on all bound families;
+    /// found peers post `dht_get_peers_reply_alert`, the write
+    /// phase runs `announce_peer` to token-holders.
+    pub fn dht_announce(&self, ih: Sha1Hash, port: u16) {
+        lock(&self.inner).dht_announce(ih, port);
+    }
+
+    /// `dht_get_item` (immutable) — BEP-44 `get`; the first `r.v`
+    /// reply posts `dht_immutable_item_alert`.
     pub fn dht_get_item(&self, target: Sha1Hash) {
-        let mut s = lock(&self.inner);
-        if let Some(n) = s.dht.get_node_mut(false) {
-            n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetItem, target);
-        }
+        lock(&self.inner).dht_get_item(target);
     }
 
-    /// `dht_sample_infohashes` — BEP-51 traversal.
-    pub fn dht_sample_infohashes(&self, target: Sha1Hash) {
-        let mut s = lock(&self.inner);
-        if let Some(n) = s.dht.get_node_mut(false) {
-            n.new_lookup(bitdaemon_dht::lookups::LookupKind::SampleInfohashes, target);
-        }
+    /// `dht_get_item` (mutable) — `get` on `sha1(pk ‖ salt)`;
+    /// replies post `dht_mutable_item_alert` (`authoritative` =
+    /// signature verified against `pk`).
+    pub fn dht_get_item_mut(&self, pk: [u8; 32], salt: Vec<u8>) {
+        lock(&self.inner).dht_get_item_mut(pk, salt);
+    }
+
+    /// `dht_sample_infohashes` — BEP-51 *direct* request to `ep`
+    /// (upstream `session_handle::dht_sample_infohashes(ep,
+    /// target)` — single node, not a traversal). The reply posts
+    /// `dht_sample_infohashes_alert`.
+    pub fn dht_sample_infohashes(&self, ep: std::net::SocketAddr, target: Sha1Hash) {
+        lock(&self.inner).dht_sample_infohashes(ep, target);
+    }
+
+    /// `dht_direct_request` — arbitrary query to `ep`; the reply
+    /// posts `dht_direct_response_alert` echoing `user_data`
+    /// (upstream `userdata`/`client_data_t`).
+    pub fn dht_direct_request(
+        &self,
+        ep: std::net::SocketAddr,
+        e: bitdaemon_bencode::Entry,
+        user_data: u64,
+    ) {
+        lock(&self.inner).dht_direct_request(ep, e, user_data);
     }
 
     /// `dht_live_nodes` — endpoints that answered the `get_peers`
-    /// lookup for `ih`.
+    /// lookup for `ih` (also posts `dht_live_nodes_alert`).
     #[must_use]
     pub fn dht_live_nodes(&self, ih: &Sha1Hash) -> Vec<std::net::SocketAddr> {
         lock(&self.inner).dht_live_nodes(ih)
@@ -644,19 +671,25 @@ impl SessionHandle {
     }
 
     /// `post_dht_stats` — routing-table snapshot routed as an alert
-    /// (upstream `dht_stats_alert`).
+    /// (upstream `dht_stats_alert`). Category-0: unconditional.
     pub fn post_dht_stats(&self) {
         let mut s = lock(&self.inner);
-        let v4 = s
-            .dht
-            .get_node(false)
-            .map(|n| n.table.size())
-            .unwrap_or_default();
-        let v6 = s
-            .dht
-            .get_node(true)
-            .map(|n| n.table.size())
-            .unwrap_or_default();
+        let stat = |v6: bool| {
+            s.dht
+                .get_node(v6)
+                .map_or_else(crate::alerts::DhtNodeStats::default, |n| {
+                    let (nid, nodes, repl, confirmed, lookups) = n.stats();
+                    crate::alerts::DhtNodeStats {
+                        nid,
+                        nodes,
+                        replacements: repl,
+                        confirmed,
+                        active_lookups: lookups,
+                    }
+                })
+        };
+        let v4 = Box::new(stat(false));
+        let v6 = Box::new(stat(true));
         s.alerts.post(crate::alerts::Alert::DhtStats { v4, v6 });
     }
 
@@ -742,10 +775,20 @@ impl SessionHandle {
             .count()
     }
 
-    /// `delete_port_mapping` — NAT-PMP/UPnP teardown is owned by the
-    /// engine (ports unmap on socket close); this is a no-op marker
-    /// matching upstream's removal bookkeeping.
-    pub fn delete_port_mapping(&self, _handle: i32) {}
+    /// `delete_port_mapping` — resolve `handle` against the
+    /// session's mapping table and queue the unmap for the engine
+    /// (`SessionOut::PortmapDelete` — NAT-PMP unmap / UPnP
+    /// `DeletePortMapping`). No-op on an unknown handle.
+    pub fn delete_port_mapping(&self, handle: i32) {
+        lock(&self.inner).delete_port_mapping(handle);
+    }
+
+    /// `add_port_mapping` — register an arbitrary mapping with the
+    /// NAT-PMP/UPnP drivers; returns the `port_mapping_t` handle.
+    /// The actual map work runs on the engine's next tick.
+    pub fn add_port_mapping(&self, protocol: u8, external_port: u16, local_port: u16) -> i32 {
+        lock(&self.inner).add_port_mapping(protocol, external_port, local_port)
+    }
 
     /// `async_add_torrent` — same as [`Self::add_torrent_params`];
     /// upstream's async split is an artifact of
@@ -797,10 +840,26 @@ impl SessionHandle {
 
     /// `dht_put_item` — BEP-44 immutable put; returns the target
     /// key (`sha1(value)`). The `put` is issued when the `get`
-    /// traversal completes.
+    /// traversal completes; `dht_put_alert` posts with the count.
     pub fn dht_put_item(&self, value: &bitdaemon_bencode::Entry) -> Sha1Hash {
         let bytes = bitdaemon_bencode::bencode(value);
         lock(&self.inner).dht_put_item(&bytes)
+    }
+
+    /// `dht_put_item` (mutable) — BEP-44 signed put: signs `value`
+    /// under `sk` (`seed ‖ pk`, 64 B) with `seq`/`salt`, then the
+    /// `get`→`put` sequence posts `dht_put_alert` carrying the key,
+    /// signature, seq and salt. Returns the target on success.
+    pub fn dht_put_item_mut(
+        &self,
+        pk: [u8; 32],
+        sk: &[u8; 64],
+        salt: Vec<u8>,
+        seq: i64,
+        value: &bitdaemon_bencode::Entry,
+    ) -> Option<Sha1Hash> {
+        let bytes = bitdaemon_bencode::bencode(value);
+        lock(&self.inner).dht_put_item_mut(pk, sk, salt, seq, &bytes)
     }
 
     /// `set_max_half_open_connections` / `max_half_open_connections`
@@ -1449,9 +1508,20 @@ impl TorrentHandle {
     /// `torrent_handle::set_ssl_certificate` — SSL torrents: the
     /// PEM keypair this torrent serves on inbound SSL handshakes
     /// (`dh` kept for signature parity; rustls is ECDHE-only).
+    /// Upstream's `set_ssl_cert_buffer` ends by posting
+    /// `torrent_need_cert_alert` — the cert requirement is now met.
     pub fn set_ssl_certificate(&self, cert: String, key: String, dh: String) {
-        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+        let mut ses = lock(&self.session);
+        if let Some(t) = ses.torrents.get_mut(&self.info_hash) {
+            let ssl = t.is_ssl_torrent();
             t.set_ssl_cert_buffer(&cert, &key, &dh);
+            if ssl {
+                ses.alerts.post(crate::alerts::Alert::TorrentNeedCert {
+                    ih: self.info_hash,
+                    error: String::new(),
+                    cert_file: String::new(),
+                });
+            }
         }
     }
 
@@ -1575,17 +1645,28 @@ impl TorrentHandle {
     }
 
     /// `torrent_handle::file_priority` — set one file's priority.
+    /// `file_prio_alert` reports the apply verdict (empty error =
+    /// success, like upstream's async `on_file_priority`).
     pub fn file_priority(
         &self,
         index: bitdaemon_common::types::FileIndex,
         prio: bitdaemon_common::types::DownloadPriority,
     ) {
-        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+        let mut ses = lock(&self.session);
+        if let Some(t) = ses.torrents.get_mut(&self.info_hash) {
             let mut prios = t.file_priorities.clone();
-            if let Some(p) = prios.get_mut(index.0 as usize) {
+            let err = if let Some(p) = prios.get_mut(index.0 as usize) {
                 *p = prio;
                 t.prioritize_files(&prios);
-            }
+                String::new()
+            } else {
+                format!("file index {} out of range", index.0)
+            };
+            ses.alerts.post(crate::alerts::Alert::FilePrio {
+                ih: self.info_hash,
+                op: "file_priority".into(),
+                error: err,
+            });
         }
     }
 

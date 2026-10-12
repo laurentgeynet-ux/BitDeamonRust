@@ -86,9 +86,17 @@ fn save_resume_data_alert_and_interval() {
     s.add_torrent(t);
     s.pop_alerts();
 
-    // not dirty → only_if_modified suppresses
+    // not dirty → only_if_modified posts
+    // `SaveResumeDataFailed(resume_data_not_modified)` — upstream
+    // `torrent::save_resume_data` emits the failure alert rather
+    // than staying silent.
     s.save_resume_data(&ih, true);
-    assert!(s.pop_alerts().is_empty());
+    assert!(
+        s.pop_alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::SaveResumeDataFailed { .. })),
+        "expected SaveResumeDataFailed alert"
+    );
 
     // verify a piece → dirty → save posts the blob alert
     s.on_piece_verified(&ih, PieceIndex(0), true, &mut Vec::new());
@@ -109,9 +117,14 @@ fn save_resume_data_alert_and_interval() {
         &bitdaemon_core::torrent_info::LoadTorrentLimits::default(),
     );
     assert!(rd.is_ok());
-    // flag cleared — a second save is suppressed
+    // flag cleared — a second save posts not-modified again
     s.save_resume_data(&ih, true);
-    assert!(s.pop_alerts().is_empty());
+    assert!(
+        s.pop_alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::SaveResumeDataFailed { .. })),
+        "expected SaveResumeDataFailed alert"
+    );
 }
 
 #[test]

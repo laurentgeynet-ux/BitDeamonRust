@@ -82,8 +82,8 @@ fn category_zero_alerts_are_unconditional() {
     let mut m = AlertManager::new(10, AlertCategory(0));
     m.post(Alert::SessionStatsHeader {});
     m.post(Alert::DhtStats {
-        v4: (1, 2, 3),
-        v6: (4, 5, 6),
+        v4: Box::new(bitdaemon_session::alerts::DhtNodeStats::default()),
+        v6: Box::new(bitdaemon_session::alerts::DhtNodeStats::default()),
     });
     m.post(Alert::PeerDisconnected {
         ih: Default::default(),

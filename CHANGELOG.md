@@ -7,6 +7,64 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — async result delivery & emission sites (Phase L, ADR-0023)
+
+- **DHT typed result sinks**: `dht_result_map` replaces
+  `dht_lookup_map`/`dht_pending_put` — every user lookup
+  (`dht_get_peers`, `dht_get_item` immutable + mutable,
+  `dht_sample_infohashes`, `dht_put_item`, `dht_announce`,
+  `direct_request`, bootstrap) registers its semantic result type;
+  `dht_drain_events` delivers `DhtGetPeersReply`,
+  `DhtImmutableItem`, `DhtMutableItem`, `DhtSampleInfohashes`
+  (incl. `r.nodes` compaction), `DhtPut`, `DhtAnnounce`,
+  `DhtDirectResponse` (timeouts included), `DhtBootstrap`,
+  `DhtLiveNodes`, `DhtError`, `DhtPacket` and `DhtLog` alerts.
+- **Mutable BEP-44**: `dht_put_item(pk, sk, salt, entry)` /
+  `dht_get_item(pk, salt)` overloads — canonical target +
+  ed25519 signature per upstream `item.cpp`.
+- **Port mapping lifecycle**: real `add_port_mapping`/
+  `delete_port_mapping` handles (`SessionOut::PortmapAdd/Delete` →
+  engine UPnP/NAT-PMP drivers); `Portmap`/`PortmapError`/
+  `PortmapLog` alerts posted from driver results; NAT-PMP parser
+  extended to carry the opcode protocol for mapping matching.
+- **Listener/incoming alerts**: `ListenSucceeded`/`ListenFailed` on
+  every acceptor bind (TCP/SSL/uTP/I2P), `IncomingConnection` on
+  accept; `PeerBlocked` on ip-filter rejects (in+outbound).
+- **`Session::vote_external`** wraps `ip_voter.cast_vote` at all
+  sites (DHT, tracker, peer `yourip`) → `ExternalIp` alert on
+  elected-address change only.
+- **Stats**: `post_session_stats` → `SessionStatsHeader` (once) +
+  `SessionStats` (category-0, unconditional); per-torrent `Stats`
+  posted on the tick; `post_dht_stats` carries the full upstream
+  `dht_stats_alert` payload.
+- **Emission-site sweep**: `MetadataReceived`, `TorrentPaused`/
+  `TorrentResumed`, `TorrentError`, `TorrentConflict`,
+  `TorrentNeedCert`, `AddTorrent`, `FastresumeRejected`,
+  `OversizedFile` (storage `initialize()` plumbed through
+  `CheckFastresume`), `Trackerid`, `FileCompleted`,
+  `BlockDownloading`/`BlockTimeout`/`BlockFinished`/
+  `BlockUploaded`, `UnwantedBlock`, `InvalidRequest`,
+  `PeerSnubbed`/`PeerUnsnubbed`, `PeerError`, `IpBan`, `Socks5`,
+  `TrackerAnnounce`/`TrackerWarning`, `UdpError`, `LsdPeer`/
+  `LsdError`, `UrlSeed`, `FilePrio`, `Log`/`TorrentLog`/`PeerLog`/
+  `PickerLog`/`I2p`/`DhtLog` (gated via `should_post`),
+  `SaveResumeDataFailed`, `SessionError`, `IpBan` on
+  secret-id mismatches.
+
+### Fixed — Phase L semantic corrections
+
+- `IncomingRequest` posted at **accept** time (request queued for
+  service), matching upstream `incoming_request` — was posted on raw
+  message receipt.
+- Malformed/out-of-range requests now emit `write_reject_request`
+  (BEP-6, gated on `supports_fast`) + `invalid_request_alert`
+  instead of disconnecting — upstream only disconnects after >300
+  invalid requests while choked.
+- `SaveResumeDataFailed` posted on `if_*_changed`-suppressed saves
+  (upstream `resume_data_not_modified`) — was silent.
+- `AlertsDropped` carries the dropped `alert_type` set; `DhtStats`
+  payload boxed to keep `size_of::<Alert>() <= 96`.
+
 ### Added — alert surface scaffolding (Phase K, ADR-0023)
 
 - `Alert` enum expanded to all 101 concrete upstream alert types

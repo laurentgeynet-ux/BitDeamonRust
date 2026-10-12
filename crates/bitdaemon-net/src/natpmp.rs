@@ -43,6 +43,8 @@ pub enum NatPmpResponse {
     PublicIp(Ipv4Addr),
     /// opcode 1/2 reply — a mapping result.
     Map {
+        /// protocol the reply refers to (opcode 1 = UDP, 2 = TCP).
+        protocol: PortmapProtocol,
         /// private port.
         private_port: u16,
         /// external port granted.
@@ -104,6 +106,11 @@ pub fn parse_response(buf: &[u8]) -> Option<NatPmpResponse> {
         let public_port = u16::from_be_bytes([buf[10], buf[11]]);
         let lifetime = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
         return Some(NatPmpResponse::Map {
+            protocol: if op == 1 {
+                PortmapProtocol::Udp
+            } else {
+                PortmapProtocol::Tcp
+            },
             private_port,
             public_port,
             lifetime,

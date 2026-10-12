@@ -379,7 +379,7 @@ impl Engine {
         }
         if slock(&self.session).settings.enable_incoming_utp {
             let acc = bitdaemon_net::utp_stream::UtpAcceptor::new(manager.clone(), dg, cfg).await;
-            self.start_acceptor(Arc::new(acc));
+            self.start_acceptor_at(Arc::new(acc), None, 6);
         }
         self.utp_manager = Some(manager);
         self.utp_enabled = true;
@@ -465,11 +465,25 @@ impl Engine {
                         self.datagram = Some(Arc::new(s));
                     }
                     Err(e) => {
+                        // `socks5_alert` — upstream posts it on every
+                        // socks handshake/relay failure.
+                        slock(&self.session).alerts.post(Alert::Socks5 {
+                            remote: proxy_addr.to_string(),
+                            op: "udp_associate".into(),
+                            error: e.to_string(),
+                        });
                         tracing::error!(%proxy_addr, error = %e, "socks5 udp-associate failed")
                     }
                 }
             }
-            Err(e) => tracing::error!(host = %p.hostname, error = %e, "proxy resolve failed"),
+            Err(e) => {
+                slock(&self.session).alerts.post(Alert::Socks5 {
+                    remote: format!("{}:{}", p.hostname, p.port),
+                    op: "hostname_lookup".into(),
+                    error: e.to_string(),
+                });
+                tracing::error!(host = %p.hostname, error = %e, "proxy resolve failed")
+            }
         }
     }
 
@@ -631,7 +645,26 @@ impl Engine {
                 SessionOut::UdpPacket(buf, to) => {
                     if let Some(d) = &self.datagram {
                         trace!(%to, len = buf.len(), "udp send");
-                        let _ = d.send_to(&buf, to).await;
+                        // `udp_error_alert` — a datagram send
+                        // failed (upstream posts it from the
+                        // socket's send handler); multicast targets
+                        // also map to `lsd_error_alert`
+                        // (`session_impl` posts it on lsd socket
+                        // send failures).
+                        if let Err(e) = d.send_to(&buf, to).await {
+                            let lsd = to.port() == 6771;
+                            let mut ses = slock(&self.session);
+                            ses.alerts.post(Alert::UdpError {
+                                remote: to.to_string(),
+                                op: "send_to".into(),
+                                error: e.to_string(),
+                            });
+                            if lsd {
+                                ses.alerts.post(Alert::LsdError {
+                                    error: e.to_string(),
+                                });
+                            }
+                        }
                     } else {
                         trace!(%to, "udp send dropped — no datagram socket");
                     }
@@ -658,6 +691,7 @@ impl Engine {
                     let resolver = self.resolver.clone();
                     self.tasks_forget();
                     let dht_tx = self.dhtnode_tx.clone();
+                    let session = Arc::clone(&self.session);
                     self.tasks.push(tokio::spawn(async move {
                         let Ok(port) = u16::try_from(port) else {
                             return;
@@ -680,7 +714,15 @@ impl Engine {
                                     let _ = dht_tx.send(addr);
                                 }
                             }
-                            Err(e) => debug!(%host, err = %e, "dht bootstrap resolve failed"),
+                            Err(e) => {
+                                // `on_dht_name_lookup` upstream →
+                                // `dht_error_alert` (hostname_lookup).
+                                slock(&session).alerts.post(Alert::DhtError {
+                                    op: 0,
+                                    error: e.to_string(),
+                                });
+                                debug!(%host, err = %e, "dht bootstrap resolve failed");
+                            }
                         }
                     }));
                 }
@@ -698,6 +740,21 @@ impl Engine {
                     // routed upstream via alerts already
                 }
                 SessionOut::Alert(_) => {}
+                SessionOut::PortmapAdd {
+                    protocol,
+                    external_port,
+                    local_port,
+                } => {
+                    self.portmap_add(protocol, external_port, local_port).await;
+                }
+                SessionOut::PortmapDelete {
+                    transport,
+                    protocol,
+                    external_port,
+                } => {
+                    self.portmap_delete(transport, protocol, external_port)
+                        .await;
+                }
                 SessionOut::InterfacesChanged => {
                     // upstream `on_ip_change` → reopen listeners;
                     // the engine re-binds at the transport level.
@@ -1113,13 +1170,14 @@ impl Engine {
         let now = Instant::now();
         match r {
             NatPmpResponse::PublicIp(ip) => {
-                slock(&self.session).ip_voter.cast_vote(
+                slock(&self.session).vote_external(
                     std::net::IpAddr::V4(ip),
                     bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_ROUTER,
                     &std::net::IpAddr::V4(ip),
                 );
             }
             NatPmpResponse::Map {
+                protocol,
                 private_port,
                 public_port,
                 lifetime,
@@ -1133,6 +1191,31 @@ impl Engine {
                             // `mapping.expires` semantics)
                             m.3 = now + std::time::Duration::from_secs(u64::from(lifetime / 2));
                         }
+                    }
+                    let local_addr = n.gateway.ip().to_string();
+                    // `on_port_mapping`/`return_error` upstream —
+                    // surface the result as portmap alerts + a
+                    // `port_mapping_t` handle.
+                    let proto_u8 = match protocol {
+                        bitdaemon_net::natpmp::PortmapProtocol::Tcp => 1,
+                        bitdaemon_net::natpmp::PortmapProtocol::Udp => 2,
+                    };
+                    if result == 0 {
+                        slock(&self.session).on_portmap_success(
+                            0,
+                            proto_u8,
+                            private_port,
+                            public_port,
+                            local_addr,
+                            0,
+                        );
+                    } else {
+                        slock(&self.session).on_portmap_error(
+                            0,
+                            -1,
+                            local_addr,
+                            format!("nat-pmp map failed (code {result})"),
+                        );
                     }
                 }
             }
@@ -1259,16 +1342,58 @@ impl Engine {
                     body,
                 } => self.spawn_upnp_post(dev, mapping, action, body),
                 UpnpOut::Mapped {
-                    external_ip: Some(ip),
-                    ..
+                    mapping,
+                    external_ip,
+                    external_port,
+                    proto,
                 } => {
-                    slock(&self.session).ip_voter.cast_vote(
-                        ip,
-                        bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_ROUTER,
-                        &ip,
+                    if let Some(ip) = external_ip {
+                        slock(&self.session).vote_external(
+                            ip,
+                            bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_ROUTER,
+                            &ip,
+                        );
+                    }
+                    // `on_port_mapping` — `portmap_alert` + handle.
+                    let m = self
+                        .upnp_devices
+                        .get(dev)
+                        .and_then(|d| d.mappings.get(mapping));
+                    if let Some(m) = m {
+                        let proto_u8 = match proto {
+                            bitdaemon_net::upnp::PortmapProtocol::Tcp => 1,
+                            bitdaemon_net::upnp::PortmapProtocol::Udp => 2,
+                        };
+                        slock(&self.session).on_portmap_success(
+                            1,
+                            proto_u8,
+                            m.local_port,
+                            external_port,
+                            m.local_addr.clone(),
+                            dev,
+                        );
+                    }
+                }
+                UpnpOut::MapError { mapping, code } => {
+                    // `return_error` → `portmap_error_alert` +
+                    // `portmap_log_alert` (upstream logs both).
+                    let local_addr = self
+                        .upnp_devices
+                        .get(dev)
+                        .map(|d| d.dev.model.clone())
+                        .unwrap_or_default();
+                    slock(&self.session).on_portmap_error(
+                        1,
+                        mapping as i32,
+                        local_addr.clone(),
+                        format!("upnp map failed (code {code})"),
+                    );
+                    slock(&self.session).portmap_log(
+                        1,
+                        local_addr,
+                        format!("AddPortMapping failed: UPnP error {code}"),
                     );
                 }
-                _ => {}
             }
         }
     }
@@ -1354,6 +1479,94 @@ impl Engine {
         };
         if let Some(outs) = outs {
             self.drive_upnp_outs(r.dev, outs);
+        }
+    }
+
+    /// `session_impl::add_port_mapping` — forward a user mapping
+    /// to both drivers. NAT-PMP gets a new `(proto,local,ext)`
+    /// slot; UPnP appends a mapping per discovered device.
+    /// Results land via `on_portmap_success`/`on_portmap_error`.
+    pub async fn portmap_add(&mut self, protocol: u8, external_port: u16, local_port: u16) {
+        use bitdaemon_net::natpmp::PortmapProtocol as Np;
+        let proto_np = match protocol {
+            2 => Np::Udp,
+            _ => Np::Tcp,
+        };
+        if let Some(n) = &mut self.natpmp
+            && let Some(dg) = self.datagram.clone()
+        {
+            n.mappings
+                .push((proto_np, local_port, external_port, Instant::now()));
+            let _ = dg
+                .send_to(
+                    &bitdaemon_net::natpmp::build_map_request(
+                        proto_np,
+                        local_port,
+                        external_port,
+                        n.ttl,
+                    ),
+                    n.gateway,
+                )
+                .await;
+        }
+        for dev in 0..self.upnp_devices.len() {
+            let proto_up = match protocol {
+                2 => bitdaemon_net::upnp::PortmapProtocol::Udp,
+                _ => bitdaemon_net::upnp::PortmapProtocol::Tcp,
+            };
+            let outs = self.upnp_devices[dev].add_mapping(
+                proto_up,
+                external_port,
+                local_port,
+                String::new(),
+            );
+            self.drive_upnp_outs(dev, outs);
+        }
+    }
+
+    /// `session_impl::delete_port_mapping` — NAT-PMP: ttl=0
+    /// request (the RFC unmap); UPnP: `DeletePortMapping` on the
+    /// slot matching `(proto, ext)`.
+    pub async fn portmap_delete(&mut self, transport: u8, protocol: u8, external_port: u16) {
+        match transport {
+            0 => {
+                use bitdaemon_net::natpmp::PortmapProtocol as Np;
+                let proto = match protocol {
+                    2 => Np::Udp,
+                    _ => Np::Tcp,
+                };
+                if let Some(n) = &mut self.natpmp
+                    && let Some(dg) = self.datagram.clone()
+                    && let Some(pos) = n
+                        .mappings
+                        .iter()
+                        .position(|m| m.0 == proto && m.2 == external_port)
+                {
+                    let local = n.mappings[pos].1;
+                    let _ = dg
+                        .send_to(
+                            &bitdaemon_net::natpmp::build_map_request(proto, local, 0, 0),
+                            n.gateway,
+                        )
+                        .await;
+                    n.mappings.remove(pos);
+                }
+            }
+            _ => {
+                let proto = match protocol {
+                    2 => bitdaemon_net::upnp::PortmapProtocol::Udp,
+                    _ => bitdaemon_net::upnp::PortmapProtocol::Tcp,
+                };
+                for dev in 0..self.upnp_devices.len() {
+                    let idx = self.upnp_devices[dev].mappings.iter().position(|m| {
+                        m.protocol == Some(proto) && m.external_port == external_port
+                    });
+                    if let Some(i) = idx {
+                        let outs = self.upnp_devices[dev].delete_mapping(i);
+                        self.drive_upnp_outs(dev, outs);
+                    }
+                }
+            }
         }
     }
 
@@ -1533,8 +1746,13 @@ impl Engine {
     /// are snapshotted now.
     pub fn spawn_dial(&mut self, ih: Sha1Hash, remote: SocketAddr, encrypted: bool) {
         // `ip_filter` gate on outbound too (upstream filters at
-        // `connect_to_peer`).
+        // `connect_to_peer` → `peer_blocked_alert`).
         if slock(&self.session).ip_access(remote.ip()) == bitdaemon_net::ip_filter::BLOCKED {
+            slock(&self.session).alerts.post(Alert::PeerBlocked {
+                ih,
+                remote: remote.to_string(),
+                reason: "ip_filter".into(),
+            });
             return;
         }
         let connector = self.connector.clone();
@@ -1583,6 +1801,7 @@ impl Engine {
         let resolver = self.resolver.clone();
         let fast = true;
         let ext = self.ext_handshake(&ih);
+        let session = Arc::clone(&self.session);
         let h = tokio::spawn(async move {
             let send_err = |e: String| {
                 let _ = tx.send(DialDone {
@@ -1648,7 +1867,12 @@ impl Engine {
                 TK::I2p => {
                     // i2p peers are reached by destination, not
                     // SocketAddr — the session never puts them in the
-                    // dial queue.
+                    // dial queue. `i2p_alert` — the subsystem can't
+                    // route this dial (upstream's `no_i2p_router`/
+                    // transport error class).
+                    slock(&session).alerts.post(Alert::I2p {
+                        error: "i2p transport requested for ip peer".into(),
+                    });
                     send_err("i2p transport requested for ip peer".to_string());
                     return;
                 }
@@ -1741,10 +1965,21 @@ impl Engine {
     /// `listen_sockets` accept pump — one task per acceptor: each
     /// inbound stream runs the responder handshake (info-hash gated
     /// by `known`, refreshed every tick) and lands in `connect_rx`
-    /// like an outbound dial.
-    pub fn start_acceptor(&mut self, acceptor: Arc<dyn bitdaemon_net::transport::PeerAcceptor>) {
+    /// like an outbound dial. Posts `listen_succeeded` when `local`
+    /// is the bound endpoint, `listen_failed` on accept errors,
+    /// `incoming_connection` per accepted stream.
+    pub fn start_acceptor_at(
+        &mut self,
+        acceptor: Arc<dyn bitdaemon_net::transport::PeerAcceptor>,
+        local: Option<SocketAddr>,
+        kind: u8,
+    ) {
+        if let Some(a) = local {
+            slock(&self.session).on_listen_succeeded(a.to_string(), kind);
+        }
         let tx = self.connect_tx.clone();
         let known = self.known_ihs.clone();
+        let session = self.session.clone();
         let (pid, dht) = {
             let ses = slock(&self.session);
             (ses.peer_id, ses.settings.dht_enabled)
@@ -1752,13 +1987,24 @@ impl Engine {
         let h = tokio::spawn(async move {
             loop {
                 let acc = acceptor.clone().accept().await;
-                let mut s = match acc {
-                    Ok((s, _remote)) => s,
+                let (s0, remote) = match acc {
+                    Ok(pair) => pair,
                     Err(e) => {
                         warn!(err = %e, "accept failed");
+                        slock(&session).on_listen_failed(
+                            local.map_or_else(String::new, |a| a.to_string()),
+                            "accept".into(),
+                            e.to_string(),
+                            kind,
+                        );
                         return;
                     }
                 };
+                let mut s = s0;
+                slock(&session).on_incoming_connection(
+                    remote.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
+                    kind,
+                );
                 let hs = bitdaemon_net::bt_peer_conn::run_handshake_responder(
                     &mut s,
                     &pid,
@@ -1787,6 +2033,12 @@ impl Engine {
         self.tasks.push(h);
     }
 
+    /// `start_acceptor` without endpoint info — `listen_succeeded`
+    /// can't be attributed; alerts still post with `""` remote.
+    pub fn start_acceptor(&mut self, acceptor: Arc<dyn bitdaemon_net::transport::PeerAcceptor>) {
+        self.start_acceptor_at(acceptor, None, 0);
+    }
+
     /// SSL-torrent accept pump — same as [`Self::start_acceptor`]
     /// but every inbound stream is TLS-accepted first
     /// (`ssl_listen_port` sockets upstream). Cert selection uses the
@@ -1795,6 +2047,21 @@ impl Engine {
         &mut self,
         acceptor: Arc<dyn bitdaemon_net::transport::PeerAcceptor>,
     ) {
+        self.start_ssl_acceptor_at(acceptor, None, 1);
+    }
+
+    /// `start_ssl_acceptor` variant carrying the bound endpoint +
+    /// `socket_type` kind — posts `listen_succeeded`/`listen_failed`
+    ////`incoming_connection` like the plain acceptor.
+    pub fn start_ssl_acceptor_at(
+        &mut self,
+        acceptor: Arc<dyn bitdaemon_net::transport::PeerAcceptor>,
+        local: Option<SocketAddr>,
+        kind: u8,
+    ) {
+        if let Some(a) = local {
+            slock(&self.session).on_listen_succeeded(a.to_string(), kind);
+        }
         let cfg = Arc::new(
             rustls::ServerConfig::builder()
                 // SSL torrents are mutual-TLS upstream
@@ -1806,6 +2073,7 @@ impl Engine {
         );
         let tx = self.connect_tx.clone();
         let known = self.known_ihs.clone();
+        let session = self.session.clone();
         let (pid, dht) = {
             let ses = slock(&self.session);
             (ses.peer_id, ses.settings.dht_enabled)
@@ -1817,10 +2085,17 @@ impl Engine {
                     Ok(pair) => pair,
                     Err(e) => {
                         warn!(err = %e, "ssl accept failed");
+                        slock(&session).on_listen_failed(
+                            local.map_or_else(String::new, |a| a.to_string()),
+                            "accept".into(),
+                            e.to_string(),
+                            kind,
+                        );
                         return;
                     }
                 };
                 let remote = remote.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+                slock(&session).on_incoming_connection(remote, kind);
                 let tls = match bitdaemon_net::ssl_stream::ssl_accept(s0, remote, cfg.clone()).await
                 {
                     Ok(t) => t,
@@ -1999,8 +2274,15 @@ impl Engine {
         mut s: BoxedPeerStream,
     ) -> std::io::Result<Option<u64>> {
         // `session_impl::incoming_connection` → `m_ip_filter` gate
-        // before the handshake even runs (block at TCP level).
+        // before the handshake even runs (block at TCP level;
+        // upstream posts `peer_blocked_alert` with an invalid
+        // handle — the info-hash isn't known yet).
         if slock(&self.session).ip_access(remote.ip()) == bitdaemon_net::ip_filter::BLOCKED {
+            slock(&self.session).alerts.post(Alert::PeerBlocked {
+                ih: Sha1Hash::default(),
+                remote: remote.to_string(),
+                reason: "ip_filter".into(),
+            });
             return Ok(None);
         }
         let (pid, dht) = {
@@ -2012,10 +2294,23 @@ impl Engine {
             let set: Vec<Sha1Hash> = slock(&self.session).torrents.keys().copied().collect();
             move |ih: &Sha1Hash| set.contains(ih)
         };
-        let hs =
-            bitdaemon_net::bt_peer_conn::run_handshake_responder(&mut s, &pid, dht, true, ih_known)
-                .await
-                .map_err(std::io::Error::other)?;
+        let hs = match bitdaemon_net::bt_peer_conn::run_handshake_responder(
+            &mut s, &pid, dht, true, ih_known,
+        )
+        .await
+        {
+            Ok(hs) => hs,
+            // `peer_connection::on_connected` — an inbound ih that
+            // matches our DHT secret-id means the remote fished it
+            // out of DHT chatter: suspicious → `ban_ip`.
+            Err(bitdaemon_net::bt_peer_conn::PeerConnError::WrongInfoHash(ih))
+                if bitdaemon_dht::node_id::verify_secret_id(&ih) =>
+            {
+                slock(&self.session).ban_ip(remote.ip());
+                return Ok(None);
+            }
+            Err(e) => return Err(std::io::Error::other(e)),
+        };
         let num_pieces = slock(&self.session)
             .torrents
             .get(&hs.info_hash)

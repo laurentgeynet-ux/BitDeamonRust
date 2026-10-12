@@ -124,12 +124,18 @@ impl Lookup {
     /// node's *live* id — `bootstrap` re-reads it on every invoke
     /// like upstream `bootstrap::invoke` (the id may rotate mid-
     /// bootstrap); other kinds ignore it.
+    ///
+    /// Returns the query entry plus the `info_hash` actually put on
+    /// the wire (`Some` for `get_peers`-family queries — obfuscated
+    /// targets differ from the lookup target; `None` otherwise).
+    /// Upstream reports that hash through
+    /// `dht_observer::outgoing_get_peers`.
     #[must_use]
     pub fn invoke_entry(
         &self,
         entry: &crate::traversal::ObserverEntry,
         current_id: NodeId,
-    ) -> Entry {
+    ) -> (Entry, Option<NodeId>) {
         let target = if self.kind == LookupKind::Bootstrap {
             current_id
         } else {
@@ -137,6 +143,7 @@ impl Lookup {
         };
         let mut e = Entry::Dict(Default::default());
         let mut a = Entry::Dict(Default::default());
+        let mut sent_hash = None;
         match self.kind {
             LookupKind::Bootstrap => {
                 // upstream: always the *current* node id (it may
@@ -151,6 +158,7 @@ impl Lookup {
                     "info_hash".into(),
                     Entry::String(target.as_bytes().to_vec()),
                 );
+                sent_hash = Some(target);
                 if entry.flags & crate::traversal::obs_flags::INITIAL != 0 {
                     am.insert("bs".into(), Entry::Int(1));
                 }
@@ -183,6 +191,7 @@ impl Lookup {
                     }
                     hash = obf;
                 }
+                sent_hash = Some(hash);
                 am.insert("info_hash".into(), Entry::String(hash.as_bytes().to_vec()));
                 if self.noseed {
                     am.insert("noseed".into(), Entry::Int(1));
@@ -203,7 +212,7 @@ impl Lookup {
             }
         }
         e.dict_mut().expect("dict").insert("a".into(), a);
-        e
+        (e, sent_hash)
     }
 
     fn algo_target(&self) -> &NodeId {

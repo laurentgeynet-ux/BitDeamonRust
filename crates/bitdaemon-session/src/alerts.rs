@@ -493,32 +493,34 @@ pub enum Alert {
     },
     /// `portmap_error_alert` (50).
     PortmapError {
+        /// `mapping` handle the failure refers to.
+        mapping: i32,
         /// `map_transport`: 0 = NAT-PMP, 1 = UPnP.
         transport: u8,
-        /// gateway endpoint.
-        remote: String,
-        /// failing operation.
-        op: String,
+        /// `local_address` — interface the mapper runs on.
+        local_addr: String,
         /// error.
         error: String,
-        /// `map_type` (0 = map, 1 = unmap).
-        map_type: u8,
     },
     /// `portmap_alert` (51).
     Portmap {
+        /// `mapping` handle (`port_mapping_t` upstream).
+        mapping: i32,
         /// `map_transport`: 0 = NAT-PMP, 1 = UPnP.
         transport: u8,
-        /// external (mapped) port.
-        ext_port: u16,
-        /// internal port.
-        int_port: u16,
         /// `protocol`: 0 = none, 1 = TCP, 2 = UDP.
         protocol: u8,
+        /// `external_port` allocated on the router.
+        ext_port: u16,
+        /// `local_address` — interface the mapper runs on.
+        local_addr: String,
     },
     /// `portmap_log_alert` (52).
     PortmapLog {
         /// `map_transport`: 0 = NAT-PMP, 1 = UPnP.
         transport: u8,
+        /// `local_address` — interface the mapper runs on.
+        local_addr: String,
         /// log message.
         msg: String,
     },
@@ -557,13 +559,13 @@ pub enum Alert {
     DhtGetPeers {
         /// info-hash.
         ih: Sha1Hash,
-        /// `obfuscated_info_hash`.
-        obfuscated: Sha1Hash,
         /// message.
         msg: String,
     },
     /// `stats_alert` — periodic bandwidth counters (57).
     Stats {
+        /// torrent (upstream carries `torrent_handle`).
+        ih: Sha1Hash,
         /// `interval` in ms.
         interval_ms: u32,
         /// transferred counters snapshot.
@@ -666,12 +668,14 @@ pub enum Alert {
         /// error.
         error: String,
     },
-    /// `dht_outgoing_get_peers_alert` — lookup started (78).
+    /// `dht_outgoing_get_peers_alert` — `get_peers` query sent (78).
     DhtOutgoingGetPeers {
         /// info-hash.
         ih: Sha1Hash,
         /// `obfuscated_info_hash`.
         obfuscated: Sha1Hash,
+        /// `endpoint` the query went to.
+        ep: SocketAddr,
     },
     /// `log_alert` — session log (79).
     Log {
@@ -700,14 +704,13 @@ pub enum Alert {
         error: String,
     },
     /// `dht_stats_alert` — routing snapshot on `post_dht_stats` (83).
-    /// Category-0: unconditional. Payload expands to upstream's
-    /// `routing_table`+`requests`+`nid`+`endpoint` in Phase L
-    /// (`dht_tracker::stats()` port).
+    /// Category-0: unconditional.
     DhtStats {
-        /// v4 table `(nodes, replacements, confirmed)`.
-        v4: (usize, usize, usize),
-        /// v6 table `(nodes, replacements, confirmed)`.
-        v6: (usize, usize, usize),
+        /// v4 table stats (`Box`ed — two inline stats would make
+        /// `Alert` ~120 B).
+        v4: Box<DhtNodeStats>,
+        /// v6 table stats.
+        v6: Box<DhtNodeStats>,
     },
     /// `incoming_request_alert` — peer requested a block (84).
     IncomingRequest {
@@ -779,18 +782,8 @@ pub enum Alert {
     /// `SessionStats` (92). Category-0: unconditional.
     SessionStatsHeader {},
     /// `dht_sample_infohashes_alert` — BEP-51 result (93).
-    DhtSampleInfohashes {
-        /// `interval` in ms.
-        interval_ms: u32,
-        /// `num_infohashes` the node reports.
-        num_infohashes: usize,
-        /// sampled info-hashes.
-        samples: Vec<Sha1Hash>,
-        /// `num_nodes` in the node's v4 table.
-        num_nodes: usize,
-        /// `num_nodes6`.
-        num_nodes6: usize,
-    },
+    /// `Box`ed: ~120 B payload keeps `size_of::<Alert>()` small.
+    DhtSampleInfohashes(Box<DhtSampleInfohashesAlert>),
     /// `block_uploaded_alert` — block sent to a peer (94).
     BlockUploaded {
         /// torrent.
@@ -917,6 +910,40 @@ pub struct DhtMutableItemAlert {
     pub value: Vec<u8>,
     /// `authoritative` — signature verified.
     pub authoritative: bool,
+}
+
+/// per-family `dht_stats_alert` payload — `routing_table` summary +
+/// `nid` + `active_requests` count (upstream carries the full bucket
+/// vector; the counters cover the same observability surface).
+#[derive(Clone, Debug, Default)]
+pub struct DhtNodeStats {
+    /// this node's id (`nid` upstream).
+    pub nid: bitdaemon_dht::node_id::NodeId,
+    /// live nodes in the routing table.
+    pub nodes: usize,
+    /// replacement-cache entries.
+    pub replacements: usize,
+    /// bucket-verified nodes.
+    pub confirmed: usize,
+    /// running traversals (`active_requests` upstream).
+    pub active_lookups: usize,
+}
+
+/// `dht_sample_infohashes_alert` payload (kept boxed — ~120 B).
+#[derive(Clone, Debug)]
+pub struct DhtSampleInfohashesAlert {
+    /// `node_id` — responder's id.
+    pub node_id: Sha1Hash,
+    /// `endpoint` the response came from.
+    pub remote: String,
+    /// `interval` (seconds) to wait before sampling again.
+    pub interval_secs: u32,
+    /// `num` — infohashes the node claims to store.
+    pub num: i64,
+    /// sampled info-hashes.
+    pub samples: Vec<Sha1Hash>,
+    /// `(node id, endpoint)` pairs the reply carried.
+    pub nodes: Vec<(bitdaemon_dht::node_id::NodeId, SocketAddr)>,
 }
 
 /// `dht_put_alert` payload (kept boxed — ~150 B).

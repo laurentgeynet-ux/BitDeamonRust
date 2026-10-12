@@ -63,11 +63,59 @@ pub enum DhtEvent {
         tag: u64,
         /// responder id when the reply carries a valid `r.id`.
         id: Option<NodeId>,
+        /// the endpoint the request was sent to (also set on
+        /// error/timeout — upstream reports `addr` either way).
+        ep: SocketAddr,
         /// raw `r`/`e` dict payload.
         response: Vec<u8>,
         /// true when the reply was `y == "e"` or the transaction
         /// timed out (upstream `direct_observer::timeout`).
         failed: bool,
+    },
+    /// `dht_observer::get_peers` — an inbound `get_peers` query hit
+    /// our node (`dht_get_peers_alert` upstream).
+    IncomingGetPeers {
+        /// queried info-hash.
+        ih: Sha1Hash,
+    },
+    /// `dht_observer::announce` — an inbound `announce_peer` was
+    /// accepted (`dht_announce_alert` upstream).
+    IncomingAnnounce {
+        /// announced info-hash.
+        ih: Sha1Hash,
+        /// announcer's address.
+        ip: IpAddr,
+        /// listen port it claims (source port when `implied_port`).
+        port: u16,
+    },
+    /// `dht_observer::outgoing_get_peers` — our traversal just sent
+    /// a `get_peers` query (`dht_outgoing_get_peers_alert` upstream).
+    OutgoingGetPeers {
+        /// the traversal's target info-hash.
+        target: Sha1Hash,
+        /// the hash actually put on the wire (obfuscated for
+        /// `ObfuscatedGetPeers`).
+        sent_target: Sha1Hash,
+        /// node the query went to.
+        ep: SocketAddr,
+    },
+    /// `dht_logger` incoming datagram — raw payload for
+    /// `dht_pkt_alert` (outgoing direction is emitted by the
+    /// caller's send loop, which owns the datagram).
+    Pkt {
+        /// remote node.
+        ep: SocketAddr,
+        /// raw datagram bytes.
+        bytes: Vec<u8>,
+    },
+    /// `dht_observer::log` — a `dht_log_alert` line; `module` is
+    /// upstream `dht_module_t` (0 tracker, 1 node, 2 routing_table,
+    /// 3 rpc_manager, 4 traversal).
+    Log {
+        /// `dht_module_t`.
+        module: u8,
+        /// message.
+        msg: String,
     },
 }
 
@@ -219,7 +267,7 @@ impl DhtNode {
         let read_only = self.settings.read_only;
         let v6 = self.v6;
         // build the query dicts under the lookup borrow, then send
-        let mut to_send: Vec<(Entry, SocketAddr, u64)> = Vec::new();
+        let mut to_send: Vec<(Entry, SocketAddr, u64, Option<NodeId>)> = Vec::new();
         {
             let l = self.lookups[idx].as_mut().expect("checked");
             let mut picked: Vec<(usize, SocketAddr)> = Vec::new();
@@ -229,14 +277,30 @@ impl DhtNode {
             });
             for (i, ep) in picked {
                 if let Some(entry) = l.algo.results().get(i) {
-                    to_send.push((l.invoke_entry(entry, our_id), ep, pack_tag(idx, i)));
+                    let (e, sent) = l.invoke_entry(entry, our_id);
+                    to_send.push((e, ep, pack_tag(idx, i), sent));
                 }
             }
         }
         let rpc = &mut self.rpc;
         let outbox = &mut self.outbox;
-        for (e, ep, tag) in to_send {
-            tracing::trace!(%ep, kind = ?self.lookups[idx].as_ref().map(|l| l.kind), "dht invoke");
+        let events = &mut self.events;
+        for (e, ep, tag, sent) in to_send {
+            let l = self.lookups[idx].as_ref().expect("checked");
+            tracing::trace!(%ep, kind = ?l.kind, "dht invoke");
+            // `dht_observer::outgoing_get_peers` — upstream hooks
+            // `get_peers::invoke`/`obfuscated_get_peers::invoke`.
+            if matches!(
+                l.kind,
+                LookupKind::GetPeers | LookupKind::ObfuscatedGetPeers
+            ) && let Some(sent_target) = sent
+            {
+                events.push(DhtEvent::OutgoingGetPeers {
+                    target: *l.algo.target(),
+                    sent_target,
+                    ep,
+                });
+            }
             rpc.invoke(e, ep, tag, our_id, read_only, v6, |e2, t| {
                 outbox.push((bitdaemon_bencode::bencode(&e2), t));
                 true
@@ -255,8 +319,18 @@ impl DhtNode {
         // (upstream calls it in `node::incoming` / `on_udp`, pre-bdecode).
         if !self.blocker.incoming(from.ip(), std::time::Instant::now()) {
             tracing::debug!(%from, "dht: dropping datagram from rate-limited source");
+            self.events.push(DhtEvent::Log {
+                module: 1,
+                msg: format!("dropping datagram from rate-limited source {from}"),
+            });
             return None;
         }
+        // `dht_logger` — every inbound datagram surfaces as
+        // `dht_pkt_alert` when the dht_log category is enabled.
+        self.events.push(DhtEvent::Pkt {
+            ep: from,
+            bytes: buf.to_vec(),
+        });
         let root = bdecode_checked(buf).ok()?;
         // upstream `dht::node::on_bdecode` — a top-level `ip` key
         // is the peer's view of our external address; vote on it.
@@ -321,6 +395,7 @@ impl DhtNode {
                     self.events.push(DhtEvent::Direct {
                         tag,
                         id: Some(id),
+                        ep: from,
                         response: r.data_section().to_vec(),
                         failed: false,
                     });
@@ -344,6 +419,7 @@ impl DhtNode {
                     self.events.push(DhtEvent::Direct {
                         tag,
                         id: None,
+                        ep: from,
                         response: Vec::new(),
                         failed: true,
                     });
@@ -381,7 +457,7 @@ impl DhtNode {
     fn finish_entry(&mut self, li: usize, oi: usize) {
         let hooks = self.hooks();
         let our_id = self.id;
-        let mut more: Vec<(Entry, SocketAddr, u64)> = Vec::new();
+        let mut more: Vec<(Entry, SocketAddr, u64, Option<NodeId>)> = Vec::new();
         if let Some(Some(l)) = self.lookups.get_mut(li) {
             let mut picked: Vec<(usize, SocketAddr)> = Vec::new();
             l.algo.finished(oi, &hooks, |i, entry| {
@@ -391,7 +467,8 @@ impl DhtNode {
             tracing::trace!(li, picked = picked.len(), "dht finish_entry picks");
             for (i, ep) in picked {
                 if let Some(entry) = l.algo.results().get(i) {
-                    more.push((l.invoke_entry(entry, our_id), ep, pack_tag(li, i)));
+                    let (e, sent) = l.invoke_entry(entry, our_id);
+                    more.push((e, ep, pack_tag(li, i), sent));
                 }
             }
         }
@@ -399,7 +476,21 @@ impl DhtNode {
         let v6 = self.v6;
         let rpc = &mut self.rpc;
         let outbox = &mut self.outbox;
-        for (e, ep, tag) in more {
+        let events = &mut self.events;
+        for (e, ep, tag, sent) in more {
+            if let Some(l) = self.lookups.get(li).and_then(Option::as_ref)
+                && matches!(
+                    l.kind,
+                    LookupKind::GetPeers | LookupKind::ObfuscatedGetPeers
+                )
+                && let Some(sent_target) = sent
+            {
+                events.push(DhtEvent::OutgoingGetPeers {
+                    target: *l.algo.target(),
+                    sent_target,
+                    ep,
+                });
+            }
             rpc.invoke(e, ep, tag, our_id, ro, v6, |e2, t| {
                 outbox.push((bitdaemon_bencode::bencode(&e2), t));
                 true
@@ -503,6 +594,22 @@ impl DhtNode {
         });
     }
 
+    /// `dht_tracker::sample_infohashes` — BEP-51: query ONE node
+    /// (a `direct_request` upstream, not a traversal). The reply
+    /// lands as `DhtEvent::Direct` keyed by the returned tag.
+    pub fn sample_infohashes(&mut self, ep: SocketAddr, target: NodeId) -> u64 {
+        let mut e = Entry::Dict(Default::default());
+        e.dict_mut()
+            .expect("dict")
+            .insert("q".into(), Entry::String(b"sample_infohashes".to_vec()));
+        let mut a = Entry::Dict(Default::default());
+        a.dict_mut()
+            .expect("dict")
+            .insert("target".into(), Entry::String(target.as_bytes().to_vec()));
+        e.dict_mut().expect("dict").insert("a".into(), a);
+        self.direct_request(e, ep)
+    }
+
     /// `node::direct_request` (`kademlia/direct_request`) — send a
     /// query that isn't a traversal and get the reply back as a
     /// `DhtEvent::Direct` event. Returns the request tag.
@@ -527,6 +634,10 @@ impl DhtNode {
     /// id should restart the bootstrap (upstream re-reads the live
     /// id — our `Lookup` target IS `self.id` at call time).
     pub fn bootstrap(&mut self) -> usize {
+        self.events.push(DhtEvent::Log {
+            module: 0,
+            msg: "starting DHT bootstrap".into(),
+        });
         self.new_lookup(LookupKind::Bootstrap, self.id)
     }
 
@@ -574,6 +685,10 @@ impl DhtNode {
                     return self.error(from, e, b"invalid get_peers");
                 }
                 let info_hash = Sha1Hash::from_bytes(ih.string_value()).unwrap_or_default();
+                // `dht_observer::get_peers` — surfaced as
+                // `dht_get_peers_alert` upstream.
+                self.events
+                    .push(DhtEvent::IncomingGetPeers { ih: info_hash });
                 self.write_nodes(&info_hash, &arg, &mut reply);
                 let noseed = arg.dict_find_int_value(b"noseed", 0) != 0;
                 let scrape = arg.dict_find_int_value(b"scrape", 0) != 0;
@@ -634,6 +749,13 @@ impl DhtNode {
                 } else {
                     port.int_value() as u16
                 };
+                // `dht_observer::announce` — surfaced as
+                // `dht_announce_alert` upstream.
+                self.events.push(DhtEvent::IncomingAnnounce {
+                    ih: info_hash,
+                    ip: from.ip(),
+                    port: p,
+                });
                 let name = arg.dict_find_string_value(b"name", b"").to_vec();
                 let seed = arg.dict_find_int_value(b"seed", 0) != 0;
                 self.storage.announce_peer(
@@ -912,10 +1034,26 @@ impl DhtNode {
         st
     }
 
-    /// `dht::live_nodes` — endpoints that answered (`flag_alive`)
-    /// on the `get_peers` traversal for `ih`.
+    /// `dht_tracker::stats` — per-family snapshot for
+    /// `dht_stats_alert`: node id, routing `(nodes, replacements,
+    /// confirmed)` and running traversals (`active_requests`).
     #[must_use]
-    pub fn live_nodes_for(&self, ih: &NodeId) -> Vec<SocketAddr> {
+    pub fn stats(&self) -> (NodeId, usize, usize, usize, usize) {
+        let (nodes, repl, confirmed) = self.table.size();
+        (
+            self.id,
+            nodes,
+            repl,
+            confirmed,
+            self.lookups.iter().flatten().count(),
+        )
+    }
+
+    /// `dht::live_nodes` — `(node id, endpoint)` pairs that answered
+    /// (`flag_alive`) on the `get_peers` traversal for `ih`.
+    /// Upstream returns `vector<pair<node_id, udp::endpoint>>`.
+    #[must_use]
+    pub fn live_nodes_for(&self, ih: &NodeId) -> Vec<(NodeId, SocketAddr)> {
         let mut out = Vec::new();
         for l in self.lookups.iter().flatten() {
             if l.kind != LookupKind::GetPeers || l.algo.target() != ih {
@@ -926,7 +1064,7 @@ impl DhtNode {
                     .results()
                     .iter()
                     .filter(|e| e.flags & crate::traversal::obs_flags::ALIVE != 0)
-                    .map(|e| e.ep),
+                    .filter_map(|e| e.id.map(|id| (id, e.ep))),
             );
         }
         out
@@ -945,12 +1083,13 @@ impl DhtNode {
     pub fn tick(&mut self) -> Duration {
         let mut expirations = Vec::new();
         let wait = self.rpc.tick(|tag, ep, ex| expirations.push((tag, ep, ex)));
-        for (tag, _ep, ex) in expirations {
+        for (tag, ep, ex) in expirations {
             if tag & DIRECT_BIT != 0 || tag == PING_TAG {
                 if tag & DIRECT_BIT != 0 {
                     self.events.push(DhtEvent::Direct {
                         tag,
                         id: None,
+                        ep,
                         response: Vec::new(),
                         failed: true,
                     });
@@ -960,9 +1099,19 @@ impl DhtNode {
             let (li, oi) = unpack_tag(tag);
             match ex {
                 Expiry::ShortTimeout => {
+                    self.events.push(DhtEvent::Log {
+                        module: 3,
+                        msg: format!("short timeout {ep}"),
+                    });
                     self.lookup_failed(li, oi, crate::traversal::trav_flags::SHORT_TIMEOUT)
                 }
-                Expiry::Timeout => self.lookup_failed(li, oi, 0),
+                Expiry::Timeout => {
+                    self.events.push(DhtEvent::Log {
+                        module: 3,
+                        msg: format!("timing out {ep}"),
+                    });
+                    self.lookup_failed(li, oi, 0)
+                }
             }
         }
         self.storage.tick();

@@ -401,6 +401,33 @@ impl UpnpDriver {
         out
     }
 
+    /// `add_port_mapping` — append one mapping slot (upstream's
+    /// `upnp::set_mapping` on a new `mapping_t` index). The
+    /// `AddPortMapping` SOAP call goes out via `update_map`.
+    pub fn add_mapping(
+        &mut self,
+        proto: PortmapProtocol,
+        external_port: u16,
+        local_port: u16,
+        local_addr: String,
+    ) -> Vec<UpnpOut> {
+        self.mappings.push(UpnpMapping {
+            act: MappingAction::Add,
+            protocol: Some(proto),
+            external_port,
+            local_port,
+            local_addr,
+            failcount: 0,
+            expires: 0,
+        });
+        let i = self.mappings.len() - 1;
+        if self.dev.service_namespace.is_empty() {
+            Vec::new()
+        } else {
+            self.update_map(i)
+        }
+    }
+
     /// `delete_mapping` — upstream marks `act=del` then `update_map`.
     pub fn delete_mapping(&mut self, i: usize) -> Vec<UpnpOut> {
         if i >= self.mappings.len() {

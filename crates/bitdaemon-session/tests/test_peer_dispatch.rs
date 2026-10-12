@@ -94,20 +94,22 @@ fn piece_marks_download_and_requests_more() {
 }
 
 #[test]
-fn invalid_request_disconnects() {
+fn invalid_request_rejected_and_alerted() {
     let mut c = conn();
     let mut eff = Vec::new();
-    c.dispatch(
-        &PeerMessage::Request(PeerRequest {
-            piece: PieceIndex(99),
-            start: 0,
-            length: 0x4000,
-        }),
-        10,
-        &mut eff,
-    );
-    assert!(matches!(eff[0], PeerEffect::Disconnect(_)));
+    let req = PeerRequest {
+        piece: PieceIndex(99),
+        start: 0,
+        length: 0x4000,
+    };
+    c.dispatch(&PeerMessage::Request(req), 10, &mut eff);
+    // upstream `incoming_request`: write_reject_request +
+    // invalid_request_alert, num_invalid_requests += 1 — no
+    // disconnect until >300 invalid requests while choked.
+    assert!(matches!(eff[0], PeerEffect::RejectRequest(_)));
+    assert!(matches!(eff[1], PeerEffect::InvalidRequest(_)));
     assert_eq!(c.num_invalid_requests, 1);
+    assert_eq!(eff.len(), 2);
 }
 
 #[test]

@@ -65,6 +65,15 @@ pub enum TorrentEffect {
     /// `yourip` seen in a BEP-10 handshake — routed to the
     /// session's `ip_voter` (`source_peer`).
     YourIp(std::net::IpAddr),
+    /// magnet `ut_metadata` assembled + hash-verified →
+    /// `metadata_received_alert`.
+    MetadataReceived,
+    /// assembled metadata failed the info-hash check →
+    /// `metadata_failed_alert`.
+    MetadataFailed,
+    /// post an alert on the session bus (`torrent`-level alerts
+    /// carry this torrent's `ih`).
+    Alert(crate::alerts::Alert),
 }
 
 /// `torrent` — one swarm.
@@ -782,10 +791,15 @@ impl Torrent {
                 let r = self.on_ut_metadata_data(data, piece as i32, total, peer, 30 * 1024 * 1024);
                 if matches!(r, MetadataResult::Complete) {
                     let md = self.metadata_tracker.metadata().to_vec();
+                    // `metadata_received{,_failed}_alert` — the
+                    // info-hash verdict (upstream posts in
+                    // `torrent::on_metadata`).
                     if self.set_metadata(&md, &LoadTorrentLimits::default()) {
                         self.metadata_tracker.clear();
+                        out.push(TorrentEffect::MetadataReceived);
                     } else {
                         self.metadata_tracker.reset_on_hash_failure();
+                        out.push(TorrentEffect::MetadataFailed);
                     }
                 }
             }
@@ -1427,6 +1441,11 @@ impl Torrent {
         out: &mut Vec<TorrentEffect>,
     ) {
         let key = self.peers.get(&peer_id).and_then(PeerConn::peer_key);
+        let remote = self
+            .peers
+            .get(&peer_id)
+            .and_then(|c| c.remote)
+            .map_or_else(String::new, |ep| ep.to_string());
         for e in effects {
             match e {
                 PeerEffect::RefcountInc(i) => {
@@ -1454,7 +1473,8 @@ impl Torrent {
                 PeerEffect::ReadRequest(req) => {
                     // super-seeding: requests outside the piece we
                     // leaked get rejected outright (upstream
-                    // `incoming_request` → `write_reject_request`).
+                    // `incoming_request` → `write_reject_request`
+                    // + `invalid_request_alert`).
                     if self.super_seeding {
                         let leaked = self.peers.get(&peer_id).and_then(|c| c.superseed_piece);
                         if leaked != Some(req.piece) {
@@ -1469,6 +1489,11 @@ impl Torrent {
                                     });
                                 }
                             }
+                            out.push(TorrentEffect::Alert(crate::alerts::Alert::InvalidRequest {
+                                ih: self.info_hash,
+                                remote: remote.clone(),
+                                msg: "piece not super-seeded".into(),
+                            }));
                             continue;
                         }
                     }
@@ -1476,22 +1501,77 @@ impl Torrent {
                     // only gets BEP-6 `allowed_fast` pieces; a piece
                     // we don't have gets a FAST `reject` (or silent
                     // drop when fast isn't negotiated) — never a
-                    // disk read.
+                    // disk read. Accepted requests post
+                    // `incoming_request_alert`; rejected ones post
+                    // `invalid_request_alert`.
                     let allowed = self.peers.get(&peer_id).is_some_and(|c| {
                         (!c.choked || c.allowed_fast.contains(&req.piece))
                             && (req.piece.0 as usize) < self.have.size()
                             && self.have.get_bit(req.piece.0 as usize)
                     });
                     if allowed {
+                        out.push(TorrentEffect::Alert(
+                            crate::alerts::Alert::IncomingRequest {
+                                ih: self.info_hash,
+                                remote: remote.clone(),
+                                piece: req.piece,
+                                start: req.start,
+                                length: req.length,
+                            },
+                        ));
                         out.push(TorrentEffect::DiskRead { peer: peer_id, req });
-                    } else if self.peers.get(&peer_id).is_some_and(|c| c.supports_fast) {
+                    } else {
+                        out.push(TorrentEffect::Alert(crate::alerts::Alert::InvalidRequest {
+                            ih: self.info_hash,
+                            remote: remote.clone(),
+                            msg: "peer choked or piece not available".into(),
+                        }));
+                        if self.peers.get(&peer_id).is_some_and(|c| c.supports_fast) {
+                            out.push(TorrentEffect::SendTo {
+                                peer: peer_id,
+                                msg: PeerMessage::RejectRequest(req),
+                            });
+                        }
+                    }
+                }
+                PeerEffect::CancelRequest(_) => {}
+                PeerEffect::UnwantedBlock(b) => {
+                    out.push(TorrentEffect::Alert(crate::alerts::Alert::UnwantedBlock {
+                        ih: self.info_hash,
+                        remote: remote.clone(),
+                        piece: b.piece_index,
+                        block: b.block_index as u32,
+                    }));
+                }
+                PeerEffect::BlockFinished(b) => {
+                    out.push(TorrentEffect::Alert(crate::alerts::Alert::BlockFinished {
+                        ih: self.info_hash,
+                        piece: b.piece_index,
+                        block: b.block_index as u32,
+                    }));
+                }
+                PeerEffect::Unsnub => {
+                    out.push(TorrentEffect::Alert(crate::alerts::Alert::PeerUnsnubbed {
+                        ih: self.info_hash,
+                        remote: remote.clone(),
+                    }));
+                }
+                PeerEffect::InvalidRequest(msg) => {
+                    out.push(TorrentEffect::Alert(crate::alerts::Alert::InvalidRequest {
+                        ih: self.info_hash,
+                        remote: remote.clone(),
+                        msg,
+                    }));
+                }
+                PeerEffect::RejectRequest(req) => {
+                    // `write_reject_request` — BEP-6 fast ext only.
+                    if self.peers.get(&peer_id).is_some_and(|c| c.supports_fast) {
                         out.push(TorrentEffect::SendTo {
                             peer: peer_id,
                             msg: PeerMessage::RejectRequest(req),
                         });
                     }
                 }
-                PeerEffect::CancelRequest(_) => {}
                 PeerEffect::MarkDownloaded(b) => {
                     if let Some(p) = self.picker.as_mut() {
                         p.mark_as_writing(b, key);
@@ -1675,10 +1755,7 @@ impl Torrent {
                 if self.hash_protocol_ok(peer_id) {
                     self.on_hash_request(peer_id, req, out);
                 } else {
-                    out.push(TorrentEffect::DisconnectPeer {
-                        peer: peer_id,
-                        reason: "invalid message",
-                    });
+                    self.peer_error_effect(peer_id, "hash_request on non-v2 connection", out);
                 }
                 return;
             }
@@ -1686,10 +1763,7 @@ impl Torrent {
                 if self.hash_protocol_ok(peer_id) {
                     self.on_hashes(req, hashes, out);
                 } else {
-                    out.push(TorrentEffect::DisconnectPeer {
-                        peer: peer_id,
-                        reason: "invalid message",
-                    });
+                    self.peer_error_effect(peer_id, "hashes on non-v2 connection", out);
                 }
                 return;
             }
@@ -1697,10 +1771,7 @@ impl Torrent {
                 if self.hash_protocol_ok(peer_id) {
                     self.on_hash_reject(req);
                 } else {
-                    out.push(TorrentEffect::DisconnectPeer {
-                        peer: peer_id,
-                        reason: "invalid message",
-                    });
+                    self.peer_error_effect(peer_id, "hash_reject on non-v2 connection", out);
                 }
                 return;
             }
@@ -1733,6 +1804,27 @@ impl Torrent {
     /// the upstream guard shared by all three hash handlers.
     fn hash_protocol_ok(&self, peer_id: u64) -> bool {
         self.metadata_raw.is_some() && self.peers.get(&peer_id).is_some_and(|c| c.protocol_v2)
+    }
+
+    /// `peer_error_alert` + disconnect — upstream
+    /// `peer_connection::disconnect` posts the alert on protocol
+    /// violations before dropping the connection.
+    fn peer_error_effect(&self, peer_id: u64, msg: &'static str, out: &mut Vec<TorrentEffect>) {
+        let remote = self
+            .peers
+            .get(&peer_id)
+            .and_then(|c| c.remote)
+            .map_or_else(String::new, |ep| ep.to_string());
+        out.push(TorrentEffect::Alert(crate::alerts::Alert::PeerError {
+            ih: self.info_hash,
+            remote,
+            op: "bittorrent".into(),
+            error: msg.into(),
+        }));
+        out.push(TorrentEffect::DisconnectPeer {
+            peer: peer_id,
+            reason: "invalid message",
+        });
     }
 
     /// `torrent::get_hashes` — serve a `hash_request` from our
@@ -2077,6 +2169,28 @@ impl Torrent {
                 true
             },
         );
+        // `request_blocks` upstream posts `picker_log_alert` — the
+        // picker's interesting-block set for this decision.
+        if !picked.is_empty() {
+            let mut bits = vec![0u8; (self.num_pieces.max(0) as usize).div_ceil(8)];
+            for (b, _) in &picked {
+                let i = b.piece_index.0 as usize;
+                if i / 8 < bits.len() {
+                    bits[i / 8] |= 1 << (7 - (i % 8));
+                }
+            }
+            let remote = self
+                .peers
+                .get(&peer_id)
+                .and_then(|c| c.remote)
+                .map_or_else(String::new, |ep| ep.to_string());
+            let _ = remote;
+            out.push(TorrentEffect::Alert(crate::alerts::Alert::PickerLog {
+                ih: self.info_hash,
+                picker_flags: 0,
+                blocks: bits,
+            }));
+        }
         if let Some(e) = eg
             && let Some(c2) = self.peers.get_mut(&peer_id)
         {
@@ -2094,6 +2208,22 @@ impl Torrent {
                 if let Some(c2) = self.peers.get_mut(&peer_id) {
                     c2.add_request(b, busy, false, now_ms);
                 }
+                // `peer_connection::add_request` posts
+                // `block_downloading_alert` once the block is
+                // marked downloading in the picker.
+                let remote = self
+                    .peers
+                    .get(&peer_id)
+                    .and_then(|c| c.remote)
+                    .map_or_else(String::new, |ep| ep.to_string());
+                out.push(TorrentEffect::Alert(
+                    crate::alerts::Alert::BlockDownloading {
+                        ih: self.info_hash,
+                        remote,
+                        piece: b.piece_index,
+                        block: b.block_index as u32,
+                    },
+                ));
                 // upstream
                 // clamp la longueur a  — le
                 // dernier bloc d'une piece partielle n'est jamais
@@ -2966,12 +3096,13 @@ impl Torrent {
     /// slow-start ends. Upstream keeps the outstanding requests
     /// (cancelling them causes re-pick churn and sawtooth rates);
     /// they're still refunded if the peer later disconnects.
-    pub fn check_request_timeouts(&mut self, _out: &mut Vec<TorrentEffect>) {
+    pub fn check_request_timeouts(&mut self, out: &mut Vec<TorrentEffect>) {
         let now_ms = self.now_ms;
         if now_ms <= 0 {
             return;
         }
-        for c in self.peers.values_mut() {
+        for (peer_id, c) in self.peers.iter_mut() {
+            let _ = peer_id;
             let idle = c.pipeline.request_queue.is_empty() && c.pipeline.download_queue.is_empty();
             if c.pipeline.requested_ms == 0 || idle {
                 continue;
@@ -2979,10 +3110,17 @@ impl Torrent {
             if now_ms - c.pipeline.requested_ms <= c.pipeline.request_timeout() * 1000 {
                 continue;
             }
+            let remote = c.remote.map_or_else(String::new, |ep| ep.to_string());
             // `peer_connection::snub_peer` — snub (idempotent),
             // wipe unsent requests, and free the last eligible
             // in-flight block so another peer can pick it.
-            c.pipeline.snubbed = true;
+            if !c.pipeline.snubbed {
+                c.pipeline.snubbed = true;
+                out.push(TorrentEffect::Alert(crate::alerts::Alert::PeerSnubbed {
+                    ih: self.info_hash,
+                    remote: remote.clone(),
+                }));
+            }
             c.pipeline.slow_start = false;
             let key = c.peer_key();
             let unsent: Vec<PieceBlock> = c
@@ -3013,6 +3151,14 @@ impl Torrent {
                     if free <= 0 {
                         c.pipeline.download_queue[i].timed_out = true;
                         p.abort_download(r, key);
+                        // `peer_connection::snub_peer` posts
+                        // `block_timeout_alert` per freed block.
+                        out.push(TorrentEffect::Alert(crate::alerts::Alert::BlockTimeout {
+                            ih: self.info_hash,
+                            remote: remote.clone(),
+                            piece: r.piece_index,
+                            block: r.block_index as u32,
+                        }));
                     }
                 }
             }
@@ -3134,25 +3280,22 @@ impl Torrent {
     }
 
     /// payload totals across conns (`m_stat` upstream).
-    fn total_download(&self) -> i64 {
+    pub fn total_download(&self) -> i64 {
         self.peers.values().map(|c| c.stat_down_total).sum()
     }
 
     /// ditto upload.
-    fn total_upload(&self) -> i64 {
+    pub fn total_upload(&self) -> i64 {
         self.peers.values().map(|c| c.stat_up_total).sum()
     }
 
-    /// `torrent_status()` — the snapshot upstream's `status()`
-    /// fills; `queue_pos` comes from the session (ordering lives
-    /// there).
-    pub fn status(
-        &self,
-        s: &crate::settings::SessionSettings,
-        queue_pos: i32,
-    ) -> crate::status::TorrentStatus {
-        use crate::status::{TorrentState, TorrentStatus};
-        let state = if self.checking {
+    /// `state()` — the coarse lifecycle state (`status().state`
+    /// without building the whole snapshot; the session diffs it
+    /// for `state_changed_alert`).
+    #[must_use]
+    pub fn state(&self) -> crate::status::TorrentState {
+        use crate::status::TorrentState;
+        if self.checking {
             TorrentState::CheckingFiles
         } else if self.magnet && self.picker.is_none() {
             TorrentState::DownloadingMetadata
@@ -3164,7 +3307,19 @@ impl Torrent {
             }
         } else {
             TorrentState::Downloading
-        };
+        }
+    }
+
+    /// `torrent_status()` — the snapshot upstream's `status()`
+    /// fills; `queue_pos` comes from the session (ordering lives
+    /// there).
+    pub fn status(
+        &self,
+        s: &crate::settings::SessionSettings,
+        queue_pos: i32,
+    ) -> crate::status::TorrentStatus {
+        use crate::status::TorrentStatus;
+        let state = self.state();
         let total_size = self.files.as_ref().map_or_else(
             || i64::from(self.num_pieces) * self.piece_length,
             |f| f.total_size(),
@@ -3483,10 +3638,16 @@ impl Torrent {
         self.last_error = e.to_string();
     }
 
-    /// `handle_disk_error` — upstream `on_error`: record the failure
-    /// and pause the torrent (disk errors are fatal until fixed).
+    /// `handle_disk_error` — upstream `on_error`: record the failure,
+    /// post `torrent_error_alert`, and pause the torrent (disk errors
+    /// are fatal until fixed).
     pub fn handle_disk_error(&mut self, e: &str, out: &mut Vec<TorrentEffect>) {
         self.set_error(e);
+        out.push(TorrentEffect::Alert(crate::alerts::Alert::TorrentError {
+            ih: self.info_hash,
+            error: e.to_string(),
+            file: String::new(),
+        }));
         self.paused = true;
         self.disconnect_all(out);
     }

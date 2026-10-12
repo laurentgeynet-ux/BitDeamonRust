@@ -659,12 +659,16 @@ impl PreadDiskIo {
             }
             return;
         };
-        // `&mut self` ops (rename, file priorities) are exclusive
-        // fence jobs — they take the write side. Everything else is
-        // `&self` and runs concurrently across pool threads on the
-        // read side; upstream `mmap_disk_io` likewise does not hold a
-        // per-storage mutex around positioned I/O.
-        if matches!(j.action, JobKind::RenameFile(_) | JobKind::FilePriority(_)) {
+        // `&mut self` ops (rename, file priorities, check_fastresume)
+        // are exclusive fence jobs — they take the write side.
+        // Everything else is `&self` and runs concurrently across
+        // pool threads on the read side; upstream `mmap_disk_io`
+        // likewise does not hold a per-storage mutex around
+        // positioned I/O.
+        if matches!(
+            j.action,
+            JobKind::RenameFile(_) | JobKind::FilePriority(_) | JobKind::CheckFastresume(_)
+        ) {
             let mut st_guard = e.storage.write().unwrap_or_else(|p| p.into_inner());
             let st: &mut dyn DiskStorage = &mut **st_guard;
             j.error = match &mut j.action {
@@ -681,6 +685,37 @@ impl PreadDiskIo {
                     match st.set_file_priority(&f.prio) {
                         Ok(()) => {
                             f.prio = st.file_priorities().to_vec();
+                            StorageError::default()
+                        }
+                        Err(e) => e,
+                    }
+                }
+                JobKind::CheckFastresume(c) => {
+                    // `storage_holder::initialize` — deferred setup
+                    // runs before the resume verdict so status bits
+                    // (`oversized_file`…) ride back with `ret`.
+                    // `ret` layout: bit 0 = resume accepted,
+                    // bits 8..16 = `disk_status` flags from
+                    // `initialize()`.
+                    let init_status = st.initialize().unwrap_or(0);
+                    let empty = bitdaemon_common::bitfield::Bitfield::new();
+                    let (pieces, seed) = c.resume_data.as_ref().map_or((&empty, false), |r| {
+                        (
+                            &r.have_pieces,
+                            r.flags
+                                .contains(bitdaemon_common::flags::TorrentFlags::SEED_MODE),
+                        )
+                    });
+                    match st.verify_resume_data(
+                        pieces,
+                        seed,
+                        &c.links
+                            .iter()
+                            .map(std::path::PathBuf::from)
+                            .collect::<Vec<_>>(),
+                    ) {
+                        Ok(ok) => {
+                            j.ret = Status::from(ok) | (Status::from(init_status) << 8);
                             StorageError::default()
                         }
                         Err(e) => e,
@@ -780,29 +815,10 @@ impl PreadDiskIo {
                 .delete_files(u8::try_from(d.flags).unwrap_or(0))
                 .err()
                 .unwrap_or_default(),
-            JobKind::CheckFastresume(c) => {
-                let empty = bitdaemon_common::bitfield::Bitfield::new();
-                let (pieces, seed) = c.resume_data.as_ref().map_or((&empty, false), |r| {
-                    (
-                        &r.have_pieces,
-                        r.flags
-                            .contains(bitdaemon_common::flags::TorrentFlags::SEED_MODE),
-                    )
-                });
-                match st.verify_resume_data(
-                    pieces,
-                    seed,
-                    &c.links
-                        .iter()
-                        .map(std::path::PathBuf::from)
-                        .collect::<Vec<_>>(),
-                ) {
-                    Ok(ok) => {
-                        j.ret = Status::from(ok);
-                        StorageError::default()
-                    }
-                    Err(e) => e,
-                }
+            JobKind::CheckFastresume(_) => {
+                // handled in the exclusive `&mut` arm above —
+                // `initialize()` needs write access.
+                StorageError::default()
             }
             JobKind::RemoveTorrent(_) => {
                 // upstream `disk_io_thread::remove_torrent` — the

@@ -24,7 +24,7 @@ use bitdaemon_disk::disk_interface::DiskIo;
 use bitdaemon_disk::storage_error::StorageError;
 use bitdaemon_net::peer_wire::PeerMessage;
 
-use crate::alerts::{Alert, AlertManager};
+use crate::alerts::{Alert, AlertCategory, AlertManager};
 use crate::counters::{Counter, Counters};
 use crate::torrent::{Torrent, TorrentEffect};
 
@@ -114,6 +114,122 @@ pub enum SessionOut {
         /// port.
         port: i32,
     },
+    /// `upnp::delete_mapping`/`natpmp` unmap — the engine owns the
+    /// drivers; the session resolves the handle to this target.
+    PortmapDelete {
+        /// `map_transport`: 0 = NAT-PMP, 1 = UPnP.
+        transport: u8,
+        /// `portmap_protocol`: 1 = TCP, 2 = UDP.
+        protocol: u8,
+        /// external port to release.
+        external_port: u16,
+    },
+    /// `session_impl::add_port_mapping` — map an arbitrary port
+    /// (upstream API; the engine forwards it to both drivers).
+    PortmapAdd {
+        /// `portmap_protocol`: 1 = TCP, 2 = UDP.
+        protocol: u8,
+        /// external port requested.
+        external_port: u16,
+        /// local port to expose.
+        local_port: u16,
+    },
+}
+
+/// What a DHT traversal's events feed — one entry per in-flight
+/// lookup (ADR-0023 D4). Upstream binds a `std::function` callback
+/// per call site; we keep the typed sink and translate to alerts.
+#[derive(Debug)]
+enum DhtResult {
+    /// torrent announce `get_peers` — replies feed `peer_list`
+    /// (source DHT) + `dht_reply_alert`; `Done` runs the
+    /// `announce_peer` write phase.
+    Announce(Sha1Hash),
+    /// user `dht_get_peers`/`dht_announce` — replies with peers
+    /// post `dht_get_peers_reply_alert` (upstream
+    /// `on_dht_get_peers`).
+    GetPeers(Sha1Hash),
+    /// user `dht_announce` — like `GetPeers` plus `announce_peer`
+    /// to token-holders on `Done` (upstream `dht_announce`).
+    UserAnnounce {
+        /// announced info-hash.
+        ih: Sha1Hash,
+        /// port to announce.
+        port: u16,
+    },
+    /// `dht_get_item` (immutable) — `r.v` → `dht_immutable_item_alert`.
+    GetItem(Sha1Hash),
+    /// `dht_get_item` (mutable) — `r.{v,k,seq,sig}` →
+    /// `dht_mutable_item_alert` (`authoritative` = signature ok).
+    GetItemMutable {
+        /// `sha1(pk ‖ salt)` lookup target.
+        target: Sha1Hash,
+        /// expected ed25519 public key.
+        pk: [u8; 32],
+        /// BEP-44 salt.
+        salt: Vec<u8>,
+    },
+    /// `dht_put_item`/`dht_put_item_mut` — the `get` traversal
+    /// collects write tokens; `Done` issues the `put` storm then
+    /// posts `dht_put_alert`.
+    Put(PendingPut),
+    /// routing-table bootstrap — `Done` → `dht_bootstrap_alert`.
+    Bootstrap,
+}
+
+/// BEP-44 item staged for its `get`-then-`put` sequence.
+#[derive(Debug)]
+enum PendingPut {
+    /// `dht_put_item(value)` — `target = sha1(v)`.
+    Immutable {
+        /// lookup target.
+        target: Sha1Hash,
+        /// bencoded value.
+        value: Vec<u8>,
+    },
+    /// `dht_put_item_mut` — signed mutable item.
+    Mutable {
+        /// `sha1(pk ‖ salt)` lookup target.
+        target: Sha1Hash,
+        /// bencoded value.
+        value: Vec<u8>,
+        /// ed25519 public key.
+        pk: [u8; 32],
+        /// signature over `canonical_string(v, seq, salt)`.
+        sig: [u8; 64],
+        /// sequence number.
+        seq: i64,
+        /// salt.
+        salt: Vec<u8>,
+    },
+}
+
+/// What a `direct_request` reply feeds (the `userdata` slot
+/// upstream hands to the caller's callback).
+#[derive(Debug)]
+enum DhtDirectSink {
+    /// `dht_direct_request` — `dht_direct_response_alert`.
+    User(u64),
+    /// `dht_sample_infohashes` — `dht_sample_infohashes_alert`.
+    Sample,
+}
+
+/// One `port_mapping_t` handle's target (upstream keeps the same
+/// triple in `mapping_t`).
+#[derive(Debug, Clone)]
+struct PortmapTarget {
+    /// `map_transport`: 0 = NAT-PMP, 1 = UPnP.
+    transport: u8,
+    /// `portmap_protocol`: 1 = TCP, 2 = UDP.
+    protocol: u8,
+    /// local (internal) port.
+    local_port: u16,
+    /// external port the router assigned.
+    external_port: u16,
+    /// `local_address` — interface the mapper runs on.
+    local_addr: String,
+    /// upnp device index (0 for NAT-PMP).
+    device: usize,
 }
 
 /// `session_impl` — all state owned on one thread.
@@ -238,18 +354,37 @@ pub struct Session {
     /// `m_ip_voter` — external-address voting (DHT `ip`, tracker
     /// `external ip`, peer `yourip`).
     pub ip_voter: bitdaemon_net::ip_voter::IpVoter,
-    /// `(v6, lookup idx)` → info_hash — maps DHT traversal events
-    /// back to the torrent they serve.
-    dht_lookup_map: std::collections::BTreeMap<(bool, usize), Sha1Hash>,
-    /// `(v6, lookup idx)` → pending BEP-44 immutable `put` value —
-    /// consumed when the `get` traversal completes (`put_data`).
-    dht_pending_put: std::collections::BTreeMap<(bool, usize), Vec<u8>>,
+    /// `(v6, lookup idx)` → what the traversal's events feed —
+    /// replaces the `dht_lookup_map`/`dht_pending_put` pair
+    /// (ADR-0023 D4): every lookup registers its sink so replies
+    /// are never silently dropped.
+    dht_result_map: std::collections::BTreeMap<(bool, usize), DhtResult>,
+    /// `direct_request` tag → what the reply feeds (upstream's
+    /// `userdata` callback slot).
+    dht_direct_map: std::collections::BTreeMap<u64, DhtDirectSink>,
+    /// `port_mapping_t` handle → the mapping it refers to
+    /// (`m_portmap_handles` upstream).
+    portmap_handles: std::collections::BTreeMap<i32, PortmapTarget>,
+    /// next `port_mapping_t` value.
+    next_portmap_handle: i32,
+    /// effects queued by `SessionHandle` calls that can't run in
+    /// sync context (port-map deletes) — drained into `tick`'s out.
+    pending_out: Vec<SessionOut>,
+    /// `session_stats_header_alert` posted once (upstream posts it
+    /// the first time `post_session_stats` runs).
+    stats_header_posted: bool,
     /// `external_udp_port()` — the port our DHT socket listens on,
     /// advertised to peers via the `port` message (BEP-5 §port).
     pub dht_port: Option<u16>,
     /// last `session_time` a DHT announce ran per torrent
     /// (`m_dht_announce_timer` upstream).
     dht_last_announce: std::collections::BTreeMap<Sha1Hash, i32>,
+    /// `torrent::m_prev_state` — last emitted `state_changed_alert`
+    /// state per torrent (the subscription diff, by state name).
+    torrent_prev_states: std::collections::BTreeMap<Sha1Hash, String>,
+    /// last tick's disk back-pressure state — `performance_alert`
+    /// fires on the rising edge only.
+    prev_disk_bp: bool,
     /// `m_auto_manage_time_scaler` — ticks until the next
     /// auto-manage pass; `add_torrent` forces 0 (immediate).
     auto_manage_scaler: i32,
@@ -294,12 +429,16 @@ pub enum DiskCompleted {
         err: StorageError,
     },
     /// `async_check_files` — fastresume validation verdict
-    /// (`ret` = accepted).
+    /// (`ret`: bit 0 = accepted, bits 8..16 = `disk_status` flags
+    /// from the storage's deferred `initialize()`).
     CheckFiles {
         /// torrent.
         ih: Sha1Hash,
-        /// resume accepted (`verify_resume_data` verdict).
+        /// resume accepted (`verify_resume_data` verdict — bit 0).
         accepted: bool,
+        /// `disk_status` bits (job `ret >> 8`) — `oversized_file`
+        /// among them.
+        status: i32,
         /// job result.
         err: StorageError,
     },
@@ -412,8 +551,14 @@ impl Default for Session {
             ip_filter: bitdaemon_net::ip_filter::IpFilter::new(),
             settings: crate::settings::SessionSettings::default(),
             ip_voter: bitdaemon_net::ip_voter::IpVoter::new(),
-            dht_lookup_map: std::collections::BTreeMap::new(),
-            dht_pending_put: std::collections::BTreeMap::new(),
+            dht_result_map: std::collections::BTreeMap::new(),
+            dht_direct_map: std::collections::BTreeMap::new(),
+            portmap_handles: std::collections::BTreeMap::new(),
+            next_portmap_handle: 0,
+            pending_out: Vec::new(),
+            stats_header_posted: false,
+            torrent_prev_states: std::collections::BTreeMap::new(),
+            prev_disk_bp: false,
             dht_port: None,
             dht_last_announce: std::collections::BTreeMap::new(),
             auto_manage_scaler: 0,
@@ -427,7 +572,13 @@ impl Session {
     /// `session_impl::session_impl`.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let mut s = Self::default();
+        // upstream `session_impl` starts with `session_log(
+        // "start session")` → `log_alert` under session_log.
+        s.alerts.post(Alert::Log {
+            msg: "start session".into(),
+        });
+        s
     }
 
     /// the sender disk-job callbacks clone to report completions.
@@ -495,6 +646,21 @@ impl Session {
                                 offset: req.start,
                                 data: data.into(),
                             },
+                        });
+                        // `block_uploaded_alert` — the block went
+                        // out to the peer (upstream posts it in
+                        // `peer_connection::on_disk_read_complete`).
+                        let remote = self
+                            .torrents
+                            .get(&ih)
+                            .and_then(|t| t.peers.get(&peer))
+                            .and_then(|c| c.remote)
+                            .map_or_else(String::new, |ep| ep.to_string());
+                        self.alerts.post(Alert::BlockUploaded {
+                            ih,
+                            remote,
+                            piece: req.piece,
+                            block: req.start as u32,
                         });
                     }
                 }
@@ -626,12 +792,27 @@ impl Session {
                         });
                     }
                 }
-                DiskCompleted::CheckFiles { ih, accepted, err } => {
+                DiskCompleted::CheckFiles {
+                    ih,
+                    accepted,
+                    status,
+                    err,
+                } => {
                     // `torrent::files_checked`: resume accepted → the
                     // optimistic `have` bits stand; rejected →
                     // `need_full_check`: per-piece `disk_hash` jobs
                     // re-verify everything (the `TorrentChecked`
                     // alert fires when `checking_pieces` drains).
+                    // `disk_status::oversized_file` →
+                    // `oversized_file_alert` (upstream posts it in
+                    // `on_check_files`).
+                    if status & i32::from(bitdaemon_disk::storage::disk_status::OVERSIZED_FILE) != 0
+                    {
+                        self.alerts.post(Alert::OversizedFile {
+                            ih,
+                            file: String::new(),
+                        });
+                    }
                     let mut eff = Vec::new();
                     let ok = err.is_ok() && accepted;
                     if let Some(t) = self.torrents.get_mut(&ih) {
@@ -649,6 +830,18 @@ impl Session {
                             ih,
                             path: String::new(),
                             error: err.to_string(),
+                        });
+                    }
+                    // `fastresume_rejected_alert` — the resume
+                    // verdict came back rejected (upstream posts it
+                    // on every !accepted check; `op`/`file` from the
+                    // failing job when known).
+                    if err.is_ok() && !accepted {
+                        self.alerts.post(Alert::FastresumeRejected {
+                            ih,
+                            error: "resume data rejected".into(),
+                            op: "check_fastresume".into(),
+                            file: String::new(),
                         });
                     }
                     self.route(ih, eff, out);
@@ -849,7 +1042,8 @@ impl Session {
             Box::new(move |ret, err| {
                 let _ = tx.send(DiskCompleted::CheckFiles {
                     ih,
-                    accepted: ret != 0,
+                    accepted: ret & 0xff != 0,
+                    status: ret >> 8,
                     err,
                 });
             }),
@@ -933,11 +1127,30 @@ impl Session {
         let mut eff = Vec::new();
         let t = Torrent::from_params(atp, storage, &mut eff)?;
         let ih = t.info_hash;
+        // `torrent_duplicate` — the info-hash is already in the
+        // swarm table → `torrent_conflict_alert` upstream.
+        if self.torrents.contains_key(&ih) {
+            self.alerts.post(Alert::TorrentConflict {
+                ih,
+                other: None,
+                url: atp
+                    .trackers
+                    .first()
+                    .map(|u| String::from_utf8_lossy(u).into_owned())
+                    .unwrap_or_default(),
+            });
+        }
         self.torrents.insert(ih, t);
         // upstream `trigger_auto_manage` — an add forces the next
         // tick into a queue pass (newly added default-flagged
         // torrents start paused+auto-managed).
         self.auto_manage_scaler = 0;
+        // `add_torrent_alert` — upstream carries name + params +
+        // error; our variant keeps the error slot ("" = ok).
+        self.alerts.post(Alert::AddTorrent {
+            ih,
+            error: String::new(),
+        });
         self.alerts.post(Alert::TorrentAdded(ih));
         self.route(ih, eff, out);
         // `.torrent` `nodes` — `dht->m_add_node` upstream: seed
@@ -968,9 +1181,18 @@ impl Session {
     /// every tracker that saw a `started` (upstream sends it on
     /// graceful shutdown/removal), then drop the swarm.
     pub fn remove_torrent(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) -> Option<Torrent> {
+        let mut sent = Vec::new();
         if let Some(t) = self.torrents.get_mut(ih) {
-            Self::announce_stopped(t, self.peer_id, self.listen_port, self.key, out);
+            Self::announce_stopped_collect(
+                t,
+                self.peer_id,
+                self.listen_port,
+                self.key,
+                out,
+                &mut sent,
+            );
         }
+        self.post_tracker_announces(sent, 3);
         let removed = self.torrents.remove(ih);
         if let Some(t) = &removed {
             // upstream `~torrent` → `m_disk_thread.remove_torrent` —
@@ -988,16 +1210,29 @@ impl Session {
     /// uses `queued` instead, like upstream). Pausing announces
     /// `stopped`; resuming re-arms `started` on the next tick.
     pub fn set_paused(&mut self, ih: &Sha1Hash, paused: bool, out: &mut Vec<SessionOut>) {
+        let mut changed = false;
         if let Some(t) = self.torrents.get_mut(ih) {
-            if paused && !t.paused {
-                // borrow dance: build stopped announces first
-            }
+            changed = t.paused != paused;
             t.paused = paused;
         }
         if paused {
+            let mut sent = Vec::new();
             if let Some(t) = self.torrents.get_mut(ih) {
-                Self::announce_stopped(t, self.peer_id, self.listen_port, self.key, out);
+                Self::announce_stopped_collect(
+                    t,
+                    self.peer_id,
+                    self.listen_port,
+                    self.key,
+                    out,
+                    &mut sent,
+                );
             }
+            self.post_tracker_announces(sent, 3);
+            if changed {
+                self.alerts.post(Alert::TorrentPaused { ih: *ih });
+            }
+        } else if changed {
+            self.alerts.post(Alert::TorrentResumed { ih: *ih });
         }
     }
 
@@ -1015,13 +1250,15 @@ impl Session {
     }
 
     /// `torrent::do_pause`/`~torrent` — `stopped` for trackers that
-    /// already announced `started`.
-    fn announce_stopped(
+    /// already announced `started`. `sent` collects `(ih,url)` for
+    /// the caller's `tracker_announce_alert` posts.
+    fn announce_stopped_collect(
         t: &mut Torrent,
         peer_id: bitdaemon_common::PeerId,
         port: u16,
         key: i32,
         out: &mut Vec<SessionOut>,
+        sent: &mut Vec<(Sha1Hash, String)>,
     ) {
         for e in &t.trackers.trackers {
             let started = e
@@ -1036,7 +1273,17 @@ impl Session {
                     params: t.announce_params(peer_id, port, 3, key),
                 });
                 t.outstanding_announces += 1;
+                sent.push((t.info_hash, e.url.clone()));
             }
+        }
+    }
+
+    /// `tracker_announce_alert` — one post per `TrackerAnnounce`
+    /// just queued (upstream fires it inside `announce_to_tracker`
+    /// when the request goes on the wire; `event`: BEP-3 code).
+    fn post_tracker_announces(&mut self, list: Vec<(Sha1Hash, String)>, event: u8) {
+        for (ih, url) in list {
+            self.alerts.post(Alert::TrackerAnnounce { ih, url, event });
         }
     }
 
@@ -1174,6 +1421,9 @@ impl Session {
         }
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(&p.info_hash) {
+            // `incoming_request_alert`/`invalid_request_alert` are
+            // posted by `Torrent`'s ReadRequest handler — upstream
+            // only posts the former for *accepted* requests.
             t.on_peer_message(p.peer, &p.msg, self.session_time, &mut eff);
         }
         self.route(p.info_hash, eff, out);
@@ -1191,6 +1441,12 @@ impl Session {
         if let Some(t) = self.torrents.get_mut(ih) {
             let mut conn = conn;
             conn.remote = Some(remote);
+            // `peer_connect_alert` — the connection is registered
+            // (upstream posts it on a completed BT handshake).
+            self.alerts.post(Alert::PeerConnect {
+                ih: *ih,
+                remote: remote.to_string(),
+            });
             // `peer_info::protocol_v2` — the handshake came in keyed
             // by the torrent's v2 (SHA-256, truncated) info-hash.
             conn.protocol_v2 =
@@ -1235,6 +1491,11 @@ impl Session {
                 ih: *ih,
                 remote: remote.to_string(),
             });
+            self.alerts.post(Alert::PeerLog {
+                ih: *ih,
+                remote: remote.to_string(),
+                msg: "peer connected".into(),
+            });
             t.add_peer(peer, conn);
             // BEP-6: FAST peers get their allowed-fast set right
             // after connect (upstream `send_allowed_set`).
@@ -1255,7 +1516,21 @@ impl Session {
             if let Some(remote) = t.peers.get(&peer).and_then(|c| c.remote) {
                 t.peer_disconnected_addr(remote, self.session_time);
             }
+            let had = t.peers.contains_key(&peer);
             t.remove_peer(peer, &mut eff);
+            if had {
+                // `peer_disconnected_alert` (upstream posts it in
+                // `peer_connection::disconnect` on every close).
+                self.alerts.post(Alert::PeerDisconnected {
+                    ih: *ih,
+                    reason: format!("peer {peer}: disconnected"),
+                });
+                self.alerts.post(Alert::PeerLog {
+                    ih: *ih,
+                    remote: String::new(),
+                    msg: "peer disconnected".into(),
+                });
+            }
         }
         self.route(*ih, eff, out);
     }
@@ -1275,6 +1550,10 @@ impl Session {
             if let Some(id) = conn_id {
                 t.peer_disconnected_addr(remote, self.session_time);
                 t.remove_peer(id, &mut eff);
+                self.alerts.post(Alert::PeerDisconnected {
+                    ih: *ih,
+                    reason: format!("peer {id}: banned"),
+                });
             }
             self.alerts.post(Alert::PeerBan {
                 ih: *ih,
@@ -1663,22 +1942,6 @@ impl Session {
         self.key = key;
     }
 
-    /// `session_handle::dht_put_item` (immutable overload) — BEP-44:
-    /// `target = sha1(value)`, run a `get` lookup, then `put` to the
-    /// token-holding responders when it completes (`put_data`).
-    /// Returns the item target key.
-    pub fn dht_put_item(&mut self, value: &[u8]) -> Sha1Hash {
-        use sha1::Digest as _;
-        let mut h = sha1::Sha1::new();
-        h.update(value);
-        let target = Sha1Hash::from_bytes(&h.finalize()).unwrap_or_default();
-        if let Some(n) = self.dht.get_node_mut(false) {
-            let idx = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetItem, target);
-            self.dht_pending_put.insert((false, idx), value.to_vec());
-        }
-        target
-    }
-
     /// `session_impl::is_dht_running`.
     #[must_use]
     pub fn is_dht_running(&self) -> bool {
@@ -1701,13 +1964,207 @@ impl Session {
     }
 
     /// `session_handle::dht_live_nodes` — nodes that answered us
-    /// recently on the given info-hash lookup.
+    /// recently on the given info-hash lookup. Upstream posts
+    /// `dht_live_nodes_alert`; we do the same *and* return the set
+    /// (the handle keeps its sync accessor).
     #[must_use]
-    pub fn dht_live_nodes(&self, ih: &Sha1Hash) -> Vec<std::net::SocketAddr> {
-        self.dht
+    pub fn dht_live_nodes(&mut self, ih: &Sha1Hash) -> Vec<std::net::SocketAddr> {
+        let nodes = self
+            .dht
             .get_node(false)
             .map(|n| n.live_nodes_for(ih))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.alerts.post(Alert::DhtLiveNodes {
+            ih: *ih,
+            nodes: nodes.clone(),
+        });
+        nodes.into_iter().map(|(_, ep)| ep).collect()
+    }
+
+    /// `session_impl::add_port_mapping` — register a mapping with
+    /// both port-map drivers; returns the `port_mapping_t` handle
+    /// (`SessionOut::PortmapAdd` reaches the engine on `tick`).
+    pub fn add_port_mapping(&mut self, protocol: u8, external_port: u16, local_port: u16) -> i32 {
+        let handle = self.next_portmap_handle;
+        self.next_portmap_handle += 1;
+        self.portmap_handles.insert(
+            handle,
+            PortmapTarget {
+                transport: 0,
+                protocol,
+                local_port,
+                external_port,
+                local_addr: String::new(),
+                device: 0,
+            },
+        );
+        self.pending_out.push(SessionOut::PortmapAdd {
+            protocol,
+            external_port,
+            local_port,
+        });
+        handle
+    }
+
+    /// `session_impl::delete_port_mapping` — resolve the handle and
+    /// queue the unmap (`PortmapDelete` runs on the engine's tick).
+    pub fn delete_port_mapping(&mut self, handle: i32) {
+        let Some(t) = self.portmap_handles.remove(&handle) else {
+            return;
+        };
+        self.pending_out.push(SessionOut::PortmapDelete {
+            transport: t.transport,
+            protocol: t.protocol,
+            external_port: t.external_port,
+        });
+    }
+
+    /// `on_port_mapping` — a driver confirmed a mapping
+    /// (`portmap_alert` + handle registration). Called by the
+    /// engine when NAT-PMP/UPnP report success.
+    pub fn on_portmap_success(
+        &mut self,
+        transport: u8,
+        protocol: u8,
+        local_port: u16,
+        external_port: u16,
+        local_addr: String,
+        device: usize,
+    ) {
+        // reuse an existing pending handle for this (proto, ports,
+        // interface) tuple when the user registered one — upstream
+        // binds the driver result back to the mapping_t it came
+        // from. `local_addr` narrows the match when known.
+        let handle = self
+            .portmap_handles
+            .iter()
+            .find(|(_, t)| {
+                t.protocol == protocol
+                    && t.local_port == local_port
+                    && t.transport == transport
+                    && t.device == device
+                    && (t.local_addr.is_empty() || t.local_addr == local_addr)
+            })
+            .map(|(h, _)| *h)
+            .unwrap_or_else(|| {
+                let h = self.next_portmap_handle;
+                self.next_portmap_handle += 1;
+                h
+            });
+        self.portmap_handles.insert(
+            handle,
+            PortmapTarget {
+                transport,
+                protocol,
+                local_port,
+                external_port,
+                local_addr: local_addr.clone(),
+                device,
+            },
+        );
+        self.alerts.post(Alert::Portmap {
+            mapping: handle,
+            transport,
+            protocol,
+            ext_port: external_port,
+            local_addr,
+        });
+    }
+
+    /// `portmap_error_alert` — a driver reported a mapping failure.
+    pub fn on_portmap_error(
+        &mut self,
+        transport: u8,
+        mapping: i32,
+        local_addr: String,
+        error: String,
+    ) {
+        self.alerts.post(Alert::PortmapError {
+            mapping,
+            transport,
+            local_addr,
+            error,
+        });
+    }
+
+    /// `portmap_log_alert` — driver-side diagnostic line.
+    pub fn portmap_log(&mut self, transport: u8, local_addr: String, msg: String) {
+        self.alerts.post(Alert::PortmapLog {
+            transport,
+            local_addr,
+            msg,
+        });
+    }
+
+    /// `post_session_stats` — `session_stats_header_alert` once,
+    /// then `session_stats_alert` (both category-0: unconditional).
+    pub fn post_session_stats(&mut self) {
+        if !self.stats_header_posted {
+            self.stats_header_posted = true;
+            self.alerts.post(Alert::SessionStatsHeader {});
+        }
+        let stats = self.session_stats();
+        self.alerts.post(Alert::SessionStats { stats });
+    }
+
+    /// `listen_succeeded_alert` — the engine reports a bound
+    /// listener (`socket_type`: upstream `lt::socket_type_t`).
+    pub fn on_listen_succeeded(&mut self, remote: String, kind: u8) {
+        self.alerts.post(Alert::ListenSucceeded { remote, kind });
+    }
+
+    /// `listen_failed_alert` — a bind/accept failure on an
+    /// interface (upstream posts `op`, `error`, `socket_type`).
+    pub fn on_listen_failed(&mut self, remote: String, op: String, error: String, kind: u8) {
+        self.alerts.post(Alert::ListenFailed {
+            remote,
+            op,
+            error,
+            kind,
+        });
+    }
+
+    /// `incoming_connection_alert` — an inbound peer stream was
+    /// accepted (`socket_type` kind).
+    pub fn on_incoming_connection(&mut self, remote: SocketAddr, kind: u8) {
+        self.alerts.post(Alert::IncomingConnection {
+            remote: remote.to_string(),
+            kind,
+        });
+    }
+
+    /// `session_impl::ban_ip` — insert a host rule into
+    /// `m_ip_filter`, post `ip_ban_alert`, propagate to every
+    /// torrent's peer list (upstream site: the DHT secret-id
+    /// fishing check on unknown inbound info-hashes).
+    pub fn ban_ip(&mut self, ip: std::net::IpAddr) {
+        self.ip_filter
+            .add_rule(ip, ip, bitdaemon_net::ip_filter::BLOCKED);
+        self.alerts.post(Alert::IpBan {
+            remote: ip.to_string(),
+            reason: "address_filter".into(),
+        });
+        let f = self.ip_filter.clone();
+        for t in self.torrents.values_mut() {
+            t.peer_list
+                .apply_ip_filter(|a| f.access(a) == bitdaemon_net::ip_filter::BLOCKED);
+        }
+    }
+
+    /// `ip_voter::cast_vote` + `external_ip_alert` when the elected
+    /// address changes (upstream `session_impl` posts the alert at
+    /// every cast-vote site).
+    pub fn vote_external(
+        &mut self,
+        ip: std::net::IpAddr,
+        source: bitdaemon_net::ip_voter::IpSourceFlags,
+        source_ip: &std::net::IpAddr,
+    ) {
+        if self.ip_voter.cast_vote(ip, source, source_ip)
+            && let Some(addr) = self.ip_voter.external_address()
+        {
+            self.alerts.post(Alert::ExternalIp { addr });
+        }
     }
 
     /// `apply_settings_pack` — hot-swap the settings bag. Upstream
@@ -1757,10 +2214,11 @@ impl Session {
         }
         // `ip_voter::cast_vote` — the `ip` key a node echoed back is
         // its view of our external address (upstream `dht.cpp`).
+        // A new consensus posts `external_ip_alert`.
         for v6 in [false, true] {
             if let Some(n) = self.dht.get_node_mut(v6) {
                 for ip in n.drain_ip_votes() {
-                    self.ip_voter.cast_vote(
+                    self.vote_external(
                         ip,
                         bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_DHT,
                         &from.ip(),
@@ -1769,6 +2227,7 @@ impl Session {
             }
         }
         if let Some(a) = bitdaemon_net::lsd::process_packet(buf, from, self.lsd_cookie) {
+            let mut lsd_found = Vec::new();
             for ih_raw in a.info_hashes {
                 let Some(ih) = Sha1Hash::from_bytes(&ih_raw) else {
                     continue;
@@ -1780,7 +2239,16 @@ impl Session {
                     let ep = SocketAddr::new(from.ip(), a.port);
                     t.peer_list
                         .add_peer(ep, bitdaemon_common::flags::PeerSourceFlags::LSD, true);
+                    lsd_found.push(ih);
                 }
+            }
+            // `lsd_peer_alert` — one per torrent the broadcast
+            // named (upstream `lsd::on_announce` → `alerts`).
+            for ih in lsd_found {
+                self.alerts.post(Alert::LsdPeer {
+                    ih,
+                    remote: SocketAddr::new(from.ip(), a.port).to_string(),
+                });
             }
         }
         let _ = out;
@@ -1846,12 +2314,33 @@ impl Session {
         let wait = self.dht.tick();
         self.dht_announce_tick();
         self.dht_drain_events();
+        // `dht_logger` outgoing direction — every datagram we send
+        // is a `dht_pkt_alert` when the category is enabled.
+        let post_dht_pkt = self.alerts.should_post(AlertCategory::DHT_LOG);
         while let Some((pkt, to)) = self.dht.poll() {
+            if post_dht_pkt {
+                self.alerts.post(Alert::DhtPacket {
+                    direction: 1,
+                    remote: to.to_string(),
+                    msg: pkt.clone(),
+                });
+            }
             out.push(SessionOut::UdpPacket(pkt, to));
         }
         let now = Instant::now();
-        for t in self.torrents.values_mut() {
+        let post_stats = self.alerts.should_post(AlertCategory::STATS);
+        for (ih, t) in &mut self.torrents {
             t.update_rates(now);
+            // `torrent::second_tick` — `stats_alert` rides the
+            // per-second counters refresh (category-gated upstream
+            // the same way).
+            if post_stats {
+                self.alerts.post(Alert::Stats {
+                    ih: *ih,
+                    interval_ms: 1000,
+                    counters: vec![t.up_rate, t.down_rate, t.total_upload(), t.total_download()],
+                });
+            }
         }
         self.lsd_tick(now, out);
         let ihs: Vec<Sha1Hash> = self
@@ -1865,6 +2354,15 @@ impl Session {
         // `disk_observer` gate — stop issuing block requests while
         // the write queue sits above `max_queued_disk_bytes`.
         let disk_bp = self.disk.as_ref().is_some_and(|d| d.write_queue_exceeded());
+        // `performance_alert` — entering disk back-pressure (upstream
+        // posts `send_buffer_watermark`/`write_discard` sites; the
+        // queue-overrun transition is the observable equivalent).
+        if disk_bp && !self.prev_disk_bp {
+            self.alerts.post(Alert::Performance {
+                warning: "disk write queue exceeded max_queued_disk_bytes".into(),
+            });
+        }
+        self.prev_disk_bp = disk_bp;
         for ih in ihs {
             let mut eff = Vec::new();
             if let Some(t) = self.torrents.get_mut(&ih) {
@@ -1911,6 +2409,40 @@ impl Session {
         }
         self.unchoke_tick(out);
         self.resume_save_tick(now);
+        // `SessionOut` produced outside the actor loop (portmap
+        // registrations) is emitted here — `effects` already went
+        // out via `route`.
+        out.append(&mut self.pending_out);
+        // `state_changed_alert` — per-torrent diff
+        // (`m_prev_state` vs now; upstream
+        // `torrent::state_subscription` notifies on change).
+        let states: Vec<(Sha1Hash, crate::status::TorrentState)> = self
+            .torrents
+            .iter()
+            .map(|(ih, t)| (*ih, t.state()))
+            .collect();
+        for (ih, st) in states {
+            let prev = self.torrent_prev_states.insert(ih, st.name().to_string());
+            match prev {
+                Some(p) if p == st.name() => continue,
+                Some(p) => {
+                    self.alerts.post(Alert::StateChanged {
+                        ih,
+                        prev: p.clone(),
+                        next: st.name().into(),
+                    });
+                    // `torrent::debug_log` — state transitions are
+                    // the upstream torrent_log staple.
+                    self.alerts.post(Alert::TorrentLog {
+                        ih,
+                        msg: format!("state changed to {}", st.name()),
+                    });
+                }
+                // first observation = baseline, no alert (upstream
+                // only posts on transitions).
+                None => {}
+            }
+        }
         wait
     }
 
@@ -1954,7 +2486,7 @@ impl Session {
 
     /// `dht::announce` for one torrent — starts the `get_peers`
     /// traversal on every bound node family and registers the
-    /// lookup id for reply routing.
+    /// `Announce` sink for reply routing.
     fn dht_announce_one(&mut self, ih: Sha1Hash) {
         self.dht_last_announce.insert(ih, self.session_time);
         if let Some(t) = self.torrents.get_mut(&ih) {
@@ -1964,9 +2496,137 @@ impl Session {
             if let Some(n) = self.dht.get_node_mut(v6) {
                 tracing::debug!(%ih, v6, nodes = n.table.size().0, "dht get_peers announce");
                 let li = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetPeers, ih);
-                self.dht_lookup_map.insert((v6, li), ih);
+                self.dht_result_map
+                    .insert((v6, li), DhtResult::Announce(ih));
             }
         }
+    }
+
+    /// `session_impl::dht_get_peers` — user query: replies with
+    /// peers post `dht_get_peers_reply_alert` (upstream binds
+    /// `on_dht_get_peers` — no `peer_list` feeding).
+    pub fn dht_get_peers(&mut self, ih: Sha1Hash) {
+        if let Some(n) = self.dht.get_node_mut(false) {
+            let li = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetPeers, ih);
+            self.dht_result_map
+                .insert((false, li), DhtResult::GetPeers(ih));
+        }
+    }
+
+    /// `session_impl::dht_announce` — user-level announce: same
+    /// traversal as `dht_get_peers`, plus `announce_peer` to every
+    /// token-holder on completion (upstream `dht_announce` binds
+    /// `on_dht_get_peers` too — replies post `DhtGetPeersReply`).
+    pub fn dht_announce(&mut self, ih: Sha1Hash, port: u16) {
+        self.dht_last_announce.insert(ih, self.session_time);
+        for v6 in [false, true] {
+            if let Some(n) = self.dht.get_node_mut(v6) {
+                let li = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetPeers, ih);
+                self.dht_result_map
+                    .insert((v6, li), DhtResult::UserAnnounce { ih, port });
+            }
+        }
+    }
+
+    /// `session_impl::dht_get_immutable_item` — `get` traversal;
+    /// the first `r.v` reply posts `dht_immutable_item_alert`.
+    pub fn dht_get_item(&mut self, target: Sha1Hash) {
+        if let Some(n) = self.dht.get_node_mut(false) {
+            let li = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetItem, target);
+            self.dht_result_map
+                .insert((false, li), DhtResult::GetItem(target));
+        }
+    }
+
+    /// `session_impl::dht_get_mutable_item` — `get` on
+    /// `sha1(pk ‖ salt)`; replies carrying `k`/`sig`/`seq`/`v`
+    /// post `dht_mutable_item_alert` (`authoritative` = the
+    /// signature verifies against `pk`).
+    pub fn dht_get_item_mut(&mut self, pk: [u8; 32], salt: Vec<u8>) {
+        let target = bitdaemon_dht::item::item_target_id_mutable(&salt, &pk);
+        if let Some(n) = self.dht.get_node_mut(false) {
+            let li = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetItem, target);
+            self.dht_result_map
+                .insert((false, li), DhtResult::GetItemMutable { target, pk, salt });
+        }
+    }
+
+    /// `session_impl::dht_sample_infohashes` — BEP-51 *direct*
+    /// request to one node (upstream `dht_tracker::sample_infohashes`
+    /// is not a traversal). The reply lands via `DhtEvent::Direct`.
+    pub fn dht_sample_infohashes(&mut self, ep: SocketAddr, target: Sha1Hash) {
+        let v6 = ep.is_ipv6();
+        if let Some(n) = self.dht.get_node_mut(v6) {
+            let tag = n.sample_infohashes(ep, target);
+            self.dht_direct_map.insert(tag, DhtDirectSink::Sample);
+        }
+    }
+
+    /// `session_impl::dht_direct_request` — send an arbitrary query
+    /// to `ep`; the reply posts `dht_direct_response_alert` with
+    /// `user_data` echoed (upstream `userdata`/`client_data_t`).
+    pub fn dht_direct_request(
+        &mut self,
+        ep: SocketAddr,
+        e: bitdaemon_bencode::Entry,
+        user_data: u64,
+    ) {
+        let v6 = ep.is_ipv6();
+        if let Some(n) = self.dht.get_node_mut(v6) {
+            let tag = n.direct_request(e, ep);
+            self.dht_direct_map
+                .insert(tag, DhtDirectSink::User(user_data));
+        }
+    }
+
+    /// `session_handle::dht_put_item` (immutable overload) — BEP-44:
+    /// `target = sha1(value)`, run a `get` lookup, then `put` to the
+    /// token-holding responders when it completes (`put_data`).
+    /// Returns the item target key.
+    pub fn dht_put_item(&mut self, value: &[u8]) -> Sha1Hash {
+        let target = bitdaemon_dht::item::item_target_id_immutable(value);
+        if let Some(n) = self.dht.get_node_mut(false) {
+            let idx = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetItem, target);
+            self.dht_result_map.insert(
+                (false, idx),
+                DhtResult::Put(PendingPut::Immutable {
+                    target,
+                    value: value.to_vec(),
+                }),
+            );
+        }
+        target
+    }
+
+    /// `session_impl::dht_put_mutable_item` — BEP-44 signed put:
+    /// signs `value` under `sk` with `seq`/`salt`, runs the `get`
+    /// for tokens, then `put`s `{v,k,seq,sig[,salt]}` and posts
+    /// `dht_put_alert`. Returns the item target.
+    pub fn dht_put_item_mut(
+        &mut self,
+        pk: [u8; 32],
+        sk: &[u8; 64],
+        salt: Vec<u8>,
+        seq: i64,
+        value: &[u8],
+    ) -> Option<Sha1Hash> {
+        let sig = bitdaemon_dht::item::sign_mutable_item(value, &salt, seq, sk)?;
+        let target = bitdaemon_dht::item::item_target_id_mutable(&salt, &pk);
+        if let Some(n) = self.dht.get_node_mut(false) {
+            let idx = n.new_lookup(bitdaemon_dht::lookups::LookupKind::GetItem, target);
+            self.dht_result_map.insert(
+                (false, idx),
+                DhtResult::Put(PendingPut::Mutable {
+                    target,
+                    value: value.to_vec(),
+                    pk,
+                    sig,
+                    seq,
+                    salt,
+                }),
+            );
+        }
+        Some(target)
     }
 
     /// `force_dht_announce` — user-triggered, ignores the interval
@@ -1997,6 +2657,7 @@ impl Session {
         };
         let idxs: Vec<usize> =
             tracker_idx.map_or_else(|| (0..t.trackers.trackers.len()).collect(), |i| vec![i]);
+        let mut sent = Vec::new();
         for i in idxs {
             let Some(e) = t.trackers.trackers.get(i) else {
                 continue;
@@ -2008,13 +2669,16 @@ impl Session {
                 params: t.announce_params(pid, port, 0, key),
             });
             t.outstanding_announces += 1;
+            sent.push((*ih, e.url.clone()));
         }
+        self.post_tracker_announces(sent, 0);
     }
 
-    /// drain `DhtEvent`s — `get_peers` replies feed `peer_list`
-    /// (source DHT), finished lookups trigger `announce_peer` to
-    /// every node that gave a write token (upstream `dht::announce`
-    /// second phase).
+    /// drain `DhtEvent`s — every lookup registered a
+    /// [`DhtResult`] sink: `get_peers` replies feed `peer_list`
+    /// (source DHT), finished lookups trigger `announce_peer`/`put`
+    /// second phases, and user-facing results land as alerts
+    /// (ADR-0023 D4 — nothing is silently dropped).
     fn dht_drain_events(&mut self) {
         use bitdaemon_dht::dht_node::DhtEvent;
         for v6 in [false, true] {
@@ -2024,62 +2688,331 @@ impl Session {
             for ev in n.drain_events() {
                 match ev {
                     DhtEvent::Data { lookup, data } => {
-                        let Some(ih) = self.dht_lookup_map.get(&(v6, lookup)).copied() else {
-                            continue;
-                        };
-                        if let Some(t) = self.torrents.get_mut(&ih) {
-                            if !data.peers.is_empty() {
-                                tracing::info!(%ih, peers = data.peers.len(), "dht get_peers found peers");
-                            }
-                            for ep in data.peers {
-                                t.peer_list.add_peer(
-                                    ep,
-                                    bitdaemon_common::flags::PeerSourceFlags::DHT,
-                                    true,
-                                );
-                            }
-                        }
+                        self.dht_on_data(v6, lookup, *data);
                     }
                     DhtEvent::Done { lookup, tokens } => {
-                        // `put_data` second phase — a `dht_put_item`
-                        // GetItem finished: write to token-holders.
-                        if let Some(value) = self.dht_pending_put.remove(&(v6, lookup)) {
-                            let targets: Vec<(SocketAddr, Vec<u8>)> =
-                                tokens.iter().map(|(_, ep, t)| (*ep, t.clone())).collect();
-                            if !targets.is_empty() {
-                                n.put(&value, None, targets);
-                            }
-                            continue;
-                        }
-                        let Some(ih) = self.dht_lookup_map.remove(&(v6, lookup)) else {
-                            continue;
-                        };
-                        if tokens.is_empty() {
-                            continue;
-                        }
-                        // `announce` — tell token-holding nodes we
-                        // are a peer (`announce_peer` second phase)
-                        let addrs: std::collections::BTreeMap<_, _> =
-                            tokens.iter().map(|(id, ep, _)| (*id, *ep)).collect();
-                        let tok_map: std::collections::BTreeMap<_, _> =
-                            tokens.iter().map(|(id, _, t)| (*id, t.clone())).collect();
-                        let seed = self.torrents.get(&ih).is_some_and(|t| t.is_seed());
-                        let port = self.listen_port;
-                        n.announce(&ih, port, seed, false, &addrs, |id| {
-                            tok_map.get(id).cloned()
+                        self.dht_on_done(v6, lookup, tokens);
+                    }
+                    DhtEvent::Direct {
+                        tag,
+                        id,
+                        ep,
+                        response,
+                        failed,
+                    } => {
+                        self.dht_on_direct(tag, id, ep, response, failed);
+                    }
+                    DhtEvent::IncomingGetPeers { ih } => {
+                        // `dht_get_peers_alert` — an inbound query
+                        // hit our node.
+                        self.alerts.post(Alert::DhtGetPeers {
+                            ih,
+                            msg: format!("incoming get_peers for {ih}"),
                         });
-                        // no more get_peers lookups for `ih` → the
-                        // announce round is over.
-                        if !self.dht_lookup_map.values().any(|v| *v == ih) {
-                            if let Some(t) = self.torrents.get_mut(&ih) {
-                                t.dht_announcing = false;
-                            }
+                    }
+                    DhtEvent::IncomingAnnounce { ih, ip, port } => {
+                        // `dht_announce_alert` — a remote peer
+                        // announced itself to our node.
+                        self.alerts.post(Alert::DhtAnnounce {
+                            remote: ip.to_string(),
+                            port,
+                            ih,
+                            msg: format!("incoming announce_peer for {ih}"),
+                        });
+                    }
+                    DhtEvent::OutgoingGetPeers {
+                        target,
+                        sent_target,
+                        ep,
+                    } => {
+                        self.alerts.post(Alert::DhtOutgoingGetPeers {
+                            ih: target,
+                            obfuscated: sent_target,
+                            ep,
+                        });
+                    }
+                    DhtEvent::Pkt { ep, bytes } => {
+                        self.alerts.post(Alert::DhtPacket {
+                            direction: 0,
+                            remote: ep.to_string(),
+                            msg: bytes,
+                        });
+                    }
+                    DhtEvent::Log { module, msg } => {
+                        self.alerts.post(Alert::DhtLog { module, msg });
+                    }
+                }
+            }
+        }
+    }
+
+    /// one lookup reply — route by the registered [`DhtResult`]
+    /// sink (upstream `find_data_observer::reply` → per-kind
+    /// callback).
+    fn dht_on_data(&mut self, v6: bool, lookup: usize, data: bitdaemon_dht::lookups::ReplyData) {
+        let Some(sink) = self.dht_result_map.get(&(v6, lookup)) else {
+            return;
+        };
+        match sink {
+            DhtResult::Announce(ih) => {
+                let ih = *ih;
+                if data.peers.is_empty() {
+                    return;
+                }
+                // `dht_reply_alert` — a DHT announce that found
+                // peers counts as a tracker reply upstream
+                // (torrent::on_dht_announce_response).
+                self.alerts.post(Alert::DhtReply {
+                    ih,
+                    url: "DHT".into(),
+                    num_peers: data.peers.len() as i32,
+                });
+                // `dht_get_peers_reply_alert` — upstream binds
+                // `on_dht_get_peers` on announce traversals too.
+                self.alerts.post(Alert::DhtGetPeersReply {
+                    ih,
+                    num_peers: data.peers.len() as u32,
+                    peers: data.peers.clone(),
+                });
+                if let Some(t) = self.torrents.get_mut(&ih) {
+                    if !data.peers.is_empty() {
+                        tracing::info!(%ih, peers = data.peers.len(), "dht get_peers found peers");
+                    }
+                    for ep in data.peers {
+                        t.peer_list.add_peer(
+                            ep,
+                            bitdaemon_common::flags::PeerSourceFlags::DHT,
+                            true,
+                        );
+                    }
+                }
+            }
+            DhtResult::GetPeers(ih) | DhtResult::UserAnnounce { ih, .. } => {
+                if !data.peers.is_empty() {
+                    self.alerts.post(Alert::DhtGetPeersReply {
+                        ih: *ih,
+                        num_peers: data.peers.len() as u32,
+                        peers: data.peers.clone(),
+                    });
+                }
+            }
+            DhtResult::GetItem(target) => {
+                if let Some(v) = &data.item {
+                    self.alerts.post(Alert::DhtImmutableItem {
+                        target: *target,
+                        value: v.clone(),
+                    });
+                }
+            }
+            DhtResult::GetItemMutable { target, pk, salt } => {
+                let (Some(v), Some(k), Some(sig)) = (&data.item, &data.key, &data.sig) else {
+                    return;
+                };
+                let (Ok(pk_b), Ok(sig_b)) = (
+                    <[u8; 32]>::try_from(k.as_slice()),
+                    <[u8; 64]>::try_from(sig.as_slice()),
+                ) else {
+                    return;
+                };
+                if pk_b != *pk {
+                    return; // not our key — upstream only reports its own item
+                }
+                let seq = data.seq.unwrap_or(-1);
+                let ok = bitdaemon_dht::item::verify_mutable_item(v, salt, seq, pk, &sig_b);
+                self.alerts.post(Alert::DhtMutableItem(Box::new(
+                    crate::alerts::DhtMutableItemAlert {
+                        target: *target,
+                        key: pk_b,
+                        signature: sig_b,
+                        seq,
+                        salt: salt.clone(),
+                        value: v.clone(),
+                        authoritative: ok,
+                    },
+                )));
+            }
+            DhtResult::Put(_) | DhtResult::Bootstrap => {}
+        }
+    }
+
+    /// lookup completion — run the write phase (`announce_peer` /
+    /// `put`) or post the completion alert, per sink.
+    fn dht_on_done(
+        &mut self,
+        v6: bool,
+        lookup: usize,
+        tokens: Vec<(bitdaemon_dht::node_id::NodeId, SocketAddr, Vec<u8>)>,
+    ) {
+        let Some(sink) = self.dht_result_map.remove(&(v6, lookup)) else {
+            return;
+        };
+        match sink {
+            DhtResult::Put(p) => {
+                let targets: Vec<(SocketAddr, Vec<u8>)> =
+                    tokens.iter().map(|(_, ep, t)| (*ep, t.clone())).collect();
+                let num = targets.len() as u32;
+                let Some(n) = self.dht.get_node_mut(v6) else {
+                    return;
+                };
+                match p {
+                    PendingPut::Immutable { target, value } => {
+                        if !targets.is_empty() {
+                            n.put(&value, None, targets);
+                        }
+                        self.alerts
+                            .post(Alert::DhtPut(Box::new(crate::alerts::DhtPutAlert {
+                                target,
+                                num_success: num,
+                                public_key: [0; 32],
+                                signature: [0; 64],
+                                seq: 0,
+                                salt: Vec::new(),
+                            })));
+                    }
+                    PendingPut::Mutable {
+                        target,
+                        value,
+                        pk,
+                        sig,
+                        seq,
+                        salt,
+                    } => {
+                        if !targets.is_empty() {
+                            n.put(&value, Some((&pk, seq, &sig, &salt)), targets);
+                        }
+                        self.alerts
+                            .post(Alert::DhtPut(Box::new(crate::alerts::DhtPutAlert {
+                                target,
+                                num_success: num,
+                                public_key: pk,
+                                signature: sig,
+                                seq,
+                                salt,
+                            })));
+                    }
+                }
+            }
+            DhtResult::Announce(ih) => {
+                if tokens.is_empty() {
+                    self.finish_announce(ih);
+                    return;
+                }
+                // `announce` — tell token-holding nodes we are a
+                // peer (`announce_peer` second phase).
+                let addrs: std::collections::BTreeMap<_, _> =
+                    tokens.iter().map(|(id, ep, _)| (*id, *ep)).collect();
+                let tok_map: std::collections::BTreeMap<_, _> =
+                    tokens.iter().map(|(id, _, t)| (*id, t.clone())).collect();
+                let seed = self.torrents.get(&ih).is_some_and(|t| t.is_seed());
+                let port = self.listen_port;
+                if let Some(n) = self.dht.get_node_mut(v6) {
+                    n.announce(&ih, port, seed, false, &addrs, |id| {
+                        tok_map.get(id).cloned()
+                    });
+                }
+                self.finish_announce(ih);
+            }
+            DhtResult::UserAnnounce { ih, port } => {
+                if tokens.is_empty() {
+                    return;
+                }
+                let addrs: std::collections::BTreeMap<_, _> =
+                    tokens.iter().map(|(id, ep, _)| (*id, *ep)).collect();
+                let tok_map: std::collections::BTreeMap<_, _> =
+                    tokens.iter().map(|(id, _, t)| (*id, t.clone())).collect();
+                if let Some(n) = self.dht.get_node_mut(v6) {
+                    n.announce(&ih, port, false, false, &addrs, |id| {
+                        tok_map.get(id).cloned()
+                    });
+                }
+            }
+            DhtResult::GetPeers(_) | DhtResult::GetItem(_) | DhtResult::GetItemMutable { .. } => {}
+            DhtResult::Bootstrap => {
+                self.alerts.post(Alert::DhtBootstrap {});
+            }
+        }
+    }
+
+    /// a torrent's announce round ends when no `Announce` sink for
+    /// `ih` remains — clears `dht_announcing`.
+    fn finish_announce(&mut self, ih: Sha1Hash) {
+        let still = self
+            .dht_result_map
+            .values()
+            .any(|s| matches!(s, DhtResult::Announce(h) if *h == ih));
+        if !still && let Some(t) = self.torrents.get_mut(&ih) {
+            t.dht_announcing = false;
+        }
+    }
+
+    /// `direct_request` reply/timeout — route by the registered
+    /// [`DhtDirectSink`] (upstream `direct_observer` → caller cb).
+    fn dht_on_direct(
+        &mut self,
+        tag: u64,
+        id: Option<bitdaemon_dht::node_id::NodeId>,
+        ep: SocketAddr,
+        response: Vec<u8>,
+        failed: bool,
+    ) {
+        let Some(sink) = self.dht_direct_map.remove(&tag) else {
+            return;
+        };
+        match sink {
+            DhtDirectSink::User(user_data) => {
+                self.alerts.post(Alert::DhtDirectResponse {
+                    remote: ep.to_string(),
+                    user_data,
+                    response,
+                });
+            }
+            DhtDirectSink::Sample => {
+                if failed {
+                    return;
+                }
+                // parse `r.{id,interval,num,samples,nodes}` — same
+                // fields `sample_infohashes` traversals extract.
+                let Ok(node) = bitdaemon_bencode::bdecode_checked(&response) else {
+                    return;
+                };
+                let interval = node.dict_find_int_value(b"interval", 0).max(0) as u32;
+                let num = node.dict_find_int_value(b"num", 0);
+                let mut samples = Vec::new();
+                let s = node.dict_find_string(b"samples");
+                if s.is_valid() {
+                    for chunk in s.string_value().chunks_exact(20) {
+                        if let Some(h) = Sha1Hash::from_bytes(chunk) {
+                            samples.push(h);
                         }
                     }
-                    // `direct_request` replies surface to the
-                    // session owner — nothing consumes them yet.
-                    DhtEvent::Direct { .. } => {}
                 }
+                // `r.nodes` — compact 26 B entries (id ‖ ip ‖ port,
+                // v4) like `get_peers` replies.
+                let mut nodes = Vec::new();
+                let nd = node.dict_find_string(b"nodes");
+                if nd.is_valid() {
+                    for chunk in nd.string_value().chunks_exact(26) {
+                        let (Some(nid), Ok(ip), port) = (
+                            Sha1Hash::from_bytes(&chunk[..20]),
+                            <[u8; 4]>::try_from(&chunk[20..24]),
+                            u16::from_be_bytes([chunk[24], chunk[25]]),
+                        ) else {
+                            continue;
+                        };
+                        nodes.push((nid, SocketAddr::new(ip.into(), port)));
+                    }
+                }
+                let nid = id.unwrap_or_default();
+                self.alerts.post(Alert::DhtSampleInfohashes(Box::new(
+                    crate::alerts::DhtSampleInfohashesAlert {
+                        node_id: nid,
+                        remote: ep.to_string(),
+                        interval_secs: interval,
+                        num,
+                        samples,
+                        nodes,
+                    },
+                )));
             }
         }
     }
@@ -2212,9 +3145,27 @@ impl Session {
                     self.alerts.post(Alert::HashFailed { ih, piece });
                     out.push(SessionOut::Torrent(TorrentEffect::PieceFailed(piece)));
                 }
+                TorrentEffect::FileCompleted(index) => {
+                    self.alerts
+                        .post(Alert::FileCompleted { ih, index: index.0 });
+                    out.push(SessionOut::Torrent(TorrentEffect::FileCompleted(index)));
+                }
+                TorrentEffect::MetadataReceived => {
+                    self.alerts.post(Alert::MetadataReceived { ih });
+                }
+                TorrentEffect::MetadataFailed => {
+                    self.alerts.post(Alert::MetadataFailed {
+                        ih,
+                        error: "metadata hash check failed".into(),
+                    });
+                }
+                TorrentEffect::Alert(a) => {
+                    self.alerts.post(a);
+                }
                 TorrentEffect::YourIp(ip) => {
-                    // BEP-10 `yourip` → `ip_voter` (source_peer)
-                    self.ip_voter.cast_vote(
+                    // BEP-10 `yourip` → `ip_voter` (source_peer) —
+                    // a new consensus posts `external_ip_alert`.
+                    self.vote_external(
                         ip,
                         bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_PEER,
                         &ip,
@@ -2234,6 +3185,7 @@ impl Session {
                     // BEP-21, plus a `completed` announce to
                     // trackers that saw `started`.
                     self.alerts.post(Alert::TorrentFinished(ih));
+                    let mut sent = Vec::new();
                     if let Some(t) = self.torrents.get_mut(&ih) {
                         for e in &t.trackers.trackers {
                             let started = e
@@ -2253,9 +3205,11 @@ impl Session {
                                     ),
                                 });
                                 t.outstanding_announces += 1;
+                                sent.push((ih, e.url.clone()));
                             }
                         }
                     }
+                    self.post_tracker_announces(sent, 1);
                     if let Some(t) = self.torrents.get(&ih) {
                         for (pid, c) in &t.peers {
                             if c.ext_upload_only != 0 {
@@ -2288,6 +3242,7 @@ impl Session {
         out: &mut Vec<SessionOut>,
     ) {
         let (pid, port, key) = (self.peer_id, self.listen_port, self.key);
+        let mut sent = Vec::new();
         for (ih, t) in &mut self.torrents {
             if t.paused || !t.announcing || !t.announce_trackers {
                 continue;
@@ -2302,8 +3257,10 @@ impl Session {
                     params: t.announce_params(pid, port, event, key),
                 });
                 t.outstanding_announces += 1;
+                sent.push((*ih, e.url.clone()));
             }
         }
+        self.post_tracker_announces(sent, event as u8);
     }
 
     /// `torrent::scrape_tracker` — request an immediate scrape of
@@ -2381,7 +3338,10 @@ impl Session {
             n.table.add_router_node(addr);
             if needs_bootstrap {
                 tracing::debug!(%addr, "dht bootstrap on first router node");
-                n.bootstrap();
+                let li = n.bootstrap();
+                // `dht_bootstrap_alert` on completion (upstream
+                // posts it when the first refresh finishes).
+                self.dht_result_map.insert((v6, li), DhtResult::Bootstrap);
             }
         }
     }
@@ -2415,14 +3375,25 @@ impl Session {
     }
 
     /// `web_peer_connection` failure — release the picked blocks.
+    /// Upstream posts `url_seed_alert` on web-seed errors.
     pub fn on_web_seed_error(
         &mut self,
         ih: &Sha1Hash,
         reqs: &[bitdaemon_common::types::PeerRequest],
     ) {
+        let url = self
+            .torrents
+            .get(ih)
+            .and_then(|t| t.web_seeds.first().cloned())
+            .unwrap_or_default();
         if let Some(t) = self.torrents.get_mut(ih) {
             t.on_web_seed_error(reqs);
         }
+        self.alerts.post(Alert::UrlSeed {
+            ih: *ih,
+            url,
+            msg: "web seed error".into(),
+        });
     }
 
     /// `on_announce_response` — a tracker exchange completed:
@@ -2440,20 +3411,13 @@ impl Session {
         };
         t.outstanding_announces = (t.outstanding_announces - 1).max(0);
         let now = std::time::Instant::now();
+        let mut ext_ip = None;
         match resp {
             Ok(r) => {
+                ext_ip = r.external_ip;
                 t.last_error.clear();
                 if let Some(i) = t.trackers.find(url) {
                     t.trackers.trackers[i].set_message("");
-                }
-                // `tracker response "external ip"` → ip_voter
-                // (`source_tracker` — upstream `on_announce`).
-                if let Some(ip) = r.external_ip {
-                    self.ip_voter.cast_vote(
-                        ip,
-                        bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_TRACKER,
-                        &ip,
-                    );
                 }
                 for ep in r.peers {
                     t.add_swarm_peer(ep, bitdaemon_common::flags::PeerSourceFlags::TRACKER, true);
@@ -2464,12 +3428,35 @@ impl Session {
                         .duration_since(std::time::SystemTime::UNIX_EPOCH)
                         .map_or(-1, |d| d.as_secs() as i64);
                 }
+                let mut trackerid = None;
                 if let Some(i) = t.trackers.find(url) {
                     let e = &mut t.trackers.trackers[i];
                     e.verified = true;
                     if let Some(tid) = r.tracker_id {
                         e.tracker_id = String::from_utf8_lossy(&tid).into_owned();
+                        trackerid = Some(e.tracker_id.clone());
                     }
+                }
+                // `trackerid_alert` — the tracker gave us a
+                // `trackerid` to echo back on later announces.
+                if let Some(tid) = trackerid {
+                    self.alerts.post(Alert::Trackerid {
+                        ih: *ih,
+                        url: url.to_string(),
+                        trackerid: tid,
+                    });
+                }
+                // `tracker_warning_alert` — `warning message` in
+                // the response (non-fatal). Upstream's
+                // `times_in_row` is a per-entry warning counter;
+                // we report the first occurrence.
+                if let Some(w) = r.warning_message {
+                    self.alerts.post(Alert::TrackerWarning {
+                        ih: *ih,
+                        url: url.to_string(),
+                        msg: w,
+                        times_in_row: 1,
+                    });
                 }
                 self.alerts.post(Alert::TrackerReply {
                     ih: *ih,
@@ -2497,6 +3484,15 @@ impl Session {
                 });
             }
         }
+        // `tracker response "external ip"` → ip_voter
+        // (`source_tracker` — upstream `on_announce`).
+        if let Some(ip) = ext_ip {
+            self.vote_external(
+                ip,
+                bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_TRACKER,
+                &ip,
+            );
+        }
     }
 
     /// `save_resume_data` — upstream `torrent::save_resume_data`
@@ -2507,7 +3503,16 @@ impl Session {
         let Some(t) = self.torrents.get_mut(ih) else {
             return;
         };
+        // upstream `torrent::save_resume_data`: when the
+        // `if_*_changed` conditions were given but nothing changed
+        // since the last save, it posts
+        // `save_resume_data_failed_alert(errors::resume_data_not_modified)`
+        // — not silence.
         if only_if_modified && !t.need_save_resume {
+            self.alerts.post(Alert::SaveResumeDataFailed {
+                ih: *ih,
+                error: "resume data not modified".into(),
+            });
             return;
         }
         let mut atp = bitdaemon_core::AddTorrentParams::default();
@@ -2619,6 +3624,10 @@ impl Session {
     /// seed `router_nodes`. Returns torrents restored.
     pub fn load_state(&mut self, buf: &[u8], out: &mut Vec<SessionOut>) -> usize {
         let Some(st) = crate::session_state::load_session_state(buf) else {
+            // upstream posts `session_error_alert` on session-level
+            // failures (corrupt `.session` is one).
+            self.alerts
+                .post(Alert::SessionError("invalid session state".into()));
             return 0;
         };
         if let Some(set) = st.settings {

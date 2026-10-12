@@ -1,6 +1,6 @@
 # ADR-0023: Alert-surface completion & asynchronous result delivery (1.0 API)
 
-- Status: accepted — Phase K (D1, D2, D7) implemented
+- Status: accepted — Phases K+L implemented (D1–D8); D9–D10 in Phase M
 - Date: 2026-10-12
 - Deciders: port team
 - Complements: ADR-0004 (error handling), ADR-0008 (injected
@@ -239,13 +239,14 @@ NAT-PMP lifetime-0 map request. `Portmap` / `PortmapError` /
 | `IncomingConnection` | acceptor accept (post-handshake, info-hash resolved) |
 | `PeerSnubbed`/`PeerUnsnubbed`, `PeerBlocked`, `PeerError` | snub transitions, ip_filter disconnects, peer transport errors |
 | `BlockDownloading`/`BlockTimeout`/`BlockUploaded` | request send, RTT timeout, piece send (upload category) |
-| `UnwantedBlock`/`RequestDropped`/`InvalidRequest`/`IncomingRequest` | pipeline validation paths in `peer_conn`/`peer_pipeline` |
+| `UnwantedBlock`/`RequestDropped`/`InvalidRequest`/`IncomingRequest` | pipeline validation paths in `peer_conn`/`peer_pipeline`; `IncomingRequest` at **accept** time (queued for service), not message receipt; `RequestDropped` is dead upstream (variant exists, no emission site) |
 | `IpBan` | `set_ip_filter`/`apply_ip_filter` disconnect loops, `ban_peer` |
 | `TrackerAnnounce`/`TrackerWarning`/`Trackerid`/`UdpError` | announce send, non-fatal tracker warns, `trackerid` capture, UDP socket errors |
 | `UrlSeed` | web-seed connect/EOF/failure in `maybe_connect_web_seeds`/`WebSeedFetch` results |
 | `OversizedFile` | `initialize_storage`/`set_size` >4 GiB-on-FAT32-style guard |
 | `FilePrio` | `prioritize_files`/`file_priority` mutation |
-| `SaveResumeDataFailed` | `save_resume_data`/`write_resume_data` error path |
+| `SaveResumeDataFailed` | `save_resume_data`/`write_resume_data` error path **and** the `if_*_changed`-suppressed save (upstream posts `resume_data_not_modified`, not silence) |
+| `AnonymousMode` | **dead upstream** — variant exists (id 59) but no `emplace_alert` site in C++; kept for table parity |
 | `AddTorrent` (params+error) | `add_torrent`/`async_add_torrent` entry point |
 | `TorrentLog`, `PeerLog`, `PickerLog`, `Log`, `I2p`, `Socks5` | gated on `*_log` categories — emit at upstream sites where the machinery exists; sites whose machinery isn't ported emit nothing (documented) |
 | `AlertsDropped` | `AlertManager::post` overflow → queue one on next accepted post |

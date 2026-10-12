@@ -349,7 +349,7 @@ unconditional with `should_post` at call sites.
 
 ---
 
-## Phase L — Async result delivery & emission sites (ADR-0023 D3–D6, D8) ⬜
+## Phase L — Async result delivery & emission sites (ADR-0023 D3–D6, D8) ✅
 
 Upstream delivers every async query result through the alert stream;
 our session currently drops several (`DhtEvent::Data` non-get_peers
@@ -358,51 +358,66 @@ outcomes, `session_stats`). This is the only place where a handle call
 returns `()` and the answer is *unreachable* — a GUI cannot work
 around it. Requires Phase K's enum.
 
-- [ ] `dht_lookup_map` → `dht_result_map: BTreeMap<(bool, usize),
-      DhtResult>` typed sinks (`GetPeers`, `GetPeersQuery`, `GetItem`,
-      `GetItemMutable{pk,salt}`, `Sample`, `Put`, `Announce`) —
-      replaces `dht_pending_put`.
-- [ ] `dht_get_peers`/`dht_get_item`/`dht_sample_infohashes` register
+- [x] `dht_lookup_map` → `dht_result_map: BTreeMap<(bool, usize),
+      DhtResult>` typed sinks (`Announce`, `GetPeers`,
+      `UserAnnounce`, `GetItem`, `GetItemMutable`, `Sample`, `Put`,
+      `Direct`, `Bootstrap`) — replaces `dht_pending_put`; direct
+      requests ride the reserved high tag bit.
+- [x] `dht_get_peers`/`dht_get_item`/`dht_sample_infohashes` register
       user lookups; `dht_drain_events` routes `Data`/`Done` per sink:
       peers → `peer_list` + `DhtGetPeersReply`; item →
       `DhtImmutableItem`/`DhtMutableItem`; samples →
-      `DhtSampleInfohashes`; `Done+Put` → `put` + `DhtPut`;
-      `Done+Announce` → announce phase + `DhtAnnounce`;
-      `Direct` → `DhtDirectResponse`; errors → `DhtError`;
-      bootstrap → `DhtBootstrap`; liveness → `DhtLiveNodes`;
-      `DhtPkt` → full `dht_pkt_alert` payload.
-- [ ] Mutable BEP-44: `dht_put_item(pk, sk, salt, entry)` and
+      `DhtSampleInfohashes` (incl. `r.nodes` compaction);
+      `Done+Put` → `DhtPut`; `Done+Announce` → announce phase +
+      `DhtAnnounce`; `Direct` → `DhtDirectResponse` (timeout
+      failures included); errors → `DhtError`; bootstrap →
+      `DhtBootstrap`; liveness → `DhtLiveNodes`; `DhtPkt` →
+      `DhtPacket` (incoming + outgoing via `dht.poll()`).
+- [x] Mutable BEP-44: `dht_put_item(pk, sk, salt, entry)` and
       `dht_get_item(pk, salt)` overloads (target =
       `item::canonical_target(pk, salt)`; sign via `dht::ed25519`).
-- [ ] Portmap: `Engine::portmap_handles: BTreeMap<i32, PortmapSlot>`
-      (upstream `m_portmap_handles`) → real `delete_port_mapping`;
-      `Portmap`/`PortmapError`/`PortmapLog` alerts posted from UPnP
-      driver actions and NAT-PMP `on_reply`.
-- [ ] `ListenSucceeded`/`ListenFailed` on `start_acceptor`/
-      `start_ssl_acceptor`/uTP/I2P bind results; `IncomingConnection`
-      on accept.
-- [ ] `ip_voter.external_address()` change detection (in `cast_vote`
-      call sites or tick) → `ExternalIp` alert.
-- [ ] `SessionHandle::post_session_stats` → `SessionStatsHeader`
+- [x] Portmap: real `add_port_mapping`/`delete_port_mapping` handles
+      via `SessionOut::PortmapAdd`/`PortmapDelete`; UPnP driver +
+      NAT-PMP `on_reply` results post `Portmap`/`PortmapError`/
+      `PortmapLog` (NAT-PMP parser extended to carry the opcode
+      protocol for mapping matching).
+- [x] `ListenSucceeded`/`ListenFailed` on `start_acceptor`/
+      `start_ssl_acceptor`/`start_utp_acceptor`/I2P bind results;
+      `IncomingConnection` on accept.
+- [x] `Session::vote_external` wraps `ip_voter.cast_vote` at all
+      call sites (DHT, tracker, peer `yourip`) → `ExternalIp` alert
+      on elected-address change only.
+- [x] `SessionHandle::post_session_stats` → `SessionStatsHeader`
       (once) + `SessionStats` (category-0 → unconditional post).
-- [ ] **Emission sites** (ADR-0023 D8 table): `MetadataReceived`/
-      `MetadataFailed` (`set_metadata` ok/fail + reject-exhaustion),
+- [x] **Emission sites** (ADR-0023 D8 table): `MetadataReceived`,
       `TorrentPaused`/`TorrentResumed`, `TorrentError`,
       `TorrentConflict`, `TorrentNeedCert`, `AddTorrent`,
-      `FastresumeRejected`, `OversizedFile`, `Trackerid`,
-      `FileCompleted` (wire `file_progress::update` `completed_cb`),
-      `Block*`/`UnwantedBlock`/`RequestDropped`/`InvalidRequest`,
-      `PeerSnubbed`/`PeerUnsnubbed`/`PeerBlocked`/`PeerError`,
-      `IpBan`, `Socks5`, `TrackerAnnounce`/`TrackerWarning`,
-      `UdpError`, `LsdPeer`/`LsdError`, `UrlSeed`, `FilePrio`,
+      `FastresumeRejected`, `OversizedFile` (`storage::initialize`
+      plumbed through `CheckFastresume`), `Trackerid`,
+      `FileCompleted`, `Block*`/`UnwantedBlock`/`InvalidRequest`
+      (upstream `write_reject_request` + `invalid_request_alert`,
+      *no* disconnect — `PeerEffect::RejectRequest`/`InvalidRequest`
+      → `TorrentEffect::Alert`), `PeerSnubbed`/`PeerUnsnubbed`/
+      `PeerBlocked`/`PeerError`, `IpBan`, `Socks5`,
+      `TrackerAnnounce`/`TrackerWarning`, `UdpError`,
+      `LsdPeer`/`LsdError`, `UrlSeed`, `FilePrio`,
       `Log`/`I2p`/`TorrentLog`/`PeerLog`/`PickerLog` (gated on
-      `*_log` categories — cheap no-ops when masked off),
-      `SaveResumeDataFailed`, `AlertsDropped`.
+      `*_log` categories via `should_post`), `SaveResumeDataFailed`
+      (incl. upstream's `resume_data_not_modified` case),
+      `AlertsDropped`, `IncomingRequest` (moved to accept-time,
+      upstream `incoming_request` semantics), `BlockUploaded` on
+      disk-read completion, `Stats` per-torrent tick.
+      `RequestDropped`/`AnonymousMode` are **dead upstream** (no
+      emission site in C++) — variants kept for table parity.
+- [x] Regression tests: `test_dht_results.rs` (7 tests — typed sinks,
+      bootstrap, live nodes, portmap, external-ip votes, state-diff
+      alerts, save-resume failure path).
 
-**Exit**: every handle call that produces an async result upstream
+**Exit**: ✅ every handle call that produces an async result upstream
 delivers it; DHT `get`/`put`/`sample`/`live_nodes`/`direct` round-trip
 to the consumer; `delete_port_mapping` actually deletes; a GUI can
-observe every state transition without polling internals.
+observe every state transition without polling internals. `MetadataFailed`
+(source-penalty exhaustion) and BEP-17 http_seed stay in Phase M.
 
 ---
 

@@ -309,17 +309,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // inbound peer pump
-    let acceptor = TokioTcpAcceptor::bind(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        args.port,
-    ))
-    .await?;
-    eng.start_acceptor(Arc::new(acceptor));
+    let listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), args.port);
+    let acceptor = TokioTcpAcceptor::bind(listen_addr).await?;
+    eng.start_acceptor_at(Arc::new(acceptor), Some(listen_addr), 0);
     if let Some(ssl_port) = args.ssl_port {
-        let ssl_acceptor =
-            TokioTcpAcceptor::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ssl_port))
-                .await?;
-        eng.start_ssl_acceptor(Arc::new(ssl_acceptor));
+        let ssl_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ssl_port);
+        let ssl_acceptor = TokioTcpAcceptor::bind(ssl_addr).await?;
+        eng.start_ssl_acceptor_at(Arc::new(ssl_acceptor), Some(ssl_addr), 1);
         println!("ssl listen on :{ssl_port}");
     }
     if args.utp {

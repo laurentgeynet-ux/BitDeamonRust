@@ -40,7 +40,7 @@ fn get_peers_invoke_shape() {
     l.set_noseed(true);
     let entry =
         bitdaemon_dht::traversal::ObserverEntry::new(id(0xbb), "8.8.8.8:6881".parse().unwrap());
-    let e = l.invoke_entry(&entry, id(0x99));
+    let (e, _) = l.invoke_entry(&entry, id(0x99));
     let d = e.dict().unwrap();
     assert_eq!(d[b"q".as_slice()].string().unwrap(), b"get_peers");
     let a = d[b"a".as_slice()].dict().unwrap();
@@ -56,7 +56,7 @@ fn find_node_invoke_shape() {
     let l = Lookup::new(LookupKind::FindData, id(0xcc), false, &hooks(), vec![]);
     let entry =
         bitdaemon_dht::traversal::ObserverEntry::new(id(0xdd), "8.8.8.8:6881".parse().unwrap());
-    let e = l.invoke_entry(&entry, id(0x99));
+    let (e, _) = l.invoke_entry(&entry, id(0x99));
     let d = e.dict().unwrap();
     assert_eq!(d[b"q".as_slice()].string().unwrap(), b"find_node");
     assert_eq!(
@@ -150,7 +150,7 @@ fn bootstrap_uses_live_id_and_bs_flag() {
     let mut entry =
         bitdaemon_dht::traversal::ObserverEntry::new(id(0xcc), "8.8.8.8:6881".parse().unwrap());
     entry.flags = bitdaemon_dht::traversal::obs_flags::INITIAL;
-    let e = l.invoke_entry(&entry, live);
+    let (e, _) = l.invoke_entry(&entry, live);
     let d = e.dict().unwrap();
     assert_eq!(d[b"q".as_slice()].string().unwrap(), b"get_peers");
     let a = d[b"a".as_slice()].dict().unwrap();
@@ -162,7 +162,7 @@ fn bootstrap_uses_live_id_and_bs_flag() {
     // non-initial entries get no bs
     let entry2 =
         bitdaemon_dht::traversal::ObserverEntry::new(id(0xdd), "1.1.1.1:6881".parse().unwrap());
-    let e2 = l.invoke_entry(&entry2, live);
+    let (e2, _) = l.invoke_entry(&entry2, live);
     let a2 = e2.dict().unwrap()[b"a".as_slice()].dict().unwrap();
     assert!(a2.get(b"bs".as_slice()).is_none());
 }

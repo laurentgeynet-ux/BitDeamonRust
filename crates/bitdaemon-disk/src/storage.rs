@@ -733,6 +733,13 @@ pub trait DiskStorage: Send + Sync {
         seed_mode: bool,
         links: &[PathBuf],
     ) -> StorageResult<bool>;
+    /// `storage_holder::initialize` — deferred storage setup
+    /// (upstream calls it on the first job that touches files).
+    /// Returns `disk_status` bits (`oversized_file` among them).
+    /// Default no-op: custom storages may not allocate files.
+    fn initialize(&mut self) -> StorageResult<u8> {
+        Ok(0)
+    }
     /// `pread_storage::store_precomputed_v2` — keep a block SHA-256
     /// computed during piece hashing so later `hash2` requests skip
     /// the disk read. Default no-op (custom storages may skip it).
@@ -822,6 +829,9 @@ impl DiskStorage for PreadStorage {
         links: &[PathBuf],
     ) -> StorageResult<bool> {
         PreadStorage::verify_resume_data(self, have_pieces, seed_mode, links)
+    }
+    fn initialize(&mut self) -> StorageResult<u8> {
+        PreadStorage::initialize(self)
     }
     fn store_precomputed_v2(
         &self,

@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use bitdaemon_common::Sha1Hash;
 use bitdaemon_common::types::PieceIndex;
 use bitdaemon_session::alerts::{
-    Alert, AlertCategory, AlertPriority, DhtMutableItemAlert, DhtPutAlert,
+    Alert, AlertCategory, AlertPriority, DhtMutableItemAlert, DhtNodeStats, DhtPutAlert,
 };
 
 const E: AlertCategory = AlertCategory::ERROR;
@@ -451,11 +451,10 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
         ),
         (
             Alert::PortmapError {
+                mapping: 0,
                 transport: 0,
-                remote: ep(),
-                op: "o".into(),
+                local_addr: "l".into(),
                 error: "e".into(),
-                map_type: 0,
             },
             50,
             N,
@@ -463,10 +462,11 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
         ),
         (
             Alert::Portmap {
+                mapping: 0,
                 transport: 0,
-                ext_port: 6881,
-                int_port: 6881,
                 protocol: 1,
+                ext_port: 6881,
+                local_addr: "l".into(),
             },
             51,
             N,
@@ -475,6 +475,7 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
         (
             Alert::PortmapLog {
                 transport: 0,
+                local_addr: "l".into(),
                 msg: "m".into(),
             },
             52,
@@ -516,7 +517,6 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
         (
             Alert::DhtGetPeers {
                 ih: ih(),
-                obfuscated: ih(),
                 msg: "m".into(),
             },
             56,
@@ -525,6 +525,7 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
         ),
         (
             Alert::Stats {
+                ih: ih(),
                 interval_ms: 0,
                 counters: vec![],
             },
@@ -660,6 +661,7 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
             Alert::DhtOutgoingGetPeers {
                 ih: ih(),
                 obfuscated: ih(),
+                ep: "1.2.3.4:6881".parse().unwrap(),
             },
             78,
             N,
@@ -688,8 +690,8 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
         (Alert::LsdError { error: "e".into() }, 82, N, E),
         (
             Alert::DhtStats {
-                v4: (0, 0, 0),
-                v6: (0, 0, 0),
+                v4: Box::new(DhtNodeStats::default()),
+                v6: Box::new(DhtNodeStats::default()),
             },
             83,
             N,
@@ -768,13 +770,16 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
         ),
         (Alert::SessionStatsHeader {}, 92, N, ZERO),
         (
-            Alert::DhtSampleInfohashes {
-                interval_ms: 0,
-                num_infohashes: 0,
-                samples: vec![],
-                num_nodes: 0,
-                num_nodes6: 0,
-            },
+            Alert::DhtSampleInfohashes(Box::new(
+                bitdaemon_session::alerts::DhtSampleInfohashesAlert {
+                    node_id: ih(),
+                    remote: "1.2.3.4:6881".into(),
+                    interval_secs: 0,
+                    num: 0,
+                    samples: vec![],
+                    nodes: vec![],
+                },
+            )),
             93,
             N,
             DOP,
