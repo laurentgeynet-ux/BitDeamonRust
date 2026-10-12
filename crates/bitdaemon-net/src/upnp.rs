@@ -116,6 +116,10 @@ pub struct RootDevice {
     pub url_base: String,
     /// external IP learned via `GetExternalIPAddress`.
     pub external_ip: Option<IpAddr>,
+    /// local address used to reach the device — upstream reads it
+    /// from `c.socket().local_endpoint()` on the control connection
+    /// and sends it as `NewInternalClient`.
+    pub local_addr: Option<IpAddr>,
 }
 
 /// `create_port_mapping` SOAP body — verbatim XML.

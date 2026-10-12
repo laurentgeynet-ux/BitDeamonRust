@@ -164,3 +164,58 @@ fn announce_write_phase() {
     assert_eq!(r.peers.len(), 6, "expected one compact v4 peer");
     let _ = pb;
 }
+
+#[test]
+fn incoming_upstream_get_peers_gets_reply() {
+    // packet captured verbatim from lt_client dhtseed (alert log):
+    // { 'a': { 'id': <20>, 'info_hash': <20>, 'noseed': 1 },
+    //   'q': 'get_peers', 't': '{6', 'v': 'LT\x02\x12', 'y': 'q' }
+    let mut n = DhtNode::new(
+        None,
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        false,
+        DhtSettings::default(),
+    );
+    let mut pkt = Vec::new();
+    pkt.extend_from_slice(b"d1:ad2:id20:");
+    pkt.extend_from_slice(&[0xf6u8; 20]);
+    pkt.extend_from_slice(b"9:info_hash20:");
+    pkt.extend_from_slice(&[0x33u8; 20]);
+    pkt.extend_from_slice(b"6:noseedi1ee1:q9:get_peers1:t2:{61:v4:LT\x02\x121:y1:qe");
+    let from: std::net::SocketAddr = "127.0.0.1:6940".parse().unwrap();
+    let reply = n.incoming(&pkt, from);
+    assert!(reply.is_some(), "no reply to get_peers");
+    let (buf, to) = reply.unwrap();
+    assert_eq!(to, from);
+    let s = String::from_utf8_lossy(&buf);
+    assert!(s.contains("1:y1:r"), "not a reply: {s}");
+    assert!(s.contains("1:t2:{6"), "tid not echoed: {s}");
+}
+
+#[test]
+fn router_seeded_lookup_yields_announce_tokens() {
+    // the real-swarm path: a lookup seeded only by a router node
+    // (NO_ID observer) must still surface the responder's write
+    // token in `DhtEvent::Done` so the session can announce.
+    let (mut a, pa) = node("1.2.3.4");
+    let (mut b, pb) = node("5.6.7.8");
+    a.table.add_router_node(pb);
+
+    let ih = NodeId::from_bytes(&[0xabu8; 20]).unwrap();
+    let li = a.new_lookup(LookupKind::GetPeers, ih);
+
+    pump(&mut a, &mut b, pa, pb);
+
+    let events = a.drain_events();
+    let done = events
+        .iter()
+        .find_map(|e| match e {
+            DhtEvent::Done { lookup, tokens } if *lookup == li => Some(tokens),
+            _ => None,
+        })
+        .expect("lookup never finished");
+    assert_eq!(done.len(), 1, "expected one write token: {events:?}");
+    assert_eq!(done[0].0, b.id, "token under responder id");
+    assert_eq!(done[0].1, pb, "token endpoint");
+    assert!(!done[0].2.is_empty(), "empty token");
+}

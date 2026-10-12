@@ -66,8 +66,8 @@ async fn extended_and_message_loop() {
         ..Default::default()
     };
     let f = tokio::join!(
-        send_extended_handshake(&mut a, &hs),
-        send_extended_handshake(&mut b, &hs),
+        send_extended_handshake(&mut a, &hs, None),
+        send_extended_handshake(&mut b, &hs, None),
     );
     f.0.unwrap();
     f.1.unwrap();

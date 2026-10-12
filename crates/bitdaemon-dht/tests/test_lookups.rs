@@ -26,6 +26,10 @@ fn id(v: u8) -> NodeId {
     NodeId::from_bytes(&[v; 20]).unwrap()
 }
 
+fn ep_any() -> SocketAddr {
+    "9.9.9.9:6881".parse().unwrap()
+}
+
 fn reply_entry(build: impl FnOnce(&mut Dictionary)) -> Vec<u8> {
     let mut r = Entry::Dict(Default::default());
     build(r.dict_mut().unwrap());
@@ -94,13 +98,13 @@ fn reply_extracts_peers_nodes_token() {
 
     let root = bdecode_checked(&buf).unwrap();
     let r = root.dict_find_dict(b"r");
-    let out = l.on_reply(&r).expect("reply parsed");
+    let out = l.on_reply(&r, node_ep).expect("reply parsed");
     assert_eq!(out.id, Some(nid));
     assert_eq!(out.token.as_deref(), Some(b"tok".as_slice()));
     assert_eq!(out.peers, vec![peer]);
     assert_eq!(out.nodes, vec![(id(0x22), node_ep)]);
     // write token recorded for a later put/announce
-    assert_eq!(l.write_tokens()[&nid], b"tok".to_vec());
+    assert_eq!(l.write_tokens()[&nid].1, b"tok".to_vec());
 }
 
 #[test]
@@ -111,7 +115,7 @@ fn reply_missing_id_is_timeout() {
     });
     let root = bdecode_checked(&buf).unwrap();
     let r = root.dict_find_dict(b"r");
-    assert!(l.on_reply(&r).is_none());
+    assert!(l.on_reply(&r, ep_any()).is_none());
 }
 
 #[test]
@@ -133,7 +137,7 @@ fn sample_infohashes_reply() {
         r.insert("samples".into(), Entry::String(s));
     });
     let root = bdecode_checked(&buf).unwrap();
-    let out = l.on_reply(&root.dict_find_dict(b"r")).unwrap();
+    let out = l.on_reply(&root.dict_find_dict(b"r"), ep_any()).unwrap();
     assert_eq!(out.interval, Some(25));
     assert_eq!(out.num, Some(1000));
     assert_eq!(out.samples, vec![id(0x44), id(0x55)]);

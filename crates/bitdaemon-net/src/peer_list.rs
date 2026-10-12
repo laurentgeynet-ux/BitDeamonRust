@@ -180,6 +180,12 @@ impl PeerList {
         &self.peers
     }
 
+    /// Mutable access — flags patched post-insert (`pe_support`
+    /// from a PEX `e` flag or a completed MSE handshake).
+    pub fn peers_mut(&mut self) -> &mut [TorrentPeer] {
+        &mut self.peers
+    }
+
     /// `num_peers`.
     #[must_use]
     pub fn num_peers(&self) -> usize {

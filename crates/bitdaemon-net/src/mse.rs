@@ -206,9 +206,27 @@ pub async fn mse_responder(
     find_skey: impl Fn(&Sha1Hash) -> Option<Sha1Hash>,
     select: impl Fn(u32) -> u32,
 ) -> Result<MseResult, MseError> {
-    // read their pub, send ours + pad
+    mse_responder_prefix(s, &[], pad_len, find_skey, select).await
+}
+
+/// `mse_responder` with the head of the remote DH key already
+/// consumed — upstream `on_receive` reads 20 bytes for the
+/// plaintext-handshake probe, then re-interprets them as the start
+/// of the DH key when they aren't `"BitTorrent protocol"`.
+pub async fn mse_responder_prefix(
+    s: &mut BoxedPeerStream,
+    dh_prefix: &[u8],
+    pad_len: usize,
+    find_skey: impl Fn(&Sha1Hash) -> Option<Sha1Hash>,
+    select: impl Fn(u32) -> u32,
+) -> Result<MseResult, MseError> {
+    // read their pub (continuing after the probe prefix), send ours + pad
+    if dh_prefix.len() > DH_KEY_LEN {
+        return Err(MseError::BadSync);
+    }
     let mut remote = [0u8; DH_KEY_LEN];
-    s.read_exact(&mut remote).await?;
+    remote[..dh_prefix.len()].copy_from_slice(dh_prefix);
+    s.read_exact(&mut remote[dh_prefix.len()..]).await?;
     let mut dh = DhKeyExchange::new();
     s.write_all(dh.local_key()).await?;
     s.write_all(&random_pad(pad_len.min(MAX_PAD))).await?;

@@ -762,9 +762,9 @@ impl RoutingTable {
         }
     }
 
-    /// `next_refresh` — index into `buckets`+`live_nodes` of the
+    /// `next_refresh` — `(bucket, id, endpoint)` of the
     /// least-recently-queried node, or `None`. Marks it queried.
-    pub fn next_refresh(&mut self) -> Option<(usize, usize, NodeId)> {
+    pub fn next_refresh(&mut self) -> Option<(usize, NodeId, std::net::SocketAddr)> {
         let mut candidate: Option<(usize, usize, bool, Instant)> = None;
         let mut found = false;
 
@@ -813,7 +813,7 @@ impl RoutingTable {
             &mut self.buckets[bi].live_nodes[i]
         };
         n.last_queried = Some(Instant::now());
-        n.id.map(|id| (bi, i, id))
+        n.id.map(|id| (bi, id, n.endpoint))
     }
 
     /// `node_failed`.

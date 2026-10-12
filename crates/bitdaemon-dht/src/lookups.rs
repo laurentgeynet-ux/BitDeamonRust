@@ -77,8 +77,10 @@ pub struct Lookup {
     pub algo: Traversal,
     /// which query it issues.
     pub kind: LookupKind,
-    /// `m_write_tokens` (`find_data`).
-    write_tokens: BTreeMap<NodeId, Vec<u8>>,
+    /// `m_write_tokens` (`find_data`) — upstream stores
+    /// `node_id -> (target_ep, token)` so the announce phase
+    /// survives `results` being cleared by `done()`.
+    write_tokens: BTreeMap<NodeId, (SocketAddr, Vec<u8>)>,
     /// `m_noseeds` (`get_peers`).
     noseed: bool,
     /// this node's protocol (`m_protocol`) — picks `nodes`/`nodes6`.
@@ -114,9 +116,10 @@ impl Lookup {
         self.noseed = noseed;
     }
 
-    /// `m_write_tokens` — accumulated put tokens.
+    /// `m_write_tokens` — accumulated put tokens with the
+    /// responder endpoint (`node_entry`).
     #[must_use]
-    pub fn write_tokens(&self) -> &BTreeMap<NodeId, Vec<u8>> {
+    pub fn write_tokens(&self) -> &BTreeMap<NodeId, (SocketAddr, Vec<u8>)> {
         &self.write_tokens
     }
 
@@ -220,9 +223,10 @@ impl Lookup {
     }
 
     /// `reply()` per subclass — extract kind-specific fields and
-    /// stash the write token (`find_data_observer::reply`).
-    /// `r` is the response `r` dict.
-    pub fn on_reply(&mut self, r: &BdecodeNode<'_>) -> Option<ReplyData> {
+    /// stash the write token under `(ep, token)`
+    /// (`find_data_observer::reply` → `m_write_tokens`).
+    /// `r` is the response `r` dict, `ep` the observer endpoint.
+    pub fn on_reply(&mut self, r: &BdecodeNode<'_>, ep: SocketAddr) -> Option<ReplyData> {
         let id_e = r.dict_find_string(b"id");
         if !id_e.is_valid() || id_e.string_length() != 20 {
             return None; // upstream: timeout()
@@ -234,7 +238,7 @@ impl Lookup {
         let tok = r.dict_find_string(b"token");
         if !!tok.is_valid() {
             let t = tok.string_value().to_vec();
-            self.write_tokens.insert(id, t.clone());
+            self.write_tokens.insert(id, (ep, t.clone()));
             out.token = Some(t);
         }
 

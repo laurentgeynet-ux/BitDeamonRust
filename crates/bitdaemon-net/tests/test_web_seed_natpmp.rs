@@ -103,7 +103,7 @@ async fn fetch_block_over_duplex() {
             got_get: true,
         }],
     };
-    let segs = fetch_block(&mut cli, &req, 64 * 1024).await.unwrap();
+    let (segs, _close) = fetch_block(&mut cli, &req, 64 * 1024).await.unwrap();
     assert_eq!(segs.len(), 1);
     assert_eq!((segs[0].0, segs[0].1), (0, 16));
     assert_eq!(segs[0].2, vec![0xAB; 16]);

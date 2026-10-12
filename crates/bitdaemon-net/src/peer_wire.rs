@@ -423,6 +423,31 @@ pub fn encode(msg: &PeerMessage) -> Bytes {
     out.into()
 }
 
+/// Total bytes [`encode`] produces for `msg`, framing included —
+/// upstream's `send_buffer_size()` counts the same chained-buffer
+/// bytes when it applies the send-buffer watermark.
+#[must_use]
+pub fn wire_len(msg: &PeerMessage) -> usize {
+    match msg {
+        PeerMessage::Keepalive => 4,
+        // id + payload only messages
+        PeerMessage::Choke
+        | PeerMessage::Unchoke
+        | PeerMessage::Interested
+        | PeerMessage::NotInterested
+        | PeerMessage::HaveAll
+        | PeerMessage::HaveNone => 5,
+        PeerMessage::Have(_) | PeerMessage::SuggestPiece(_) | PeerMessage::AllowedFast(_) => 9,
+        PeerMessage::Bitfield(b) => 5 + b.len(),
+        PeerMessage::Request(_) | PeerMessage::Cancel(_) | PeerMessage::RejectRequest(_) => 17,
+        PeerMessage::Piece { data, .. } => 13 + data.len(),
+        PeerMessage::DhtPort(_) => 7,
+        PeerMessage::Extended { data, .. } => 6 + data.len(),
+        PeerMessage::HashRequest(_) | PeerMessage::HashReject(_) => 53,
+        PeerMessage::Hashes { hashes, .. } => 53 + 32 * hashes.len(),
+    }
+}
+
 fn read_u32(cur: &mut crate::socket_io::Cursor<'_>) -> Result<u32, WireError> {
     cur.read_u32().map_err(|_| WireError::Truncated("u32"))
 }

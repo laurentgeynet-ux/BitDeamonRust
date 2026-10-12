@@ -149,6 +149,8 @@ pub struct DhtNode {
     /// `m_blocker` — per-source rate limit, first gate on every
     /// inbound datagram (ADR-0021).
     blocker: crate::dos_blocker::DosBlocker,
+    /// `m_last_self_refresh` — last `node::tick` self-id lookup.
+    last_self_refresh: Option<std::time::Instant>,
 }
 
 impl DhtNode {
@@ -173,6 +175,7 @@ impl DhtNode {
             events: Vec::new(),
             ip_votes: Vec::new(),
             blocker: crate::dos_blocker::DosBlocker::new(),
+            last_self_refresh: None,
         }
     }
 
@@ -402,11 +405,20 @@ impl DhtNode {
                     return;
                 }
                 let (li, oi) = unpack_tag(tag);
+                // the observer endpoint goes into `m_write_tokens`
+                // (`find_data_observer::reply` uses `o->target_ep()`).
+                let obs_ep = self
+                    .lookups
+                    .get(li)
+                    .and_then(Option::as_ref)
+                    .and_then(|l| l.algo.results().get(oi))
+                    .map(|o| o.ep)
+                    .unwrap_or(from);
                 match self
                     .lookups
                     .get_mut(li)
                     .and_then(Option::as_mut)
-                    .map(|l| (l.on_reply(&r), l.kind))
+                    .map(|l| (l.on_reply(&r, obs_ep), l.kind))
                 {
                     Some((Some(data), _)) => self.lookup_reply(li, oi, data),
                     other => {
@@ -437,12 +449,19 @@ impl DhtNode {
         let hooks = self.hooks();
         // traverse into discovered nodes
         let nodes = data.nodes.clone();
+        let resp_id = data.id;
         self.events.push(DhtEvent::Data {
             lookup: li,
             data: Box::new(data),
         });
         let table = &mut self.table;
         if let Some(Some(l)) = self.lookups.get_mut(li) {
+            // `observer::reply` — the responder's id lands on the
+            // observer so `NO_ID` router entries become real nodes
+            // for `take_write_tokens` (announce phase).
+            if let Some(id) = resp_id {
+                l.algo.set_id(oi, id);
+            }
             tracing::trace!(li, nodes = nodes.len(), "dht traverse nodes");
             for (id, ep) in nodes {
                 l.algo.traverse(id, ep, &hooks, |i2, e2| {
@@ -514,15 +533,12 @@ impl DhtNode {
         let Some(Some(l)) = self.lookups.get(li) else {
             return Vec::new();
         };
+        // `find_data::done` — `m_write_tokens` already carries the
+        // responder endpoint; upstream does not consult `m_results`
+        // here (they are cleared by `done()`).
         l.write_tokens()
             .iter()
-            .filter_map(|(id, tok)| {
-                l.algo
-                    .results()
-                    .iter()
-                    .find(|o| o.id == Some(*id))
-                    .map(|o| (*id, o.ep, tok.clone()))
-            })
+            .map(|(id, (ep, tok))| (*id, *ep, tok.clone()))
             .collect()
     }
 
@@ -1115,13 +1131,79 @@ impl DhtNode {
             }
         }
         self.storage.tick();
+
+        // `node::tick` — every `refresh_timeout` (5 s upstream; our
+        // session calls us every tick): self-refresh the routing
+        // table's own-id region when shallow (`depth() < 4`), else
+        // refresh the least-recently-queried node. While the table
+        // is still empty the bootstrap is retried at that cadence —
+        // a single lost datagram must not stall discovery for the
+        // whole self-refresh interval.
+        let now = std::time::Instant::now();
+        let empty = self.table.size().0 == 0;
+        let stale = self
+            .last_self_refresh
+            .is_none_or(|t| now.duration_since(t) >= SELF_REFRESH_INTERVAL);
+        let retry = empty
+            && self
+                .last_self_refresh
+                .is_none_or(|t| now.duration_since(t) >= BOOTSTRAP_RETRY);
+        if (stale && self.table.depth() < 4) || retry {
+            self.last_self_refresh = Some(now);
+            self.bootstrap();
+        } else if let Some((bucket, nid, ep)) = self.table.next_refresh() {
+            self.send_single_refresh(bucket, nid, ep);
+        }
         wait
+    }
+
+    /// `send_single_refresh` — ping a stale node (full bucket) or
+    /// `get_peers` toward a random in-bucket id (upstream folds
+    /// `find_node` into `get_peers` for the extra `values` chance).
+    fn send_single_refresh(&mut self, bucket: usize, nid: NodeId, ep: SocketAddr) {
+        let _ = nid;
+        let mut e = Entry::Dict(Default::default());
+        {
+            let d = e.dict_mut().expect("dict");
+            d.insert("y".into(), Entry::String(b"q".to_vec()));
+            if self.table.is_full(bucket) {
+                d.insert("q".into(), Entry::String(b"ping".to_vec()));
+            } else {
+                d.insert("q".into(), Entry::String(b"get_peers".to_vec()));
+                // upstream: `generate_prefix_mask(bucket + 1)`, random
+                // id keeping our leading `bucket + 1` bits.
+                let mask = crate::node_id::generate_prefix_mask(bucket as i32 + 1);
+                let target = (crate::node_id::generate_secret_id() & !mask) | (self.id & mask);
+                let mut a = Entry::Dict(Default::default());
+                a.dict_mut().expect("dict").insert(
+                    "info_hash".into(),
+                    Entry::String(target.as_bytes().to_vec()),
+                );
+                d.insert("a".into(), a);
+            }
+        }
+        let our_id = self.id;
+        let ro = self.settings.read_only;
+        let v6 = self.v6;
+        let rpc = &mut self.rpc;
+        let outbox = &mut self.outbox;
+        rpc.invoke(e, ep, PING_TAG, our_id, ro, v6, |e2, t| {
+            outbox.push((bitdaemon_bencode::bencode(&e2), t));
+            true
+        });
     }
 }
 
 /// `(pk, seq, sig, salt)` for a mutable `put` (BEP-44).
 pub type MutableFields<'a> = (&'a [u8; 32], i64, &'a [u8; 64], &'a [u8]);
 
+/// `m_last_self_refresh` gate — upstream refreshes its own-id
+/// region every 10 min while the table stays shallow
+/// (`node::tick`).
+const SELF_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Empty-table bootstrap retry cadence — upstream's
+/// `refresh_timeout` re-fires `node::tick` every 5 s.
+const BOOTSTRAP_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 /// Tag space for `add_node` pings — decodes to `usize::MAX` which
 /// never indexes a live lookup.
 const PING_TAG: u64 = u64::MAX;

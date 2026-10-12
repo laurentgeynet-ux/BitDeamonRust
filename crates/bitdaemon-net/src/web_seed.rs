@@ -236,19 +236,23 @@ pub enum WebSeedError {
 /// one HTTP response **per non-pad file request** (upstream issues
 /// one GET per file slice; each gets its own 206 response).
 ///
-/// Returns `(file_index, file_offset, bytes)` segments — the caller
-/// reassembles the block; pad files yield no segment (upstream
-/// synthesizes zeroes).
+/// Returns `((file_index, file_offset, bytes) segments, close)` —
+/// the caller reassembles the block; pad files yield no segment
+/// (upstream synthesizes zeroes). `close` is the `Connection:
+/// close` flag of the last response (upstream
+/// `m_received_disconnect` → the connection must be rebuilt before
+/// the next request, as required by HTTP/1.0-only seeds).
 pub async fn fetch_block(
     s: &mut crate::transport::BoxedPeerStream,
     req: &WebSeedRequest,
     max_response: usize,
-) -> Result<Vec<(usize, i64, Vec<u8>)>, WebSeedError> {
+) -> Result<(Vec<(usize, i64, Vec<u8>)>, bool), WebSeedError> {
     use tokio::io::AsyncWriteExt;
     s.write_all(req.request.as_bytes())
         .await
         .map_err(crate::http_conn::HttpError::Io)?;
     let mut out = Vec::new();
+    let mut close = false;
     for f in req.files.iter().filter(|f| f.got_get) {
         let r = crate::http_conn::recv_response(s, max_response).await?;
         if !(200..300).contains(&r.status()) {
@@ -257,6 +261,7 @@ pub async fn fetch_block(
                 r.header("server").unwrap_or("").to_string(),
             ));
         }
+        close = r.parser.connection_close();
         let body = r.body();
         if body.len() as i64 != f.length {
             return Err(WebSeedError::ShortBody {
@@ -266,7 +271,7 @@ pub async fn fetch_block(
         }
         out.push((f.file_index, f.start, body));
     }
-    Ok(out)
+    Ok((out, close))
 }
 
 #[cfg(test)]

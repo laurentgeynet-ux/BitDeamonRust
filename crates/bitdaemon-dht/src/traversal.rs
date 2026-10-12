@@ -162,6 +162,16 @@ impl Traversal {
     pub fn results(&self) -> &[ObserverEntry] {
         &self.results
     }
+    /// `observer::reply` — upstream stamps the responder's id onto
+    /// the observer (`o->m_id = id`), which is how `NO_ID` router
+    /// entries become addressable for the announce phase.
+    pub fn set_id(&mut self, idx: usize, id: NodeId) {
+        if let Some(o) = self.results.get_mut(idx) {
+            if o.id.is_none() {
+                o.id = Some(id);
+            }
+        }
+    }
     /// `target()`.
     #[must_use]
     pub fn target(&self) -> &NodeId {

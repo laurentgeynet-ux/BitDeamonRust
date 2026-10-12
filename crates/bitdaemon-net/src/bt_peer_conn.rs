@@ -12,8 +12,8 @@ use bitdaemon_common::{PeerId, Sha1Hash};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::bep10::ExtendedHandshake;
-use crate::mse::{MseError, MseResult, mse_initiator, mse_responder};
-use crate::pe_crypto::Rc4Handler;
+use crate::mse::{MseError, MseResult, mse_initiator, mse_responder_prefix};
+use crate::pe_crypto::{EncPolicy, Rc4Handler};
 use crate::peer_wire::{
     Handshake, PeerMessage, WireError, decode, encode, parse_handshake, write_handshake,
 };
@@ -122,7 +122,34 @@ pub async fn run_handshake_encrypted_responder(
     find_skey: impl Fn(&Sha1Hash) -> Option<Sha1Hash>,
     select: impl Fn(u32) -> u32,
 ) -> Result<(Handshake, MseResult), PeerConnError> {
-    let mut mse = mse_responder(s, pad_len, find_skey, select).await?;
+    run_handshake_encrypted_responder_prefix(
+        s,
+        our_peer_id,
+        dht,
+        fast,
+        pad_len,
+        &[],
+        find_skey,
+        select,
+    )
+    .await
+}
+
+/// `run_handshake_encrypted_responder` with the head of the remote
+/// DH key already consumed by the plaintext probe (`dh_prefix`,
+/// ≤ [`DH_KEY_LEN`](crate::pe_crypto::DH_KEY_LEN) bytes).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_handshake_encrypted_responder_prefix(
+    s: &mut BoxedPeerStream,
+    our_peer_id: &PeerId,
+    dht: bool,
+    fast: bool,
+    pad_len: usize,
+    dh_prefix: &[u8],
+    find_skey: impl Fn(&Sha1Hash) -> Option<Sha1Hash>,
+    select: impl Fn(u32) -> u32,
+) -> Result<(Handshake, MseResult), PeerConnError> {
+    let mut mse = mse_responder_prefix(s, dh_prefix, pad_len, find_skey, select).await?;
     if mse.initial_payload.len() >= HANDSHAKE_LEN {
         let mut buf = [0u8; HANDSHAKE_LEN];
         buf.copy_from_slice(&mse.initial_payload[..HANDSHAKE_LEN]);
@@ -140,6 +167,68 @@ pub async fn run_handshake_encrypted_responder(
     let hs = parse_handshake(&theirs).map_err(|_| PeerConnError::Protocol("bad handshake"))?;
     write_bt_handshake(s, &hs.info_hash.clone(), our_peer_id, dht, fast, &mut mse).await?;
     Ok((hs, mse))
+}
+
+/// `on_receive` — upstream tries the plaintext handshake first and,
+/// when the probe bytes aren't `"BitTorrent protocol"`, re-interprets
+/// them as the head of an MSE DH key (`bt_peer_connection.cpp`).
+/// Returns the handshake, the negotiated RC4 stream state
+/// (`Some` iff `crypto_select == RC4`), and whether the connection
+/// went through MSE at all (`supports_encryption` for PEX).
+///
+/// Policy (upstream):
+/// * `in_enc_policy == pe_disabled` + MSE probe → `no_incoming_encrypted`
+/// * `in_enc_policy == pe_forced` + plaintext → `no_incoming_regular`
+#[allow(clippy::too_many_arguments)]
+pub async fn run_handshake_responder_auto(
+    s: &mut BoxedPeerStream,
+    our_peer_id: &PeerId,
+    dht: bool,
+    fast: bool,
+    known: impl Fn(&Sha1Hash) -> bool,
+    in_policy: EncPolicy,
+    find_skey: impl Fn(&Sha1Hash) -> Option<Sha1Hash>,
+    select: impl Fn(u32) -> u32,
+) -> Result<(Handshake, Option<Rc4Handler>, bool), PeerConnError> {
+    // upstream's first receive buffer is 20 bytes (pstrlen+pstr);
+    // anything else means the stream head is a DH key, not a
+    // handshake — cut(0) re-interprets it as MSE.
+    let mut head = [0u8; 20];
+    s.read_exact(&mut head).await?;
+    if head[0] == 19 && head[1..] == *b"BitTorrent protocol" {
+        if in_policy == EncPolicy::Forced {
+            return Err(PeerConnError::Protocol("no incoming regular"));
+        }
+        let mut theirs = [0u8; HANDSHAKE_LEN];
+        theirs[..20].copy_from_slice(&head);
+        s.read_exact(&mut theirs[20..]).await?;
+        let hs = parse_handshake(&theirs).map_err(|_| PeerConnError::Protocol("bad handshake"))?;
+        if !known(&hs.info_hash) {
+            return Err(PeerConnError::WrongInfoHash(hs.info_hash));
+        }
+        let ours = write_handshake(&hs.info_hash, our_peer_id, dht, true, fast, false);
+        s.write_all(&ours).await?;
+        return Ok((hs, None, false));
+    }
+    if in_policy == EncPolicy::Disabled {
+        return Err(PeerConnError::Protocol("no incoming encrypted"));
+    }
+    let (hs, mse) = run_handshake_encrypted_responder_prefix(
+        s,
+        our_peer_id,
+        dht,
+        fast,
+        0,
+        &head,
+        find_skey,
+        select,
+    )
+    .await?;
+    let rc4 = mse.rc4_encrypted.then(|| {
+        let MseResult { rc4, .. } = mse;
+        rc4
+    });
+    Ok((hs, rc4, true))
 }
 
 /// write one BT handshake, RC4-encrypted iff negotiated.
@@ -185,8 +274,13 @@ async fn exchange_handshake(
 pub async fn send_extended_handshake(
     s: &mut BoxedPeerStream,
     hs: &ExtendedHandshake,
+    rc4: Option<&mut Rc4Handler>,
 ) -> Result<(), PeerConnError> {
-    s.write_all(&hs.encode()).await?;
+    let mut frame = hs.encode();
+    if let Some(r) = rc4 {
+        r.encrypt(&mut frame);
+    }
+    s.write_all(&frame).await?;
     Ok(())
 }
 
@@ -287,6 +381,23 @@ pub async fn write_messages(
             chain.pop_front(n);
         }
     }
+    Ok(())
+}
+
+/// `write_messages` + `rc4_encrypt` — post-MSE batched write: the
+/// whole batch is encoded contiguously, encrypted once, then sent
+/// with a single write (upstream `rc4` wraps the chained buffer).
+pub async fn write_messages_rc4(
+    s: &mut BoxedPeerStream,
+    rc4: &mut Rc4Handler,
+    msgs: &[PeerMessage],
+) -> Result<(), PeerConnError> {
+    let mut frame = Vec::new();
+    for m in msgs {
+        frame.extend_from_slice(&encode(m));
+    }
+    rc4.encrypt(&mut frame);
+    s.write_all(&frame).await?;
     Ok(())
 }
 
