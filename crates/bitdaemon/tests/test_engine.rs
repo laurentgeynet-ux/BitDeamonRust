@@ -99,7 +99,9 @@ async fn connect_pump_lists_candidates() {
     lock(&eng.session).add_torrent(t);
     let st = bitdaemon_net::peer_list::PeerListState::default();
     let dialing = eng.connect_pump(0, &st, 10);
-    assert_eq!(dialing, vec![(ih, ep())]);
+    // pe_enabled + pe_support=false → first dial is plaintext
+    // (the self-toggling flag retries encrypted on failure).
+    assert_eq!(dialing, vec![(ih, ep(), false)]);
 }
 
 #[tokio::test(flavor = "current_thread")]

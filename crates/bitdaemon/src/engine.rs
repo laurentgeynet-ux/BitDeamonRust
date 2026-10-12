@@ -156,6 +156,12 @@ struct DialDone {
     /// reserved-bit caps parsed from the peer's handshake.
     fast: bool,
     dht: bool,
+    /// `m_encrypted` — the conn went through the MSE handshake
+    /// (`supports_encryption()`, feeds `pex_encryption`).
+    encrypted: bool,
+    /// negotiated RC4 stream state when `crypto_select == RC4` —
+    /// moved into the io pump to wrap all wire traffic.
+    rc4: Option<bitdaemon_net::pe_crypto::Rc4Handler>,
 }
 
 /// A web-seed fetch completion: per-block data or the failed
@@ -197,6 +203,11 @@ pub struct Engine {
     connector: Arc<dyn PeerConnector>,
     /// datagram transport for DHT + UDP trackers.
     datagram: Option<Arc<dyn DatagramSocket>>,
+    /// dedicated LSD socket (`lsd` upstream binds its own socket on
+    /// the well-known port 6771 joined to the BEP-14 group — LSD
+    /// announces both arrive and leave from it). Injected by the
+    /// caller; `None` disables the multicast lanes.
+    lsd_datagram: Option<Arc<dyn DatagramSocket>>,
     /// hostname resolution (anonymous: inject a circuit resolver —
     /// without one only IP-literal tracker hosts work).
     resolver: Option<BoxedResolver>,
@@ -213,6 +224,11 @@ pub struct Engine {
     /// disconnect events from dead streams.
     gone_rx: mpsc::UnboundedReceiver<(Sha1Hash, u64)>,
     gone_tx: mpsc::UnboundedSender<(Sha1Hash, u64)>,
+    /// socket-write completions from peer pumps — upstream's
+    /// `on_sent` handler: shrink the peer's send buffer and
+    /// re-run `fill_send_buffer`.
+    sent_rx: mpsc::UnboundedReceiver<(Sha1Hash, u64, usize)>,
+    sent_tx: mpsc::UnboundedSender<(Sha1Hash, u64, usize)>,
     /// inbound datagrams (DHT, UDP tracker replies).
     udp_rx: mpsc::UnboundedReceiver<(SocketAddr, Vec<u8>)>,
     /// tracker-reply demux on the shared datagram — upstream gives
@@ -287,6 +303,11 @@ pub struct Engine {
     /// non-peer `SessionOut`s queued by [`Self::dispatch_out`] —
     /// dispatched (async) at the start of the next `tick`.
     pending_out: Vec<SessionOut>,
+    /// upstream `post(ioc, call_job_handlers)` — the disk
+    /// completion queue's drain poster notifies this; `run` wakes
+    /// and calls `drain_disk_completed` instead of batching to the
+    /// 1 Hz tick.
+    disk_notify: Arc<tokio::sync::Notify>,
     /// `m_peer_ssl_ctx` SNI dispatch — per-info-hash `CertifiedKey`
     /// map for SSL-torrent listen sockets (`ssl_server_name_callback`
     /// upstream). Fed by [`Self::refresh_ssl_certs`].
@@ -306,6 +327,7 @@ impl Engine {
         let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
         let (announce_tx, announce_rx) = mpsc::unbounded_channel();
         let (gone_tx, gone_rx) = mpsc::unbounded_channel();
+        let (sent_tx, sent_rx) = mpsc::unbounded_channel();
         let (udp_tx, udp_rx) = mpsc::unbounded_channel();
         let (connect_tx, connect_rx) = mpsc::unbounded_channel();
         let (webseed_tx, webseed_rx) = mpsc::unbounded_channel();
@@ -325,8 +347,11 @@ impl Engine {
             announce_tx,
             gone_rx,
             gone_tx,
+            sent_rx,
+            sent_tx,
             udp_rx,
             udp_tx,
+            lsd_datagram: None,
             udp_tracker_demux: Arc::new(bitdaemon_net::tracker_client::UdpTrackerDemux::default()),
             connect_rx,
             connect_tx,
@@ -357,7 +382,15 @@ impl Engine {
             ssl_resolver: Arc::new(bitdaemon_net::ssl_stream::SniResolver::new(None)),
             ssl_roots: Arc::new(bitdaemon_net::ssl_stream::SslTorrentRoots::new()),
             pending_out: Vec::new(),
+            disk_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// handle for the disk completion queue's drain poster —
+    /// `PreadDiskIo::new(threads, poster)` where
+    /// `poster = move || notify.notify_one()`.
+    pub fn disk_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.disk_notify.clone()
     }
 
     /// `enable_outgoing_utp`/`enable_incoming_utp` wiring — build the
@@ -385,6 +418,30 @@ impl Engine {
         self.utp_enabled = true;
     }
 
+    /// SSL-over-uTP lane — upstream's `…s` listen interfaces create a
+    /// separate `ssl_stream<utp_stream>` accept socket on the
+    /// interface's own UDP port (`utp_socket_manager` per socket).
+    /// `datagram` is that dedicated socket: every datagram is uTP,
+    /// every accepted stream is TLS-wrapped like `start_ssl_acceptor`.
+    pub async fn start_ssl_utp(
+        &mut self,
+        dg: Arc<dyn bitdaemon_net::transport::DatagramSocket>,
+        local: SocketAddr,
+        kind: u8,
+    ) {
+        let cfg = bitdaemon_net::utp_socket::UtpConfig::default();
+        let manager = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
+        let acc =
+            bitdaemon_net::utp_stream::UtpAcceptor::new(manager.clone(), dg.clone(), cfg).await;
+        self.start_ssl_acceptor_at(Arc::new(acc), Some(local), kind);
+        self.tasks.push(tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            while let Ok((n, from)) = dg.recv_from(&mut buf).await {
+                manager.route(from, &buf[..n]).await;
+            }
+        }));
+    }
+
     /// start the datagram pump — every received packet is queued
     /// for `session.on_udp` at the next `tick` (upstream's
     /// `udp_socket` → `on_receive` fan-out; the injected socket
@@ -401,15 +458,63 @@ impl Engine {
         let utp = self.utp_manager.clone();
         self.tasks.push(tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
-            while let Ok((n, from)) = dg.recv_from(&mut buf).await {
-                if let Some(mgr) = &utp {
-                    if is_utp_datagram(&buf[..n]) {
-                        mgr.route(from, &buf[..n]).await;
-                        continue;
+            loop {
+                match dg.recv_from(&mut buf).await {
+                    Ok((n, from)) => {
+                        if let Some(mgr) = &utp {
+                            if is_utp_datagram(&buf[..n]) {
+                                mgr.route(from, &buf[..n]).await;
+                                continue;
+                            }
+                        }
+                        if tx.send((from, buf[..n].to_vec())).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        // `udp_socket.cpp` re-arms the read on
+                        // receive errors — a UDP socket that sent
+                        // to a dead port gets a transient ICMP
+                        // `WSAECONNRESET` on Windows; it must not
+                        // kill the pump.
+                        warn!(error = %e, "udp recv error — pump continues");
+                        tokio::task::yield_now().await;
                     }
                 }
-                if tx.send((from, buf[..n].to_vec())).is_err() {
-                    return;
+            }
+        }));
+    }
+
+    /// inject the dedicated LSD socket (`lsd` upstream binds its
+    /// own socket on port 6771 — separate from the listen socket).
+    /// Call before `start_lsd_pump`.
+    pub fn set_lsd_datagram(&mut self, dg: Arc<dyn DatagramSocket>) {
+        self.lsd_datagram = Some(dg);
+    }
+
+    /// LSD receive pump — the dedicated 6771 socket feeds the same
+    /// `udp_tx` demux; BT-SEARCH datagrams fall through to
+    /// `Session::on_udp` → `lsd::process_packet` (DHT bdecode fails
+    /// on them harmlessly first, like upstream's udp_socket
+    /// fan-out order).
+    pub fn start_lsd_pump(&mut self) {
+        let Some(dg) = self.lsd_datagram.clone() else {
+            return;
+        };
+        let tx = self.udp_tx.clone();
+        self.tasks.push(tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_535];
+            loop {
+                match dg.recv_from(&mut buf).await {
+                    Ok((n, from)) => {
+                        if tx.send((from, buf[..n].to_vec())).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "lsd recv error — pump continues");
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
         }));
@@ -505,6 +610,9 @@ impl Engine {
         while let Ok((ih, peer)) = self.gone_rx.try_recv() {
             self.writers.remove(&(ih, peer));
             slock(&self.session).peer_disconnected(&ih, peer, &mut out);
+        }
+        while let Ok((ih, peer, bytes)) = self.sent_rx.try_recv() {
+            slock(&self.session).on_peer_sent(&ih, peer, bytes, &mut out);
         }
         while let Ok(a) = self.announce_rx.try_recv() {
             if a.scrape {
@@ -643,7 +751,21 @@ impl Engine {
                     }
                 }
                 SessionOut::UdpPacket(buf, to) => {
-                    if let Some(d) = &self.datagram {
+                    // upstream sends BT-SEARCH *from* its dedicated
+                    // 6771 socket — route multicast-group traffic
+                    // there when one was injected.
+                    let lsd = to.port() == 6771;
+                    let sock = if lsd {
+                        self.lsd_datagram.as_ref().or(self.datagram.as_ref())
+                    } else {
+                        self.datagram.as_ref()
+                    };
+                    // upstream only has an lsd socket for families it
+                    // can bind — a v4 socket never sees the v6 send.
+                    let skip = lsd
+                        && to.is_ipv6()
+                        && sock.is_some_and(|s| DatagramSocket::local_addr(s.as_ref()).is_ipv4());
+                    if let Some(d) = sock.filter(|_| !skip) {
                         trace!(%to, len = buf.len(), "udp send");
                         // `udp_error_alert` — a datagram send
                         // failed (upstream posts it from the
@@ -652,7 +774,6 @@ impl Engine {
                         // (`session_impl` posts it on lsd socket
                         // send failures).
                         if let Err(e) = d.send_to(&buf, to).await {
-                            let lsd = to.port() == 6771;
                             let mut ses = slock(&self.session);
                             ses.alerts.post(Alert::UdpError {
                                 remote: to.to_string(),
@@ -812,7 +933,7 @@ impl Engine {
                     // RTC offers + interval/complete stats
                     let port = u16::try_from(c.port).unwrap_or(80);
                     match resolve(&resolver, &c.hostname, port).await {
-                        Ok(addr) => match connector.connect(addr).await {
+                        Ok(addr) => match connector.clone().connect(addr).await {
                             Ok(mut s) => {
                                 let host = if c.port < 0 {
                                     c.hostname.clone()
@@ -851,7 +972,7 @@ impl Engine {
                     let default_port = if https { 443 } else { 80 };
                     let port = u16::try_from(c.port).unwrap_or(default_port);
                     match resolve(&resolver, &c.hostname, port).await {
-                        Ok(addr) => match connector.connect(addr).await {
+                        Ok(addr) => match connector.clone().connect(addr).await {
                             Ok(s) => {
                                 let mut s: BoxedPeerStream = if https {
                                     match bitdaemon_net::ssl_stream::ssl_connect(
@@ -980,7 +1101,7 @@ impl Engine {
                     };
                     let port = u16::try_from(c.port).unwrap_or(80);
                     match resolve(&resolver, &c.hostname, port).await {
-                        Ok(addr) => match connector.connect(addr).await {
+                        Ok(addr) => match connector.clone().connect(addr).await {
                             Ok(mut s) => {
                                 let host = if c.port < 0 {
                                     c.hostname.clone()
@@ -1035,25 +1156,34 @@ impl Engine {
         let resolver = self.resolver.clone();
         self.tasks_forget();
         let handle = tokio::spawn(async move {
-            macro_rules! fail {
-                () => {
-                    let _ = tx.send(WebSeedDone {
-                        ih,
-                        result: Err(reqs),
-                    });
-                };
+            // report the completed blocks, then release the rest —
+            // mirrors `web_peer_connection` keeping finished file
+            // requests while retrying the failed tail on a fresh
+            // connection (`maybe_reconnect`).
+            macro_rules! report {
+                ($done:expr, $rest:expr) => {{
+                    if !$done.is_empty() {
+                        let _ = tx.send(WebSeedDone {
+                            ih,
+                            result: Ok($done),
+                        });
+                    }
+                    if !$rest.is_empty() {
+                        let _ = tx.send(WebSeedDone {
+                            ih,
+                            result: Err($rest),
+                        });
+                    }
+                }};
             }
             let Ok(c) = bitdaemon_net::parse_url::parse_url_components(&url) else {
-                fail!();
+                report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs);
                 return;
             };
+            let mut done: Vec<(PeerRequest, Vec<u8>)> = Vec::with_capacity(reqs.len());
             let port = u16::try_from(c.port).unwrap_or(80);
             let Ok(addr) = resolve(&resolver, &c.hostname, port).await else {
-                fail!();
-                return;
-            };
-            let Ok(mut s) = connector.connect(addr).await else {
-                fail!();
+                report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs);
                 return;
             };
             let host = if c.port < 0 {
@@ -1066,7 +1196,7 @@ impl Engine {
                 send_user_agent: false,
                 ..Default::default()
             };
-            let mut done = Vec::with_capacity(reqs.len());
+            let mut conn: Option<BoxedPeerStream> = None;
             for i in 0..reqs.len() {
                 let r = reqs[i];
                 let wreq = build_piece_request(
@@ -1081,8 +1211,28 @@ impl Engine {
                     false,
                     &headers,
                 );
-                match fetch_block(&mut s, &wreq, 4 * 1024 * 1024).await {
-                    Ok(segs) => {
+                // `Connection: close` (incl. implicit HTTP/1.0)
+                // invalidates the stream — upstream reconnects per
+                // request batch (`http_connection::close` handling
+                // in `web_peer_connection`).
+                if conn.is_none() {
+                    match connector.clone().connect(addr).await {
+                        Ok(s) => conn = Some(s),
+                        Err(_) => {
+                            report!(done, reqs[i..].to_vec());
+                            return;
+                        }
+                    }
+                }
+                let Some(s) = conn.as_mut() else {
+                    report!(done, reqs[i..].to_vec());
+                    return;
+                };
+                match fetch_block(s, &wreq, 4 * 1024 * 1024).await {
+                    Ok((segs, close)) => {
+                        if close {
+                            conn = None;
+                        }
                         // reassemble in `m_file_requests` order —
                         // pad slices contribute zeroes
                         let mut data = Vec::with_capacity(r.length as usize);
@@ -1099,15 +1249,12 @@ impl Engine {
                         done.push((r, data));
                     }
                     Err(_) => {
-                        fail!();
+                        report!(done, reqs[i..].to_vec());
                         return;
                     }
                 }
             }
-            let _ = tx.send(WebSeedDone {
-                ih,
-                result: Ok(done),
-            });
+            report!(done, Vec::<PeerRequest>::new());
         });
         self.tasks.push(handle);
     }
@@ -1260,6 +1407,13 @@ impl Engine {
             let Ok(addr) = resolve(&resolver, &c.hostname, port).await else {
                 return;
             };
+            // upstream reads `c.socket().local_endpoint()` on the
+            // control connection for `NewInternalClient` — the
+            // connect-probe yields the same source address without
+            // exposing stream internals.
+            let local_addr = bitdaemon_net::os_transports::local_addr_to(addr)
+                .ok()
+                .map(|a| a.ip());
             let Ok(mut s) = connector.connect(addr).await else {
                 return;
             };
@@ -1279,6 +1433,7 @@ impl Engine {
             let Ok(resp) = r else { return };
             let body = String::from_utf8_lossy(&resp.body()).into_owned();
             let mut dev = bitdaemon_net::upnp::parse_device_description(&body);
+            dev.local_addr = local_addr;
             if dev.control_url.is_empty() || dev.service_namespace.is_empty() {
                 return;
             }
@@ -1315,10 +1470,16 @@ impl Engine {
         if slock(&self.session).settings.anonymous_mode {
             return;
         }
+        let local_addr = dev.local_addr.map(|a| a.to_string()).unwrap_or_default();
         let mut d = UpnpDriver::new(dev, 3600, description);
         let outs = d.set_mappings(vec![
-            (PortmapProtocol::Tcp, local_port, local_port, String::new()),
-            (PortmapProtocol::Udp, local_port, local_port, String::new()),
+            (
+                PortmapProtocol::Tcp,
+                local_port,
+                local_port,
+                local_addr.clone(),
+            ),
+            (PortmapProtocol::Udp, local_port, local_port, local_addr),
         ]);
         self.upnp_devices.push(d);
         let idx = self.upnp_devices.len() - 1;
@@ -1340,7 +1501,10 @@ impl Engine {
                     mapping,
                     action,
                     body,
-                } => self.spawn_upnp_post(dev, mapping, action, body),
+                } => {
+                    debug!(dev, mapping, %action, "upnp soap post");
+                    self.spawn_upnp_post(dev, mapping, action, body);
+                }
                 UpnpOut::Mapped {
                     mapping,
                     external_ip,
@@ -1465,9 +1629,14 @@ impl Engine {
 
     /// feed a SOAP response back into the driver's state machine.
     fn on_upnp_reply(&mut self, r: UpnpReply) {
-        let Ok(body) = r.body else {
-            return; // transport errors drop like upstream timeouts
+        let body = match r.body {
+            Ok(b) => b,
+            Err(e) => {
+                debug!(err = %e, "upnp soap post failed");
+                return; // transport errors drop like upstream timeouts
+            }
         };
+        debug!(dev = r.dev, ip_query = r.is_ip_query, body = %body.get(..160).unwrap_or(&body), "upnp soap reply");
         let outs = if r.is_ip_query {
             self.upnp_devices
                 .get_mut(r.dev)
@@ -1614,29 +1783,32 @@ impl Engine {
                 return Err(std::io::Error::other(e));
             }
         };
-        let (pid, dht) = {
+        let (pid, dht, enc_level) = {
             let ses = slock(&self.session);
-            (ses.peer_id, ses.settings.enable_dht)
+            (
+                ses.peer_id,
+                ses.settings.enable_dht,
+                u32::from(ses.pe_settings.allowed_enc_level),
+            )
         };
         // upstream `peer_connection` always advertises the FAST
         // extension (BEP-6); DHT bit follows `enable_dht`.
         let fast = true;
-        // encrypted flag selects the MSE path upstream-style;
-        // plaintext default for now (`run_handshake_encrypted_*`
-        // available when the caller wants PE)
-        let _hs = if encrypted {
+        // `bt_peer_connection::start` — the encrypted flag selects
+        // the MSE path; the negotiated RC4 state follows the conn
+        // into the io pump.
+        let mut mse_rc4 = None;
+        if encrypted {
             match bitdaemon_net::bt_peer_conn::run_handshake_encrypted_initiator(
-                &mut s,
-                ih,
-                &pid,
-                dht,
-                fast,
-                bitdaemon_net::mse::CRYPTO_PLAINTEXT | bitdaemon_net::mse::CRYPTO_RC4,
-                0,
+                &mut s, ih, &pid, dht, fast, enc_level, 0,
             )
             .await
             {
-                Ok((hs, _)) => hs,
+                Ok((_hs, mse)) => {
+                    if mse.rc4_encrypted {
+                        mse_rc4 = Some(mse.rc4);
+                    }
+                }
                 Err(e) => {
                     slock(&self.session).peer_connect_failed(ih, remote);
                     return Err(std::io::Error::other(e));
@@ -1644,7 +1816,7 @@ impl Engine {
             }
         } else {
             match run_handshake(&mut s, ih, &pid, dht, fast).await {
-                Ok(hs) => hs,
+                Ok(_hs) => {}
                 Err(e) => {
                     slock(&self.session).peer_connect_failed(ih, remote);
                     return Err(std::io::Error::other(e));
@@ -1657,12 +1829,15 @@ impl Engine {
             .get(ih)
             .map_or(0, |t| t.num_pieces as usize);
         // BEP-10: advertise our extension ids right after the handshake
-        let _ =
-            bitdaemon_net::bt_peer_conn::send_extended_handshake(&mut s, &self.ext_handshake(ih))
-                .await;
+        let _ = bitdaemon_net::bt_peer_conn::send_extended_handshake(
+            &mut s,
+            &self.ext_handshake(ih),
+            mse_rc4.as_mut(),
+        )
+        .await;
         let peer = self.next_peer;
         self.next_peer += 1;
-        let conn = PeerConn::new(
+        let mut conn = PeerConn::new(
             num_pieces,
             PeerPipeline::new(
                 self.queue_time,
@@ -1671,9 +1846,13 @@ impl Engine {
             ),
             0,
         );
+        conn.outgoing = true;
+        conn.connecting = false;
+        conn.handshake_done = true;
+        conn.supports_encryption = encrypted;
         let mut out = Vec::new();
         slock(&self.session).peer_connected(ih, peer, conn, remote, &mut out);
-        self.attach_stream(*ih, peer, remote, s);
+        self.attach_stream(*ih, peer, remote, s, mse_rc4);
         self.send_msgs_to_peers(out);
         Ok(peer)
     }
@@ -1740,9 +1919,12 @@ impl Engine {
         conn.outgoing = d.outbound;
         conn.connecting = false;
         conn.handshake_done = true;
+        // `m_encrypted` → `supports_encryption()` (drives the
+        // `pex_encryption` flag + `pi->pe_support` re-arm).
+        conn.supports_encryption = d.encrypted;
         let mut out = Vec::new();
         slock(&self.session).peer_connected(&d.ih, peer, conn, remote, &mut out);
-        self.attach_stream(d.ih, peer, remote, s);
+        self.attach_stream(d.ih, peer, remote, s, d.rc4);
         self.send_msgs_to_peers(out);
     }
 
@@ -1770,7 +1952,7 @@ impl Engine {
             None
         };
         let tx = self.connect_tx.clone();
-        let (pid, dht, ssl_params, peer_proxy) = {
+        let (pid, dht, ssl_params, peer_proxy, enc_level) = {
             let ses = slock(&self.session);
             let ssl = ses.torrents.get(&ih).and_then(|t| {
                 if !t.is_ssl_torrent() {
@@ -1788,6 +1970,7 @@ impl Engine {
                 ses.settings.enable_dht,
                 ssl,
                 ses.proxies.peer.clone(),
+                u32::from(ses.pe_settings.allowed_enc_level),
             )
         };
         // `instantiate_connection` — upstream's transport decision
@@ -1795,6 +1978,9 @@ impl Engine {
         // when `proxy_peer_connections`, plain TCP otherwise.
         let utp_wanted = utp.is_some();
         let is_ssl = ssl_params.is_some();
+        // SSL sockets never run MSE (upstream: `is_ssl_torrent()`
+        // streams are TLS-wrapped — encryption is redundant).
+        let encrypted = encrypted && !is_ssl;
         let kind = match bitdaemon_net::instantiate::instantiate(
             &peer_proxy,
             bitdaemon_net::instantiate::ConnKind::Peer,
@@ -1808,6 +1994,7 @@ impl Engine {
         let fast = true;
         let ext = self.ext_handshake(&ih);
         let session = Arc::clone(&self.session);
+        debug!(%remote, ih = %crate::common::hex::to_hex(&ih.as_bytes()[..8]), "dial spawned");
         let h = tokio::spawn(async move {
             let send_err = |e: String| {
                 let _ = tx.send(DialDone {
@@ -1817,6 +2004,8 @@ impl Engine {
                     outbound: true,
                     fast: false,
                     dht: false,
+                    encrypted: false,
+                    rc4: None,
                 });
             };
             // `instantiate` resolved the socket type — map it back to
@@ -1932,26 +2121,35 @@ impl Engine {
             } else {
                 s
             };
-            let hs = if encrypted {
-                bitdaemon_net::bt_peer_conn::run_handshake_encrypted_initiator(
-                    &mut s,
-                    &ih,
-                    &pid,
-                    dht,
-                    fast,
-                    bitdaemon_net::mse::CRYPTO_PLAINTEXT | bitdaemon_net::mse::CRYPTO_RC4,
-                    0,
+            let (hs, mut mse_rc4) = if encrypted {
+                match bitdaemon_net::bt_peer_conn::run_handshake_encrypted_initiator(
+                    &mut s, &ih, &pid, dht, fast, enc_level, 0,
                 )
                 .await
-                .map(|(hs, _)| hs)
+                {
+                    Ok((hs, mse)) => {
+                        let rc4 = if mse.rc4_encrypted {
+                            Some(mse.rc4)
+                        } else {
+                            None
+                        };
+                        (Ok(hs), rc4)
+                    }
+                    Err(e) => (Err(e), None),
+                }
             } else {
-                run_handshake(&mut s, &ih, &pid, dht, fast).await
+                (run_handshake(&mut s, &ih, &pid, dht, fast).await, None)
             };
-            if let Err(e) = hs {
-                send_err(e.to_string());
-                return;
-            }
-            if let Err(e) = bitdaemon_net::bt_peer_conn::send_extended_handshake(&mut s, &ext).await
+            let hs = match hs {
+                Ok(h) => h,
+                Err(e) => {
+                    send_err(e.to_string());
+                    return;
+                }
+            };
+            if let Err(e) =
+                bitdaemon_net::bt_peer_conn::send_extended_handshake(&mut s, &ext, mse_rc4.as_mut())
+                    .await
             {
                 send_err(e.to_string());
                 return;
@@ -1961,8 +2159,10 @@ impl Engine {
                 remote: Some(remote),
                 stream: Ok(s),
                 outbound: true,
-                fast: hs.as_ref().is_ok_and(|h| h.supports_fast()),
-                dht: hs.as_ref().is_ok_and(|h| h.supports_dht()),
+                fast: hs.supports_fast(),
+                dht: hs.supports_dht(),
+                encrypted,
+                rc4: mse_rc4,
             });
         });
         self.tasks.push(h);
@@ -2011,16 +2211,32 @@ impl Engine {
                     remote.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
                     kind,
                 );
-                let hs = bitdaemon_net::bt_peer_conn::run_handshake_responder(
+                // upstream `on_receive`: probe as plaintext, fall back
+                // to MSE per `in_enc_policy` (the 20 probe bytes are
+                // re-interpreted as the DH key head).
+                let (pe, skeys) = {
+                    let ses = slock(&session);
+                    (
+                        ses.pe_settings,
+                        ses.torrents
+                            .keys()
+                            .map(|ih| (bitdaemon_net::pe_crypto::stream_key_hash(ih), *ih))
+                            .collect::<std::collections::HashMap<_, _>>(),
+                    )
+                };
+                let hs = bitdaemon_net::bt_peer_conn::run_handshake_responder_auto(
                     &mut s,
                     &pid,
                     dht,
                     true,
                     |ih| known.lock().unwrap_or_else(|e| e.into_inner()).contains(ih),
+                    pe.in_enc_policy,
+                    |sk| skeys.get(sk).copied(),
+                    |provide| crypto_select(provide, pe),
                 )
                 .await;
                 match hs {
-                    Ok(hs) => {
+                    Ok((hs, rc4, encrypted)) => {
                         let _ = tx.send(DialDone {
                             ih: hs.info_hash,
                             // the accepted source endpoint — needed for
@@ -2030,6 +2246,8 @@ impl Engine {
                             outbound: false,
                             fast: hs.supports_fast(),
                             dht: hs.supports_dht(),
+                            encrypted,
+                            rc4,
                         });
                     }
                     Err(e) => {
@@ -2130,6 +2348,9 @@ impl Engine {
                             outbound: false,
                             fast: hs.supports_fast(),
                             dht: hs.supports_dht(),
+                            // upstream: SSL sockets never run MSE.
+                            encrypted: false,
+                            rc4: None,
                         });
                     }
                     Err(e) => {
@@ -2205,6 +2426,7 @@ impl Engine {
         max_dials_per_tick: usize,
     ) {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let disk_notify = self.disk_notify.clone();
         tokio::pin!(stop);
         loop {
             tokio::select! {
@@ -2229,6 +2451,47 @@ impl Engine {
                             Err(_) => break,
                         }
                     }
+                    // `call_job_handlers` — upstream posts this on the
+                    // io_context on each 0→1 completion transition, so
+                    // piece responses are written as disk jobs land,
+                    // not on the next 1 Hz tick. Draining per inbound
+                    // batch keeps upload latency bounded under load.
+                    slock(&self.session).drain_disk_completed(&mut out);
+                    // `on_sent` events pile up under sustained upload —
+                    // drain them here too (the dedicated select branch
+                    // covers the quiet case).
+                    while let Ok((ih, peer, bytes)) = self.sent_rx.try_recv() {
+                        slock(&self.session).on_peer_sent(&ih, peer, bytes, &mut out);
+                    }
+                    self.dispatch(out).await;
+                    continue;
+                }
+                _ = disk_notify.notified() => {
+                    // `disk_completed_queue` poster → run the handlers
+                    // and push the resulting effects now.
+                    let mut out = Vec::new();
+                    slock(&self.session).drain_disk_completed(&mut out);
+                    self.dispatch(out).await;
+                    continue;
+                }
+                first = self.sent_rx.recv() => {
+                    // `on_sent` — a peer socket drained some of its
+                    // send buffer; re-run `fill_send_buffer` so reads
+                    // resume under the watermark without waiting for
+                    // the 1 Hz tick.
+                    let mut out = Vec::new();
+                    if let Some((ih, peer, bytes)) = first {
+                        slock(&self.session).on_peer_sent(&ih, peer, bytes, &mut out);
+                    }
+                    for _ in 0..1024 {
+                        match self.sent_rx.try_recv() {
+                            Ok((ih, peer, bytes)) => {
+                                slock(&self.session)
+                                    .on_peer_sent(&ih, peer, bytes, &mut out);
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     self.dispatch(out).await;
                     continue;
                 }
@@ -2243,8 +2506,8 @@ impl Engine {
                 max_dials_per_tick
             };
             let candidates = self.connect_pump(stime, &st, budget);
-            for (ih, ep) in candidates {
-                self.spawn_dial(ih, ep, false);
+            for (ih, ep, enc) in candidates {
+                self.spawn_dial(ih, ep, enc);
             }
         }
     }
@@ -2265,9 +2528,10 @@ impl Engine {
             if let Some(md) = &t.metadata_raw {
                 hs.metadata_size = Some(md.len() as i64);
             }
-            // BEP-21 — seeds advertise `upload_only`; likewise
-            // `share_mode` when the swarm flag is set.
-            hs.upload_only = t.is_seed();
+            // BEP-21 — `is_upload_only() && !share_mode() &&
+            // !super_seeding()` (upstream `write_extensions`);
+            // `share_mode` is advertised on its own key.
+            hs.upload_only = (t.is_seed() || t.upload_mode) && !t.share_mode && !t.super_seeding;
             hs.share_mode = t.share_mode;
         }
         hs
@@ -2297,17 +2561,29 @@ impl Engine {
             let ses = slock(&self.session);
             (ses.peer_id, ses.settings.enable_dht)
         };
-        let ih_known = {
-            // snapshot of known info-hashes for the callback
-            let set: Vec<Sha1Hash> = slock(&self.session).torrents.keys().copied().collect();
-            move |ih: &Sha1Hash| set.contains(ih)
+        let (ih_known, in_policy, skeys, pe) = {
+            let ses = slock(&self.session);
+            let set: Vec<Sha1Hash> = ses.torrents.keys().copied().collect();
+            let skeys = ses
+                .torrents
+                .keys()
+                .map(|ih| (bitdaemon_net::pe_crypto::stream_key_hash(ih), *ih))
+                .collect::<std::collections::HashMap<_, _>>();
+            (set, ses.pe_settings.in_enc_policy, skeys, ses.pe_settings)
         };
-        let hs = match bitdaemon_net::bt_peer_conn::run_handshake_responder(
-            &mut s, &pid, dht, true, ih_known,
+        let hs = match bitdaemon_net::bt_peer_conn::run_handshake_responder_auto(
+            &mut s,
+            &pid,
+            dht,
+            true,
+            |ih| ih_known.contains(ih),
+            in_policy,
+            |sk| skeys.get(sk).copied(),
+            |provide| crypto_select(provide, pe),
         )
         .await
         {
-            Ok(hs) => hs,
+            Ok(r) => r,
             // `peer_connection::on_connected` — an inbound ih that
             // matches our DHT secret-id means the remote fished it
             // out of DHT chatter: suspicious → `ban_ip`.
@@ -2319,47 +2595,51 @@ impl Engine {
             }
             Err(e) => return Err(std::io::Error::other(e)),
         };
+        let (hs, rc4, encrypted) = hs;
         let num_pieces = slock(&self.session)
             .torrents
             .get(&hs.info_hash)
             .map_or(0, |t| t.num_pieces as usize);
         let peer = self.next_peer;
         self.next_peer += 1;
-        let mut out = Vec::new();
-        slock(&self.session).peer_connected(
-            &hs.info_hash,
-            peer,
-            PeerConn::new(
-                num_pieces,
-                PeerPipeline::new(
-                    self.queue_time,
-                    self.request_timeout,
-                    self.max_out_request_queue,
-                ),
-                0,
+        let mut conn = PeerConn::new(
+            num_pieces,
+            PeerPipeline::new(
+                self.queue_time,
+                self.request_timeout,
+                self.max_out_request_queue,
             ),
-            remote,
-            &mut out,
+            0,
         );
-        self.attach_stream(hs.info_hash, peer, remote, s);
+        conn.outgoing = false;
+        conn.connecting = false;
+        conn.handshake_done = true;
+        conn.supports_encryption = encrypted;
+        let mut out = Vec::new();
+        slock(&self.session).peer_connected(&hs.info_hash, peer, conn, remote, &mut out);
+        self.attach_stream(hs.info_hash, peer, remote, s, rc4);
         self.send_msgs_to_peers(out);
         Ok(Some(peer))
     }
 
     /// split a live peer stream into reader/writer tasks feeding the
-    /// engine queues.
+    /// engine queues. `rc4` is the negotiated MSE keystream — all
+    /// wire traffic goes through it when present
+    /// (`m_rc4_encrypted`).
     fn attach_stream(
         &mut self,
         ih: Sha1Hash,
         peer: u64,
         remote: SocketAddr,
         mut s: BoxedPeerStream,
+        rc4: Option<bitdaemon_net::pe_crypto::Rc4Handler>,
     ) {
         let (tx, mut rx) = mpsc::unbounded_channel::<PeerMessage>();
         self.writers.insert((ih, peer), tx);
 
         let inbound_tx = self.inbound_tx.clone();
         let gone_tx = self.gone_tx.clone();
+        let sent_tx = self.sent_tx.clone();
         let ul = self.upload_limiter.clone();
         let dl = self.download_limiter.clone();
         let tul = self.torrent_up_limiters.get(&ih).cloned();
@@ -2372,6 +2652,7 @@ impl Engine {
         // and desyncs the frame stream.
         let h = tokio::spawn(async move {
             let mut buf = bytes::BytesMut::with_capacity(256 * 1024);
+            let mut rc4 = rc4;
             'pump: loop {
                 tokio::select! {
                     r = tokio::io::AsyncReadExt::read_buf(&mut s, &mut buf) => {
@@ -2380,7 +2661,14 @@ impl Engine {
                                 debug!(peer = peer, remote = ?remote, err = %"eof", "peer read error, dropping");
                                 break;
                             }
-                            Ok(_) => loop {
+                            Ok(n) => {
+                                // RC4 stream decryption happens in
+                                // place before frame decode.
+                                if let Some(r) = &mut rc4 {
+                                    let tail = buf.len() - n;
+                                    r.decrypt(&mut buf[tail..]);
+                                }
+                                loop {
                                 match bitdaemon_net::bt_peer_conn::decode_next(&mut buf) {
                                     Ok(Some(msg)) => {
                                         // download throttle — hold the
@@ -2411,6 +2699,7 @@ impl Engine {
                                         debug!(peer = peer, remote = ?remote, err = %e, "peer read error, dropping");
                                         break 'pump;
                                     }
+                                }
                                 }
                             },
                             Err(e) => {
@@ -2453,9 +2742,29 @@ impl Engine {
                                         }
                                     }
                                 }
-                                if let Err(e) = write_messages(&mut s, &batch).await {
-                                    debug!(peer = peer, remote = ?remote, err = %e, "peer write error, dropping");
-                                    break;
+                                let wres = if let Some(r) = &mut rc4 {
+                                    bitdaemon_net::bt_peer_conn::write_messages_rc4(
+                                        &mut s, r, &batch,
+                                    )
+                                    .await
+                                } else {
+                                    write_messages(&mut s, &batch).await
+                                };
+                                match wres {
+                                    Err(e) => {
+                                        debug!(peer = peer, remote = ?remote, err = %e, "peer write error, dropping");
+                                        break;
+                                    }
+                                    Ok(()) => {
+                                        // `on_sent` — the bytes left
+                                        // the send buffer; session
+                                        // re-runs `fill_send_buffer`.
+                                        let n: usize = batch
+                                            .iter()
+                                            .map(bitdaemon_net::peer_wire::wire_len)
+                                            .sum();
+                                        let _ = sent_tx.send((ih, peer, n));
+                                    }
                                 }
                             }
                             None => break,
@@ -2478,18 +2787,24 @@ impl Engine {
         session_time: i32,
         state: &bitdaemon_net::peer_list::PeerListState,
         max_peers: usize,
-    ) -> Vec<(Sha1Hash, SocketAddr)> {
-        let seeding_outgoing = slock(&self.session).settings.seeding_outgoing_connections;
+    ) -> Vec<(Sha1Hash, SocketAddr, bool)> {
+        let (seeding_outgoing, out_policy) = {
+            let ses = slock(&self.session);
+            (
+                ses.settings.seeding_outgoing_connections,
+                ses.pe_settings.out_enc_policy,
+            )
+        };
         let mut dialing = Vec::new();
         for (ih, t) in &mut slock(&self.session).torrents {
             if dialing.len() >= max_peers || !t.want_peers(seeding_outgoing) {
                 continue;
             }
-            for ep in t.connect_candidates(session_time, state) {
+            for (ep, enc) in t.connect_candidates(session_time, state, out_policy) {
                 if dialing.len() >= max_peers {
                     break;
                 }
-                dialing.push((*ih, ep));
+                dialing.push((*ih, ep, enc));
             }
         }
         dialing
@@ -2559,6 +2874,26 @@ async fn resolve_for_socket(
 /// (low nibble) and `type <= ST_RESET` (high nibble).
 fn is_utp_datagram(buf: &[u8]) -> bool {
     buf.len() >= 20 && buf[0] & 0x0f == 1 && (buf[0] >> 4) <= 4
+}
+
+/// upstream `read_pe_cryptofield`'s `crypto_select` — intersect the
+/// peer's `crypto_provide` with `allowed_enc_level`, keep the most
+/// significant bit when `prefer_rc4`, the least significant
+/// otherwise (bt_peer_connection.cpp:3153).
+fn crypto_select(provide: u32, pe: bitdaemon_net::pe_crypto::PeSettings) -> u32 {
+    use bitdaemon_net::mse::{CRYPTO_PLAINTEXT, CRYPTO_RC4};
+    let allowed = provide & u32::from(pe.allowed_enc_level);
+    if pe.prefer_rc4 {
+        if allowed & CRYPTO_RC4 != 0 {
+            CRYPTO_RC4
+        } else {
+            allowed & CRYPTO_PLAINTEXT
+        }
+    } else if allowed & CRYPTO_PLAINTEXT != 0 {
+        CRYPTO_PLAINTEXT
+    } else {
+        allowed & CRYPTO_RC4
+    }
 }
 
 impl Drop for Engine {

@@ -14,6 +14,7 @@ use std::sync::Arc;
 use bitdaemon::core::add_torrent_params::AddTorrentParams;
 use bitdaemon::core::magnet_uri::parse_magnet;
 use bitdaemon::core::torrent_info::load_torrent;
+use bitdaemon::disk::disk_interface::DiskIo;
 use bitdaemon::disk::disk_io::PreadDiskIo;
 use bitdaemon::engine::Engine;
 use bitdaemon::net::os_transports::{TokioTcpAcceptor, TokioTcpConnector, TokioUdpSocket};
@@ -24,8 +25,10 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "bitdaemon", version, about)]
 struct Args {
-    /// .torrent file path or magnet: URI.
-    torrent: String,
+    /// .torrent file path or magnet: URI — repeatable (upstream
+    /// `client_test` adds every positional to the same session).
+    #[arg(required_unless_present = "session")]
+    torrent: Vec<String>,
 
     /// Download directory.
     #[arg(short, long, default_value = ".")]
@@ -35,6 +38,11 @@ struct Args {
     #[arg(short, long, default_value_t = 6881)]
     port: u16,
 
+    /// Extra IPv6 loopback listen port (`[::1]:<port6>`) — upstream
+    /// `listen_interfaces` accepts v6 endpoints alongside v4.
+    #[arg(long)]
+    port6: Option<u16>,
+
     /// Direct peer to connect to (ip:port), repeatable.
     #[arg(long = "peer")]
     peers: Vec<String>,
@@ -43,6 +51,20 @@ struct Args {
     /// (upstream `add_torrent_params::flag_seed_mode`).
     #[arg(long)]
     seed: bool,
+
+    /// Super-seeding mode (upstream `torrent_flags::super_seeding`).
+    #[arg(long)]
+    super_seed: bool,
+
+    /// Upload-only mode — never request pieces, only serve (upstream
+    /// `torrent_flags::upload_mode` + BEP-21 `upload_only` announce).
+    #[arg(long)]
+    upload_only: bool,
+
+    /// File priority `index:level` (0-7, upstream `file_priority`),
+    /// repeatable — applied to every positional torrent.
+    #[arg(long = "file-priority")]
+    file_priorities: Vec<String>,
 
     /// Download rate limit in bytes/s (upstream
     /// `settings_pack::download_rate_limit`; 0 = unlimited).
@@ -114,6 +136,12 @@ struct Args {
     #[arg(long)]
     ssl_port: Option<u16>,
 
+    /// `.session` file — full session state (torrents + DHT routing
+    /// and settings) restored at startup and written back on graceful
+    /// shutdown (upstream `client_test`'s session-state round-trip).
+    #[arg(long)]
+    session: Option<PathBuf>,
+
     /// Fastresume file (libtorrent `.fastresume` format) — restores
     /// have-bits and unfinished blocks; the positional .torrent/magnet
     /// supplies metadata when the resume file has no info dict.
@@ -124,6 +152,43 @@ struct Args {
     /// ctrl-c, writes `.resume` before exiting).
     #[arg(long)]
     stop_after: Option<u64>,
+
+    /// MSE/PE encryption policy for both directions (upstream
+    /// `out_enc_policy`/`in_enc_policy`).
+    #[arg(long, default_value = "enabled")]
+    enc_policy: EncPolicyArg,
+
+    /// Crypto level offered during MSE negotiation (upstream
+    /// `allowed_enc_level`).
+    #[arg(long, default_value = "both")]
+    enc_level: EncLevelArg,
+
+    /// Pick RC4 over plaintext when both are offered (upstream
+    /// `prefer_rc4`).
+    #[arg(long)]
+    prefer_rc4: bool,
+
+    /// Extra DHT bootstrap node `host:port`, repeatable (upstream
+    /// `dht_bootstrap_nodes`) — replaces the public-router defaults
+    /// when given.
+    #[arg(long = "dht-node")]
+    dht_nodes: Vec<String>,
+}
+
+/// `pe_settings::enc_policy` CLI mapping.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum EncPolicyArg {
+    Disabled,
+    Enabled,
+    Forced,
+}
+
+/// `pe_settings::enc_level` CLI mapping.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum EncLevelArg {
+    Plaintext,
+    Rc4,
+    Both,
 }
 
 fn load_atp(arg: &str, save_path: &std::path::Path) -> anyhow::Result<AddTorrentParams> {
@@ -142,53 +207,67 @@ fn load_atp(arg: &str, save_path: &std::path::Path) -> anyhow::Result<AddTorrent
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    let mut atp = if let Some(resume) = &args.resume {
-        let buf = std::fs::read(resume)?;
-        let mut a = bitdaemon::core::resume_data::read_resume_data(
-            &buf,
-            &bitdaemon::core::LoadTorrentLimits::default(),
-        )
-        .map_err(|e| anyhow::anyhow!("resume: {e}"))?;
-        // a resume without an embedded info dict still needs metadata
-        // from the positional .torrent/magnet
-        if a.ti.is_none() {
-            let base = load_atp(&args.torrent, &args.save_path)?;
-            a.ti = base.ti;
-            a.info_hashes = base.info_hashes;
-            if a.trackers.is_empty() {
-                a.trackers = base.trackers;
+    anyhow::ensure!(
+        args.resume.is_none() || args.torrent.len() == 1,
+        "--resume only pairs with a single positional torrent"
+    );
+    let mut atps = Vec::new();
+    for entry in &args.torrent {
+        let mut atp = if let Some(resume) = &args.resume {
+            let buf = std::fs::read(resume)?;
+            let mut a = bitdaemon::core::resume_data::read_resume_data(
+                &buf,
+                &bitdaemon::core::LoadTorrentLimits::default(),
+            )
+            .map_err(|e| anyhow::anyhow!("resume: {e}"))?;
+            // a resume without an embedded info dict still needs metadata
+            // from the positional .torrent/magnet
+            if a.ti.is_none() {
+                let base = load_atp(entry, &args.save_path)?;
+                a.ti = base.ti;
+                a.info_hashes = base.info_hashes;
+                if a.trackers.is_empty() {
+                    a.trackers = base.trackers;
+                }
+            }
+            a.save_path = args.save_path.as_os_str().as_encoded_bytes().to_vec();
+            a.storage_mode = bitdaemon::core::StorageMode::Allocate;
+            a
+        } else {
+            load_atp(entry, &args.save_path)?
+        };
+        if args.seed {
+            atp.flags |= bitdaemon::common::flags::TorrentFlags::SEED_MODE;
+            // seed_mode upstream still requires the `have` bits set —
+            // claim every piece (verify is skipped by contract).
+            if let Some(ti) = &atp.ti {
+                let mut bf = bitdaemon::common::Bitfield::with_size(ti.num_pieces() as usize);
+                bf.set_all();
+                atp.have_pieces = bf;
             }
         }
-        a.save_path = args.save_path.as_os_str().as_encoded_bytes().to_vec();
-        a.storage_mode = bitdaemon::core::StorageMode::Allocate;
-        a
-    } else {
-        load_atp(&args.torrent, &args.save_path)?
-    };
-    if args.seed {
-        atp.flags |= bitdaemon::common::flags::TorrentFlags::SEED_MODE;
-        // seed_mode upstream still requires the `have` bits set —
-        // claim every piece (verify is skipped by contract).
-        if let Some(ti) = &atp.ti {
-            let mut bf = bitdaemon::common::Bitfield::with_size(ti.num_pieces() as usize);
-            bf.set_all();
-            atp.have_pieces = bf;
+        if args.super_seed {
+            atp.flags |= bitdaemon::common::flags::TorrentFlags::SUPER_SEEDING;
         }
-    }
-
-    // disk io — `pread_disk_io(aio_threads, poster)`; the poster is a
-    // no-op here because the engine tick drains the completion queue.
-    // Upstream defaults: hashing pool = 1 thread, no_atime = true,
-    // SetFileValidData on for qBittorrent parity (ADR-0022).
-    let disk = PreadDiskIo::new(args.aio_threads, Arc::new(|| {}));
-    disk.set_hash_threads(args.hashing_threads);
-    {
-        use bitdaemon::disk::open_mode::OpenMode;
-        let mut extra = OpenMode::NO_ATIME;
-        if !args.no_set_file_valid_data {
-            extra |= OpenMode::ALLOW_SET_FILE_VALID_DATA;
+        if args.upload_only {
+            atp.flags |= bitdaemon::common::flags::TorrentFlags::UPLOAD_MODE;
         }
-        disk.set_open_mode_extra(extra);
+        for fp in &args.file_priorities {
+            let (idx, lvl) = fp
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("--file-priority wants index:level, got {fp}"))?;
+            let idx: usize = idx.parse()?;
+            let lvl: u8 = lvl.parse()?;
+            anyhow::ensure!(lvl <= 7, "--file-priority level 0-7, got {lvl}");
+            if atp.file_priorities.len() <= idx {
+                // `file_storage::file_priority` default is 4
+                // (upstream `default_prio`); resize keeps the tail.
+                atp.file_priorities
+                    .resize(idx + 1, bitdaemon::common::types::DownloadPriority::DEFAULT);
+            }
+            atp.file_priorities[idx] = bitdaemon::common::types::DownloadPriority::from(lvl);
+        }
+        atps.push(atp);
     }
 
     // `torrent::init` semantics: the session builds the storage from
@@ -207,6 +286,43 @@ async fn main() -> anyhow::Result<()> {
     // OS resolver — the default transports' DNS companion (anonymous
     // deployments inject a circuit resolver instead; ADR-0008).
     eng.set_resolver(Arc::new(bitdaemon::net::resolver::SystemResolver));
+    // disk io — `pread_disk_io(aio_threads, poster)`; the poster is
+    // the engine's wake-up: each 0→1 completion transition runs
+    // `call_job_handlers` on the network loop like upstream, instead
+    // of batching piece responses to the 1 Hz tick.
+    // Upstream defaults: hashing pool = 1 thread, no_atime = true,
+    // SetFileValidData on for qBittorrent parity (ADR-0022).
+    let disk = PreadDiskIo::new(args.aio_threads, {
+        let n = eng.disk_notify();
+        Arc::new(move || n.notify_one())
+    });
+    disk.set_hash_threads(args.hashing_threads);
+    {
+        use bitdaemon::disk::open_mode::OpenMode;
+        let mut extra = OpenMode::NO_ATIME;
+        if !args.no_set_file_valid_data {
+            extra |= OpenMode::ALLOW_SET_FILE_VALID_DATA;
+        }
+        disk.set_open_mode_extra(extra);
+    }
+    // `lsd` socket — upstream opens a dedicated socket on the
+    // well-known multicast port 6771 (separate from the listen
+    // socket). `enable_lsd` is on by default; a bind/join failure
+    // just drops the feature for this run.
+    if let Some(iface) = bitdaemon::net::enum_net::enum_interfaces()
+        .iter()
+        .find_map(|i| match i.interface_address {
+            IpAddr::V4(a) => Some(a),
+            _ => None,
+        })
+    {
+        match TokioUdpSocket::bind_lsd(iface) {
+            Ok(lsd) => {
+                eng.set_lsd_datagram(Arc::new(lsd));
+            }
+            Err(e) => eprintln!("lsd socket unavailable: {e}"),
+        }
+    }
     // `client_test` upstream runs with `alert_mask = all_categories`;
     // the session default is `error`-only.
     {
@@ -223,7 +339,29 @@ async fn main() -> anyhow::Result<()> {
         slock(&eng.session).settings.disk_io_read_mode =
             bitdaemon::session::settings::DiskIoMode::DisableOsCache;
     }
-    slock(&eng.session).set_disk(disk);
+    {
+        use bitdaemon::net::pe_crypto::{EncPolicy, enc_level};
+        let pol = match args.enc_policy {
+            EncPolicyArg::Disabled => EncPolicy::Disabled,
+            EncPolicyArg::Enabled => EncPolicy::Enabled,
+            EncPolicyArg::Forced => EncPolicy::Forced,
+        };
+        let lvl = match args.enc_level {
+            EncLevelArg::Plaintext => enc_level::PLAINTEXT,
+            EncLevelArg::Rc4 => enc_level::RC4,
+            EncLevelArg::Both => enc_level::BOTH,
+        };
+        let mut s = slock(&eng.session);
+        s.settings.out_enc_policy = pol;
+        s.settings.in_enc_policy = pol;
+        s.settings.allowed_enc_level = lvl;
+        s.settings.prefer_rc4 = args.prefer_rc4;
+        s.pe_settings.out_enc_policy = pol;
+        s.pe_settings.in_enc_policy = pol;
+        s.pe_settings.allowed_enc_level = lvl;
+        s.pe_settings.prefer_rc4 = args.prefer_rc4;
+    }
+    slock(&eng.session).set_disk(disk.clone());
     slock(&eng.session).set_listen_port(args.port);
     slock(&eng.session).set_dht_port(udp_port);
     if args.limit > 0 {
@@ -277,9 +415,66 @@ async fn main() -> anyhow::Result<()> {
         bitdaemon::dht::dht_settings::DhtSettings::default(),
     );
 
+    // `.session` restore — upstream `session_params` load order:
+    // the saved blob wins for everything the CLI didn't touch, so
+    // the flags applied above (enc policy, cache modes, limits,
+    // alert mask) are re-asserted after the load.
+    if let Some(sp) = &args.session
+        && let Ok(buf) = std::fs::read(sp)
     {
+        let prev = {
+            let s = slock(&eng.session);
+            (
+                s.settings.alert_mask,
+                s.settings.disk_io_write_mode,
+                s.settings.disk_io_read_mode,
+                s.settings.out_enc_policy,
+                s.settings.in_enc_policy,
+                s.settings.allowed_enc_level,
+                s.settings.prefer_rc4,
+                s.settings.download_rate_limit,
+            )
+        };
         let mut out = Vec::new();
-        let ih = slock(&eng.session).add_torrent_params(&atp, storage, &mut out);
+        let n = slock(&eng.session).load_state(&buf, &mut out);
+        for o in out {
+            eng.dispatch_out(o);
+        }
+        {
+            let mut s = slock(&eng.session);
+            s.settings.alert_mask = prev.0;
+            s.settings.disk_io_write_mode = prev.1;
+            s.settings.disk_io_read_mode = prev.2;
+            s.settings.out_enc_policy = prev.3;
+            s.settings.in_enc_policy = prev.4;
+            s.settings.allowed_enc_level = prev.5;
+            s.settings.prefer_rc4 = prev.6;
+            s.settings.download_rate_limit = prev.7;
+        }
+        println!("session restored: {n} torrent(s)");
+        // `--peer` reaches torrents restored from `.session` too
+        // (the positional loop below only covers new additions).
+        if !args.peers.is_empty() {
+            let ihs: Vec<bitdaemon::common::Sha1Hash> =
+                slock(&eng.session).torrents.keys().copied().collect();
+            let h =
+                bitdaemon::session::session_handle::SessionHandle::from_shared(eng.session.clone());
+            for ih in ihs {
+                if let Some(t) = h.find_torrent(&ih) {
+                    for p in &args.peers {
+                        match p.parse::<std::net::SocketAddr>() {
+                            Ok(addr) => t.connect_peer(addr),
+                            Err(e) => eprintln!("bad --peer {p}: {e}"),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for atp in &atps {
+        let mut out = Vec::new();
+        let ih = slock(&eng.session).add_torrent_params(atp, storage, &mut out);
         for o in out {
             eng.dispatch_out(o);
         }
@@ -324,6 +519,16 @@ async fn main() -> anyhow::Result<()> {
     let listen_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), args.port);
     let acceptor = TokioTcpAcceptor::bind(listen_addr).await?;
     eng.start_acceptor_at(Arc::new(acceptor), Some(listen_addr), 0);
+    if let Some(p6) = args.port6 {
+        let addr6 = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), p6);
+        match TokioTcpAcceptor::bind(addr6).await {
+            Ok(acc6) => {
+                eng.start_acceptor_at(Arc::new(acc6), Some(addr6), 0);
+                println!("v6 listen on {addr6}");
+            }
+            Err(e) => eprintln!("v6 bind {addr6}: {e}"),
+        }
+    }
     if let Some(ssl_port) = args.ssl_port {
         let ssl_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ssl_port);
         let ssl_acceptor = TokioTcpAcceptor::bind(ssl_addr).await?;
@@ -333,22 +538,51 @@ async fn main() -> anyhow::Result<()> {
     if args.utp {
         eng.enable_utp().await;
         println!("uTP enabled (outgoing + incoming)");
+        // upstream `…s` listen interfaces also accept uTP — a
+        // dedicated UDP socket on the ssl port for `ssl_stream<
+        // utp_stream>` accepts.
+        if let Some(ssl_port) = args.ssl_port {
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ssl_port);
+            match TokioUdpSocket::bind(addr).await {
+                Ok(dg) => {
+                    eng.start_ssl_utp(Arc::new(dg), addr, 6).await;
+                    println!("ssl uTP listen on :{ssl_port} (udp)");
+                }
+                Err(e) => eprintln!("ssl uTP bind :{ssl_port}: {e}"),
+            }
+        }
     }
     eng.start_udp_pump();
+    eng.start_lsd_pump();
 
-    // upstream `dht_bootstrap_nodes` setting — seed the routing
-    // table from the well-known public routers.
-    for host in [
-        "router.bittorrent.com",
-        "router.utorrent.com",
-        "router.bitcomet.com",
-        "dht.transmissionbt.com",
-        "dht.aelitis.com",
-    ] {
-        eng.dispatch_out(bitdaemon::session::session::SessionOut::DhtAddNode {
-            host: host.into(),
-            port: 6881,
-        });
+    // upstream `dht_bootstrap_nodes` setting — `--dht-node` supplies
+    // explicit nodes (loopback benches); otherwise the well-known
+    // public routers.
+    if args.dht_nodes.is_empty() {
+        for host in [
+            "router.bittorrent.com",
+            "router.utorrent.com",
+            "router.bitcomet.com",
+            "dht.transmissionbt.com",
+            "dht.aelitis.com",
+        ] {
+            eng.dispatch_out(bitdaemon::session::session::SessionOut::DhtAddNode {
+                host: host.into(),
+                port: 6881,
+            });
+        }
+    } else {
+        for n in &args.dht_nodes {
+            match n.rsplit_once(':') {
+                Some((h, p)) => {
+                    eng.dispatch_out(bitdaemon::session::session::SessionOut::DhtAddNode {
+                        host: h.into(),
+                        port: p.parse().unwrap_or(6881),
+                    });
+                }
+                None => eprintln!("bad --dht-node {n}"),
+            }
+        }
     }
 
     // status printer + ctrl-c stop
@@ -367,7 +601,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(d) = &guard.disk {
                 let q = d.queue_stats();
                 println!(
-                    "disk queue: w={} h={} other={} parked={} write_blocks={} cache={} unhashed={} bufs={} threads={} bp={}",
+                    "disk queue: w={} h={} other={} parked={} write_blocks={} cache={} unhashed={} bufs={} threads={} ro={} rb={} bp={}",
                     q.queued_writes,
                     q.queued_hashes,
                     q.queued_other,
@@ -377,6 +611,8 @@ async fn main() -> anyhow::Result<()> {
                     q.num_unhashed,
                     q.disk_blocks_in_use,
                     q.threads,
+                    q.num_read_ops,
+                    q.num_blocks_read,
                     d.write_queue_exceeded(),
                 );
             }
@@ -426,6 +662,19 @@ async fn main() -> anyhow::Result<()> {
     )
     .await;
 
+    // graceful teardown: flush every dirty write run before saving
+    // state — upstream drains the write cache on shutdown; skipping
+    // it leaves holes the next run's recheck hashes as missing.
+    disk.flush_all();
+    for _ in 0..800 {
+        disk.call_job_handlers();
+        let q = disk.queue_stats();
+        if q.queued_disk_jobs == 0 && q.queued_writes == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
     // client_test behavior: drop a fastresume file per torrent on
     // shutdown — `<save_path>/<v1-infohash>.resume`, loadable via
     // `--resume` on the next run (or by a C++ client).
@@ -444,6 +693,18 @@ async fn main() -> anyhow::Result<()> {
                 Ok(()) => println!("saved {}", path.display()),
                 Err(e) => eprintln!("resume save {}: {e}", path.display()),
             }
+        }
+    }
+    // `.session` round-trip — torrents + DHT + settings in one blob
+    // (upstream `save_session_state` on shutdown).
+    if let Some(sp) = &args.session {
+        let buf = {
+            let s = slock(&eng.session);
+            bitdaemon::session::session_state::save_session_state_buf(&s.save_state())
+        };
+        match std::fs::write(sp, &buf) {
+            Ok(()) => println!("saved session {}", sp.display()),
+            Err(e) => eprintln!("session save {}: {e}", sp.display()),
         }
     }
     Ok(())
