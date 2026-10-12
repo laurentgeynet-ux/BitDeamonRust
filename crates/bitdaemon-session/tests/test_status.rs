@@ -11,7 +11,7 @@ use std::time::Instant;
 use bitdaemon_common::types::StorageIndex;
 use bitdaemon_common::{Bitfield, Sha1Hash};
 use bitdaemon_net::http_tracker::TrackerResponse;
-use bitdaemon_session::alerts::Alert;
+use bitdaemon_session::alerts::{Alert, AlertCategory};
 use bitdaemon_session::session::Session;
 use bitdaemon_session::status::TorrentState;
 use bitdaemon_session::torrent::Torrent;
@@ -24,6 +24,7 @@ fn status_snapshot() {
     t.name = "swarm-x".into();
     t.save_path = "/dl".into();
     let mut s = Session::new();
+    s.alerts.set_mask(AlertCategory::ALL);
     s.add_torrent(t);
 
     // scrape feeds the status counters

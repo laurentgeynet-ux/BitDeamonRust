@@ -238,6 +238,11 @@ pub fn save_settings_to_dict(s: &SessionSettings) -> Entry {
         s.alert_queue_size as i64,
         dflt.alert_queue_size as i64
     );
+    i!(
+        b"alert_mask",
+        i64::from(s.alert_mask.bits()),
+        i64::from(dflt.alert_mask.bits())
+    );
     b!(b"enable_dht", s.dht_enabled, dflt.dht_enabled);
     b!(
         b"enable_incoming_utp",
@@ -405,6 +410,10 @@ pub fn read_settings_dict(n: &BdecodeNode<'_>) -> SessionSettings {
     let v = g!(b"alert_queue_size");
     if v != i64::MIN {
         s.alert_queue_size = v.max(0) as usize;
+    }
+    let v = g!(b"alert_mask");
+    if v != i64::MIN {
+        s.alert_mask = crate::alerts::AlertCategory::from_bits(v.max(0) as u32);
     }
     b!(b"enable_dht", &mut s.dht_enabled);
     b!(b"enable_incoming_utp", &mut s.enable_incoming_utp);

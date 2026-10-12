@@ -55,8 +55,9 @@ fn tier_ordering_and_failover() {
 
 #[test]
 fn alert_mask_and_queue_limit() {
-    let mut m = AlertManager::new(2, AlertCategory::PEER);
-    m.post(Alert::SessionError("x".into())); // filtered out
+    // `peer_disconnected_alert` is CONNECT category upstream.
+    let mut m = AlertManager::new(2, AlertCategory::CONNECT);
+    m.post(Alert::SessionError("x".into())); // ERROR — masked off
     assert!(m.is_empty());
     for i in 0..4 {
         m.post(Alert::PeerDisconnected {
@@ -64,6 +65,57 @@ fn alert_mask_and_queue_limit() {
             reason: i.to_string(),
         });
     }
+    // 2 queued; the overflow drops are recorded per `alert_type` and
+    // a synthesized `alerts_dropped_alert` rides `get_all`.
+    let all = m.get_all();
+    assert_eq!(all.len(), 3);
+    assert!(matches!(
+        all.last(),
+        Some(Alert::AlertsDropped { types }) if types == &[24]
+    ));
+}
+
+#[test]
+fn category_zero_alerts_are_unconditional() {
+    // upstream `emplace_alert` is unconditional — `SessionStats`/
+    // `DhtStats`/`SessionStatsHeader` post even under `mask = 0`.
+    let mut m = AlertManager::new(10, AlertCategory(0));
+    m.post(Alert::SessionStatsHeader {});
+    m.post(Alert::DhtStats {
+        v4: (1, 2, 3),
+        v6: (4, 5, 6),
+    });
+    m.post(Alert::PeerDisconnected {
+        ih: Default::default(),
+        reason: "x".into(),
+    }); // CONNECT — masked
     assert_eq!(m.get_all().len(), 2);
-    assert_eq!(m.num_dropped(), 2);
+}
+
+#[test]
+fn priority_gives_queue_headroom() {
+    // upstream: `queue.size() / (1 + priority) >= limit` — a
+    // critical alert has 3× the headroom of a normal one.
+    let mut m = AlertManager::new(2, AlertCategory::ALL);
+    // high (factor 2): posts 1–4 land (len/2 < 2), post 5 drops.
+    for _ in 0..5 {
+        m.post(Alert::TorrentFinished(Default::default()));
+    }
+    let all = m.get_all();
+    assert_eq!(all.len(), 5); // 4 queued + synthesized AlertsDropped
+    assert!(matches!(
+        all.last(),
+        Some(Alert::AlertsDropped { types }) if types == &[26]
+    ));
+
+    let mut m = AlertManager::new(1, AlertCategory::ALL);
+    m.post(Alert::PieceFinished {
+        ih: Default::default(),
+        piece: Default::default(),
+    }); // normal — len=1/1 >= 1 → next drops
+    m.post(Alert::SaveResumeData {
+        ih: Default::default(),
+        data: vec![],
+    }); // critical — 1/3 < 1 → lands
+    assert_eq!(m.get_all().len(), 2);
 }

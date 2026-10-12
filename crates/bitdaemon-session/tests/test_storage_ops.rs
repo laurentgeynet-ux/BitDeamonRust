@@ -11,12 +11,14 @@ use std::path::PathBuf;
 use bitdaemon_common::types::{FileIndex, StorageIndex};
 use bitdaemon_common::{Bitfield, Sha1Hash};
 use bitdaemon_disk::storage_error::StorageError;
-use bitdaemon_session::alerts::Alert;
+use bitdaemon_session::alerts::{Alert, AlertCategory};
 use bitdaemon_session::session::{DiskCompleted, Session};
 use bitdaemon_session::torrent::Torrent;
 
 fn mk(ih: Sha1Hash) -> Session {
     let mut s = Session::new();
+    // upstream tests opt into alert categories — default is error-only.
+    s.alerts.set_mask(AlertCategory::ALL);
     s.add_torrent(Torrent::new(
         ih,
         2,

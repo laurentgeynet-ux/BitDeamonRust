@@ -7,8 +7,17 @@
 
 use bitdaemon_common::types::{DownloadPriority, PieceIndex, StorageIndex};
 use bitdaemon_common::{Bitfield, Sha1Hash};
+use bitdaemon_session::alerts::AlertCategory;
 use bitdaemon_session::session::{Session, SessionOut};
 use bitdaemon_session::torrent::{Torrent, TorrentEffect};
+
+/// upstream tests opt into the alert categories they assert on —
+/// the default `alert_mask` is `error` only.
+fn session() -> Session {
+    let mut s = Session::new();
+    s.alerts.set_mask(AlertCategory::ALL);
+    s
+}
 
 #[test]
 fn force_recheck_queues_hash_per_piece() {
@@ -18,7 +27,7 @@ fn force_recheck_queues_hash_per_piece() {
     t.init_picker(false);
     // pretend we had a verified piece — recheck must re-hash it
     t.have.set_bit(0);
-    let mut s = Session::new();
+    let mut s = session();
     s.add_torrent(t);
 
     let mut out = Vec::new();
@@ -73,7 +82,7 @@ fn save_resume_data_alert_and_interval() {
     let mut t = Torrent::new(ih, 2, 128 * 1024, Bitfield::with_size(2), StorageIndex(0));
     t.piece_hashes = Some(vec![Sha1Hash::from_bytes(&[0; 20]).unwrap(); 2]);
     t.init_picker(false);
-    let mut s = Session::new();
+    let mut s = session();
     s.add_torrent(t);
     s.pop_alerts();
 
@@ -112,7 +121,7 @@ fn force_announce_emits_effects() {
     let mut t = Torrent::new(ih, 2, 128 * 1024, Bitfield::with_size(2), StorageIndex(0));
     t.add_tracker("http://a/announce".into(), 0);
     t.add_tracker("http://b/announce".into(), 1);
-    let mut s = Session::new();
+    let mut s = session();
     s.add_torrent(t);
 
     let mut out = Vec::new();
@@ -155,7 +164,7 @@ fn force_announce_emits_effects() {
 #[test]
 fn queue_position_moves() {
     use bitdaemon_session::session::QueueMove;
-    let mut s = Session::new();
+    let mut s = session();
     let mut ihs = Vec::new();
     for b in [10u8, 11, 12] {
         let ih = Sha1Hash::from_bytes(&[b; 20]).unwrap();
@@ -228,7 +237,7 @@ fn piece_deadline_and_read_piece() {
     )));
 
     // disk readback → read_piece_alert with payload
-    let mut s = Session::new();
+    let mut s = session();
     s.add_torrent(t);
     s.pop_alerts();
     s.disk_completions()

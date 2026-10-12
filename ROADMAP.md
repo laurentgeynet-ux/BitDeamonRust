@@ -300,14 +300,63 @@ allocation/check plateau.
 
 ---
 
-## Phase K — Asynchronous result delivery (ADR-0023) ⬜
+## Phase K — Alert scaffolding & category realignment (ADR-0023 D1, D2, D7) ✅
+
+The enum must exist before any emission can land (Phase L), and the
+category machinery has three *fidelity* bugs found on review, not
+just missing variants: `AlertCategory` uses compacted bits while
+upstream is bits 0–24 (`alert_mask` is persisted in `session_params`);
+`alert_mask` isn't even a setting yet; and `AlertManager::post`
+mask-filters inside `post` while upstream's `emplace_alert` is
+unconditional with `should_post` at call sites.
+
+- [x] **Enum expansion**: `Alert` → all 101 concrete upstream alert
+      types (ids 3–107 verbatim) + `ReadPieceFailed` split sharing
+      id 5. Fat DHT payloads `Box`ed (`DhtMutableItemAlert`,
+      `DhtPutAlert`); `size_of::<Alert>() <= 96` guarded by test —
+      the floor is 3-`String` variants. `DhtStats` payload → upstream
+      `dht_stats_alert` shape (routing table + requests + nid +
+      endpoint) moved to Phase L with the `dht_tracker::stats()` port.
+- [x] **Upstream tables**: `Alert::category()`, `alert_type() -> u32`
+      (ids verbatim — feeds the `alerts_dropped` type set),
+      `priority()` (`alert_priority` normal/high/critical/meta).
+- [x] **`AlertCategory` = `alert_category_t` verbatim** (bits 0–24,
+      all 23 categories + `DEBUG`=`CONNECT` alias). Breaking-change
+      note in CHANGELOG — persisted masks decode correctly both ways.
+- [x] **`alert_mask` setting**: `SessionSettings::alert_mask`
+      (default `error`, upstream `settings_pack` verbatim) +
+      `session_params` `i!`/`g!` rows + `apply_settings` →
+      `update_alert_mask` + `SessionHandle::set_alert_mask` persists
+      to settings; `AlertManager::default` mask = `error`. CLI and
+      existing tests opt into `ALL` explicitly (upstream idiom).
+      `SessionHandle::new` now applies `params.settings` and fans
+      `params.plugins` into `alerts.add_extension` (was dropped).
+- [x] **`AlertManager` parity**: category-0 posts unconditionally
+      (`SessionStats`/`SessionStatsHeader`/`DhtStats` land with
+      `mask=0`); priority-weighted queue limit
+      `len/(1+priority) >= limit`; `m_dropped` → per-type set →
+      synthesized `AlertsDropped{types}` rides `get_all`; `post`
+      fans out to `SessionPlugin::on_alert`; `should_post` exposed
+      for call-site gating.
+- [x] Conformance test ported: `tests/test_alert_types.rs` — 102-row
+      table, every variant → `(alert_type, priority, category)`
+      asserted verbatim + category-0/`mask=0`/`session_params`
+      round-trip cases.
+
+**Exit**: ✅ enum complete & compiling; `alert_mask` round-trips via
+`session_params`; category-0 alerts deliver with `mask=0`;
+`test_alert_types` green (3 tests, 102-row table).
+
+---
+
+## Phase L — Async result delivery & emission sites (ADR-0023 D3–D6, D8) ⬜
 
 Upstream delivers every async query result through the alert stream;
 our session currently drops several (`DhtEvent::Data` non-get_peers
 payloads, `DhtEvent::Direct`, `ip_voter` winner changes, portmap
 outcomes, `session_stats`). This is the only place where a handle call
 returns `()` and the answer is *unreachable* — a GUI cannot work
-around it.
+around it. Requires Phase K's enum.
 
 - [ ] `dht_lookup_map` → `dht_result_map: BTreeMap<(bool, usize),
       DhtResult>` typed sinks (`GetPeers`, `GetPeersQuery`, `GetItem`,
@@ -319,7 +368,9 @@ around it.
       `DhtImmutableItem`/`DhtMutableItem`; samples →
       `DhtSampleInfohashes`; `Done+Put` → `put` + `DhtPut`;
       `Done+Announce` → announce phase + `DhtAnnounce`;
-      `Direct` → `DhtDirectResponse`; errors → `DhtError`.
+      `Direct` → `DhtDirectResponse`; errors → `DhtError`;
+      bootstrap → `DhtBootstrap`; liveness → `DhtLiveNodes`;
+      `DhtPkt` → full `dht_pkt_alert` payload.
 - [ ] Mutable BEP-44: `dht_put_item(pk, sk, salt, entry)` and
       `dht_get_item(pk, salt)` overloads (target =
       `item::canonical_target(pk, salt)`; sign via `dht::ed25519`).
@@ -328,72 +379,30 @@ around it.
       `Portmap`/`PortmapError`/`PortmapLog` alerts posted from UPnP
       driver actions and NAT-PMP `on_reply`.
 - [ ] `ListenSucceeded`/`ListenFailed` on `start_acceptor`/
-      `start_ssl_acceptor`/uTP/I2P bind results.
+      `start_ssl_acceptor`/uTP/I2P bind results; `IncomingConnection`
+      on accept.
 - [ ] `ip_voter.external_address()` change detection (in `cast_vote`
       call sites or tick) → `ExternalIp` alert.
 - [ ] `SessionHandle::post_session_stats` → `SessionStatsHeader`
-      (once) + `SessionStats` (upstream `session_stats_alert`
-      semantics; `session_stats_metrics()` names already verbatim).
+      (once) + `SessionStats` (category-0 → unconditional post).
+- [ ] **Emission sites** (ADR-0023 D8 table): `MetadataReceived`/
+      `MetadataFailed` (`set_metadata` ok/fail + reject-exhaustion),
+      `TorrentPaused`/`TorrentResumed`, `TorrentError`,
+      `TorrentConflict`, `TorrentNeedCert`, `AddTorrent`,
+      `FastresumeRejected`, `OversizedFile`, `Trackerid`,
+      `FileCompleted` (wire `file_progress::update` `completed_cb`),
+      `Block*`/`UnwantedBlock`/`RequestDropped`/`InvalidRequest`,
+      `PeerSnubbed`/`PeerUnsnubbed`/`PeerBlocked`/`PeerError`,
+      `IpBan`, `Socks5`, `TrackerAnnounce`/`TrackerWarning`,
+      `UdpError`, `LsdPeer`/`LsdError`, `UrlSeed`, `FilePrio`,
+      `Log`/`I2p`/`TorrentLog`/`PeerLog`/`PickerLog` (gated on
+      `*_log` categories — cheap no-ops when masked off),
+      `SaveResumeDataFailed`, `AlertsDropped`.
 
 **Exit**: every handle call that produces an async result upstream
 delivers it; DHT `get`/`put`/`sample`/`live_nodes`/`direct` round-trip
-to the consumer; `delete_port_mapping` actually deletes.
-
----
-
-## Phase L — Alert surface completion (ADR-0023) ⬜
-
-`Alert`: 38 variants → full `alert_types.hpp` coverage (~105 types;
-~60 to add). `AlertCategory` re-aligned to upstream
-`alert_category_t` bit positions — `settings_pack::alert_mask` is
-persisted in `.session`/`session_params`, so current compacted bits
-are an **interop bug**, not a style issue. Pure surfacing work on
-existing machinery (`alerts.post`, category mask, notify hook).
-
-- [ ] **Category fix**: `AlertCategory` consts = upstream bits 0–24
-      verbatim (add `progress`, `session_log`, `torrent_log`,
-      `peer_log`, `incoming_request`, `dht_log`, `dht_operation`,
-      `port_mapping_log`, `picker_log`, `block_progress`,
-      `debug`=`connect` alias); `Alert::category()` = upstream
-      `static_category` table per variant, doc-commented.
-      Breaking-change note in CHANGELOG.
-- [ ] **Torrent lifecycle**: `MetadataReceived`/`MetadataFailed`
-      (`on_metadata_packet` → `set_metadata` ok/fail +
-      reject-exhaustion), `TorrentPaused`/`TorrentResumed`,
-      `TorrentError`, `TorrentConflict` (duplicate info-hash),
-      `TorrentNeedCert` (SSL torrent without cert),
-      `AddTorrent` (params+error payload), `FastresumeRejected`,
-      `OversizedFile`, `Trackerid`, `TorrentLog`.
-- [ ] **Progress/pipeline**: `FileCompleted` (wire
-      `file_progress::update`'s existing `completed_cb`),
-      `BlockDownloading`/`BlockTimeout`/`BlockUploaded`,
-      `UnwantedBlock`/`RequestDropped`/`InvalidRequest`,
-      `PeerSnubbed`/`PeerUnsnubbed`, `PeerBlocked`, `PeerError`.
-- [ ] **Connection**: `IncomingConnection`, `IpBan`, `Socks5`.
-- [ ] **Tracker**: `TrackerAnnounce`, `TrackerWarning`, `UdpError`.
-- [ ] **LSD**: `LsdPeer` (accepted info-hash), `LsdError`.
-- [ ] **Web seed**: `UrlSeed` (connect/EOF/failure).
-- [ ] **Session**: `Log`, `I2p`, `FilePrio`, `SaveResumeDataFailed`,
-      `AlertsDropped` (`AlertManager::post` overflow → synthesize on
-      next accepted post).
-- [ ] **DHT family** (plumbing from Phase K): `dht_announce`,
-      `dht_bootstrap`, `dht_direct_response`, `dht_error`,
-      `dht_get_peers`, `dht_get_peers_reply`, `dht_immutable_item`,
-      `dht_live_nodes`, `dht_log`, `dht_mutable_item`,
-      `dht_outgoing_get_peers`, `dht_put`, `dht_reply`,
-      `dht_sample_infohashes` (+ `DhtPkt` → full `dht_pkt_alert`
-      payload: dir, addr, message).
-- [ ] **Log family**: `TorrentLog`/`PeerLog`/`PickerLog`/`PortmapLog`/
-      `DhtLog` emitted at upstream sites where the machinery exists —
-      cheap no-ops when their category is masked off.
-- [ ] Payload-heavy alerts become `pub struct XxxAlert` in
-      `alerts.rs` (split to `alerts/` submodules if needed); every
-      torrent-scoped alert carries `ih`.
-
-**Exit**: `test_alert_types.cpp`-equivalent table green (each variant
-→ upstream `category()` value); `alert_mask` round-trips byte-exact
-through upstream-written `session_params` fixtures; a GUI can observe
-every state transition without polling internals.
+to the consumer; `delete_port_mapping` actually deletes; a GUI can
+observe every state transition without polling internals.
 
 ---
 
@@ -405,13 +414,12 @@ every state transition without polling internals.
       `retry_web_seed` backoff (upstream `http_seed_connection.cpp`
       semantics). `add_http_seed`/`remove_http_seed`/`http_seeds`
       already manage endpoints.
-- [ ] **Extension factories invoked** (ADR-0023 D8): `ExtensionFactory`
+- [ ] **Extension factories invoked** (ADR-0023 D9): `ExtensionFactory`
       vec applied at torrent start + late `add_extension`;
       `SessionPlugin::new_peer_connection(&PeerInfo)` seam + minimal
       `PeerPlugin` trait (`on_message`, `on_tick`). Full
       `torrent_plugin`/`peer_plugin` surface stays deferred-with-reason
       until a consumer needs it.
-- [ ] `delete_port_mapping(handle)` — real impl per Phase K table.
 - [ ] `MetadataFailed` on ut_metadata source-penalty exhaustion.
 - [ ] **GUI parity matrix** (`docs/gui-parity.md`): alert/handle →
       widget checklist (add/remove/pause/queue/priorities/deadlines/

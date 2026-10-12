@@ -266,8 +266,8 @@ mod win32 {
     use std::sync::Once;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Security::{
-        AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
-        SE_MANAGE_VOLUME_NAME, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+        AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_MANAGE_VOLUME_NAME,
+        SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
     };
     use windows_sys::Win32::Storage::FileSystem::SetFileValidData;
     use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -322,14 +322,7 @@ mod win32 {
                     Attributes: SE_PRIVILEGE_ENABLED,
                 }],
             };
-            AdjustTokenPrivileges(
-                token,
-                0,
-                &tp,
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
+            AdjustTokenPrivileges(token, 0, &tp, 0, std::ptr::null_mut(), std::ptr::null_mut());
         }
     }
 }

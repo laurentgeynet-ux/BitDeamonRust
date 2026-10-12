@@ -1,6 +1,6 @@
 # ADR-0023: Alert-surface completion & asynchronous result delivery (1.0 API)
 
-- Status: accepted
+- Status: accepted — Phase K (D1, D2, D7) implemented
 - Date: 2026-10-12
 - Deciders: port team
 - Complements: ADR-0004 (error handling), ADR-0008 (injected
@@ -43,8 +43,23 @@ Verified gaps (all confirmed in code):
   `picker_log=20`, `file_progress=21`, `piece_progress=22`,
   `upload=23`, `block_progress=24`). Ours are compacted 0x01–0x4000.
   `settings_pack::alert_mask` is persisted in `.session` /
-  `session_params` — a session file exchanged with upstream applies a
-  **wrong mask** today.
+  `session_params` — once we add the field it must carry upstream bit
+  positions. Worse: **`alert_mask` is missing entirely** from
+  `SessionSettings` and `session_params` today (only
+  `alert_queue_size` is wired), and our `AlertManager` default mask is
+  `ALL` while upstream defaults to `alert_category::error` in both
+  `alert_manager`'s ctor and `settings_pack::alert_mask` — a silent
+  behavioral deviation.
+- **`AlertManager` semantics diverge in three more places**:
+  upstream `emplace_alert` never checks the mask — `should_post<T>()`
+  is a **call-site** gate, so the three category-0 alerts
+  (`session_stats`, `session_stats_header`, `dht_stats`) post
+  *unconditionally*; our `post()` drops `category & mask == 0`,
+  which would permanently discard them. Upstream's queue limit is
+  **priority-weighted** (`queue.size() / (1 + priority) >= limit` —
+  critical alerts get 3× headroom, meta 4×); ours is a flat cap. And
+  upstream `m_dropped` is a **per-type bitset** keyed by `alert_type`
+  feeding `alerts_dropped_alert`; ours is a bare count.
 - **DHT user-initiated queries drop their results.**
   `SessionHandle::dht_get_peers`/`dht_get_item`/
   `dht_sample_infohashes` start lookups but register nothing;
@@ -94,7 +109,9 @@ Payload rules:
 - Heavy payloads become named `pub struct XxxAlert` types in
   `alerts.rs` (e.g. `DhtPktAlert`, `SessionStatsAlert`,
   `TrackerErrorAlert`), referenced as `Alert::Xxx(XxxAlert)` — matches
-  the current `PeerInfo`/`FileProgress` style.
+  the current `PeerInfo`/`FileProgress` style. `Box` the payload when
+  a variant would exceed ~48 B (`SessionStats` is `Vec`-backed so it
+  stays small); add a `debug_assert!(size_of::<Alert>() <= 48)` guard.
 - Trivial variants keep inline fields (`TorrentPaused { ih }`).
 - `handle()`/`torrent_handle` ergonomics: every torrent-scoped alert
   carries `ih` (and `name` where upstream carries it) — no
@@ -102,8 +119,15 @@ Payload rules:
 - `Alert::category()` becomes the verbatim upstream `category()`
   table — each variant lists its upstream `*_alert::static_category`
   in a doc comment.
+- `Alert::alert_type() -> u32` and `Alert::priority()` mirror upstream
+  `alert::type()`/`*_alert::alert_type` and `alert_priority` — the
+  type id is required by the `test_alert_types.cpp` conformance table
+  **and** by the per-type `alerts_dropped` bitset (D7).
+- Payload parity where an existing variant is a subset:
+  `DhtStats` expands to upstream `dht_stats_alert` shape (routing
+  table + requests + node id + endpoint).
 
-### D2 — `AlertCategory` re-aligned to upstream bit positions
+### D2 — `AlertCategory` re-aligned + `alert_mask` becomes a real setting
 
 Rewrite the constants to `alert_category_t` verbatim (bits 0–24 above,
 incl. `debug = connect` alias) and add the missing categories:
@@ -112,6 +136,16 @@ incl. `debug = connect` alias) and add the missing categories:
 `block_progress`, `progress`. **Interop fix, not cosmetics**:
 `alert_mask` round-trips through `session_params`. Flag as a breaking
 change in CHANGELOG (pre-1.0, allowed).
+
+In the same pass:
+
+- Add `alert_mask: AlertCategory` to `SessionSettings`, upstream
+  default `error` (bit 0) — **not** `ALL` — and wire
+  `settings_pack::alert_mask` rows into the `session_params` dict
+  (`i!`/`g!` macros) so the field actually persists.
+- `apply_settings` hot-applies it (`update_alert_mask` upstream).
+- `AlertManager::default()` mask → `error` (upstream ctor default);
+  `set_alert_mask`/`get_alert_mask` handle methods keep working.
 
 ### D3 — Async results are delivered as alerts, never callbacks
 
@@ -169,7 +203,25 @@ NAT-PMP lifetime-0 map request. `Portmap` / `PortmapError` /
 `PortmapLog` alerts posted from the UPnP driver actions and NAT-PMP
 `on_reply` paths.
 
-### D7 — Emission points (normative table)
+### D7 — `AlertManager` upstream parity details
+
+- **Category-0 alerts post unconditionally.** Upstream
+  `emplace_alert` never consults the mask — `should_post<T>()` gates
+  the *call site* — so `session_stats`, `session_stats_header` and
+  `dht_stats` always land. `AlertManager::post` must short-circuit the
+  mask check for `category == 0` (or gain `post_unconditional` +
+  call-site `should_post` gates — pick one, document the equivalent
+  in the module rustdoc).
+- **Priority-weighted queue limit.** Port
+  `queue.size() / (1 + priority) >= limit` verbatim so
+  critical/meta alerts get upstream's 3×/4× headroom; `Alert::priority()`
+  (D1) feeds the formula.
+- **Per-type dropped bitset.** `m_dropped` is a bitfield indexed by
+  `alert_type`; `AlertsDropped` carries the bitset (upstream
+  `alerts_dropped_alert::dropped_alerts`), synthesized on the next
+  accepted post — not just a count.
+
+### D8 — Emission points (normative table)
 
 | Alert | Emission site |
 |---|---|
@@ -181,7 +233,7 @@ NAT-PMP lifetime-0 map request. `Portmap` / `PortmapError` /
 | `TorrentNeedCert` | SSL dial/accept when torrent requires cert and none set |
 | `ListenSucceeded` / `ListenFailed` | `start_acceptor`/`start_ssl_acceptor`/uTP/I2P bind results |
 | `ExternalIp` | `ip_voter.cast_vote` sites + tick diff on `external_address()` change |
-| `SessionStats` (+ `SessionStatsHeader` once) | `SessionHandle::post_session_stats` (upstream: header precedes first stats alert) |
+| `SessionStats` (+ `SessionStatsHeader` once) — **category-0, unconditional** | `SessionHandle::post_session_stats` (upstream: header precedes first stats alert) |
 | `Portmap`/`PortmapError`/`PortmapLog` | UPnP map/delete/renew + NAT-PMP replies (D6) |
 | `LsdPeer` / `LsdError` | LSD demux accepted-infohash / malformed paths |
 | `IncomingConnection` | acceptor accept (post-handshake, info-hash resolved) |
@@ -197,9 +249,9 @@ NAT-PMP lifetime-0 map request. `Portmap` / `PortmapError` /
 | `AddTorrent` (params+error) | `add_torrent`/`async_add_torrent` entry point |
 | `TorrentLog`, `PeerLog`, `PickerLog`, `Log`, `I2p`, `Socks5` | gated on `*_log` categories — emit at upstream sites where the machinery exists; sites whose machinery isn't ported emit nothing (documented) |
 | `AlertsDropped` | `AlertManager::post` overflow → queue one on next accepted post |
-| DHT family | Phase K sinks (D4/D5) + `DhtPkt` extended to full `dht_pkt_alert` (dir, addr, msg) |
+| DHT family | Phase L sinks (D4/D5) + `DhtPkt` extended to full `dht_pkt_alert` (dir, addr, msg) |
 
-### D8 — Extension factories: instantiate, scoped plugin seam
+### D9 — Extension factories: instantiate, scoped plugin seam
 
 - `Torrent::extensions` factories are invoked when the torrent starts
   (upstream `torrent::start` → `add_extension_func` application) and
@@ -216,7 +268,7 @@ NAT-PMP lifetime-0 map request. `Portmap` / `PortmapError` /
   ut_holepunch) keep their dedicated paths — refactoring them onto the
   generic seam is not required for parity.
 
-### D9 — BEP-17 `http_seed` (GetRight) fetch completion
+### D10 — BEP-17 `http_seed` (GetRight) fetch completion
 
 `net::web_seed` gains the `http_seed` endpoint kind: URL join is
 `base_url + file_path` (no `?piece=` query), `Range` headers
@@ -267,9 +319,17 @@ endpoint kinds; BEP-19 path unchanged.
 
 ## Test plan
 
-- Port `test_alert_types.cpp` mapping checks: every `Alert` variant
-  asserts its upstream `category()` value and `type()`-equivalent id
-  table.
+- Port `test_alert_types.cpp` verbatim: every variant asserts its
+  upstream `category()`, `alert_type` id and `priority` — this is the
+  conformance table, it lives next to the enum.
+- Category-0 delivery: `alert_mask = 0`, `post_session_stats` /
+  `post_dht_stats` still deliver `SessionStats`/`SessionStatsHeader`/
+  `DhtStats`.
+- `alert_mask` round-trips through `session_params` byte-exact vs an
+  upstream-written fixture; `AlertManager` default = `error`; setting
+  a mask filters exactly upstream's categories.
+- Priority-weighted limit: queue full of normal alerts still accepts
+  a critical one; `alerts_dropped` bitset names the right types.
 - Golden fixture: `session_params` with a non-default `alert_mask`
   written by upstream v2.1.2 loads to the identical mask.
 - DHT: unit-test sink routing (`GetItemMutable` data →

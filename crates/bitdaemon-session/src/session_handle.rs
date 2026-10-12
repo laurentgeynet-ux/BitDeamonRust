@@ -117,7 +117,14 @@ impl SessionHandle {
         if let Some(disk) = params.disk_io {
             s.set_disk(disk);
         }
-        let _plugins = params.plugins; // fan-out wired on alert post
+        // upstream `session_impl` applies `params.settings` at
+        // construction — this also seeds the alert mask.
+        s.apply_settings(params.settings);
+        // `alert_manager::add_extension` — plugins see every posted
+        // alert via `on_alert`.
+        for p in params.plugins {
+            s.alerts.add_extension(p);
+        }
         Self {
             inner: Arc::new(Mutex::new(s)),
         }
@@ -306,7 +313,11 @@ impl SessionHandle {
 
     /// `set_alert_mask` / `get_alert_mask`.
     pub fn set_alert_mask(&self, mask: crate::alerts::AlertCategory) {
-        lock(&self.inner).alerts.set_mask(mask);
+        let mut s = lock(&self.inner);
+        // upstream `update_alert_mask` — persist to settings AND the
+        // manager so `session_params` round-trips it.
+        s.settings.alert_mask = mask;
+        s.alerts.set_mask(mask);
     }
 
     /// `get_alert_mask`.

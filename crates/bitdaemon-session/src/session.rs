@@ -1724,6 +1724,9 @@ impl Session {
             d.set_cache_expiry(s.cache_expiry.as_secs());
         }
         self.alerts.set_queue_limit(s.alert_queue_size);
+        // `update_alert_mask` — upstream hot-applies the persisted
+        // mask to the alert manager.
+        self.alerts.set_mask(s.alert_mask);
         self.settings = s;
     }
 

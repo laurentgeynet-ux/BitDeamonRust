@@ -68,6 +68,11 @@ pub struct SessionSettings {
     pub send_buffer_watermark: usize,
     /// `alert_queue_size` — alert_manager limit.
     pub alert_queue_size: usize,
+    /// `settings_pack::alert_mask` — which alert categories get
+    /// queued. Upstream default = `alert_category::error`
+    /// (`settings_pack.cpp`); persisted in `session_params` so the
+    /// bit values are upstream `alert_category_t` (ADR-0023 D2).
+    pub alert_mask: crate::alerts::AlertCategory,
     /// `dht_upload_rate_limit` — datagrams/s the DHT may send.
     pub dht_enabled: bool,
     /// `enable_outgoing_utp` — dial uTP to peers that support it.
@@ -155,6 +160,7 @@ impl Default for SessionSettings {
             enable_set_file_valid_data: false,
             send_buffer_watermark: 500 << 10,
             alert_queue_size: 2000,
+            alert_mask: crate::alerts::AlertCategory::ERROR,
             dht_enabled: true,
             // upstream defaults: both true
             enable_outgoing_utp: true,

@@ -197,6 +197,14 @@ async fn main() -> anyhow::Result<()> {
     // OS resolver — the default transports' DNS companion (anonymous
     // deployments inject a circuit resolver instead; ADR-0008).
     eng.set_resolver(Arc::new(bitdaemon::net::resolver::SystemResolver));
+    // `client_test` upstream runs with `alert_mask = all_categories`;
+    // the session default is `error`-only.
+    {
+        let mut s = slock(&eng.session);
+        s.settings.alert_mask = bitdaemon::session::alerts::AlertCategory::ALL;
+        s.alerts
+            .set_mask(bitdaemon::session::alerts::AlertCategory::ALL);
+    }
     if args.no_os_cache {
         slock(&eng.session).settings.disable_os_write_cache = true;
     }

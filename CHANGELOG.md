@@ -7,6 +7,35 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — alert surface scaffolding (Phase K, ADR-0023)
+
+- `Alert` enum expanded to all 101 concrete upstream alert types
+  (ids 3–107 verbatim from `alert_types.hpp`) plus a
+  `ReadPieceFailed` split variant sharing type 5.
+  `Alert::alert_type()`/`priority()`/`category()` expose the upstream
+  `(alert_type, alert_priority, static_category)` tables; fat DHT
+  payloads are `Box`ed (`DhtMutableItemAlert`, `DhtPutAlert`) and
+  `size_of::<Alert>() <= 96` is test-guarded.
+- **Breaking**: `AlertCategory` realigned to upstream
+  `alert_category_t` bit positions (bits 0–24, 23 categories +
+  `DEBUG`=`CONNECT` alias). Persisted `alert_mask` values now
+  interoperate byte-exact with libtorrent `session_params` files.
+- `SessionSettings::alert_mask` — real setting, upstream default
+  `error` (previously the manager defaulted to `ALL`), serialized in
+  `session_params`, hot-applied by `apply_settings` and
+  `SessionHandle::set_alert_mask`. `SessionHandle::new` now applies
+  `params.settings` and registers `params.plugins` (were dropped).
+- `AlertManager` upstream parity: category-0 alerts
+  (`session_stats`/`session_stats_header`/`dht_stats`) post
+  unconditionally; the queue limit is priority-weighted
+  (`len/(1+priority) >= limit`); dropped alerts are tracked per
+  `alert_type` and a synthesized `alerts_dropped_alert` rides
+  `get_all`; `post` fans out to `SessionPlugin::on_alert`;
+  `should_post` exposed for call-site gating.
+- New `tests/test_alert_types.rs` — 102-row conformance table ported
+  from upstream `test_alert_types.cpp` plus mask/category-0/
+  `session_params` round-trip cases.
+
 ### Added — docs: 1.0 API-surface program (ADR-0023)
 
 - New `docs/adr/0023-alert-surface-and-api-completion.md`: full
