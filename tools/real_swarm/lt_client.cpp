@@ -41,12 +41,13 @@
 using namespace lt;
 using namespace std::chrono;
 
-static int make_torrent(char const* payload, char const* out)
+static int make_torrent(char const* payload, char const* out,
+    create_flags_t flags)
 {
     file_storage fstore;
     add_files(fstore, payload);
     if (fstore.num_files() == 0) { std::fprintf(stderr, "no files\n"); return 1; }
-    create_torrent ct(fstore, 256 * 1024);
+    create_torrent ct(fstore, 256 * 1024, -1, flags);
     std::filesystem::path const pp = std::filesystem::path(payload).parent_path();
     set_piece_hashes(ct, pp.empty() ? "." : pp.string());
     std::ofstream f(out, std::ios::binary);
@@ -283,7 +284,12 @@ int main(int argc, char** argv)
     std::string mode = argv[1];
     try
     {
-        if (mode == "make" && argc == 4) return make_torrent(argv[2], argv[3]);
+        if (mode == "make" && argc == 4)
+            return make_torrent(argv[2], argv[3], create_torrent::merkle);
+        if (mode == "makev1" && argc == 4)
+            return make_torrent(argv[2], argv[3], create_torrent::v1_only);
+        if (mode == "makev2" && argc == 4)
+            return make_torrent(argv[2], argv[3], create_torrent::v2_only);
         if (mode == "makessl" && argc == 5) return make_ssl_torrent(argv[2], argv[3], argv[4]);
         if (mode == "sslseed" && argc >= 8)
             return sslseed(argv[2], argv[3], std::atoi(argv[4]),
