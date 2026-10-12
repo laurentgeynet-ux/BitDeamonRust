@@ -15,7 +15,6 @@ use bitdaemon::core::add_torrent_params::AddTorrentParams;
 use bitdaemon::core::magnet_uri::parse_magnet;
 use bitdaemon::core::torrent_info::load_torrent;
 use bitdaemon::disk::disk_io::PreadDiskIo;
-use bitdaemon::disk::storage::StorageParams;
 use bitdaemon::engine::Engine;
 use bitdaemon::net::os_transports::{TokioTcpAcceptor, TokioTcpConnector, TokioUdpSocket};
 use bitdaemon::session::session_handle::lock as slock;
@@ -114,6 +113,17 @@ struct Args {
     /// handshakes (upstream `listen_interfaces` `…s` suffix).
     #[arg(long)]
     ssl_port: Option<u16>,
+
+    /// Fastresume file (libtorrent `.fastresume` format) — restores
+    /// have-bits and unfinished blocks; the positional .torrent/magnet
+    /// supplies metadata when the resume file has no info dict.
+    #[arg(long)]
+    resume: Option<PathBuf>,
+
+    /// Stop gracefully after N seconds (bench tool — same path as
+    /// ctrl-c, writes `.resume` before exiting).
+    #[arg(long)]
+    stop_after: Option<u64>,
 }
 
 fn load_atp(arg: &str, save_path: &std::path::Path) -> anyhow::Result<AddTorrentParams> {
@@ -132,7 +142,29 @@ fn load_atp(arg: &str, save_path: &std::path::Path) -> anyhow::Result<AddTorrent
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
-    let mut atp = load_atp(&args.torrent, &args.save_path)?;
+    let mut atp = if let Some(resume) = &args.resume {
+        let buf = std::fs::read(resume)?;
+        let mut a = bitdaemon::core::resume_data::read_resume_data(
+            &buf,
+            &bitdaemon::core::LoadTorrentLimits::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("resume: {e}"))?;
+        // a resume without an embedded info dict still needs metadata
+        // from the positional .torrent/magnet
+        if a.ti.is_none() {
+            let base = load_atp(&args.torrent, &args.save_path)?;
+            a.ti = base.ti;
+            a.info_hashes = base.info_hashes;
+            if a.trackers.is_empty() {
+                a.trackers = base.trackers;
+            }
+        }
+        a.save_path = args.save_path.as_os_str().as_encoded_bytes().to_vec();
+        a.storage_mode = bitdaemon::core::StorageMode::Allocate;
+        a
+    } else {
+        load_atp(&args.torrent, &args.save_path)?
+    };
     if args.seed {
         atp.flags |= bitdaemon::common::flags::TorrentFlags::SEED_MODE;
         // seed_mode upstream still requires the `have` bits set —
@@ -159,31 +191,9 @@ async fn main() -> anyhow::Result<()> {
         disk.set_open_mode_extra(extra);
     }
 
-    // storage for the torrent (factory path → StorageIndex)
-    let storage = if let Some(ti) = &atp.ti {
-        let params = StorageParams {
-            files: ti.files(),
-            renamed: &Default::default(),
-            path: args.save_path.clone(),
-            part_file_dir: PathBuf::new(),
-            mode: match atp.storage_mode {
-                bitdaemon::core::StorageMode::Sparse => {
-                    bitdaemon::disk::storage::StorageMode::Sparse
-                }
-                bitdaemon::core::StorageMode::Allocate => {
-                    bitdaemon::disk::storage::StorageMode::Allocate
-                }
-            },
-            priorities: &[],
-            info_hash: *atp.info_hashes.v1.as_bytes(),
-            v1: atp.info_hashes.has_v1(),
-            v2: atp.info_hashes.has_v2(),
-        };
-        disk.new_torrent(&params)
-    } else {
-        // magnets land without metadata — deferred storage
-        bitdaemon::common::types::StorageIndex(0)
-    };
+    // `torrent::init` semantics: the session builds the storage from
+    // the atp (`.torrent` now, magnet at `MetadataReceived`).
+    let storage = bitdaemon::common::types::StorageIndex::INVALID;
 
     let connector: Arc<TokioTcpConnector> = Arc::new(TokioTcpConnector);
     let udp = TokioUdpSocket::bind(SocketAddr::new(
@@ -404,11 +414,37 @@ async fn main() -> anyhow::Result<()> {
 
     eng.run(
         async {
-            let _ = tokio::signal::ctrl_c().await;
+            match args.stop_after {
+                Some(s) => tokio::time::sleep(std::time::Duration::from_secs(s)).await,
+                None => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
         },
         // 0 → `settings.connection_speed` (upstream default 30/s).
         0,
     )
     .await;
+
+    // client_test behavior: drop a fastresume file per torrent on
+    // shutdown — `<save_path>/<v1-infohash>.resume`, loadable via
+    // `--resume` on the next run (or by a C++ client).
+    {
+        let guard = slock(&eng.session);
+        for (ih, t) in &guard.torrents {
+            let buf = t.write_resume_data();
+            if buf.is_empty() {
+                continue;
+            }
+            let path = args.save_path.join(format!(
+                "{}.resume",
+                bitdaemon::common::hex::to_hex(ih.as_bytes())
+            ));
+            match std::fs::write(&path, &buf) {
+                Ok(()) => println!("saved {}", path.display()),
+                Err(e) => eprintln!("resume save {}: {e}", path.display()),
+            }
+        }
+    }
     Ok(())
 }
