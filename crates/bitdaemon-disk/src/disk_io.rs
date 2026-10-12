@@ -208,6 +208,37 @@ impl PreadDiskIo {
         Arc::clone(&self.buffer_pool)
     }
 
+    /// Graceful-shutdown flush — enqueue a `Flush` for every dirty
+    /// run regardless of age (upstream's teardown drains the write
+    /// cache before resume data is written, or the restored torrent
+    /// re-hashes holes).
+    pub fn flush_all(&self) {
+        let entries: Vec<(StorageIndex, Arc<StorageEntry>)> = self
+            .storages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(i, e)| (*i, Arc::clone(e)))
+            .collect();
+        for (idx, e) in entries {
+            let runs = e
+                .cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take_expired_runs(std::time::Duration::ZERO);
+            for ((_s, piece), first, bufs) in runs {
+                self.add_job(
+                    idx,
+                    self.mk_job(JobKind::Flush(crate::disk_job::FlushJob {
+                        piece,
+                        first_block: first,
+                        bufs,
+                    })),
+                );
+            }
+        }
+    }
+
     /// `cache_expiry` periodic flush (upstream `m_disk_cache`
     /// flush timer): every dirty run older than `cache_expiry` is
     /// enqueued as a coalesced Flush. Called once per session tick.

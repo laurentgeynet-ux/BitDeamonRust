@@ -93,9 +93,16 @@ pub struct PeerConn {
     pub peer_listen_port: Option<u16>,
     /// `i2p_pex_peer_plugin` per-connection state.
     pub i2p_pex: crate::i2p_pex::I2pPexPeerState,
-    /// `m_superseed_piece` — the piece we're currently
-    /// super-seeding to this peer (BEP initial-seed).
-    pub superseed_piece: Option<PieceIndex>,
+    /// `m_superseed_piece[2]` — the piece(s) we're currently
+    /// super-seeding to this peer (BEP initial-seed); requests for
+    /// either slot are honored.
+    pub superseed_pieces: [Option<PieceIndex>; 2],
+    /// `m_became_uninterested` — conn-clock ms of the last
+    /// interested → not-interested transition; upstream's
+    /// `relative_time` default is the connect instant, so a
+    /// never-interested peer still ages into the super-seed
+    /// recovery window.
+    pub became_uninterested_ms: i64,
     /// `peer_info::protocol_v2` — the connection was established
     /// with the v2 info-hash. Hash messages (`hash_request`/
     /// `hashes`/`hash_reject`) are a protocol violation without it.
@@ -106,6 +113,13 @@ pub struct PeerConn {
     pub client_version: Vec<u8>,
     /// `m_upload_queue` — peer's requests to us.
     pub upload_queue: Vec<PeerRequest>,
+    /// `m_send_buffer.size()` — bytes queued for the socket that the
+    /// writer pump hasn't sent yet. Drives `fill_send_buffer`'s
+    /// watermark gate (`send_buffer + reading_bytes < watermark`).
+    pub send_buffer: usize,
+    /// `m_reading_bytes` — payload bytes of disk reads in flight for
+    /// this peer (issued, completion not yet drained).
+    pub reading_bytes: usize,
     /// `m_num_invalid_requests`.
     pub num_invalid_requests: i32,
     /// `m_num_pieces` — total pieces the peer announced.
@@ -127,6 +141,11 @@ pub struct PeerConn {
     pub supports_fast: bool,
     /// `m_supports_dht_port` — remote advertised a DHT port bit.
     pub supports_dht: bool,
+    /// `supports_encryption()` — the connection went through the
+    /// MSE/PE handshake (`m_encrypted`), regardless of the negotiated
+    /// `crypto_select` (plaintext-select still counts). Feeds the
+    /// `pex_encryption` flag in ut_pex.
+    pub supports_encryption: bool,
     /// `HaveAll`/`Have` semantics arrived while the torrent had no
     /// metadata (magnet): the peer claims every piece but
     /// `peer_pieces` could not represent it yet — replayed into a
@@ -190,10 +209,13 @@ impl PeerConn {
             local_ut_metadata: 1,
             local_ut_pex: 2,
             local_ut_holepunch: 3,
-            superseed_piece: None,
+            superseed_pieces: [None, None],
+            became_uninterested_ms: now_ms,
             remote_upload_only: false,
             client_version: Vec::new(),
             upload_queue: Vec::new(),
+            send_buffer: 0,
+            reading_bytes: 0,
             num_invalid_requests: 0,
             num_pieces: 0,
             connect_ms: now_ms,
@@ -212,6 +234,7 @@ impl PeerConn {
             supports_fast: false,
             pre_metadata_all: false,
             supports_dht: false,
+            supports_encryption: false,
             local_dont_have: 3,
             ext_i2p_pex: 0,
             local_i2p_pex: crate::i2p_pex::I2P_PEX_ID,
@@ -286,8 +309,12 @@ impl PeerConn {
     pub fn on_interested(&mut self) {
         self.peer_interested = true;
     }
-    /// not interested.
+    /// `incoming_not_interested` — `m_became_uninterested` stamps
+    /// only the interested → not-interested edge.
     pub fn on_not_interested(&mut self) {
+        if self.peer_interested {
+            self.became_uninterested_ms = self.now_ms;
+        }
         self.peer_interested = false;
     }
 

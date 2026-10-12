@@ -1432,10 +1432,33 @@ impl TorrentHandle {
         }
     }
 
-    /// `torrent_handle::set_upload_mode`.
+    /// `torrent_handle::set_upload_mode` — toggling pushes the BEP-21
+    /// `upload_only` extension message to every peer that negotiated
+    /// it (upstream `torrent::send_upload_only`: skipped under
+    /// super-seeding/share-mode, gated on `close_redundant_connections`).
     pub fn set_upload_mode(&self, on: bool) {
-        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
+        let mut s = lock(&self.session);
+        let close_redundant = s.settings.close_redundant_connections;
+        let mut eff = Vec::new();
+        if let Some(t) = s.torrents.get_mut(&self.info_hash) {
             t.upload_mode = on;
+            if close_redundant && !t.super_seeding && !t.share_mode {
+                eff = t
+                    .peers
+                    .iter()
+                    .filter(|(_, c)| c.ext_upload_only != 0)
+                    .map(|(pid, c)| crate::torrent::TorrentEffect::SendTo {
+                        peer: *pid,
+                        msg: bitdaemon_net::peer_wire::PeerMessage::Extended {
+                            id: c.ext_upload_only,
+                            data: bytes::Bytes::from_static(if on { &[1] } else { &[0] }),
+                        },
+                    })
+                    .collect();
+            }
+        }
+        if !eff.is_empty() {
+            s.route_into_pending(self.info_hash, eff);
         }
     }
 

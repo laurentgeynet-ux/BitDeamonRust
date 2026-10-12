@@ -112,6 +112,53 @@ fn read_job(piece: i32, got: Arc<Mutex<Vec<u8>>>, done: Arc<AtomicUsize>) -> Box
     })
 }
 
+/// real-swarm catch: a burst of `async_read` uploads (seed serving
+/// a leech) must all complete — buffers and handlers must not get
+/// stuck behind the pool worker machinery.
+#[test]
+fn read_burst_all_complete() {
+    use bitdaemon_disk::disk_interface::DiskIo;
+
+    let d = dir("read_burst");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    std::fs::write(d.join("t/a.bin"), vec![0xABu8; 1000]).unwrap();
+    std::fs::write(d.join("t/b.bin"), vec![0xCDu8; 1000]).unwrap();
+
+    let (io, _drained) = make_io(4);
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs(), &d)));
+
+    const N: usize = 300;
+    let done = Arc::new(AtomicUsize::new(0));
+    for i in 0..N {
+        let d2 = Arc::clone(&done);
+        io.async_read(
+            StorageIndex(0),
+            bitdaemon_common::types::PeerRequest {
+                piece: PieceIndex((i % 2) as i32),
+                start: 0,
+                length: 1000,
+            },
+            Box::new(move |b, e| {
+                assert!(!e.is_err());
+                // read jobs return the whole 16 KiB disk block; the
+                // requester slices `length` out of it
+                let data = b.data().unwrap_or(&[]);
+                assert!(data.len() >= 1000);
+                d2.fetch_add(1, Ordering::Relaxed);
+            }),
+            0,
+        );
+    }
+    for _ in 0..500 {
+        io.completed().call_job_handlers();
+        if done.load(Ordering::Relaxed) == N {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("only {}/{N} reads completed", done.load(Ordering::Relaxed));
+}
+
 /// real-swarm catch: `check_fastresume` with **no resume data** must
 /// return `need_full_check` (ret bit0 = 0) when files exist on disk,
 /// and `accepted` only when the directory is empty — upstream

@@ -43,6 +43,12 @@ fn announce_cycle() {
     assert_eq!(url, "udp://tr/announce");
     assert_eq!(params.info_hash, ih.to_bytes());
     assert_eq!(params.left, 4 * 128 * 1024);
+    // first announce carries `started` (BEP-3 event 2) and the
+    // entry is held in-flight — no re-fire while it is out.
+    assert_eq!(params.event, 2);
+    out.clear();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    assert!(out.is_empty(), "announce in flight must not re-fire");
 
     // response: 2 peers + trackerid + 3 seeds
     let resp = TrackerResponse {
@@ -66,6 +72,16 @@ fn announce_cycle() {
     let i = t.trackers.find("udp://tr/announce").unwrap();
     assert_eq!(t.trackers.trackers[i].tracker_id, "tid1");
     assert!(t.trackers.trackers[i].verified);
+    // `announce_endpoint::sent` — start_sent latched, next announce
+    // scheduled at the tracker interval (no per-tick re-fire), the
+    // next announce is a plain interval one (event 0).
+    assert!(t.trackers.trackers[i].endpoints[0].v1.start_sent);
+    assert!(
+        t.trackers.trackers[i].endpoints[0]
+            .v1
+            .next_announce
+            .is_some()
+    );
     // TRACKER source on the fed peers
     let pi = t.peer_list.find_peer(ep(1).ip()).unwrap();
     assert!(
@@ -73,6 +89,18 @@ fn announce_cycle() {
             .source
             .contains(PeerSourceFlags::TRACKER)
     );
+    // inside the tracker interval → nothing due; past it → a
+    // periodic announce with event `none` (not `started` again).
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    assert!(out.is_empty());
+    let later = Instant::now() + std::time::Duration::from_secs(1801);
+    s.tracker_announce_due(later, 0, &mut out);
+    assert_eq!(out.len(), 1);
+    let SessionOut::TrackerAnnounce { params, .. } = &out[0] else {
+        panic!("announce effect")
+    };
+    assert_eq!(params.event, 0);
 }
 
 #[test]

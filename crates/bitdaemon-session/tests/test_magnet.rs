@@ -164,6 +164,7 @@ fn pex_feeds_swarm_and_broadcasts() {
             data: bitdaemon_bencode::bencode(&hs.build()).into(),
         },
         0,
+        &bitdaemon_session::settings::SessionSettings::default(),
         &mut out,
     );
 
@@ -177,6 +178,7 @@ fn pex_feeds_swarm_and_broadcasts() {
             data: body.into(),
         },
         0,
+        &bitdaemon_session::settings::SessionSettings::default(),
         &mut out,
     );
     assert_eq!(t.peer_list.num_peers(), 1);
@@ -233,6 +235,7 @@ fn pex_advertises_only_completed_dialable_peers() {
             data: bitdaemon_bencode::bencode(&hs.build()).into(),
         },
         0,
+        &bitdaemon_session::settings::SessionSettings::default(),
         &mut scratch,
     );
 

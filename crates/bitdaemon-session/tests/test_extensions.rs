@@ -151,7 +151,13 @@ fn new_peer_connection_and_message_fanout() {
 
     // an incoming wire message reaches the peer_plugin.
     let mut out = Vec::new();
-    t.on_peer_message(9, &PeerMessage::Have(PieceIndex(0)), 0, &mut out);
+    t.on_peer_message(
+        9,
+        &PeerMessage::Have(PieceIndex(0)),
+        0,
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &mut out,
+    );
     assert_eq!(rec.peer_msgs.lock().unwrap().len(), 1);
 
     // per-peer `on_tick` rides the session tick.

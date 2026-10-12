@@ -37,7 +37,12 @@ fn peer_bitfield_refcounts_picker() {
     );
     t.add_peer(1, c);
     let mut out = Vec::new();
-    t.apply_peer_effects(1, eff, &mut out);
+    t.apply_peer_effects(
+        1,
+        eff,
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &mut out,
+    );
     // pieces 0,1 now have refcount 1
     let p = t.picker.as_ref().unwrap();
     assert_eq!(p.piece_stats(PieceIndex(0)).peer_count, 1);
@@ -130,4 +135,106 @@ fn failed_piece_restores() {
     );
     // piece back in open queue — pickable again
     assert!(!t.finished);
+}
+
+/// `fill_send_buffer` (upstream `peer_connection::fill_send_buffer`)
+/// — a peer's accepted requests issue disk reads only while
+/// `send_buffer + reading_bytes` stays under the dynamic watermark;
+/// the rest queue in `upload_queue` (`m_requests`) until the socket
+/// drains (`on_peer_sent` / the second tick).
+#[test]
+fn fill_send_buffer_gates_reads_on_watermark() {
+    use bitdaemon_common::PeerRequest;
+    use bitdaemon_session::settings::SessionSettings;
+
+    let s = SessionSettings::default();
+    // seed: every piece present
+    let mut have = Bitfield::new();
+    have.resize_with(4, true);
+    let mut t = Torrent::new(
+        Sha1Hash::from_bytes(&[9u8; 20]).unwrap(),
+        4,
+        0x40000,
+        have,
+        StorageIndex(0),
+    );
+    let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
+    c.choked = false;
+    // rate 0 → watermark = send_buffer_low_watermark (10 KiB)
+    c.upload_queue.push(PeerRequest {
+        piece: PieceIndex(0),
+        start: 0,
+        length: 0x4000,
+    });
+    c.upload_queue.push(PeerRequest {
+        piece: PieceIndex(1),
+        start: 0,
+        length: 0x4000,
+    });
+    t.add_peer(1, c);
+
+    let mut out = Vec::new();
+    t.fill_send_buffer(1, &s, &mut out);
+    // first read admitted, second held (16 KiB in flight >= 10 KiB)
+    let reads: Vec<_> = out
+        .iter()
+        .filter(|e| matches!(e, TorrentEffect::DiskRead { .. }))
+        .collect();
+    assert_eq!(reads.len(), 1);
+    assert_eq!(t.peers[&1].upload_queue.len(), 1);
+    assert_eq!(t.peers[&1].reading_bytes, 0x4000);
+
+    // read completes → reading_bytes frees, but the payload moves to
+    // the send buffer: still over the watermark, nothing new issues.
+    {
+        let c = t.peers.get_mut(&1).unwrap();
+        c.reading_bytes = 0;
+        c.send_buffer = 0x4000;
+    }
+    let mut out2 = Vec::new();
+    t.fill_send_buffer(1, &s, &mut out2);
+    assert_eq!(
+        out2.iter()
+            .filter(|e| matches!(e, TorrentEffect::DiskRead { .. }))
+            .count(),
+        0
+    );
+
+    // socket drains (`on_sent`) → buffer below watermark → next
+    // queued request issues.
+    {
+        let c = t.peers.get_mut(&1).unwrap();
+        c.send_buffer = 0;
+    }
+    let mut out3 = Vec::new();
+    t.fill_send_buffer(1, &s, &mut out3);
+    assert_eq!(
+        out3.iter()
+            .filter(|e| matches!(e, TorrentEffect::DiskRead { .. }))
+            .count(),
+        1
+    );
+    assert!(t.peers[&1].upload_queue.is_empty());
+
+    // upstream's watermark scales with the measured upload rate:
+    // rate_up_speed × factor/100, clamped to [low, high].
+    let mut c2 = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
+    c2.choked = false;
+    c2.rate_up_speed = 1_000_000; // 1 MB/s × 50 % → 500 KiB cap
+    for i in 0..3 {
+        c2.upload_queue.push(PeerRequest {
+            piece: PieceIndex(i),
+            start: 0,
+            length: 0x4000,
+        });
+    }
+    t.add_peer(2, c2);
+    let mut out4 = Vec::new();
+    t.fill_send_buffer(2, &s, &mut out4);
+    assert_eq!(
+        out4.iter()
+            .filter(|e| matches!(e, TorrentEffect::DiskRead { .. }))
+            .count(),
+        3
+    );
 }

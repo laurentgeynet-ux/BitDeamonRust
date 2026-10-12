@@ -682,6 +682,9 @@ impl Torrent {
         t.share_mode = atp
             .flags
             .contains(bitdaemon_common::flags::TorrentFlags::SHARE_MODE);
+        t.super_seeding = atp
+            .flags
+            .contains(bitdaemon_common::flags::TorrentFlags::SUPER_SEEDING);
         // upstream `torrent::torrent`: seed_mode only sticks when the
         // resume data is consistent — no dont_download priorities and
         // every piece claimed present. Otherwise the flag is dropped
@@ -973,8 +976,18 @@ impl Torrent {
         for p in added {
             // upstream skips local addresses unless the sender is
             // local — our peers are anonymous endpoints, keep all
-            self.peer_list
-                .add_peer(p.addr, bitdaemon_common::flags::PeerSourceFlags::PEX, true);
+            let (i, _new) = self.peer_list.add_peer(
+                p.addr,
+                bitdaemon_common::flags::PeerSourceFlags::PEX,
+                true,
+            );
+            // `added.f` pex_encryption → `pi->pe_support` (upstream
+            // `ut_pex::on_message`); drives the MSE dial decision.
+            if p.flags & crate::ut_pex::flags::PEX_ENCRYPTION != 0
+                && let Some(peer) = self.peer_list.peers_mut().get_mut(i)
+            {
+                peer.pe_support = true;
+            }
         }
     }
 
@@ -1005,11 +1018,16 @@ impl Torrent {
                 {
                     ep.set_port(p);
                 }
-                let flags = if c.peer_pieces.count() == c.num_pieces as usize {
+                let mut flags = if c.peer_pieces.count() == c.num_pieces as usize {
                     crate::ut_pex::flags::PEX_SEED
                 } else {
                     0
                 };
+                // `pex_encryption` — advertised when the conn went
+                // through MSE (`supports_encryption()` upstream).
+                if c.supports_encryption {
+                    flags |= crate::ut_pex::flags::PEX_ENCRYPTION;
+                }
                 Some((ep, flags))
             })
             .collect();
@@ -1126,8 +1144,76 @@ impl Torrent {
         } else {
             atp.info_hashes.v1 = self.info_hash;
         }
+        // `m_save_path` — without it a restored torrent silently
+        // downloads into the caller's CWD instead of its real
+        // save directory.
+        atp.save_path = self.save_path.clone().into_bytes();
+        atp.part_file_dir = self.part_file_dir.clone().into_bytes();
+        atp.name = self.name.clone().into_bytes();
+        atp.storage_mode = self.storage_mode;
+        atp.flags = self.flags();
         atp.have_pieces = self.have.clone();
-        atp.verified_pieces = self.have.clone();
+        // upstream: `verified` only meaningful in seed mode.
+        if self.seed_mode {
+            atp.verified_pieces = self.seed_verified.clone();
+        }
+        // `m_trackers` — url + tier pairs.
+        for e in self.trackers.trackers.iter() {
+            atp.trackers.push(e.url.clone().into_bytes());
+            atp.tracker_tiers.push(e.tier);
+        }
+        // `m_peer_list` — connectable, non-banned, working peers
+        // (upstream skips failcount>0, trust<0, non-connectable;
+        // never-seen peers fill up to 100).
+        let mut deferred: Vec<SocketAddr> = Vec::new();
+        for p in self.peer_list.peers() {
+            let Some(addr) = p.ip() else { continue };
+            if p.banned {
+                atp.banned_peers.push(addr);
+                continue;
+            }
+            if !p.connectable || p.failcount > 0 || p.trust_points < 0 {
+                continue;
+            }
+            if p.last_connected == 0 {
+                if deferred.len() < 100 {
+                    deferred.push(addr);
+                }
+                continue;
+            }
+            atp.peers.push(addr);
+        }
+        for p in deferred {
+            if atp.peers.len() >= 100 {
+                break;
+            }
+            atp.peers.push(p);
+        }
+        // `m_file_priority` — mutually exclusive with piece
+        // priorities upstream; skipped in seed mode.
+        if !self.file_priorities.is_empty() && !self.seed_mode {
+            atp.file_priorities = self.file_priorities.clone();
+            atp.piece_priorities.clear();
+        }
+        for (i, name) in &self.renamed_files {
+            atp.renamed_files.insert(*i, name.clone().into_bytes());
+        }
+        atp.total_uploaded = self.total_upload();
+        atp.total_downloaded = self.total_download();
+        atp.upload_limit = self.upload_limit;
+        atp.download_limit = self.download_limit;
+        atp.max_connections = i64::from(self.max_connections);
+        atp.max_uploads = i64::from(self.max_uploads);
+        atp.last_seen_complete = self.last_seen_complete;
+        atp.added_time = self
+            .added_time
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        atp.active_time = self.started.elapsed().as_secs() as i64;
+        atp.finished_time = self.finished_at.map_or(0, |t| t.elapsed().as_secs() as i64);
+        atp.seeding_time = self
+            .seeding_since
+            .map_or(0, |t| t.elapsed().as_secs() as i64);
         // upstream `torrent::write_resume_data`: every non-removed,
         // non-ephemeral `m_web_seeds` entry folds into
         // `ret.url_seeds` — http_seed-type entries included (the
@@ -1218,6 +1304,18 @@ impl Torrent {
                 self.have.set_bit(i as usize);
             }
         }
+        // `total_done` counts resume-claimed bytes too (upstream
+        // progress is `total_done/total_size`) — a rejected
+        // fastresume later rewinds both `have` and this counter.
+        self.verified_bytes = (0..self.num_pieces).fold(0i64, |acc, i| {
+            if self.have.get_bit(i as usize) {
+                acc + self.files.as_ref().map_or(self.piece_length, |f| {
+                    i64::from(f.piece_size(PieceIndex(i)))
+                })
+            } else {
+                acc
+            }
+        });
         for (i, prio) in atp.piece_priorities.iter().enumerate() {
             if i as i32 >= self.num_pieces {
                 break;
@@ -1392,16 +1490,24 @@ impl Torrent {
             // passed `piece_verified` — resume bits live solely in
             // `self.have`, clearing it is sufficient.
             self.have.clear_all();
+            self.verified_bytes = 0;
             self.finished = false;
             self.seeding = false;
             return;
         }
-        if self.have.count() as i32 == self.num_pieces && self.num_pieces > 0 {
+        // `is_finished()` — all *wanted* pieces (upstream
+        // `files_checked` → `finished()`); `seeding` needs the
+        // full set (`completed()` → `torrent_status::seeding`).
+        let all = self.num_pieces > 0 && self.have.count() as i32 == self.num_pieces;
+        let want_done = all || self.picker.as_ref().is_some_and(|p| p.is_finished());
+        if want_done {
             self.finished = true;
-            self.seeding = true;
             self.finished_at.get_or_insert_with(Instant::now);
-            self.seeding_since.get_or_insert_with(Instant::now);
             out.push(TorrentEffect::BecameSeed);
+        }
+        if all {
+            self.seeding = true;
+            self.seeding_since.get_or_insert_with(Instant::now);
         }
     }
 
@@ -1494,7 +1600,8 @@ impl Torrent {
         &mut self,
         session_time: i32,
         state: &bitdaemon_net::peer_list::PeerListState,
-    ) -> Vec<std::net::SocketAddr> {
+        out_policy: bitdaemon_net::pe_crypto::EncPolicy,
+    ) -> Vec<(std::net::SocketAddr, bool)> {
         // keep `finished` in sync so seeds skip seeds/upload-only
         let mut st = state.clone();
         st.is_finished = self.is_seed();
@@ -1506,7 +1613,29 @@ impl Torrent {
             self.peer_list.set_connected(*i);
         }
         idxs.into_iter()
-            .filter_map(|i| self.peer_list.peers().get(i).and_then(|p| p.ip()))
+            .filter_map(|i| {
+                let p = self.peer_list.peers_mut().get_mut(i)?;
+                let ep = p.ip()?;
+                // upstream `bt_peer_connection::start`: pe_forced →
+                // MSE always; pe_enabled → MSE iff `pi->pe_support`,
+                // with the self-toggling flag: a plain dial pre-sets
+                // it (a failure retries encrypted), an MSE dial
+                // clears it (success re-arms via peer_connected).
+                let encrypted = match out_policy {
+                    bitdaemon_net::pe_crypto::EncPolicy::Forced => true,
+                    bitdaemon_net::pe_crypto::EncPolicy::Disabled => false,
+                    bitdaemon_net::pe_crypto::EncPolicy::Enabled => {
+                        if p.pe_support {
+                            p.pe_support = false;
+                            true
+                        } else {
+                            p.pe_support = true;
+                            false
+                        }
+                    }
+                };
+                Some((ep, encrypted))
+            })
             .collect()
     }
 
@@ -1521,10 +1650,14 @@ impl Torrent {
     }
 
     /// `set_connection` — mark the swarm entry for `remote` as
-    /// connected (also covers inbound accepts).
-    pub fn peer_connected_addr(&mut self, remote: std::net::SocketAddr) {
+    /// connected (also covers inbound accepts). `encrypted` = the
+    /// conn negotiated MSE → upstream re-arms `pi->pe_support`.
+    pub fn peer_connected_addr(&mut self, remote: std::net::SocketAddr, encrypted: bool) {
         if let Some(i) = self.peer_index(remote) {
             self.peer_list.set_connected(i);
+            if let Some(p) = self.peer_list.peers_mut().get_mut(i) {
+                p.pe_support = encrypted;
+            }
         }
     }
 
@@ -1600,12 +1733,54 @@ impl Torrent {
         let _ = eff;
     }
 
+    /// `peer_connection::fill_send_buffer` — issue disk reads for the
+    /// requests the peer has queued (`upload_queue` ≡ `m_requests`)
+    /// while `send_buffer + reading_bytes` stays under the dynamic
+    /// watermark:
+    /// `clamp(uploaded_last_second * factor/100, low, high)`.
+    /// Requests for pieces we no longer have are rejected upstream-
+    /// style (`write_reject_request`, FAST-gated).
+    pub fn fill_send_buffer(
+        &mut self,
+        peer_id: u64,
+        s: &crate::settings::SessionSettings,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        let Some(c) = self.peers.get_mut(&peer_id) else {
+            return;
+        };
+        let watermark = (i64::from(c.rate_up_speed) * i64::from(s.send_buffer_watermark_factor)
+            / 100)
+            .clamp(s.send_buffer_low_watermark, s.send_buffer_watermark as i64)
+            .max(0) as usize;
+        while !c.upload_queue.is_empty() && c.send_buffer + c.reading_bytes < watermark {
+            let r = c.upload_queue[0];
+            if (r.piece.0 as usize) < self.have.size() && self.have.get_bit(r.piece.0 as usize) {
+                c.reading_bytes += r.length.max(0) as usize;
+                c.upload_queue.remove(0);
+                out.push(TorrentEffect::DiskRead {
+                    peer: peer_id,
+                    req: r,
+                });
+            } else {
+                c.upload_queue.remove(0);
+                if c.supports_fast {
+                    out.push(TorrentEffect::SendTo {
+                        peer: peer_id,
+                        msg: PeerMessage::RejectRequest(r),
+                    });
+                }
+            }
+        }
+    }
+
     /// `peer_has`/`peer_lost` — apply [`PeerEffect`]s from a peer
     /// dispatch into picker/disk intents.
     pub fn apply_peer_effects(
         &mut self,
         peer_id: u64,
         effects: Vec<PeerEffect>,
+        s: &crate::settings::SessionSettings,
         out: &mut Vec<TorrentEffect>,
     ) {
         let key = self.peers.get(&peer_id).and_then(PeerConn::peer_key);
@@ -1644,10 +1819,20 @@ impl Torrent {
                     // `incoming_request` → `write_reject_request`
                     // + `invalid_request_alert`).
                     if self.super_seeding {
-                        let leaked = self.peers.get(&peer_id).and_then(|c| c.superseed_piece);
-                        if leaked != Some(req.piece) {
+                        // `super_seeded_piece` — either of the two
+                        // leaked slots honors the request.
+                        let leaked = self
+                            .peers
+                            .get(&peer_id)
+                            .is_some_and(|c| c.superseed_pieces.contains(&Some(req.piece)));
+                        if !leaked {
                             if let Some(c) = self.peers.get_mut(&peer_id) {
                                 c.num_invalid_requests += 1;
+                                // rejected requests never enter
+                                // `m_requests` upstream — drop the
+                                // entry peer_conn queued.
+                                c.upload_queue
+                                    .retain(|u| !(u.piece == req.piece && u.start == req.start));
                                 // `write_reject_request` is gated
                                 // on the FAST extension upstream.
                                 if c.supports_fast {
@@ -1671,12 +1856,17 @@ impl Torrent {
                     // drop when fast isn't negotiated) — never a
                     // disk read. Accepted requests post
                     // `incoming_request_alert`; rejected ones post
-                    // `invalid_request_alert`.
-                    let allowed = self.peers.get(&peer_id).is_some_and(|c| {
-                        (!c.choked || c.allowed_fast.contains(&req.piece))
-                            && (req.piece.0 as usize) < self.have.size()
-                            && self.have.get_bit(req.piece.0 as usize)
+                    // `invalid_request_alert`. A flood beyond
+                    // `max_allowed_in_request_queue` is rejected too.
+                    let queue_full = self.peers.get(&peer_id).is_some_and(|c| {
+                        c.upload_queue.len() as i32 > s.max_allowed_in_request_queue
                     });
+                    let allowed = !queue_full
+                        && self.peers.get(&peer_id).is_some_and(|c| {
+                            (!c.choked || c.allowed_fast.contains(&req.piece))
+                                && (req.piece.0 as usize) < self.have.size()
+                                && self.have.get_bit(req.piece.0 as usize)
+                        });
                     if allowed {
                         out.push(TorrentEffect::Alert(
                             crate::alerts::Alert::IncomingRequest {
@@ -1687,8 +1877,16 @@ impl Torrent {
                                 length: req.length,
                             },
                         ));
-                        out.push(TorrentEffect::DiskRead { peer: peer_id, req });
+                        // the request is already in `upload_queue`
+                        // (≡ `m_requests`) — `fill_send_buffer`
+                        // admits reads under the send-buffer
+                        // watermark.
+                        self.fill_send_buffer(peer_id, s, out);
                     } else {
+                        if let Some(c) = self.peers.get_mut(&peer_id) {
+                            c.upload_queue
+                                .retain(|u| !(u.piece == req.piece && u.start == req.start));
+                        }
                         out.push(TorrentEffect::Alert(crate::alerts::Alert::InvalidRequest {
                             ih: self.info_hash,
                             remote: remote.clone(),
@@ -1907,11 +2105,13 @@ impl Torrent {
 
     /// feed one decoded message from `peer` — `dispatch` + effects.
     /// `now` is `session_time` (s) for inactivity bookkeeping.
+    /// `s` feeds the send-buffer watermark (`m_settings` upstream).
     pub fn on_peer_message(
         &mut self,
         peer_id: u64,
         msg: &PeerMessage,
         now: i32,
+        s: &crate::settings::SessionSettings,
         out: &mut Vec<TorrentEffect>,
     ) {
         match msg {
@@ -1946,11 +2146,18 @@ impl Torrent {
             _ => {}
         }
         let mut effects = Vec::new();
-        // super-seeding: a `have` for the piece we leaked triggers
-        // the next superseed pick (upstream `incoming_have`).
+        // super-seeding: a `have` for a piece we leaked triggers
+        // the next superseed pick (upstream `incoming_have` runs
+        // this before updating `m_have_piece`, so the announced
+        // piece is still a candidate — the second_tick recovery
+        // below unsticks the rare re-pick stall).
         if self.super_seeding {
             if let PeerMessage::Have(p) = msg {
-                if self.peers.get(&peer_id).and_then(|c| c.superseed_piece) == Some(*p) {
+                if self
+                    .peers
+                    .get(&peer_id)
+                    .is_some_and(|c| c.superseed_pieces.contains(&Some(*p)))
+                {
                     self.on_superseeded_have(peer_id, *p, out);
                 }
             }
@@ -1971,7 +2178,7 @@ impl Torrent {
             }
             c.dispatch(msg, self.num_pieces, &mut effects);
         }
-        self.apply_peer_effects(peer_id, effects, out);
+        self.apply_peer_effects(peer_id, effects, s, out);
     }
 
     /// `!peer_info_struct()->protocol_v2 || !t->valid_metadata()` —
@@ -2154,6 +2361,20 @@ impl Torrent {
     /// other peer is already super-seeded on.
     #[must_use]
     pub fn get_piece_to_super_seed(&self, remote_bits: &Bitfield) -> Option<PieceIndex> {
+        self.get_piece_to_super_seed_ex(remote_bits, None)
+    }
+
+    /// `get_piece_to_super_seed` variant that also counts an extra
+    /// connection — used during `send_bitfield`, when the new conn
+    /// is not registered in `peers` yet but its leaked slots must
+    /// still bias the second bootstrap pick (upstream iterates
+    /// `*this`, which already includes the sending connection).
+    #[must_use]
+    pub fn get_piece_to_super_seed_ex(
+        &self,
+        remote_bits: &Bitfield,
+        extra: Option<&crate::peer_conn::PeerConn>,
+    ) -> Option<PieceIndex> {
         let mut min_avail = 9999i32;
         let mut avail: Vec<PieceIndex> = Vec::new();
         for i in 0..self.num_pieces {
@@ -2161,8 +2382,18 @@ impl Torrent {
                 continue;
             }
             let mut availability = 0i32;
+            if let Some(c) = extra {
+                if c.superseed_pieces.contains(&Some(PieceIndex(i))) {
+                    availability = 999;
+                } else if (i as usize) < c.peer_pieces.size() && c.peer_pieces.get_bit(i as usize) {
+                    availability += 1;
+                }
+            }
             for c in self.peers.values() {
-                if c.superseed_piece == Some(PieceIndex(i)) {
+                if availability == 999 {
+                    break;
+                }
+                if c.superseed_pieces.contains(&Some(PieceIndex(i))) {
                     availability = 999;
                     break;
                 }
@@ -2185,25 +2416,96 @@ impl Torrent {
         Some(avail[(rand::random::<u32>() as usize) % avail.len()])
     }
 
+    /// `peer_connection::superseed_piece` — leak `new` to the peer
+    /// (a `have`), replacing `replace` in the two leaked slots;
+    /// `None` ends super-seeding for this peer by sending the real
+    /// bitfield (`have_all` when FAST was negotiated).
+    fn superseed_piece(
+        &mut self,
+        peer: u64,
+        replace: Option<PieceIndex>,
+        new: Option<PieceIndex>,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        match new {
+            None => {
+                let active = self
+                    .peers
+                    .get(&peer)
+                    .is_some_and(|c| c.superseed_pieces.iter().any(Option::is_some));
+                if !active {
+                    return;
+                }
+                let fast = self.peers.get(&peer).is_some_and(|c| c.supports_fast);
+                if let Some(c) = self.peers.get_mut(&peer) {
+                    c.superseed_pieces = [None, None];
+                }
+                // `write_bitfield` — full state ends super-seeding;
+                // a super-seeder is a seed, so FAST peers get
+                // `have_all`, others the full bitfield.
+                let bits: Vec<u8> = self.have.bytes().into();
+                let msg = if fast {
+                    PeerMessage::HaveAll
+                } else {
+                    PeerMessage::Bitfield(bits.into())
+                };
+                out.push(TorrentEffect::SendTo { peer, msg });
+            }
+            Some(p) => {
+                out.push(TorrentEffect::SendTo {
+                    peer,
+                    msg: PeerMessage::Have(p),
+                });
+                if let Some(c) = self.peers.get_mut(&peer) {
+                    // upstream moves the replaced piece to the tail
+                    // slot so both leaked pieces stay requestable.
+                    if c.superseed_pieces[0] == replace {
+                        c.superseed_pieces.swap(0, 1);
+                    }
+                    c.superseed_pieces[1] = c.superseed_pieces[0];
+                    c.superseed_pieces[0] = Some(p);
+                }
+            }
+        }
+    }
+
+    /// `peer_connection::second_tick` super-seed recovery — a peer
+    /// uninterested for > 10 s might be waiting on a leaked piece it
+    /// already has (re-pick stall): leak it a fresh piece.
+    pub fn super_seed_second_tick(&mut self, out: &mut Vec<TorrentEffect>) {
+        // upstream gate: `super_seeding && ready_for_connections`.
+        if !self.super_seeding || self.paused || self.now_ms <= 0 {
+            return;
+        }
+        let stale: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|(_, c)| !c.peer_interested && c.became_uninterested_ms + 10_000 < self.now_ms)
+            .map(|(pid, _)| *pid)
+            .collect();
+        for pid in stale {
+            let bits = self
+                .peers
+                .get(&pid)
+                .map(|c| c.peer_pieces.clone())
+                .unwrap_or_default();
+            let next = self.get_piece_to_super_seed(&bits);
+            // `superseed_piece(-1, …)` — no replace.
+            self.superseed_piece(pid, None, next, out);
+        }
+    }
+
     /// `peer_connection::incoming_have` super-seed hook: when the
-    /// remote completed the piece we super-seeded it, pick the next
+    /// remote completed a piece we super-seeded it, pick the next
     /// one and `have`-announce it.
-    fn on_superseeded_have(&mut self, peer: u64, _piece: PieceIndex, out: &mut Vec<TorrentEffect>) {
+    fn on_superseeded_have(&mut self, peer: u64, piece: PieceIndex, out: &mut Vec<TorrentEffect>) {
         let bits = self
             .peers
             .get(&peer)
             .map(|c| c.peer_pieces.clone())
             .unwrap_or_default();
         let next = self.get_piece_to_super_seed(&bits);
-        if let Some(c) = self.peers.get_mut(&peer) {
-            c.superseed_piece = next;
-        }
-        if let Some(p) = next {
-            out.push(TorrentEffect::SendTo {
-                peer,
-                msg: PeerMessage::Have(p),
-            });
-        }
+        self.superseed_piece(peer, Some(piece), next, out);
     }
 
     /// `request_a_block` for one peer — `drive_requests` emits the
@@ -2688,16 +2990,39 @@ impl Torrent {
                     msg: PeerMessage::Have(piece),
                 });
             }
-            if self.have.count() as i32 == self.num_pieces {
+            // upstream `torrent::finished()` fires on `is_finished()`
+            // — all *wanted* pieces, not necessarily all pieces (a
+            // file priority of 0 makes its pieces unwanted).
+            let all = self.have.count() as i32 == self.num_pieces;
+            let want_done = all || self.picker.as_ref().is_some_and(|p| p.is_finished());
+            if !self.finished && want_done {
                 self.finished = true;
                 self.finished_at.get_or_insert_with(Instant::now);
                 out.push(TorrentEffect::BecameSeed);
+                // upstream `finished()` drops upload-only peers —
+                // nothing more to exchange either way.
+                let uo: Vec<u64> = self
+                    .peers
+                    .iter()
+                    .filter(|(_, c)| c.remote_upload_only)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in uo {
+                    out.push(TorrentEffect::DisconnectPeer {
+                        peer: id,
+                        reason: "torrent finished",
+                    });
+                }
                 // `stop_when_ready` — pause as soon as the download
                 // completes (upstream pauses the torrent in
                 // `files_checked`/piece-finish path).
                 if self.stop_when_ready && !self.paused {
                     self.paused = true;
                 }
+            }
+            if all {
+                self.seeding = true;
+                self.seeding_since.get_or_insert_with(Instant::now);
             }
             // our bitfield changed → peers may stop being
             // interesting (`update_peer_interest` upstream).
@@ -3132,6 +3457,7 @@ impl Torrent {
             return 0;
         }
         self.have.clear_all();
+        self.verified_bytes = 0;
         self.finished = false;
         self.seeding = false;
         self.checking = true;

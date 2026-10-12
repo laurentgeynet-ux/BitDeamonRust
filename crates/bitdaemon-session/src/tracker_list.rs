@@ -30,6 +30,10 @@ pub struct AnnounceInfohash {
     pub complete_sent: bool,
     /// `start_sent`.
     pub start_sent: bool,
+    /// the `event` value of the in-flight request — carried to the
+    /// response so `sent()` can mark `start_sent`/`complete_sent`
+    /// (upstream `tracker_connection` remembers its request).
+    pub sent_event: i32,
 }
 
 impl AnnounceInfohash {
@@ -70,6 +74,26 @@ impl AnnounceInfohash {
     /// `announce_infohash::reset`.
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// `announce_endpoint::sent` — successful response bookkeeping:
+    /// clears `updating`/`fails`, schedules `next_announce` at
+    /// `now + interval`, `min_announce` at `now + min_interval`,
+    /// and records the lifecycle event actually delivered
+    /// (`started`/`completed`) so it is never sent twice.
+    pub fn sent(&mut self, interval: Duration, min_interval: Option<Duration>, now: Instant) {
+        self.updating = false;
+        self.fails = 0;
+        self.next_announce = Some(now + interval);
+        if let Some(m) = min_interval {
+            self.min_announce = Some(now + m);
+        }
+        match self.sent_event {
+            1 => self.complete_sent = true,
+            2 => self.start_sent = true,
+            _ => {}
+        }
+        self.sent_event = 0;
     }
 }
 
@@ -178,6 +202,20 @@ impl AnnounceEntry {
         for e in &mut self.endpoints {
             e.v1.failed(backoff_ratio, retry_interval, now);
             e.v2.failed(backoff_ratio, retry_interval, now);
+        }
+    }
+
+    /// `sent` on every endpoint slot — the entry's announce covers
+    /// all slots in this port (one exchange per tracker URL).
+    pub fn sent(&mut self, interval: Duration, min_interval: Option<Duration>, now: Instant) {
+        for e in &mut self.endpoints {
+            e.v1.sent(interval, min_interval, now);
+            // the v2 slot was held in-flight too — it shares the
+            // schedule (upstream announces each info-hash
+            // separately; our single exchange stands in for both).
+            e.v2.updating = false;
+            e.v2.fails = 0;
+            e.v2.next_announce = Some(now + interval);
         }
     }
 

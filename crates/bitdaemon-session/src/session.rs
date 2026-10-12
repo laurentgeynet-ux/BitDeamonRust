@@ -324,6 +324,10 @@ pub struct Session {
     pub next_queue_seq: i64,
     /// last LSD broadcast.
     last_lsd: Option<Instant>,
+    /// torrents that already fired their prioritized first LSD
+    /// announce (upstream `torrent::start_announcing` emits one
+    /// immediately, the 5-min timer only re-sends).
+    lsd_announced: std::collections::BTreeSet<Sha1Hash>,
     /// `m_session_time` — seconds since session start, bumped once
     /// per `tick` (peer_list reconnect backoff epoch).
     pub session_time: i32,
@@ -548,6 +552,7 @@ impl Default for Session {
                 rand::rng().random::<i32>()
             },
             lsd_cookie: rand::random::<u32>(),
+            lsd_announced: std::collections::BTreeSet::new(),
             next_queue_seq: 0,
             last_lsd: None,
             session_time: 0,
@@ -620,10 +625,15 @@ impl Session {
         // handlers push `DiskCompleted` into `disk_rx`, so run them
         // first or nothing below ever fires (writes/hashes wedged).
         if let Some(d) = &self.disk {
-            d.call_job_handlers();
+            let n = d.call_job_handlers();
+            if n > 0 {
+                tracing::debug!(n, "disk completions drained");
+            }
             d.flush_expired();
         }
+        let mut drained = 0usize;
         while let Ok(c) = self.disk_rx.try_recv() {
+            drained += 1;
             match c {
                 DiskCompleted::Read {
                     ih,
@@ -632,6 +642,14 @@ impl Session {
                     buf,
                     err,
                 } => {
+                    // `on_disk_read_complete` — the in-flight read is
+                    // over regardless of outcome (`m_reading_bytes`).
+                    if let Some(t) = self.torrents.get_mut(&ih)
+                        && let Some(c) = t.peers.get_mut(&peer)
+                    {
+                        c.reading_bytes =
+                            c.reading_bytes.saturating_sub(req.length.max(0) as usize);
+                    }
                     if err.is_err() {
                         self.alerts.post(Alert::FileError {
                             ih,
@@ -641,15 +659,16 @@ impl Session {
                         continue;
                     }
                     if let Some(data) = buf.data().map(|d| d.to_vec()) {
-                        out.push(SessionOut::ToPeer {
-                            ih,
+                        self.push_to_peer(
+                            &ih,
                             peer,
-                            msg: PeerMessage::Piece {
+                            PeerMessage::Piece {
                                 piece: req.piece,
                                 offset: req.start,
                                 data: data.into(),
                             },
-                        });
+                            out,
+                        );
                         // `block_uploaded_alert` — the block went
                         // out to the peer (upstream posts it in
                         // `peer_connection::on_disk_read_complete`).
@@ -884,6 +903,9 @@ impl Session {
                     self.on_piece_verified(&ih, piece, passed, out);
                 }
             }
+        }
+        if drained > 0 {
+            tracing::debug!(drained, "disk_rx drained");
         }
     }
 
@@ -1285,6 +1307,7 @@ impl Session {
             );
         }
         self.post_tracker_announces(sent, 3);
+        self.lsd_announced.remove(ih);
         let removed = self.torrents.remove(ih);
         if let Some(t) = &removed {
             // upstream `~torrent` → `m_disk_thread.remove_torrent` —
@@ -1358,21 +1381,30 @@ impl Session {
         out: &mut Vec<SessionOut>,
         sent: &mut Vec<(Sha1Hash, String)>,
     ) {
-        for e in &t.trackers.trackers {
+        let mut due = Vec::new();
+        for e in &mut t.trackers.trackers {
             let started = e
                 .endpoints
                 .iter()
                 .any(|ep| ep.v1.start_sent || ep.v2.start_sent);
             if started {
-                out.push(SessionOut::TrackerAnnounce {
-                    ih: t.info_hash,
-                    url: e.url.clone(),
-                    tracker_id: e.tracker_id.clone(),
-                    params: t.announce_params(peer_id, port, 3, key),
-                });
-                t.outstanding_announces += 1;
-                sent.push((t.info_hash, e.url.clone()));
+                for ep in &mut e.endpoints {
+                    ep.v1.updating = true;
+                    ep.v1.sent_event = 3;
+                    ep.v2.updating = true;
+                }
+                due.push((e.url.clone(), e.tracker_id.clone()));
             }
+        }
+        for (url, tracker_id) in due {
+            out.push(SessionOut::TrackerAnnounce {
+                ih: t.info_hash,
+                url: url.clone(),
+                tracker_id,
+                params: t.announce_params(peer_id, port, 3, key),
+            });
+            t.outstanding_announces += 1;
+            sent.push((t.info_hash, url));
         }
     }
 
@@ -1522,7 +1554,7 @@ impl Session {
             // `incoming_request_alert`/`invalid_request_alert` are
             // posted by `Torrent`'s ReadRequest handler — upstream
             // only posts the former for *accepted* requests.
-            t.on_peer_message(p.peer, &p.msg, self.session_time, &mut eff);
+            t.on_peer_message(p.peer, &p.msg, self.session_time, &self.settings, &mut eff);
         }
         self.route(p.info_hash, eff, out);
     }
@@ -1560,26 +1592,43 @@ impl Session {
                 t.ti.as_ref()
                     .and_then(|ti| ti.info_hash_v2())
                     .is_some_and(|v2| v2.as_bytes()[..20] == ih.as_bytes()[..]);
-            t.peer_connected_addr(remote);
-            // upstream `send_bitfield` on connect — super-seeding
-            // hides the real bitfield and `have`s only the leaked
-            // piece instead.
-            let msg = if t.super_seeding {
-                t.get_piece_to_super_seed(&conn.peer_pieces).map(|p| {
-                    conn.superseed_piece = Some(p);
-                    PeerMessage::Have(p)
-                })
+            t.peer_connected_addr(remote, conn.supports_encryption);
+            // upstream `write_bitfield` on connect — super-seeding
+            // hides the real bitfield (`have_none` under FAST) and
+            // bootstraps by leaking *two* pieces via `have`.
+            let msgs: Vec<PeerMessage> = if t.super_seeding {
+                let mut v = Vec::new();
+                if conn.supports_fast {
+                    v.push(PeerMessage::HaveNone);
+                }
+                for _ in 0..2 {
+                    // the conn isn't in `t.peers` yet — its own
+                    // leaked slots still bias the second pick
+                    // (`get_piece_to_super_seed_ex`).
+                    if let Some(p) = t.get_piece_to_super_seed_ex(&conn.peer_pieces, Some(&conn)) {
+                        conn.superseed_pieces[1] = conn.superseed_pieces[0];
+                        conn.superseed_pieces[0] = Some(p);
+                        v.push(PeerMessage::Have(p));
+                    }
+                }
+                v
             } else if conn.supports_fast && t.is_seed() {
                 // BEP-6: `have_all` replaces a full bitfield.
-                Some(PeerMessage::HaveAll)
+                vec![PeerMessage::HaveAll]
             } else if conn.supports_fast && t.have.count() == 0 {
-                Some(PeerMessage::HaveNone)
+                vec![PeerMessage::HaveNone]
             } else {
                 let bits: Vec<u8> = t.have.bytes().into();
-                (!bits.is_empty() && t.have.count() > 0)
-                    .then_some(PeerMessage::Bitfield(bits.into()))
+                if bits.is_empty() || t.have.count() == 0 {
+                    Vec::new()
+                } else {
+                    vec![PeerMessage::Bitfield(bits.into())]
+                }
             };
-            if let Some(msg) = msg {
+            for msg in msgs {
+                if let Some(c) = t.peers.get_mut(&peer) {
+                    c.send_buffer += bitdaemon_net::peer_wire::wire_len(&msg);
+                }
                 out.push(SessionOut::ToPeer { ih: *ih, peer, msg });
             }
             // upstream `peer_connection::init` sends `port` when
@@ -1587,11 +1636,11 @@ impl Session {
             if conn.supports_dht
                 && let Some(port) = self.dht_port
             {
-                out.push(SessionOut::ToPeer {
-                    ih: *ih,
-                    peer,
-                    msg: PeerMessage::DhtPort(port),
-                });
+                let msg = PeerMessage::DhtPort(port);
+                if let Some(c) = t.peers.get_mut(&peer) {
+                    c.send_buffer += bitdaemon_net::peer_wire::wire_len(&msg);
+                }
+                out.push(SessionOut::ToPeer { ih: *ih, peer, msg });
             }
             // `peer_connect_alert` on successful registration.
             self.alerts.post(Alert::PeerConnect {
@@ -2291,6 +2340,15 @@ impl Session {
         // `update_alert_mask` — upstream hot-applies the persisted
         // mask to the alert manager.
         self.alerts.set_mask(s.alert_mask);
+        // upstream 2.x keeps the deprecated `pe_settings` in sync
+        // with the `settings_pack` encryption knobs — mirror that so
+        // `m_pe_settings` readers always see the live policy.
+        self.pe_settings = bitdaemon_net::pe_crypto::PeSettings {
+            out_enc_policy: s.out_enc_policy,
+            in_enc_policy: s.in_enc_policy,
+            allowed_enc_level: s.allowed_enc_level,
+            prefer_rc4: s.prefer_rc4,
+        };
         self.settings = s;
     }
 
@@ -2369,15 +2427,18 @@ impl Session {
             return;
         }
         const LSD_INTERVAL: Duration = Duration::from_secs(300);
-        if self
+        let resend = self
             .last_lsd
-            .is_some_and(|t| now.duration_since(t) < LSD_INTERVAL)
-        {
-            return;
-        }
-        self.last_lsd = Some(now);
+            .is_none_or(|t| now.duration_since(t) >= LSD_INTERVAL);
         for t in self.torrents.values_mut() {
             if t.private || !t.announce_lsd || t.paused {
+                continue;
+            }
+            // upstream `torrent::start_announcing` emits a
+            // prioritized announce per torrent immediately; the
+            // broadcast timer only re-sends.
+            let first = self.lsd_announced.insert(t.info_hash);
+            if !first && !resend {
                 continue;
             }
             t.lsd_announcing = true;
@@ -2396,6 +2457,9 @@ impl Session {
                 };
                 out.push(SessionOut::UdpPacket(pkt, to));
             }
+        }
+        if resend {
+            self.last_lsd = Some(now);
         }
     }
 
@@ -2489,10 +2553,19 @@ impl Session {
                 t.pex_tick(Instant::now(), &mut eff);
                 for id in t.peers.keys().copied().collect::<Vec<_>>() {
                     t.drive_peer(id, &mut eff);
+                    // `peer_connection::second_tick` tail —
+                    // `fill_send_buffer` admits queued requests once
+                    // the send buffer drained (covers stalls where
+                    // no `on_sent` fired, e.g. slow sockets).
+                    t.fill_send_buffer(id, &self.settings, &mut eff);
                 }
                 // `peer_connection::second_tick` — snub + refund
                 // blocks stuck past `request_timeout`.
                 t.check_request_timeouts(&mut eff);
+                // `peer_connection::second_tick` super-seed
+                // recovery — peers uninterested >10 s get a fresh
+                // leaked piece.
+                t.super_seed_second_tick(&mut eff);
                 // `web_connection_base` — feed url seeds too
                 if let Some((url, reqs)) = t.next_web_seed_blocks(web_seed_blocks)
                     && let Some(fs) = t.files.clone()
@@ -2572,22 +2645,33 @@ impl Session {
         if !self.settings.enable_dht || !self.services.dht || self.settings.anonymous_mode {
             return;
         }
-        // don't announce into an empty routing table — a `get_peers`
-        // lookup with no nodes finishes instantly and upstream only
-        // announces on a running (bootstrapped) DHT. Retrying every
-        // tick while the table is empty is harmless and matches the
-        // announce-once-bootstrapped behaviour.
-        let bootstrapped = [false, true]
-            .iter()
-            .any(|v6| self.dht.get_node(*v6).is_some_and(|n| n.table.size().0 > 0));
-        if !bootstrapped {
+        // upstream announces on a *running* DHT — the traversal
+        // seeds itself from `router_nodes` when the table is empty
+        // (`find_data::start` mixes both), so an empty routing table
+        // must not gate the announce. What *does* gate it is having
+        // nothing to seed from at all: a node with neither live
+        // entries nor router nodes would finish the traversal
+        // instantly, so we hold the announce until the first router
+        // node lands (upstream resolves `dht_bootstrap_nodes`
+        // before torrents are added, so its announces always see
+        // seeded traversals).
+        let seeded = [false, true].iter().any(|v6| {
+            self.dht
+                .get_node(*v6)
+                .is_some_and(|n| n.table.size().0 > 0 || n.table.router_nodes().next().is_some())
+        });
+        if !seeded {
             return;
         }
+        // upstream `should_announce_dht`: no `want_peers` gate — a
+        // seed announces too (the announce is so *others* can find
+        // us). Paused/private/disabled-DHT torrents are skipped.
         let ihs: Vec<Sha1Hash> = self
             .torrents
             .iter()
             .filter(|(ih, t)| {
-                t.want_peers(self.settings.seeding_outgoing_connections)
+                !t.paused
+                    && t.files_checked
                     && !t.private
                     && t.announce_dht
                     && self
@@ -2777,17 +2861,25 @@ impl Session {
             tracker_idx.map_or_else(|| (0..t.trackers.trackers.len()).collect(), |i| vec![i]);
         let mut sent = Vec::new();
         for i in idxs {
-            let Some(e) = t.trackers.trackers.get(i) else {
-                continue;
+            let (url, tracker_id) = {
+                let Some(e) = t.trackers.trackers.get_mut(i) else {
+                    continue;
+                };
+                for ep in &mut e.endpoints {
+                    ep.v1.updating = true;
+                    ep.v1.sent_event = 0;
+                    ep.v2.updating = true;
+                }
+                (e.url.clone(), e.tracker_id.clone())
             };
             out.push(SessionOut::TrackerAnnounce {
                 ih: *ih,
-                url: e.url.clone(),
-                tracker_id: e.tracker_id.clone(),
+                url: url.clone(),
+                tracker_id,
                 params: t.announce_params(pid, port, 0, key),
             });
             t.outstanding_announces += 1;
-            sent.push((*ih, e.url.clone()));
+            sent.push((*ih, url));
         }
         self.post_tracker_announces(sent, 0);
     }
@@ -3227,6 +3319,44 @@ impl Session {
         }
     }
 
+    /// Queue `msg` to `peer` — charges its wire size to the peer's
+    /// `send_buffer` so `fill_send_buffer`'s watermark sees queued
+    /// bytes (upstream `append_to_send_buffer`).
+    fn push_to_peer(
+        &mut self,
+        ih: &Sha1Hash,
+        peer: u64,
+        msg: PeerMessage,
+        out: &mut Vec<SessionOut>,
+    ) {
+        if let Some(t) = self.torrents.get_mut(ih)
+            && let Some(c) = t.peers.get_mut(&peer)
+        {
+            c.send_buffer += bitdaemon_net::peer_wire::wire_len(&msg);
+        }
+        out.push(SessionOut::ToPeer { ih: *ih, peer, msg });
+    }
+
+    /// `on_sent` — the writer pump reports `bytes` actually written
+    /// to `peer`'s socket: the send buffer shrinks and
+    /// `fill_send_buffer` runs to admit queued requests.
+    pub fn on_peer_sent(
+        &mut self,
+        ih: &Sha1Hash,
+        peer: u64,
+        bytes: usize,
+        out: &mut Vec<SessionOut>,
+    ) {
+        let mut eff = Vec::new();
+        if let Some(t) = self.torrents.get_mut(ih) {
+            if let Some(c) = t.peers.get_mut(&peer) {
+                c.send_buffer = c.send_buffer.saturating_sub(bytes);
+            }
+            t.fill_send_buffer(peer, &self.settings, &mut eff);
+        }
+        self.route(*ih, eff, out);
+    }
+
     fn route(&mut self, ih: Sha1Hash, effects: Vec<TorrentEffect>, out: &mut Vec<SessionOut>) {
         self.dispatch_disk(ih, &effects);
         for e in effects {
@@ -3243,7 +3373,7 @@ impl Session {
                         c.stat_up_round += n;
                         t.last_payload_up = Some(std::time::Instant::now());
                     }
-                    out.push(SessionOut::ToPeer { ih, peer, msg });
+                    self.push_to_peer(&ih, peer, msg, out);
                 }
                 TorrentEffect::DhtNode(addr) => {
                     self.dht_add_peer_node(addr);
@@ -3312,8 +3442,16 @@ impl Session {
                     // BEP-21, plus a `completed` announce to
                     // trackers that saw `started`.
                     self.alerts.post(Alert::TorrentFinished(ih));
+                    // upstream `finished()` calls `completed()`
+                    // (event=completed announce) only on `is_seed`
+                    // — a torrent finished-by-priorities posts the
+                    // alert but no completed announce.
+                    let is_full_seed = self
+                        .torrents
+                        .get(&ih)
+                        .is_some_and(|t| t.have.count() as i32 == t.num_pieces);
                     let mut sent = Vec::new();
-                    if let Some(t) = self.torrents.get_mut(&ih) {
+                    if is_full_seed && let Some(t) = self.torrents.get_mut(&ih) {
                         for e in &t.trackers.trackers {
                             let started = e
                                 .endpoints
@@ -3337,19 +3475,36 @@ impl Session {
                         }
                     }
                     self.post_tracker_announces(sent, 1);
-                    if let Some(t) = self.torrents.get(&ih) {
-                        for (pid, c) in &t.peers {
-                            if c.ext_upload_only != 0 {
-                                out.push(SessionOut::ToPeer {
-                                    ih,
-                                    peer: *pid,
-                                    msg: PeerMessage::Extended {
-                                        id: c.ext_upload_only,
-                                        data: bytes::Bytes::new(),
-                                    },
-                                });
-                            }
-                        }
+                    // `write_upload_only` — skipped under
+                    // super-seeding/share-mode and gated on
+                    // `close_redundant_connections`; payload is the
+                    // `enabled` byte (1 on becoming upload-only).
+                    let uo_peers: Vec<(u64, u8)> = self
+                        .torrents
+                        .get(&ih)
+                        .filter(|t| {
+                            self.settings.close_redundant_connections
+                                && !t.super_seeding
+                                && !t.share_mode
+                        })
+                        .map(|t| {
+                            t.peers
+                                .iter()
+                                .filter(|(_, c)| c.ext_upload_only != 0)
+                                .map(|(pid, c)| (*pid, c.ext_upload_only))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for (pid, ext_id) in uo_peers {
+                        self.push_to_peer(
+                            &ih,
+                            pid,
+                            PeerMessage::Extended {
+                                id: ext_id,
+                                data: bytes::Bytes::from_static(&[1]),
+                            },
+                            out,
+                        );
                     }
                     out.push(SessionOut::Torrent(TorrentEffect::BecameSeed));
                 }
@@ -3376,15 +3531,40 @@ impl Session {
             }
             let is_seed = t.is_seed();
             for idx in t.trackers.due(now, is_seed) {
-                let e = &t.trackers.trackers[idx];
+                // `torrent::tracker_request` — an explicit event
+                // (stopped/completed from callers) wins; otherwise
+                // `started` until one lands, then `completed` once
+                // for a fresh seed, `none` afterwards.
+                let (ev, url, tracker_id) = {
+                    let e = &mut t.trackers.trackers[idx];
+                    let slot = &mut e.endpoints[0].v1;
+                    let ev = if event != 0 {
+                        event
+                    } else if !slot.start_sent {
+                        2
+                    } else if is_seed && !slot.complete_sent {
+                        1
+                    } else {
+                        0
+                    };
+                    slot.updating = true;
+                    slot.sent_event = ev;
+                    // our announce covers the whole entry — hold
+                    // both slots in-flight so a hybrid torrent
+                    // doesn't re-fire on the v2 slot next tick.
+                    for ep in &mut e.endpoints {
+                        ep.v2.updating = true;
+                    }
+                    (ev, e.url.clone(), e.tracker_id.clone())
+                };
                 out.push(SessionOut::TrackerAnnounce {
                     ih: *ih,
-                    url: e.url.clone(),
-                    tracker_id: e.tracker_id.clone(),
-                    params: t.announce_params(pid, port, event, key),
+                    url,
+                    tracker_id,
+                    params: t.announce_params(pid, port, ev, key),
                 });
                 t.outstanding_announces += 1;
-                sent.push((*ih, e.url.clone()));
+                sent.push((*ih, t.trackers.trackers[idx].url.clone()));
             }
         }
         self.post_tracker_announces(sent, event as u8);
@@ -3559,6 +3739,13 @@ impl Session {
                 if let Some(i) = t.trackers.find(url) {
                     let e = &mut t.trackers.trackers[i];
                     e.verified = true;
+                    // `announce_endpoint::sent` — re-arms
+                    // `next_announce` at the tracker interval and
+                    // records `started`/`completed` delivery.
+                    let iv = std::time::Duration::from_secs(r.interval.max(0) as u64);
+                    let min_iv = (r.min_interval > 0)
+                        .then(|| std::time::Duration::from_secs(r.min_interval as u64));
+                    e.sent(iv, min_iv, now);
                     if let Some(tid) = r.tracker_id {
                         e.tracker_id = String::from_utf8_lossy(&tid).into_owned();
                         trackerid = Some(e.tracker_id.clone());
