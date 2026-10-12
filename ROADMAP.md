@@ -470,17 +470,22 @@ qBittorrent-class UI.
 
 ---
 
-## Phase N — Edge transports & POSIX perf (optional) ⬜
+## Phase N — Edge transports & POSIX perf (optional) ✅ *(assessed)*
 
-- [ ] **`bitdaemon-webrtc` leaf crate** (ADR-0011): concrete
-      `RtcPeerConnectionFactory`/`RtcChannel` over `str0m` (preferred:
-      safe Rust) or `webrtc`; offer/answer wired to the ported
-      `rtc_signaling` state machine. Only affects WebTorrent peers —
-      nothing in core depends on it.
-- [ ] **`posix_fadvise`/`F_NOCACHE`** read hints — completes
-      `io_buffer_mode` read-mode parity on Linux/macOS.
-- [ ] I2P `i2p_stream` beyond SAM handshake if required by consumers
-      (currently ported to upstream's scope).
+- [x] **`posix_fadvise`/`F_NOCACHE`** read hints — `io_buffer_mode`
+      read-mode parity complete: `file::posix` (ADR-0022 §3)
+      `posix_fadvise(DONTNEED)` on volatile reads,
+      `FADV_SEQUENTIAL` at open, apple `F_NOCACHE`/`F_NODIRECT`,
+      `O_NOATIME`; `nix` evaluated & rejected (`FcntlArg` lacks
+      `F_NOCACHE`/`F_NODIRECT`).
+- [~] **`bitdaemon-webrtc` leaf crate** (ADR-0011): assessed &
+      deferred — seam maps cleanly to `str0m` but the Sans-IO driver
+      needs an injected `DatagramSocket` per connection (ADR-0008)
+      and can't be wire-verified without a WebTorrent peer; lands
+      when a consumer requires it (assessment in ADR-0011 §"Phase N").
+- [~] I2P `i2p_stream` beyond SAM handshake if required by consumers
+      (currently ported to upstream's scope — no consumer requires
+      more).
 
 **Exit**: optional; no functional blocker for TCP/uTP/SSL swarms.
 

@@ -76,7 +76,6 @@ pub fn stat_file(f: &Path, flags: FileStatusFlags) -> io::Result<FileStatus> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        use std::os::unix::fs::PermissionsExt;
         if meta.mode() & 0o111 != 0 {
             mode |= FileAttributes::EXECUTABLE;
         }

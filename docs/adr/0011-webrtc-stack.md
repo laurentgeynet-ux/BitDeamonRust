@@ -44,3 +44,29 @@ deadline, `webtorrent_stun_server` ICE config.
 - When a default stack is chosen for `bitdaemon-cli`, the choice is a
   leaf decision and needs no further ADR; swapping `str0m` ↔ `webrtc`
   only touches the factory impl.
+
+## Phase N assessment (2026-10-12)
+
+Binding analysis for `str0m` against the ported seam:
+
+- `RtcPeerConnection::create_data_channel` →
+  `str0m::Rtc::direct_api().create_data_channel(...)`; events feed
+  `RtcEvent::{GatheringComplete,Failed,DataChannel}` from
+  `rtc.poll_output()` `Output::Event`s.
+- `set_remote_description` → `rtc.sdp_api()` offer/answer accept;
+  the local SDP at `GatheringComplete` is str0m's generated
+  description post-ICE-gathering.
+- The blocker is **not** the seam (it maps cleanly) but the driver:
+  str0m is Sans-IO — each `RtcPeerConnection` needs a tokio task
+  pumping `handle_input`/`poll_output`/`poll_transmit` against a
+  UDP transport *plus* the `Instant` timer loop. Per ADR-0008 that
+  socket must be an injected `Arc<dyn DatagramSocket>`, not a bound
+  `UdpSocket` — the factory signature must gain a transport
+  parameter, which is a real API change, not a shim.
+- Verdict: the leaf stays **optional-deferred** — roadmap Phase N
+  marks it non-blocking (`no functional blocker for TCP/uTP/SSL
+  swarms`), no current consumer (OnionBit routes over its own lanes,
+  WebTorrent peers are out of its threat model), and an untested
+  driver can't be wire-verified without a real WebTorrent peer.
+  Landing criteria: a consumer asks for it, or interop validation
+  against libtorrent's WebTorrent peers is scheduled.

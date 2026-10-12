@@ -1,7 +1,7 @@
 # ADR-0015: `disk_io_write_mode`/`disk_io_read_mode` — complete io_buffer_mode wiring
 
-Status: Implemented
-`--no-os-cache`, 2026-10-11); read side pending.
+Status: Implemented (`--no-os-cache` 2026-10-11;
+read-side POSIX hints 2026-10-12).
 Date: 2026-10-11
 
 ## Context
@@ -25,10 +25,15 @@ was the original freeze mechanism).
 1. `SessionSettings.disable_os_write_cache: bool` (landed) →
    `DiskIo::set_write_no_cache` → `OpenMode::NO_CACHE` OR'd into data
    write opens. CLI exposes `--no-os-cache`.
-2. Pending: `disk_io_read_mode` symmetric wiring — `no_cache` on
-   *read* opens (hash jobs, upload reads) for users on memory-tight
-   systems; POSIX `posix_fadvise(DONTNEED)`/`F_NOCACHE` equivalents
-   after reads, matching `file.cpp`'s advisory calls.
+2. `disk_io_read_mode` symmetric wiring — **landed (Phase N)**.
+   `read_no_cache` marks read/hash jobs `volatile`; `advise_dont_need`
+   now performs the real upstream hint: `posix_fadvise(DONTNEED)`
+   after each read (linux/android/*BSD — no-op on apple/solaris, same
+   `#ifdef` as upstream). Open-time hints completed: `NO_CACHE` →
+   `O_SYNC` (linux/android) or `fcntl(F_NOCACHE)`+`F_NODIRECT` (apple);
+   `SEQUENTIAL_ACCESS` → `posix_fadvise(SEQUENTIAL)`; `NO_ATIME` →
+   `O_NOATIME` (linux/android). All in `file::posix` — the reviewed
+   FFI sibling of `file::win32` (ADR-0022 §3).
 3. Pending: `disable_os_cache_for_aligned_files` — the
    `NO_BUFFERING` variant; only valid once writes are sector-aligned
    (currently they are not — 16 KiB blocks at arbitrary file offsets).

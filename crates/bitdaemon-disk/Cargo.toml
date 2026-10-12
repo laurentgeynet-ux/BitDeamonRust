@@ -22,3 +22,8 @@ sha2.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# posix_fadvise / F_NOCACHE / O_NOATIME read hints — reviewed FFI
+# boundary in file::posix (ADR-0022 §3, same carve-out as file::win32).
+libc.workspace = true

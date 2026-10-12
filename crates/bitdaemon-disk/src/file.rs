@@ -38,9 +38,18 @@ impl FileHandle {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
+            let mut custom = 0;
             if mode.contains(OpenMode::NO_CACHE) {
-                // upstream maps no_cache → O_SYNC
-                opts.custom_flags(libc_sync_flag());
+                // upstream maps no_cache → O_SYNC (synchronous
+                // writes, no dirty pages) — not O_DIRECT, which
+                // would require aligned I/O.
+                custom |= libc::O_SYNC;
+            }
+            if mode.contains(OpenMode::NO_ATIME) {
+                custom |= posix::O_NOATIME;
+            }
+            if custom != 0 {
+                opts.custom_flags(custom);
             }
             if mode.contains(OpenMode::EXECUTABLE) {
                 opts.mode(0o755);
@@ -81,6 +90,17 @@ impl FileHandle {
             // marked sparse; failure tolerated (non-NTFS volumes).
             if mode.contains(OpenMode::WRITE) && mode.contains(OpenMode::SPARSE) {
                 win32::set_sparse(&file);
+            }
+        }
+        #[cfg(unix)]
+        {
+            // upstream file.cpp — post-open cache hints:
+            // F_NOCACHE/F_NODIRECT (apple), fadvise(SEQUENTIAL).
+            if mode.contains(OpenMode::NO_CACHE) {
+                posix::set_nocache(&file);
+            }
+            if mode.contains(OpenMode::SEQUENTIAL_ACCESS) {
+                posix::fadvise_sequential(&file);
             }
         }
         // Upstream does NOT extend sparse files — they grow organically
@@ -127,24 +147,6 @@ impl FileHandle {
         }
         let _ = mode;
         Ok(())
-    }
-}
-
-#[cfg(unix)]
-const fn libc_sync_flag() -> i32 {
-    // upstream `no_cache` → O_SYNC (synchronous writes, no dirty
-    // pages) — not O_DIRECT, which would require aligned I/O.
-    #[cfg(target_os = "linux")]
-    {
-        0o4010000 // O_SYNC
-    }
-    #[cfg(target_os = "macos")]
-    {
-        0x0080 // O_SYNC
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        0
     }
 }
 
@@ -242,11 +244,89 @@ pub fn pread_best_effort(file: &File, buf: &mut [u8], file_offset: u64) -> io::R
     Ok(ret)
 }
 
-/// `aux::advise_dont_need` — hint the OS to drop the range from cache
-/// (`posix_fadvise(DONTNEED)` upstream). Advisory only; no-op here —
-/// `#![forbid(unsafe_code)]` rules out the raw libc call and the
-/// effect is a cache hint, not observable behavior.
-pub fn advise_dont_need(_file: &File, _offset: u64, _len: u64) {}
+/// `aux::advise_dont_need` — hint the OS to drop the range from the
+/// page cache (`posix_fadvise(POSIX_FADV_DONTNEED)` upstream).
+/// Advisory; upstream no-ops where `POSIX_FADV_DONTNEED` doesn't
+/// exist (apple, solaris), same gates here.
+pub fn advise_dont_need(file: &File, offset: u64, len: u64) {
+    #[cfg(unix)]
+    posix::fadvise_dontneed(file, offset, len);
+    #[cfg(windows)]
+    let _ = (file, offset, len);
+}
+
+/// POSIX file controls — `posix_fadvise`, `F_NOCACHE`/`F_NODIRECT`
+/// fcntls, `O_NOATIME`. Sole `unsafe` site beside `win32` in this
+/// crate (ADR-0022 §3): every FFI call is reviewed, best-effort —
+/// upstream ignores hint failures too.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+mod posix {
+    use std::fs::File;
+    use std::os::unix::io::AsRawFd;
+
+    /// `O_NOATIME` — linux/android only (upstream `#ifdef O_NOATIME`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub const O_NOATIME: i32 = libc::O_NOATIME;
+    /// `O_NOATIME` — linux/android only (upstream `#ifdef O_NOATIME`).
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub const O_NOATIME: i32 = 0;
+
+    /// `advise_dont_need` — errors ignored upstream.
+    pub fn fadvise_dontneed(file: &File, offset: u64, len: u64) {
+        // SAFETY: fd is borrowed for the call's duration only;
+        // posix_fadvise is advisory and cannot corrupt state.
+        // Platforms where libc lacks posix_fadvise (apple, solaris)
+        // no-op — upstream compiles this out identically.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                offset as libc::off_t,
+                len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+        let _ = (file, offset, len);
+    }
+
+    /// open-time `sequential_access` hint — file.cpp:718, errors
+    /// ignored upstream.
+    pub fn fadvise_sequential(file: &File) {
+        // SAFETY: see fadvise_dontneed.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        }
+        let _ = file;
+    }
+
+    /// `no_cache` post-open — BSD/Mac `F_NOCACHE` (+ `F_NODIRECT`:
+    /// caching written pages temporarily is fine). Upstream
+    /// file.cpp:702-710; Linux instead sets `O_SYNC` at open.
+    /// Errors ignored upstream.
+    pub fn set_nocache(file: &File) {
+        // SAFETY: fcntl on a borrowed live fd, advisory hints only.
+        #[cfg(target_vendor = "apple")]
+        unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+            libc::fcntl(file.as_raw_fd(), libc::F_NODIRECT, 1);
+        }
+        let _ = file;
+    }
+}
 
 /// `aux::sync_file` — `fdatasync`/`FlushFileBuffers` over the range
 /// (upstream flushes the whole file on platforms without ranged sync).

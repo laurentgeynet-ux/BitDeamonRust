@@ -7,6 +7,22 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — POSIX read-cache hints (Phase N, ADR-0015/0022)
+
+- `file::posix` — reviewed FFI sibling of `file::win32` (ADR-0022 §3):
+  `posix_fadvise(POSIX_FADV_DONTNEED)` on `volatile_read` blocks
+  (upstream `advise_dont_need`), `FADV_SEQUENTIAL` on
+  `SEQUENTIAL_ACCESS` opens, apple `fcntl(F_NOCACHE)`+`F_NODIRECT`
+  on `NO_CACHE`, `O_NOATIME` on `NO_ATIME` (linux/android). Completes
+  `disk_io_read_mode` parity — previously the flags were honored as
+  no-ops on POSIX. `libc` joins as a `cfg(unix)`-only dependency
+  (already declared in the workspace root; `nix` evaluated and
+  rejected — its `FcntlArg` lacks `F_NOCACHE`/`F_NODIRECT`).
+- WebRTC leaf crate assessment recorded in ADR-0011: `str0m` maps
+  the `RtcPeerConnection` seam cleanly but requires a per-connection
+  Sans-IO driver over injected `DatagramSocket` (ADR-0008) — deferred
+  until a consumer requires it (optional, non-blocking).
+
 ### Added — functional completions (Phase M, ADR-0023)
 
 - **Extension seam live** (ADR-0023 D9): `Torrent::extensions` now

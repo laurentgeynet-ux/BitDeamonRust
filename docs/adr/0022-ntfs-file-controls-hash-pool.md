@@ -61,7 +61,7 @@ open modes gain `ALLOW_SET_FILE_VALID_DATA`; `FileHandle` then calls
 best-effort `SE_MANAGE_VOLUME_NAME` privilege enable — upstream does
 exactly this and tolerates failure.
 
-### 3. Second `unsafe` carve-out — `bitdaemon-disk::file::win32`
+### 3. Second `unsafe` carve-out — `bitdaemon-disk::file::{win32,posix}`
 
 `FSCTL_SET_SPARSE` / `SetFileValidData` have no safe-Rust std
 equivalent. `#![forbid(unsafe_code)]` in `bitdaemon-disk` becomes
@@ -73,9 +73,17 @@ file, Windows-only, with every call site reviewed. `windows-sys` is
 added as a `cfg(windows)`-only dependency (ADR-0007 note: zero cost
 on POSIX).
 
-Non-Windows platforms are unchanged — upstream's sparse/valid-data
-knobs are `#ifdef _WIN32` too; on POSIX `SPARSE` is a no-op (the FS
-already allocates on write).
+**Phase N extension**: `file::posix` is the symmetric POSIX sibling
+(`#[cfg(unix)]`) holding `libc` calls for the advisory cache hints —
+`posix_fadvise(DONTNEED|SEQUENTIAL)` and apple `fcntl(F_NOCACHE|
+F_NODIRECT)`. `nix` was evaluated first: its `FcntlArg` does not
+expose `F_NOCACHE`/`F_NODIRECT`, so it would only cover fadvise —
+raw `libc` (already a workspace dependency) is the single mechanism.
+Every call is best-effort (upstream ignores hint failures).
+
+Non-Windows platforms are otherwise unchanged — upstream's
+sparse/valid-data knobs are `#ifdef _WIN32` too; on POSIX `SPARSE`
+is a no-op (the FS already allocates on write).
 
 ### 4. Dedicated hashing pool (upstream `m_hash_threads`)
 
@@ -103,9 +111,10 @@ qBittorrent baseline we benchmark against).
 - `StorageParams` unchanged — injected storages (OnionBit private
   storage) are unaffected; the new `DiskStorage::open_mode_extra`
   trait hook is a default no-op.
-- `windows-sys` joins the dependency list under an ADR note; it is
-  the upstream-supported FFI surface (no unsafe on our POSIX paths).
+- `windows-sys` joins the dependency list under an ADR note; `libc`
+  joins as a `cfg(unix)`-only dependency for `file::posix` (already
+  declared in the workspace root — zero new crate).
 - The `forbid`→`deny` change weakens a compile-time guarantee inside
   `bitdaemon-disk`; reviewers must verify `unsafe` stays confined to
-  `file::win32` (enforced by code review + `#[allow]` scoping —
-  `deny` still fires on any new unsafe elsewhere in the crate).
+  `file::{win32,posix}` (enforced by code review + `#[allow]`
+  scoping — `deny` still fires on any new unsafe elsewhere).
