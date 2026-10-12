@@ -617,7 +617,12 @@ impl PreadDiskIo {
                         }
                     }
                     for bj in released {
-                        self.add_job(j.storage, bj);
+                        // parked jobs already passed the fence once —
+                        // they carry IN_PROGRESS and stay counted in
+                        // `outstanding`, so they go straight to the pool;
+                        // re-entering add_job would double-account them
+                        // (and trip the fence's debug_assert).
+                        self.enqueue(bj);
                     }
                 }
                 let mut reposted = Vec::new();

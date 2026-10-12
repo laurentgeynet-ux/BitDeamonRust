@@ -210,6 +210,140 @@ fn hash_job_computes_piece_sha1() {
 }
 
 #[test]
+fn hash_parked_behind_inflight_write_is_released() {
+    use std::sync::Barrier;
+
+    use bitdaemon_disk::open_mode::OpenMode;
+    use bitdaemon_disk::storage::{DiskStorage, MoveFlags};
+    use bitdaemon_disk::storage_error::StorageResult;
+
+    // `write` blocks on a barrier so the piece_gate holds the hash job
+    // deterministically until the test releases the worker.
+    struct GatedStorage {
+        inner: PreadStorage,
+        gate: Arc<Barrier>,
+    }
+    impl DiskStorage for GatedStorage {
+        fn set_storage_index(&self, idx: StorageIndex) {
+            self.inner.set_storage_index(idx);
+        }
+        fn files(&self) -> &FileStorage {
+            self.inner.files()
+        }
+        fn file_priorities(&self) -> &[DownloadPriority] {
+            self.inner.file_priorities()
+        }
+        fn read(
+            &self,
+            buf: &mut [u8],
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+            volatile: bool,
+        ) -> StorageResult<i64> {
+            self.inner.read(buf, piece, offset, mode, volatile)
+        }
+        fn write(
+            &self,
+            buf: &[u8],
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+        ) -> StorageResult<i64> {
+            self.gate.wait();
+            self.inner.write(buf, piece, offset, mode)
+        }
+        fn hash_with(
+            &self,
+            feed: &mut dyn FnMut(&[u8]),
+            len: i64,
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+            volatile: bool,
+        ) -> StorageResult<i64> {
+            self.inner
+                .hash_with(feed, len, piece, offset, mode, volatile)
+        }
+        fn release_files(&self) -> StorageResult<()> {
+            self.inner.release_files()
+        }
+        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> StorageResult<(u8, PathBuf)> {
+            unimplemented!()
+        }
+        fn delete_files(&self, _o: u8) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn rename_file(&mut self, _i: FileIndex, _n: &[u8]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn set_file_priority(&mut self, _p: &[DownloadPriority]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn verify_resume_data(
+            &self,
+            _h: &bitdaemon_common::bitfield::Bitfield,
+            _s: bool,
+            _l: &[PathBuf],
+        ) -> StorageResult<bool> {
+            unimplemented!()
+        }
+    }
+
+    let d = dir("gate");
+    let (io, _drained) = make_io(1);
+    let gate = Arc::new(Barrier::new(2));
+    io.insert_storage(
+        StorageIndex(0),
+        Box::new(GatedStorage {
+            inner: storage(&make_fs(), &d),
+            gate: Arc::clone(&gate),
+        }),
+    );
+
+    let done = Arc::new(AtomicUsize::new(0));
+    io.add_job(StorageIndex(0), write_job(0, 0x5A, &io, Arc::clone(&done)));
+
+    // the write is registered against piece 0 and cannot complete
+    // while the barrier holds — this hash job parks in piece_gate
+    let got = Arc::new(Mutex::new(Sha1Hash::default()));
+    let g2 = Arc::clone(&got);
+    let d2 = Arc::clone(&done);
+    io.add_job(
+        StorageIndex(0),
+        Box::new(DiskJob {
+            storage: StorageIndex(u32::MAX),
+            flags: 0,
+            ret: 0,
+            error: Default::default(),
+            action: JobKind::Hash(bitdaemon_disk::disk_job::HashJob {
+                handler: Box::new(move |_, h, _v2, _| {
+                    *g2.lock().unwrap() = h;
+                    d2.fetch_add(1, Ordering::Relaxed);
+                }),
+                piece: PieceIndex(0),
+                block_hashes: Vec::new(),
+                piece_hash: Sha1Hash::default(),
+            }),
+        }),
+    );
+
+    gate.wait();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while done.load(Ordering::Relaxed) < 2 && std::time::Instant::now() < deadline {
+        io.completed().call_job_handlers();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // released hash jobs must reach the pool (not re-enter the fence)
+    assert_eq!(done.load(Ordering::Relaxed), 2);
+    use sha1::{Digest as _, Sha1};
+    let expect = Sha1::digest([0x5Au8; 1024]);
+    assert_eq!(&got.lock().unwrap().as_bytes()[..], &expect[..]);
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
 fn file_progress_accounts_per_file() {
     use bitdaemon_common::bitfield::Bitfield;
     use bitdaemon_disk::file_progress::FileProgress;

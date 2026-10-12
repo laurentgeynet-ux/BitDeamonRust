@@ -7,6 +7,16 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- `disk_io`: hash jobs parked by `piece_gate` behind in-flight writes
+  were re-submitted through `add_job` on release, tripping the fence's
+  `IN_PROGRESS` debug_assert (worker panic → stalled downloads) and
+  double-counting `outstanding` in release builds (fence starvation).
+  Released jobs now go straight to the pool (`enqueue`); covered by a
+  deterministic `hash_parked_behind_inflight_write_is_released`
+  regression test.
+
 ### Added — full `settings_pack` surface
 
 - `SessionSettings` now exposes **every upstream `settings_pack`
