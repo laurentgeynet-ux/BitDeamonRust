@@ -62,6 +62,28 @@ Until `1.0.0`, breaking changes may occur in any release.
   `contains_resume_data ? verify : (has_any_file ? need_full_check
   : ok)`; `DiskIo` gained `has_any_file`. Regression:
   `check_fastresume_no_resume_needs_full_check_when_files_exist`.
+- `to_resume_data` exported a fraction of upstream
+  `torrent::write_resume_data` — most importantly an **empty
+  `save_path`**, so a `.session`-restored torrent silently
+  re-downloaded into the process CWD (verified live: a second
+  `payload.bin` appeared in the repo root, byte-perfect, while the
+  real save-path kept a sparse file). Ported the full field set:
+  `save_path`/`part_file_dir`, `flags()`, trackers (url+tier),
+  swarm peers (connectable, `failcount == 0`, `trust >= 0`,
+  never-connected fillers up to 100, banned list), file priorities
+  (mutually exclusive with piece priorities, skipped in
+  `seed_mode`), renamed files, up/down stats + limits, time
+  counters.
+- `Torrent::verified_bytes` (drives `torrent_status::progress`)
+  ignored resume-claimed pieces — a restored torrent reported
+  `68 %` while seeding 16/16. Claimed bytes now count toward
+  `total_done` like upstream, and rewind with `have` when a
+  fastresume is rejected or a full recheck is armed.
+- Graceful teardown could drop dirty cache blocks queued behind
+  in-flight writes — `PreadDiskIo::flush_all` enqueues a `Flush`
+  for every dirty run (age-independent), and the CLI drains
+  `call_job_handlers` until the queue empties before writing
+  `.resume`/`.session`.
 
 ### Added — differential bench tooling
 
@@ -69,7 +91,11 @@ Until `1.0.0`, breaking changes may occur in any release.
   fastresume (falls back to the positional `.torrent`/magnet for
   metadata), `--stop-after <s>` graceful bench stop that still
   writes `.resume`; a fastresume is saved per torrent on shutdown
-  (`<v1-infohash>.resume` in save-path — loadable by libtorrent).
+  (`<v1-infohash>.resume` in save-path — loadable by libtorrent);
+  `--session <file>` loads/writes full `.session` state
+  (`session_params` layout) — `session restored: N torrent(s)`,
+  disk settles via `flush_all` + `call_job_handlers` drain before
+  any resume/session write.
 - `tools/real_swarm/lt_client`: `makessl`/`sslseed`/`sslleech`/`info`
   modes, `.resume` save+reload, and
   `allow_multiple_connections_per_ip` for multi-client loopback

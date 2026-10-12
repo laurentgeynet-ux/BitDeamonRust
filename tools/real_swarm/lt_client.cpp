@@ -99,12 +99,130 @@ static session_params base_params(int port)
     return p;
 }
 
-static int seed(char const* torr, char const* save, int port, int seconds)
+// IPv6 loopback listen — `[::1]:port` (upstream listen_interfaces
+// v6 syntax); exercises the v6 wire path against BitDaemon.
+static session_params v6_params(int port)
+{
+    settings_pack sp;
+    sp.set_int(settings_pack::alert_mask, alert::all_categories);
+    sp.set_str(settings_pack::listen_interfaces, "[::1]:" + std::to_string(port));
+    sp.set_bool(settings_pack::enable_upnp, false);
+    sp.set_bool(settings_pack::enable_natpmp, false);
+    sp.set_bool(settings_pack::enable_lsd, false);
+    sp.set_bool(settings_pack::enable_dht, false);
+    sp.set_bool(settings_pack::allow_multiple_connections_per_ip, true);
+    return session_params(sp);
+}
+
+static int v6seed(char const* torr, char const* save, int port, int seconds)
 {
     auto atp = load_torrent_file(torr);
-    session ses(base_params(port));
+    session ses(v6_params(port));
     atp.save_path = save;
     atp.flags |= torrent_flags::seed_mode;
+    ses.async_add_torrent(std::move(atp));
+    std::printf("v6 seeding on [::1]:%d for %ds\n", port, seconds);
+    auto end = steady_clock::now() + std::chrono::seconds(seconds);
+    while (steady_clock::now() < end)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        ses.post_torrent_updates();
+        std::vector<alert*> alerts;
+        ses.pop_alerts(&alerts);
+        for (alert* a : alerts)
+            std::printf("  seed alert[%d]: %s\n", a->type(), a->message().c_str());
+    }
+    return 0;
+}
+
+static int v6leech(char const* torr, char const* save, int port,
+    std::vector<std::string> const& peers)
+{
+    auto atp = load_torrent_file(torr);
+    session ses(v6_params(port));
+    atp.save_path = save;
+    auto h = ses.add_torrent(std::move(atp));
+    for (auto const& p : peers)
+    {
+        auto pos = p.rfind(':');
+        if (pos == std::string::npos) continue;
+        auto host = p.substr(0, pos);
+        if (host.size() > 2 && host.front() == '[' && host.back() == ']')
+            host = host.substr(1, host.size() - 2);
+        error_code ec;
+        auto ip = make_address(host.c_str(), ec);
+        if (ec) continue;
+        h.connect_peer(tcp::endpoint(ip, (unsigned short)std::atoi(p.c_str() + pos + 1)));
+    }
+    auto t0 = steady_clock::now();
+    long long last_done = -1;
+    for (;;)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        ses.post_torrent_updates();
+        std::vector<alert*> alerts;
+        ses.pop_alerts(&alerts);
+        for (alert* a : alerts)
+        {
+            std::printf("  leech alert[%d]: %s\n", a->type(), a->message().c_str());
+            if (auto* st = alert_cast<state_update_alert>(a))
+                for (auto const& s : st->status)
+                    if (s.total_done != last_done)
+                    {
+                        last_done = s.total_done;
+                        std::printf("  leech: %lld/%lld peers=%d\n",
+                            (long long)s.total_done, (long long)s.total_wanted,
+                            s.num_peers);
+                    }
+        }
+        torrent_status st = h.status();
+        if (st.is_seeding) { std::printf("DONE\n"); return 0; }
+        if (duration_cast<seconds>(steady_clock::now() - t0).count() > 300)
+            return 2;
+    }
+}
+
+// MSE/PE: force encrypted peer connections, RC4-only — exercises the
+// full DH-768 + RC4 cipher path against BitDaemon (`pe_forced` both
+// directions + `pe_rc4` level so plaintext-select can't hide a bug).
+static void apply_enc(session_params& p)
+{
+    p.settings.set_int(settings_pack::out_enc_policy, settings_pack::pe_forced);
+    p.settings.set_int(settings_pack::in_enc_policy, settings_pack::pe_forced);
+    p.settings.set_int(settings_pack::allowed_enc_level, settings_pack::pe_rc4);
+    p.settings.set_bool(settings_pack::prefer_rc4, true);
+}
+
+static int seed(char const* torr, char const* save, int port, int seconds,
+    bool enc = false, char const* dht_node = nullptr, bool lsd = false,
+    bool sseed = false, bool uponly = false)
+{
+    auto atp = load_torrent_file(torr);
+    auto params = base_params(port);
+    if (enc) apply_enc(params);
+    if (dht_node)
+    {
+        params.settings.set_bool(settings_pack::enable_dht, true);
+        params.settings.set_str(settings_pack::dht_bootstrap_nodes, dht_node);
+    }
+    if (lsd)
+    {
+        params.settings.set_bool(settings_pack::enable_lsd, true);
+        std::printf("lsd mode\n");
+    }
+    session ses(params);
+    atp.save_path = save;
+    atp.flags |= torrent_flags::seed_mode;
+    if (sseed)
+    {
+        atp.flags |= torrent_flags::super_seeding;
+        std::printf("super-seeding\n");
+    }
+    if (uponly)
+    {
+        atp.flags |= torrent_flags::upload_mode;
+        std::printf("upload-only\n");
+    }
     ses.async_add_torrent(std::move(atp));
     std::printf("seeding on port %d for %ds\n", port, seconds);
     auto end = steady_clock::now() + std::chrono::seconds(seconds);
@@ -122,6 +240,16 @@ static int seed(char const* torr, char const* save, int port, int seconds)
                     std::printf("  seed: up=%lld peers=%d\n",
                         (long long)s.total_upload, s.num_peers);
         }
+        for (auto const& th : ses.get_torrents())
+        {
+            std::vector<peer_info> pi;
+            th.get_peer_info(pi);
+            for (auto const& p : pi)
+                std::printf("  seed peer %s flags=%x uo=%d\n",
+                    p.ip.address().to_string().c_str(),
+                    static_cast<unsigned int>(p.flags),
+                    bool(p.flags & peer_info::upload_only));
+        }
     }
     return 0;
 }
@@ -137,7 +265,8 @@ static int info(char const* torr)
 }
 
 static int leech(char const* torr, char const* save, int port,
-    std::vector<std::string> const& peers, bool utp_only)
+    std::vector<std::string> const& peers, bool utp_only, bool enc = false,
+    char const* dht_node = nullptr, bool lsd = false)
 {
     auto atp = load_torrent_file(torr);
 
@@ -162,6 +291,17 @@ static int leech(char const* torr, char const* save, int port,
     }
 
     auto params = base_params(port);
+    if (enc) apply_enc(params);
+    if (dht_node)
+    {
+        params.settings.set_bool(settings_pack::enable_dht, true);
+        params.settings.set_str(settings_pack::dht_bootstrap_nodes, dht_node);
+    }
+    if (lsd)
+    {
+        params.settings.set_bool(settings_pack::enable_lsd, true);
+        std::printf("lsd mode\n");
+    }
     if (utp_only)
     {
         params.settings.set_bool(settings_pack::enable_outgoing_tcp, false);
@@ -186,9 +326,20 @@ static int leech(char const* torr, char const* save, int port,
 
     auto t0 = steady_clock::now();
     long long last_done = -1;
+    int iters = 0;
     for (;;)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (++iters % 8 == 0)
+        {
+            std::vector<peer_info> pi;
+            h.get_peer_info(pi);
+            for (auto const& p : pi)
+                std::printf("  leech peer %s flags=%x uo=%d\n",
+                    p.ip.address().to_string().c_str(),
+                    static_cast<unsigned int>(p.flags),
+                    bool(p.flags & peer_info::upload_only));
+        }
         // keep `<torrent>.resume` fresh so a kill mid-download leaves
         // usable resume state (cross-client interop test)
         h.save_resume_data(torrent_handle::save_info_dict);
@@ -287,10 +438,20 @@ static int sslseed(char const* torr, char const* save, int port, int seconds,
 }
 
 static int sslleech(char const* torr, char const* save, int port,
-    char const* peer, char const* cert, char const* key, char const* dh)
+    char const* peer, char const* cert, char const* key, char const* dh,
+    bool utp_only = false)
 {
     auto atp = load_torrent_file(torr);
-    session ses(ssl_params(port, true));
+    auto params = ssl_params(port, true);
+    if (utp_only)
+    {
+        params.settings.set_bool(settings_pack::enable_outgoing_tcp, false);
+        params.settings.set_bool(settings_pack::enable_incoming_tcp, false);
+        params.settings.set_bool(settings_pack::enable_outgoing_utp, true);
+        params.settings.set_bool(settings_pack::enable_incoming_utp, true);
+        std::printf("ssl utp-only mode (TCP disabled)\n");
+    }
+    session ses(params);
     atp.save_path = save;
     auto h = ses.add_torrent(std::move(atp));
     set_cert(h, cert, key, dh);
@@ -353,18 +514,54 @@ int main(int argc, char** argv)
         if (mode == "sslseed" && argc >= 8)
             return sslseed(argv[2], argv[3], std::atoi(argv[4]),
                 std::atoi(argv[5]), argv[6], argv[7], argv[8]);
-        if (mode == "sslleech" && argc >= 9)
+        if ((mode == "sslleech" || mode == "sslutpleech") && argc >= 9)
             return sslleech(argv[2], argv[3], std::atoi(argv[4]),
-                argv[5], argv[6], argv[7], argv[8]);
+                argv[5], argv[6], argv[7], argv[8], mode == "sslutpleech");
         if (mode == "seed" && argc >= 5)
             return seed(argv[2], argv[3], std::atoi(argv[4]), argc > 5 ? std::atoi(argv[5]) : 600);
-        if (mode == "info" && argc == 3) return info(argv[2]);
-        if ((mode == "leech" || mode == "utpleech") && argc >= 5)
+        if (mode == "sseed" && argc >= 5)
+            return seed(argv[2], argv[3], std::atoi(argv[4]), argc > 5 ? std::atoi(argv[5]) : 600,
+                false, nullptr, false, true);
+        if (mode == "upseed" && argc >= 5)
+            return seed(argv[2], argv[3], std::atoi(argv[4]), argc > 5 ? std::atoi(argv[5]) : 600,
+                false, nullptr, false, false, true);
+        if (mode == "encseed" && argc >= 5)
+            return seed(argv[2], argv[3], std::atoi(argv[4]), argc > 5 ? std::atoi(argv[5]) : 600, true);
+        if (mode == "dhtseed" && argc >= 7)
+            return seed(argv[2], argv[3], std::atoi(argv[4]),
+                std::atoi(argv[5]), false, argv[6]);
+        if (mode == "dhtleech" && argc >= 6)
+        {
+            std::vector<std::string> peers;
+            for (int i = 6; i < argc; ++i) peers.emplace_back(argv[i]);
+            return leech(argv[2], argv[3], std::atoi(argv[4]), peers,
+                false, false, argv[5]);
+        }
+        if (mode == "v6seed" && argc >= 6)
+            return v6seed(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]));
+        if (mode == "v6leech" && argc >= 5)
+        {
+            std::vector<std::string> peers;
+            for (int i = 5; i < argc; ++i) peers.emplace_back(argv[i]);
+            return v6leech(argv[2], argv[3], std::atoi(argv[4]), peers);
+        }
+        if (mode == "lsdseed" && argc >= 6)
+            return seed(argv[2], argv[3], std::atoi(argv[4]),
+                std::atoi(argv[5]), false, nullptr, true);
+        if (mode == "lsdleech" && argc >= 5)
         {
             std::vector<std::string> peers;
             for (int i = 5; i < argc; ++i) peers.emplace_back(argv[i]);
             return leech(argv[2], argv[3], std::atoi(argv[4]), peers,
-                mode == "utpleech");
+                false, false, nullptr, true);
+        }
+        if (mode == "info" && argc == 3) return info(argv[2]);
+        if ((mode == "leech" || mode == "utpleech" || mode == "encleech") && argc >= 5)
+        {
+            std::vector<std::string> peers;
+            for (int i = 5; i < argc; ++i) peers.emplace_back(argv[i]);
+            return leech(argv[2], argv[3], std::atoi(argv[4]), peers,
+                mode == "utpleech", mode == "encleech");
         }
     }
     catch (std::exception const& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
