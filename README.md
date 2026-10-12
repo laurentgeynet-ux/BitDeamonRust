@@ -4,21 +4,30 @@ A BitTorrent client library ported from
 [libtorrent](https://github.com/arvidn/libtorrent) (Rasterbar, C++) to
 **100% safe Rust** — no C++ bindings, no FFI, no `unsafe`.
 
-> **Status: protocol port complete — every upstream C++ file is
-> `ported`, `verified` or explicitly `won't port`** in
-> [`docs/PORTING.md`](docs/PORTING.md). Interoperability verified
-> live: BitDaemon downloads from and seeds to official libtorrent
-> C++ peers (byte-identical output), does the same over uTP and
-> mutual-TLS SSL torrents, boots a real Mainline DHT table, and
-> downloads real public torrents from the global swarm (Ubuntu
-> 24.04.4 ISO, 3.4 GB, ~117 MB/s peak, official SHA-256 verified).
+> **Status: port complete — every upstream C++ file is `ported`,
+> `verified` or explicitly `won't port`** in
+> [`docs/PORTING.md`](docs/PORTING.md). The API surface is at
+> upstream parity: the full `Alert` type set (101 types, category/
+> type/priority conformant to upstream), async DHT query results,
+> port-mapping handles, extension/plugin hooks
+> ([ADR-0023](docs/adr/0023-alert-surface-and-api-completion.md)) —
+> everything a GUI client needs is exposed; see
+> [`docs/gui-parity.md`](docs/gui-parity.md) for the
+> widget ↔ handle/alert matrix.
 >
-> **Remaining for 1.0** is *surface* work, not protocol work:
-> expand the `Alert` event surface to upstream parity, deliver DHT
-> query results to API consumers, finish BEP-17 web seeds and a
-> WebRTC backend — see
-> [`docs/adr/0023`](docs/adr/0023-alert-surface-and-api-completion.md)
-> and ROADMAP phases K–N.
+> Interoperability verified live: BitDaemon downloads from and seeds
+> to official libtorrent C++ peers (byte-identical output), does the
+> same over uTP and mutual-TLS SSL torrents, boots a real Mainline
+> DHT table, and downloads real public torrents from the global
+> swarm (Ubuntu 24.04.4 ISO, 3.4 GB, ~117 MB/s peak, official
+> SHA-256 verified).
+>
+> **Remaining for 1.0** is hardening, not features: promote `ported`
+> → `verified` across the remaining modules (live trackers, web
+> seeds, UPnP/NAT-PMP, multi-torrent soak), run the `cargo-fuzz`
+> campaigns, finish benchmarks vs C++, then release engineering
+> (API freeze, `cargo deny`, crates.io) — see [`ROADMAP.md`](ROADMAP.md)
+> Phase G.
 
 ## Reference implementation
 
@@ -74,6 +83,7 @@ Windows and Linux.
 
 - [`ROADMAP.md`](ROADMAP.md) — phased port plan
 - [`docs/PORTING.md`](docs/PORTING.md) — C++ file → Rust module mapping and status
+- [`docs/gui-parity.md`](docs/gui-parity.md) — GUI integration matrix: every widget ↔ handle/alert
 - [`docs/architecture.md`](docs/architecture.md) — crate graph and threading model
 - [`docs/adr/`](docs/adr/) — architecture decision records
 - [`AGENTS.md`](AGENTS.md) — conventions for AI agents and contributors
