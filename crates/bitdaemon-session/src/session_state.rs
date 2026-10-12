@@ -97,129 +97,18 @@ pub fn load_session_state(buf: &[u8]) -> Option<SessionState> {
     Some(st)
 }
 
-/// `session_state::settings` — int/bool fields persist as ints,
-/// durations as milliseconds.
+/// `session_state::settings` — upstream stores the `settings_pack`
+/// dict verbatim (same `save_settings_to_dict` format as
+/// `write_session_params`), so we delegate: upstream key names,
+/// upstream units, sparse (non-default) entries.
 #[must_use]
 pub fn save_settings(s: &crate::settings::SessionSettings) -> Entry {
-    let mut d = Entry::Dict(std::collections::BTreeMap::new());
-    if let Entry::Dict(m) = &mut d {
-        let ms = |x: std::time::Duration| x.as_millis() as i64;
-        for (k, v) in [
-            ("connections_limit", i64::from(s.connections_limit)),
-            ("active_limit", i64::from(s.active_limit)),
-            ("active_downloads", i64::from(s.active_downloads)),
-            ("active_seeds", i64::from(s.active_seeds)),
-            ("unchoke_slots", i64::from(s.unchoke_slots)),
-            (
-                "optimistic_unchoke_slots",
-                i64::from(s.optimistic_unchoke_slots),
-            ),
-            ("request_timeout", ms(s.request_timeout)),
-            ("peer_timeout", ms(s.peer_timeout)),
-            ("request_queue_time", ms(s.request_queue_time)),
-            ("max_allowed_in_queue", i64::from(s.max_allowed_in_queue)),
-            ("upload_rate_limit", s.upload_rate_limit),
-            ("download_rate_limit", s.download_rate_limit),
-            ("piece_timeout", ms(s.piece_timeout)),
-            ("max_disk_write_queue", s.max_disk_write_queue),
-            ("send_buffer_watermark", s.send_buffer_watermark as i64),
-            ("alert_queue_size", s.alert_queue_size as i64),
-            ("dht_enabled", i64::from(s.dht_enabled)),
-            ("prefer_rc4", i64::from(s.prefer_rc4)),
-            ("connection_speed", i64::from(s.connection_speed)),
-            ("tick_interval", ms(s.tick_interval)),
-            (
-                "web_seed_blocks_per_tick",
-                i64::from(s.web_seed_blocks_per_tick),
-            ),
-            ("min_reconnect_time", i64::from(s.min_reconnect_time)),
-            ("max_peerlist_size", i64::from(s.max_peerlist_size)),
-            ("max_failcount", i64::from(s.max_failcount)),
-            ("anonymous_mode", i64::from(s.anonymous_mode)),
-        ] {
-            m.insert(k.as_bytes().to_vec(), Entry::Int(v));
-        }
-    }
-    d
+    crate::session_params::save_settings_to_dict(s)
 }
 
 /// read back a `settings` dict — missing keys keep defaults
 /// (forward/backward compatible like upstream).
 #[must_use]
 pub fn read_settings(n: &BdecodeNode<'_>) -> crate::settings::SessionSettings {
-    use std::time::Duration;
-    let mut s = crate::settings::SessionSettings::default();
-    let ms = |v: i64| Duration::from_millis(v.max(0) as u64);
-    let g = |k: &str| n.dict_find_int_value(k.as_bytes(), -1);
-    let b = |k: &str, cur: &mut bool| {
-        let v = g(k);
-        if v >= 0 {
-            *cur = v != 0;
-        }
-    };
-    let i = |k: &str, cur: &mut i32| {
-        let v = g(k);
-        if v >= 0 {
-            *cur = v as i32;
-        }
-    };
-    i("connections_limit", &mut s.connections_limit);
-    i("active_limit", &mut s.active_limit);
-    i("active_downloads", &mut s.active_downloads);
-    i("active_seeds", &mut s.active_seeds);
-    i("unchoke_slots", &mut s.unchoke_slots);
-    i("optimistic_unchoke_slots", &mut s.optimistic_unchoke_slots);
-    let v = g("request_timeout");
-    if v >= 0 {
-        s.request_timeout = ms(v);
-    }
-    let v = g("peer_timeout");
-    if v >= 0 {
-        s.peer_timeout = ms(v);
-    }
-    let v = g("request_queue_time");
-    if v >= 0 {
-        s.request_queue_time = ms(v);
-    }
-    i("max_allowed_in_queue", &mut s.max_allowed_in_queue);
-    let v = g("upload_rate_limit");
-    if v >= 0 {
-        s.upload_rate_limit = v;
-    }
-    let v = g("download_rate_limit");
-    if v >= 0 {
-        s.download_rate_limit = v;
-    }
-    let v = g("piece_timeout");
-    if v >= 0 {
-        s.piece_timeout = ms(v);
-    }
-    let v = g("max_disk_write_queue");
-    if v >= 0 {
-        s.max_disk_write_queue = v;
-    }
-    let v = g("send_buffer_watermark");
-    if v >= 0 {
-        s.send_buffer_watermark = v as usize;
-    }
-    let v = g("alert_queue_size");
-    if v >= 0 {
-        s.alert_queue_size = v as usize;
-    }
-    b("dht_enabled", &mut s.dht_enabled);
-    b("prefer_rc4", &mut s.prefer_rc4);
-    i("connection_speed", &mut s.connection_speed);
-    let v = g("tick_interval");
-    if v >= 0 {
-        s.tick_interval = ms(v);
-    }
-    i("web_seed_blocks_per_tick", &mut s.web_seed_blocks_per_tick);
-    i("min_reconnect_time", &mut s.min_reconnect_time);
-    i("max_peerlist_size", &mut s.max_peerlist_size);
-    i("max_failcount", &mut s.max_failcount);
-    b("anonymous_mode", &mut s.anonymous_mode);
-    s
+    crate::session_params::read_settings_dict(n)
 }
-
-#[allow(dead_code)]
-fn _node_ty(_: &BdecodeNode<'_>) {}

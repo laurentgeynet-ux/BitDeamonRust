@@ -1616,7 +1616,7 @@ impl Engine {
         };
         let (pid, dht) = {
             let ses = slock(&self.session);
-            (ses.peer_id, ses.settings.dht_enabled)
+            (ses.peer_id, ses.settings.enable_dht)
         };
         // upstream `peer_connection` always advertises the FAST
         // extension (BEP-6); DHT bit follows `enable_dht`.
@@ -1685,7 +1685,8 @@ impl Engine {
         self.download_limiter.set_limit(s.download_rate_limit);
         self.queue_time = s.request_queue_time.as_secs() as i32;
         self.request_timeout = s.request_timeout.as_secs() as i32;
-        self.max_out_request_queue = s.max_allowed_in_queue.clamp(0, i32::from(u16::MAX)) as u16;
+        self.max_out_request_queue =
+            s.max_allowed_in_request_queue.clamp(0, i32::from(u16::MAX)) as u16;
         self.connection_speed = s.connection_speed;
         slock(&self.session).apply_settings(s);
     }
@@ -1779,7 +1780,7 @@ impl Engine {
             });
             (
                 ses.peer_id,
-                ses.settings.dht_enabled,
+                ses.settings.enable_dht,
                 ssl,
                 ses.proxies.peer.clone(),
             )
@@ -1982,7 +1983,7 @@ impl Engine {
         let session = self.session.clone();
         let (pid, dht) = {
             let ses = slock(&self.session);
-            (ses.peer_id, ses.settings.dht_enabled)
+            (ses.peer_id, ses.settings.enable_dht)
         };
         let h = tokio::spawn(async move {
             loop {
@@ -2076,7 +2077,7 @@ impl Engine {
         let session = self.session.clone();
         let (pid, dht) = {
             let ses = slock(&self.session);
-            (ses.peer_id, ses.settings.dht_enabled)
+            (ses.peer_id, ses.settings.enable_dht)
         };
         let h = tokio::spawn(async move {
             loop {
@@ -2287,7 +2288,7 @@ impl Engine {
         }
         let (pid, dht) = {
             let ses = slock(&self.session);
-            (ses.peer_id, ses.settings.dht_enabled)
+            (ses.peer_id, ses.settings.enable_dht)
         };
         let ih_known = {
             // snapshot of known info-hashes for the callback

@@ -32,7 +32,7 @@ fn golden_session_custom() {
     let cpp = fixture("session_custom");
     let mut sp = SessionParams::default();
     sp.settings.download_rate_limit = 12345;
-    sp.settings.dht_enabled = false;
+    sp.settings.enable_dht = false;
     sp.settings.user_agent = b"fixture/1.0".to_vec();
     let ours = write_session_params_buf(&sp);
     assert_eq!(
@@ -48,7 +48,7 @@ fn golden_session_custom() {
 fn golden_session_read() {
     let sp = read_session_params(&fixture("session_custom"));
     assert_eq!(sp.settings.download_rate_limit, 12345);
-    assert!(!sp.settings.dht_enabled);
+    assert!(!sp.settings.enable_dht);
     assert_eq!(sp.settings.user_agent, b"fixture/1.0");
     // untouched fields stay at defaults
     assert_eq!(sp.settings.connections_limit, 200);

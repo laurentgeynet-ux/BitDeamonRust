@@ -7,6 +7,34 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — full `settings_pack` surface
+
+- `SessionSettings` now exposes **every upstream `settings_pack`
+  key** (~230 string/bool/int fields incl. deprecated ones for
+  `.session` round-trip), named verbatim and ordered like
+  `settings_pack.cpp`. Fields renamed to upstream names:
+  `unchoke_slots` → `unchoke_slots_limit`,
+  `optimistic_unchoke_slots` → `num_optimistic_unchoke_slots`,
+  `max_allowed_in_queue` → `max_allowed_in_request_queue`,
+  `max_disk_write_queue` → `max_queued_disk_bytes`,
+  `dht_enabled` → `enable_dht`,
+  `save_resume_interval` → `save_resume_data_interval`,
+  `disable_os_write_cache`/`disable_os_read_cache` →
+  `disk_io_write_mode`/`disk_io_read_mode` (new `DiskIoMode` enum).
+- New typed enums: `SuggestMode`, `DiskIoMode`,
+  `BandwidthMixedAlgo`, `MmapWriteMode`; `EncPolicy`, `ProxyType`,
+  `ChokingAlgorithm`, `SeedChokingAlgorithm` serialize as upstream
+  int values in `.session`/params dicts.
+- **Default fixes vs upstream**: `tick_interval` 1 s → **500 ms**,
+  `cache_expiry` 60 s → **300 s**; Windows now defaults
+  `disk_io_write_mode=write_through` and `close_file_interval=240`
+  like upstream (`DISK_WRITE_MODE`/`CLOSE_FILE_INTERVAL` macros).
+- `save_settings_to_dict`/`read_settings_dict` now cover all keys;
+  `session_state`'s embedded `settings` dict delegates to the same
+  upstream-format functions (replaces the BitDaemon-internal key
+  names — old internal `.session` settings keys are ignored on
+  load, fields fall back to defaults).
+
 ### Added — POSIX read-cache hints (Phase N, ADR-0015/0022)
 
 - `file::posix` — reviewed FFI sibling of `file::win32` (ADR-0022 §3):

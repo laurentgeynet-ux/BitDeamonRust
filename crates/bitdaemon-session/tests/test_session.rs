@@ -483,7 +483,7 @@ fn unchoke_tick_unchokes_top_peer() {
     use bitdaemon_session::session::SessionOut;
 
     let mut s = Session::new();
-    s.settings.unchoke_slots = 1;
+    s.settings.unchoke_slots_limit = 1;
     let mut t = mk_torrent(4);
     t.init_picker(true);
     let ih = s.add_torrent(t);
@@ -550,13 +550,13 @@ fn dht_announce_tick_issues_get_peers() {
 fn session_state_roundtrip_settings() {
     use bitdaemon_session::session_state::{load_session_state, save_session_state_buf};
     let mut s = Session::new();
-    s.settings.unchoke_slots = 42;
+    s.settings.unchoke_slots_limit = 42;
     s.settings.anonymous_mode = true;
     let st = s.save_state();
     let buf = save_session_state_buf(&st);
     let st2 = load_session_state(&buf).unwrap();
     let set = st2.settings.unwrap();
-    assert_eq!(set.unchoke_slots, 42);
+    assert_eq!(set.unchoke_slots_limit, 42);
     assert!(set.anonymous_mode);
     assert_eq!(set.connections_limit, 200); // defaults preserved
 }

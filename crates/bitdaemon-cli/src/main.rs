@@ -206,10 +206,12 @@ async fn main() -> anyhow::Result<()> {
             .set_mask(bitdaemon::session::alerts::AlertCategory::ALL);
     }
     if args.no_os_cache {
-        slock(&eng.session).settings.disable_os_write_cache = true;
+        slock(&eng.session).settings.disk_io_write_mode =
+            bitdaemon::session::settings::DiskIoMode::DisableOsCache;
     }
     if args.no_os_read_cache {
-        slock(&eng.session).settings.disable_os_read_cache = true;
+        slock(&eng.session).settings.disk_io_read_mode =
+            bitdaemon::session::settings::DiskIoMode::DisableOsCache;
     }
     slock(&eng.session).set_disk(disk);
     slock(&eng.session).set_listen_port(args.port);

@@ -995,9 +995,9 @@ impl Session {
 
     /// attach the disk backend (`session_params` wiring).
     pub fn set_disk(&mut self, io: Arc<dyn DiskIo>) {
-        io.set_max_queued_bytes(self.settings.max_disk_write_queue);
-        io.set_write_no_cache(self.settings.disable_os_write_cache);
-        io.set_read_no_cache(self.settings.disable_os_read_cache);
+        io.set_max_queued_bytes(self.settings.max_queued_disk_bytes);
+        io.set_write_no_cache(self.settings.disk_io_write_mode.bypasses_os_cache());
+        io.set_read_no_cache(self.settings.disk_io_read_mode.bypasses_os_cache());
         io.set_cache_expiry(self.settings.cache_expiry.as_secs());
         self.disk = Some(io);
     }
@@ -2181,9 +2181,9 @@ impl Session {
         // (`update_alert_queue_size`, `update_disk_cache_limit`):
         // the rest is read lazily through `self.settings`.
         if let Some(d) = &self.disk {
-            d.set_max_queued_bytes(s.max_disk_write_queue);
-            d.set_write_no_cache(s.disable_os_write_cache);
-            d.set_read_no_cache(s.disable_os_read_cache);
+            d.set_max_queued_bytes(s.max_queued_disk_bytes);
+            d.set_write_no_cache(s.disk_io_write_mode.bypasses_os_cache());
+            d.set_read_no_cache(s.disk_io_read_mode.bypasses_os_cache());
             d.set_cache_expiry(s.cache_expiry.as_secs());
         }
         self.alerts.set_queue_limit(s.alert_queue_size);
@@ -2468,7 +2468,7 @@ impl Session {
     /// `get_peers` traversal on each bound node family.
     fn dht_announce_tick(&mut self) {
         const DHT_ANNOUNCE_INTERVAL: i32 = 15 * 60;
-        if !self.settings.dht_enabled || !self.services.dht || self.settings.anonymous_mode {
+        if !self.settings.enable_dht || !self.services.dht || self.settings.anonymous_mode {
             return;
         }
         // don't announce into an empty routing table — a `get_peers`
@@ -2649,7 +2649,7 @@ impl Session {
     /// `force_dht_announce` — user-triggered, ignores the interval
     /// (private torrents still never touch the DHT).
     pub fn force_dht_announce(&mut self, ih: &Sha1Hash) {
-        if !self.settings.dht_enabled
+        if !self.settings.enable_dht
             || !self.services.dht
             || self.settings.anonymous_mode
             || self.torrents.get(ih).is_none_or(|t| t.private)
@@ -3043,7 +3043,7 @@ impl Session {
             return;
         }
         let now = Instant::now();
-        let slots = self.settings.unchoke_slots;
+        let slots = self.settings.unchoke_slots_limit;
         // upstream `optimistic_unchoke_interval` default 30 s.
         let rotate_optimistic = self.session_time % 30 == 0;
         let ihs: Vec<Sha1Hash> = self.torrents.keys().copied().collect();
@@ -3543,7 +3543,7 @@ impl Session {
     /// `auto_save_resume` — periodic flush of dirty resume data
     /// (upstream saves every `save_resume_data_interval`).
     fn resume_save_tick(&mut self, now: Instant) {
-        let interval = self.settings.save_resume_interval;
+        let interval = self.settings.save_resume_data_interval;
         let due: Vec<Sha1Hash> = self
             .torrents
             .values()

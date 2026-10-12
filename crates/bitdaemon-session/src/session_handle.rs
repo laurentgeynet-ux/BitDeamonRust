@@ -539,13 +539,13 @@ impl SessionHandle {
 
     /// `set_max_uploads` (`unchoke_slots_limit`).
     pub fn set_max_uploads(&self, limit: i32) {
-        lock(&self.inner).settings.unchoke_slots = limit;
+        lock(&self.inner).settings.unchoke_slots_limit = limit;
     }
 
     /// `max_uploads`.
     #[must_use]
     pub fn max_uploads(&self) -> i32 {
-        lock(&self.inner).settings.unchoke_slots
+        lock(&self.inner).settings.unchoke_slots_limit
     }
 
     // ---- service switches (`start_*`/`stop_*`)
