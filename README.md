@@ -20,7 +20,9 @@ A BitTorrent client library ported from
 > same over uTP and mutual-TLS SSL torrents, boots a real Mainline
 > DHT table, and downloads real public torrents from the global
 > swarm (Ubuntu 24.04.4 ISO, 3.4 GB, ~117 MB/s peak, official
-> SHA-256 verified).
+> SHA-256 verified). Conformance is pinned by golden fixtures
+> generated *from the C++ code itself* and a real-swarm differential
+> bench — see [Conformance testing](#conformance-testing).
 >
 > **Remaining for 1.0** is hardening, not features: promote `ported`
 > → `verified` across the remaining modules (live trackers, web
@@ -65,7 +67,31 @@ Supports `.torrent` files and magnets, `--seed`, `--peer host:port`,
 HTTPS/UDP trackers, DHT, uTP, UPnP/NAT-PMP port mapping, SOCKS5/HTTP
 proxies (`--proxy`, `--proxy-auth`, peer + tracker + DHT UDP lanes)
 and OS-cache control (`--no-os-cache`, `--no-os-read-cache`,
-`--no-upnp`).
+`--no-upnp`). It also loads upstream-format fastresume files
+(`--resume`) and writes `<infohash>.resume` on shutdown — both
+directions round-trip with libtorrent.
+
+## Conformance testing
+
+Two harnesses pin BitDaemon against upstream itself, not against
+re-implementations:
+
+- **Golden vectors** (`tools/golden_vectors/`) — a generator built
+  against the C++ v2.1.2 sources emits reference bytes, committed as
+  fixtures under `crates/*/tests/data/`. The `test_golden` suites in
+  `bitdaemon-{bencode,core,dht,session}` byte-compare them: bencode
+  dict order + int64-overflow quirks, `write_resume_data` output,
+  `.session` params dicts, DHT state serialization,
+  `create_torrent` output (v1 + v2), `-XXNNNN-` fingerprints and
+  magnet URIs.
+- **Real-swarm bench** (`tools/real_swarm/`) — a C++ client built
+  on libtorrent itself exchanges data with BitDaemon: TCP, uTP and
+  mutual-TLS SSL torrents in both directions, magnet `ut_metadata`
+  retrieval + download, `.resume` files round-tripped both ways
+  (upstream detects and repairs a truncated tail), `ut_pex` driving
+  upstream's dialer, and boundary file layouts (0-byte, tiny, deep
+  paths, UTF-8/space names, pad files). All transfers verified
+  byte-identical.
 
 ## Building
 
