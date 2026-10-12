@@ -114,6 +114,8 @@ pub struct CachedPieceEntry {
     pub v2: bool,
     /// when the first dirty block arrived — drives `cache_expiry`.
     pub dirty_since: std::time::Instant,
+    /// this piece's contribution to [`DiskCache::num_unhashed`].
+    pub unhashed: i32,
 }
 
 impl CachedPieceEntry {
@@ -191,9 +193,17 @@ impl DiskCache {
                 v1: params.v1,
                 v2: params.v2,
                 dirty_since: std::time::Instant::now(),
+                unhashed: 0,
             }
         });
         if let Some(b) = piece.blocks.get_mut(block_idx) {
+            // `m_num_unhashed` counts cached blocks the hasher has
+            // not consumed — only a freshly landed buffer adds one;
+            // a duplicate insert replaces the buffer in place.
+            if params.v1 && buf.is_some() && b.buf.is_none() {
+                piece.unhashed += 1;
+                self.num_unhashed += 1;
+            }
             b.buf = buf;
             b.has_write_job = true;
         }
@@ -201,9 +211,6 @@ impl DiskCache {
             piece.v2_pending += 1;
         }
         self.num_cached_blocks += 1;
-        if params.v1 {
-            self.num_unhashed += 1;
-        }
         if force_flush || compute_force_flush(piece) {
             piece.flags |= piece_flags::FORCE_FLUSH;
         }
@@ -231,15 +238,24 @@ impl DiskCache {
         }
         let freed = p.blocks.iter().filter(|b| b.buf.is_some()).count() as i64;
         self.num_cached_blocks -= freed;
-        self.pieces.remove(&loc);
+        self.remove_piece(loc);
         true
     }
 
     /// `free_piece` — bookkeeping when a piece leaves the cache.
     pub fn free_piece(&mut self, loc: PieceLocation) {
-        if let Some(p) = self.pieces.remove(&loc) {
+        if let Some(p) = self.pieces.get(&loc) {
             let freed = p.blocks.iter().filter(|b| b.buf.is_some()).count() as i64;
             self.num_cached_blocks -= freed;
+        }
+        self.remove_piece(loc);
+    }
+
+    /// Single removal point — settles the piece's `unhashed` tally
+    /// whatever the exit path (cleared, freed, fully flushed).
+    fn remove_piece(&mut self, loc: PieceLocation) {
+        if let Some(p) = self.pieces.remove(&loc) {
+            self.num_unhashed -= i64::from(p.unhashed);
         }
     }
 
@@ -350,7 +366,7 @@ impl DiskCache {
                 && (!p.v2 || p.flags & piece_flags::PIECE_HASH_RETURNED != 0);
         }
         if free {
-            self.pieces.remove(&loc);
+            self.remove_piece(loc);
         }
     }
 
@@ -391,10 +407,16 @@ impl DiskCache {
         let mut free = false;
         if let Some(p) = self.pieces.get_mut(&loc) {
             p.flags |= piece_flags::PIECE_HASH_RETURNED;
+            // whole-piece hashing consumes every queued v1 block at
+            // once — settle the piece's `unhashed` tally here
+            // (upstream does it block-by-block via `hashed_block`
+            // as its incremental hasher advances).
+            self.num_unhashed -= i64::from(p.unhashed);
+            p.unhashed = 0;
             free = p.blocks.iter().all(|b| b.flushed);
         }
         if free {
-            self.pieces.remove(&loc);
+            self.remove_piece(loc);
         }
     }
 
@@ -425,7 +447,8 @@ impl DiskCache {
             && p.hasher_cursor as usize == block_idx
         {
             p.hasher_cursor += 1;
-            self.num_unhashed -= 1;
+            p.unhashed = p.unhashed.saturating_sub(1);
+            self.num_unhashed = self.num_unhashed.saturating_sub(1);
         }
     }
 
@@ -509,5 +532,28 @@ mod tests {
         c.pieces.get_mut(&loc).unwrap().flags |= piece_flags::PIECE_HASH_RETURNED;
         c.insert(loc, 1, Some(vec![0; 4]), false, params());
         assert!(c.piece(loc).unwrap().flags & piece_flags::FORCE_FLUSH != 0);
+    }
+
+    /// `m_num_unhashed` must return to zero once every queued v1
+    /// block has been hashed — a stuck counter made `queue_stats`
+    /// report 183k unhashed blocks on a completed 2 GiB swarm.
+    #[test]
+    fn unhashed_settles_on_hash_and_clear() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        c.insert(loc, 0, Some(vec![0; 4]), false, params());
+        c.insert(loc, 1, Some(vec![0; 4]), false, params());
+        assert_eq!(c.num_unhashed, 2);
+        // duplicate inserts replace in place — no double counting
+        c.insert(loc, 1, Some(vec![9; 4]), false, params());
+        assert_eq!(c.num_unhashed, 2);
+        c.hash_returned(loc);
+        assert_eq!(c.num_unhashed, 0);
+        // a piece evicted un-hashed settles too
+        let loc2 = (StorageIndex(0), PieceIndex(1));
+        c.insert(loc2, 0, Some(vec![0; 4]), false, params());
+        assert_eq!(c.num_unhashed, 1);
+        c.free_piece(loc2);
+        assert_eq!(c.num_unhashed, 0);
     }
 }
