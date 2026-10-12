@@ -116,12 +116,26 @@ impl UtpManager {
         let id = u16::from_be_bytes([syn[2], syn[3]]);
         // upstream `utp_socket_manager::incoming_packet`: responder
         // send_id = the SYN's connection id, recv_id = send_id + 1
-        let sock = UtpSocket::new(id.wrapping_add(1), id, cfg);
+        let mut sock = UtpSocket::new(id.wrapping_add(1), id, cfg);
+        // Feed the SYN *synchronously* — upstream constructs the
+        // socket impl already-Connected (the SYN is what creates it).
+        // Routing it through the pump's inbound channel let
+        // `tokio::select!` deliver a pending `write()` first, which
+        // emitted data packets toward the unset remote (0.0.0.0:0)
+        // and poisoned outbuf/cwnd before the handshake — a rare but
+        // permanent stall.
+        sock.incoming_packet(syn, from, Instant::now());
+        sock.send_deferred_ack();
         let recv_id = sock.recv_id();
         let rx = self.register((from, recv_id)).await;
         let (rd_tx, rd_rx) = mpsc::channel::<Vec<u8>>(64);
         let (wr_tx, wr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (st_tx, st_rx) = mpsc::channel::<UtpState>(1);
+        // state notifications ride a `watch` — latest-value
+        // semantics, never blocks the pump when the consumer isn't
+        // listening (upstream fires callbacks fire-and-forget). A
+        // bounded mpsc here deadlocked the pump on the first
+        // post-Connected transition nobody read.
+        let (st_tx, st_rx) = tokio::sync::watch::channel(UtpState::None);
 
         let dg2 = dg.clone();
         let pump = tokio::spawn(socket_pump(
@@ -134,14 +148,6 @@ impl UtpManager {
             (from, recv_id),
             self.clone(),
         ));
-        // feed the SYN — the pump transitions to Connected and emits
-        // the deferred STATE ack on its first loop turn
-        {
-            let inner = self.inner.lock().await;
-            if let Some(tx) = inner.sockets.get(&(from, recv_id)) {
-                let _ = tx.send((syn.to_vec(), from)).await;
-            }
-        }
         self.inner.lock().await.tasks.push(pump);
         Ok(UtpStream {
             rd_rx,
@@ -191,7 +197,7 @@ impl UtpManager {
         let rx = self.register((remote, recv_id)).await;
         let (rd_tx, rd_rx) = mpsc::channel::<Vec<u8>>(64);
         let (wr_tx, wr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (st_tx, st_rx) = mpsc::channel::<UtpState>(1);
+        let (st_tx, st_rx) = tokio::sync::watch::channel(UtpState::None);
 
         let dg2 = dg.clone();
         let pump = tokio::spawn(socket_pump(
@@ -230,7 +236,7 @@ async fn socket_pump(
     mut inbound_rx: mpsc::Receiver<Inbound>,
     mut wr_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     rd_tx: mpsc::Sender<Vec<u8>>,
-    st_tx: mpsc::Sender<UtpState>,
+    st_tx: tokio::sync::watch::Sender<UtpState>,
     key: (SocketAddr, u16),
     mgr: Arc<UtpManager>,
 ) {
@@ -261,7 +267,7 @@ async fn socket_pump(
         }
         if sock.state() != last_state {
             last_state = sock.state();
-            let _ = st_tx.send(last_state).await;
+            let _ = st_tx.send(last_state);
         }
         if matches!(last_state, UtpState::Deleting | UtpState::ErrorWait) {
             break;
@@ -291,7 +297,7 @@ async fn socket_pump(
 pub struct UtpStream {
     rd_rx: mpsc::Receiver<Vec<u8>>,
     wr_tx: mpsc::UnboundedSender<Vec<u8>>,
-    st_rx: Arc<Mutex<mpsc::Receiver<UtpState>>>,
+    st_rx: Arc<Mutex<tokio::sync::watch::Receiver<UtpState>>>,
     read_buf: std::collections::VecDeque<u8>,
 }
 
@@ -299,16 +305,18 @@ impl UtpStream {
     /// wait until the socket reports `Connected` (or error).
     pub async fn wait_connected(&mut self) -> io::Result<()> {
         let mut rx = self.st_rx.lock().await;
-        while let Some(st) = rx.recv().await {
-            match st {
+        loop {
+            match *rx.borrow() {
                 UtpState::Connected => return Ok(()),
                 UtpState::ErrorWait | UtpState::Deleting => {
                     return Err(io::Error::other("utp connect failed"));
                 }
                 _ => {}
             }
+            if rx.changed().await.is_err() {
+                return Err(io::Error::other("utp pump died"));
+            }
         }
-        Err(io::Error::other("utp pump died"))
     }
 }
 

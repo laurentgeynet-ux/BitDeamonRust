@@ -421,29 +421,52 @@ observe every state transition without polling internals. `MetadataFailed`
 
 ---
 
-## Phase M — Functional completions ⬜
+## Phase M — Functional completions ✅
 
-- [ ] **BEP-17 `http_seed` (GetRight)**: `net::web_seed` gains the
-      http_seed endpoint kind — URL join `base + file_path` (no
-      `?piece=` query), redirect→seed-URL update, 4xx/503 →
-      `retry_web_seed` backoff (upstream `http_seed_connection.cpp`
-      semantics). `add_http_seed`/`remove_http_seed`/`http_seeds`
-      already manage endpoints.
-- [ ] **Extension factories invoked** (ADR-0023 D9): `ExtensionFactory`
-      vec applied at torrent start + late `add_extension`;
-      `SessionPlugin::new_peer_connection(&PeerInfo)` seam + minimal
-      `PeerPlugin` trait (`on_message`, `on_tick`). Full
-      `torrent_plugin`/`peer_plugin` surface stays deferred-with-reason
-      until a consumer needs it.
-- [ ] `MetadataFailed` on ut_metadata source-penalty exhaustion.
-- [ ] **GUI parity matrix** (`docs/gui-parity.md`): alert/handle →
-      widget checklist (add/remove/pause/queue/priorities/deadlines/
-      trackers/peers/DHT/portmap/stats graphs) — acceptance doc for
-      "GUI complet".
+- [x] **BEP-17 `http_seed` — upstream-faithful resolution**:
+      upstream **removed BEP-17 fetching** in 2.x (ChangeLog:
+      "removed support for BEP 17 web seeds (in favor of BEP 19)";
+      `web_seed_entry::type` is `TORRENT_DEPRECATED`, no
+      `http_seed_connection` exists). What upstream actually does:
+      `atp.http_seeds` → `m_web_seeds` typed entries fetched through
+      the same BEP-19 `web_peer_connection`; `torrent_handle::
+      {add,remove}_http_seed` are literal `{}` no-ops and
+      `http_seeds()` returns `{}`; `torrent::write_resume_data`
+      folds all web seeds into `url_seeds` (the `httpseeds` resume
+      key is write-only — `read_resume_data` never reads it).
+      Ported verbatim: `from_atp` merges `atp.http_seeds` →
+      `web_seeds`, handle methods = no-op/empty, `to_resume_data`
+      folds into `atp.url_seeds`.
+- [x] **Extension factories invoked** (ADR-0023 D9):
+      `Torrent::extensions` holds instantiated `Arc<dyn
+      SessionPlugin>`s (`m_extensions`); `TorrentHandle::
+      add_extension(factory)` invokes immediately (upstream
+      `add_extension_fun`) → `add_extension_plugin` walks existing
+      peers through `new_peer_connection` and replays
+      `on_files_checked` when checked. `SessionPlugin` gained the
+      `torrent_plugin` hooks: `new_peer_connection`, `on_piece_pass`/
+      `on_piece_failed`, `on_files_checked`, `on_pause` veto, `tick`.
+      `PeerPlugin` trait (`on_message`, `on_tick`) stored per-conn
+      (`peer_conn::plugins`); hooks fired in `add_peer`,
+      `on_peer_message`, `piece_verified`, `on_files_checked`,
+      `set_paused`, `tick`. `atp.extensions` stays won't-port:
+      `AddTorrentParams` lives in `bitdaemon-core` (dependency
+      direction) and our synchronous handle calls leave no race
+      window — `add_extension` right after `add_torrent` observes
+      the same ordering.
+- [x] `MetadataFailed` — `set_metadata_verdict` distinguishes
+      `HashMismatch` (retry, source penalty bookkeeping) from
+      `ParseError` (upstream `set_error(invalid_swarm_metadata)` +
+      `pause` + `torrent_error_alert`); both post `MetadataFailed`.
+- [x] **GUI parity matrix** — `docs/gui-parity.md`: alert/handle →
+      widget checklist (lifecycle, list/detail, session panels,
+      per-category mapping, extension points, upstream caveats).
 
-**Exit**: BEP-17 web seeds actually fetch; `add_extension` factories
-run and receive peer connections; a consumer needs no internal access
-for anything a qBittorrent-class UI shows.
+**Exit**: ✅ upstream's actual `http_seed` contract reproduced
+(deprecated API no-ops + resume fold + BEP-19 fetch of
+`atp.http_seeds`); `add_extension` factories run and receive peer
+connections; `docs/gui-parity.md` is the acceptance checklist for a
+qBittorrent-class UI.
 
 ---
 

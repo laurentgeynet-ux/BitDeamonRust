@@ -150,6 +150,9 @@ pub struct PeerConn {
     /// monotonic ms clock refreshed each `second_tick` — drives the
     /// pipeline's RTT samples and request-timeout bookkeeping.
     pub now_ms: i64,
+    /// `peer_connection::m_extensions` — per-connection plugins
+    /// produced by `SessionPlugin::new_peer_connection`.
+    pub plugins: Vec<std::sync::Arc<dyn crate::alerts::PeerPlugin>>,
 }
 
 impl PeerConn {
@@ -212,6 +215,7 @@ impl PeerConn {
             we_sent_interested: false,
             last_unchoke: std::time::Instant::now(),
             now_ms,
+            plugins: Vec::new(),
         }
     }
 

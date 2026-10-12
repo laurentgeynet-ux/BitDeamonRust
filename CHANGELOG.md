@@ -7,6 +7,58 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added — functional completions (Phase M, ADR-0023)
+
+- **Extension seam live** (ADR-0023 D9): `Torrent::extensions` now
+  holds instantiated `Arc<dyn SessionPlugin>`s (upstream
+  `m_extensions`). `TorrentHandle::add_extension(factory)` invokes
+  the factory immediately and walks existing peers through
+  `new_peer_connection`, replaying `on_files_checked` when the
+  storage check already ran. `SessionPlugin` gained the
+  `torrent_plugin` hooks: `new_peer_connection`, `on_piece_pass`,
+  `on_piece_failed`, `on_files_checked`, `on_pause` (veto), `tick`.
+  New `PeerPlugin` trait (`on_message`, `on_tick`) stored per-conn;
+  hooks fired in `add_peer`, `on_peer_message`, `piece_verified`,
+  `set_paused`, and the session tick.
+- **`MetadataFailed` verdict split**: `Torrent::set_metadata_verdict`
+  distinguishes `HashMismatch` (retry — upstream source-penalty
+  semantics) from `ParseError` (hash-correct but unparseable →
+  `set_error(invalid_swarm_metadata)` + pause + `TorrentError`).
+- **`docs/gui-parity.md`** — acceptance matrix mapping every
+  qBittorrent-class widget to its handle methods + alert coverage.
+
+### Changed — http_seed upstream-parity resolution (Phase M)
+
+- **BEP-17 is upstream-removed**: libtorrent 2.x ChangeLog —
+  "removed support for BEP 17 web seeds (in favor of BEP 19)".
+  Ported the actual remaining contract instead of resurrecting a
+  deleted protocol: `AddTorrentParams::http_seeds` merges into the
+  BEP-19 `web_seeds` fetch path; `TorrentHandle::
+  {add,remove}_http_seed` are upstream-faithful no-ops and
+  `http_seeds()` returns empty; `to_resume_data` folds all web
+  seeds into `atp.url_seeds` (the `httpseeds` resume key is
+  write-only upstream — `read_resume_data` never reads it).
+- **Breaking (pre-1.0)**: `Torrent::add_http_seed`/
+  `remove_http_seed`/`http_seeds()` now behave as upstream's
+  deprecated API instead of tracking a private never-fetched list —
+  previously-added `http_seeds` entries were silently ignored by
+  the fetch machinery anyway.
+
+### Fixed — uTP pump startup race (Phase M)
+
+- **`utp_stream::accept_syn`**: feed the SYN to `UtpSocket`
+  synchronously before spawning the pump. Routing it through the
+  pump's inbound channel let `tokio::select!` deliver a queued
+  `write()` first, emitting data packets toward the unset remote
+  (`0.0.0.0:0`) that were lost but kept `bytes_in_flight` — a rare
+  permanent stall (intermittent `bulk_transfer_throughput` timeouts).
+  The socket is now born `Connected`, matching upstream where the
+  socket impl is constructed by the SYN itself.
+- **State notifications** ride `tokio::sync::watch` instead of a
+  `channel(1)` mpsc — a post-`Connected` transition nobody read could
+  block `st_tx.send().await` and freeze the pump. `wait_connected`
+  polls `borrow()`/`changed()` (latest-value semantics).
+
 ### Added — async result delivery & emission sites (Phase L, ADR-0023)
 
 - **DHT typed result sinks**: `dht_result_map` replaces

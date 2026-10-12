@@ -263,10 +263,6 @@ pub struct Torrent {
     pub stop_when_ready: bool,
     /// `m_ratio` — `set_ratio` upload/download ratio target (0 = none).
     pub ratio: f32,
-    /// BEP-17 `http_seed` endpoints — upstream keeps `url_seed`
-    /// (BEP-19) and `http_seed` (BEP-17) as typed `web_seed_entry`s;
-    /// we keep two lists instead of a tagged variant.
-    pub http_seeds: Vec<String>,
     /// `m_tracker_login` — `set_tracker_login` user/pass.
     pub tracker_login: Option<(String, String)>,
     /// `m_ssl_certificate` — `set_ssl_certificate` (SSL torrents):
@@ -283,9 +279,14 @@ pub struct Torrent {
     /// `set_peer_download_limit` (upstream stores them on the peer
     /// object; we keep them keyed by remote endpoint).
     pub peer_limits: std::collections::HashMap<std::net::SocketAddr, (i64, i64)>,
-    /// per-torrent extension factories — `add_extension`
-    /// (`std::function<torrent_plugin(torrent_handle, client_data)>`).
-    pub extensions: Vec<ExtensionFactory>,
+    /// `m_extensions` — instantiated `torrent_plugin`s (upstream
+    /// stores plugin objects; the factories that produced them are
+    /// invoked by `TorrentHandle::add_extension` →
+    /// `add_extension_plugin`).
+    pub extensions: Vec<std::sync::Arc<dyn crate::alerts::SessionPlugin>>,
+    /// `m_files_checked` — storage check completed at least once;
+    /// late-added extensions get `on_files_checked` immediately.
+    pub files_checked: bool,
     /// `i2p_pex_plugin` per-torrent state (message cache + rebuild
     /// cadence). Always allocated like upstream's plugin list; the
     /// plugin itself no-ops unless the torrent is i2p.
@@ -351,6 +352,20 @@ pub type ExtensionFactory = std::sync::Arc<
         + Send
         + Sync,
 >;
+
+/// `torrent::set_metadata` verdict — upstream distinguishes
+/// `mismatching_info_hash` (retry) from `invalid_swarm_metadata`
+/// (hash-correct but unparseable → `set_error` + `pause`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataVerdict {
+    /// Metadata accepted.
+    Ok,
+    /// SHA-1 doesn't match the info-hash — retry from other peers.
+    HashMismatch,
+    /// Hash-correct but bdecode/`torrent_info` parse failed —
+    /// upstream sets `invalid_swarm_metadata` and pauses.
+    ParseError,
+}
 
 impl Torrent {
     /// `peer_connection::send_allowed_set` — BEP-6: when the peer
@@ -522,7 +537,6 @@ impl Torrent {
             pinned: false,
             stop_when_ready: false,
             ratio: 0.0,
-            http_seeds: Vec::new(),
             tracker_login: None,
             ssl_cert: None,
             ssl_key: None,
@@ -530,6 +544,7 @@ impl Torrent {
             apply_ip_filter: false,
             peer_limits: std::collections::HashMap::new(),
             extensions: Vec::new(),
+            files_checked: false,
             i2p_pex_state: crate::i2p_pex::I2pPexState::default(),
             failed_bytes: 0,
             redundant_bytes: 0,
@@ -620,6 +635,18 @@ impl Torrent {
             .iter()
             .map(|u| String::from_utf8_lossy(u).into_owned())
             .collect();
+        // upstream `torrent_info` adds `atp.http_seeds` to
+        // `m_web_seeds` as deprecated-typed entries — BEP-17 fetching
+        // was removed ("removed support for BEP 17 web seeds (in
+        // favor of BEP 19)"), they ride the same BEP-19 path. The
+        // `httpseeds` resume key is write-only upstream
+        // (`read_resume_data` never reads it back), so this is the
+        // only place `atp.http_seeds` matters.
+        t.web_seeds.extend(
+            atp.http_seeds
+                .iter()
+                .map(|u| String::from_utf8_lossy(u).into_owned()),
+        );
         for &ep in &atp.peers {
             t.add_swarm_peer(
                 ep,
@@ -692,19 +719,35 @@ impl Torrent {
     /// upstream — caller penalizes sources via
     /// `metadata_tracker.reset_on_hash_failure`).
     pub fn set_metadata(&mut self, metadata: &[u8], cfg: &LoadTorrentLimits) -> bool {
+        matches!(
+            self.set_metadata_verdict(metadata, cfg),
+            MetadataVerdict::Ok
+        )
+    }
+
+    /// `torrent::set_metadata` — typed verdict so callers can tell
+    /// `mismatching_info_hash` (retry from other sources, upstream
+    /// penalizes the serving peers) from a hash-valid but
+    /// unparseable payload (upstream `set_error(invalid_swarm_metadata)`
+    /// + `pause()`).
+    pub fn set_metadata_verdict(
+        &mut self,
+        metadata: &[u8],
+        cfg: &LoadTorrentLimits,
+    ) -> MetadataVerdict {
         use sha1::Digest as _;
         let mut h = sha1::Sha1::new();
         h.update(metadata);
         let actual = Sha1Hash::from_bytes(&h.finalize()).unwrap_or_default();
         if actual != self.info_hash {
-            return false;
+            return MetadataVerdict::HashMismatch;
         }
         let node = match bdecode_checked(metadata) {
             Ok(n) => n,
-            Err(_) => return false,
+            Err(_) => return MetadataVerdict::ParseError,
         };
         let Ok(info) = TorrentInfo::from_info_node(&node, cfg) else {
-            return false;
+            return MetadataVerdict::ParseError;
         };
         self.num_pieces = info.num_pieces();
         self.piece_length = i64::from(info.piece_length());
@@ -725,7 +768,7 @@ impl Torrent {
         self.magnet = false;
         self.init_picker(true);
         self.need_save_resume = true;
-        true
+        MetadataVerdict::Ok
     }
 
     /// `on_metadata` — one `ut_metadata` `data` packet arrived.
@@ -793,13 +836,34 @@ impl Torrent {
                     let md = self.metadata_tracker.metadata().to_vec();
                     // `metadata_received{,_failed}_alert` — the
                     // info-hash verdict (upstream posts in
-                    // `torrent::on_metadata`).
-                    if self.set_metadata(&md, &LoadTorrentLimits::default()) {
-                        self.metadata_tracker.clear();
-                        out.push(TorrentEffect::MetadataReceived);
-                    } else {
-                        self.metadata_tracker.reset_on_hash_failure();
-                        out.push(TorrentEffect::MetadataFailed);
+                    // `torrent::on_metadata`/`set_metadata`). A
+                    // hash-valid but unparseable payload sets
+                    // `invalid_swarm_metadata` and pauses upstream.
+                    match self.set_metadata_verdict(&md, &LoadTorrentLimits::default()) {
+                        MetadataVerdict::Ok => {
+                            self.metadata_tracker.clear();
+                            out.push(TorrentEffect::MetadataReceived);
+                        }
+                        MetadataVerdict::HashMismatch => {
+                            self.metadata_tracker.reset_on_hash_failure();
+                            out.push(TorrentEffect::MetadataFailed);
+                        }
+                        MetadataVerdict::ParseError => {
+                            self.metadata_tracker.reset_on_hash_failure();
+                            out.push(TorrentEffect::MetadataFailed);
+                            // upstream `set_metadata`:
+                            // `set_error(invalid_swarm_metadata)` +
+                            // `pause()` — hash-correct but
+                            // unparseable is fatal until fixed
+                            // (no disconnect_all — `pause` only).
+                            self.set_error("invalid swarm metadata");
+                            out.push(TorrentEffect::Alert(crate::alerts::Alert::TorrentError {
+                                ih: self.info_hash,
+                                error: "invalid swarm metadata".into(),
+                                file: String::new(),
+                            }));
+                            self.paused = true;
+                        }
                     }
                 }
             }
@@ -1006,6 +1070,15 @@ impl Torrent {
         }
         atp.have_pieces = self.have.clone();
         atp.verified_pieces = self.have.clone();
+        // upstream `torrent::write_resume_data`: every non-removed,
+        // non-ephemeral `m_web_seeds` entry folds into
+        // `ret.url_seeds` — http_seed-type entries included (the
+        // `httpseeds` resume key is never re-emitted).
+        atp.url_seeds = self
+            .web_seeds
+            .iter()
+            .map(|u| u.clone().into_bytes())
+            .collect();
         // upstream embeds the `info` dict when the torrent has
         // metadata — rebuild `ti` from our raw copy so
         // `write_resume_data_buf` emits it and `load` restores
@@ -1250,6 +1323,12 @@ impl Torrent {
     pub fn on_files_checked(&mut self, accepted: bool, out: &mut Vec<TorrentEffect>) {
         self.checking = false;
         self.need_save_resume = true;
+        // `m_files_checked`/`m_connections_initialized` — gates the
+        // late-add `on_files_checked` replay in `add_extension`.
+        self.files_checked = true;
+        for ext in &self.extensions {
+            ext.on_files_checked();
+        }
         if !accepted {
             // the picker's have-tracking only knows pieces that
             // passed `piece_verified` — resume bits live solely in
@@ -1406,8 +1485,39 @@ impl Torrent {
             .position(|p| p.ip() == Some(remote))
     }
 
-    /// `add_peer` — a new connection registered.
-    pub fn add_peer(&mut self, id: u64, conn: PeerConn) {
+    /// `torrent::add_extension` — register an instantiated plugin.
+    /// Upstream then walks every existing connection through
+    /// `new_connection` (producing per-peer `peer_plugin`s) and
+    /// calls `on_files_checked` when the storage check already ran.
+    pub fn add_extension_plugin(&mut self, ext: std::sync::Arc<dyn crate::alerts::SessionPlugin>) {
+        self.extensions.push(ext);
+        let Some(ext_ref) = self.extensions.last().cloned() else {
+            return;
+        };
+        // disjoint field borrows: extensions is already pushed, so
+        // iterate the clone while mutating peer conns.
+        for c in self.peers.values_mut() {
+            let Some(remote) = c.remote else { continue };
+            if let Some(pp) = ext_ref.new_peer_connection(&remote) {
+                c.plugins.push(pp);
+            }
+        }
+        if self.files_checked {
+            ext_ref.on_files_checked();
+        }
+    }
+
+    /// `add_peer` — a new connection registered. Upstream runs
+    /// `torrent_plugin::new_connection` for each extension at
+    /// attach time (`peer_connection::init`).
+    pub fn add_peer(&mut self, id: u64, mut conn: PeerConn) {
+        if let Some(remote) = conn.remote {
+            for ext in &self.extensions {
+                if let Some(pp) = ext.new_peer_connection(&remote) {
+                    conn.plugins.push(pp);
+                }
+            }
+        }
         self.peers.insert(id, conn);
     }
 
@@ -1794,6 +1904,12 @@ impl Torrent {
                 c.stat_down_total += n;
                 c.stat_down_round += n;
                 self.last_payload_down = Some(Instant::now());
+            }
+            // `peer_plugin::on_*` — plugins observe the decoded
+            // message before our dispatch consumes it (upstream
+            // fires the per-message hooks inside `incoming_*`).
+            for p in &c.plugins {
+                p.on_message(msg);
             }
             c.dispatch(msg, self.num_pieces, &mut effects);
         }
@@ -2470,6 +2586,15 @@ impl Torrent {
         // the hash job landed either way — clear `dp.hashing`
         // (`picker.completed_hash_job` upstream).
         self.hashing_done(piece);
+        // `torrent_plugin::on_piece_pass`/`on_piece_failed` —
+        // upstream fires both inside `piece_finished`.
+        for ext in &self.extensions {
+            if passed {
+                ext.on_piece_pass(piece);
+            } else {
+                ext.on_piece_failed(piece);
+            }
+        }
         if !passed {
             // `m_total_failed` — the discarded payload bytes.
             self.failed_bytes += self
@@ -2799,26 +2924,23 @@ impl Torrent {
         self.peer_list.peers()
     }
 
-    /// `torrent_handle::add_http_seed` — BEP-17 endpoint.
-    pub fn add_http_seed(&mut self, url: String) {
-        if !self.http_seeds.contains(&url) {
-            self.http_seeds.push(url);
-            self.need_save_resume = true;
-        }
-    }
+    /// `torrent_handle::add_http_seed` — **deprecated upstream
+    /// no-op**: libtorrent 2.x removed BEP-17 fetching ("removed
+    /// support for BEP 17 web seeds (in favor of BEP 19)"); the
+    /// handle method is `add_http_seed(std::string const&) {}`.
+    /// `atp.http_seeds` (torrent_info ctor input) is the only path
+    /// that still lands — merged into `web_seeds` at add time.
+    pub fn add_http_seed(&mut self, _url: String) {}
 
-    /// `torrent_handle::remove_http_seed`.
-    pub fn remove_http_seed(&mut self, url: &str) {
-        if self.http_seeds.iter().any(|u| u == url) {
-            self.http_seeds.retain(|u| u != url);
-            self.need_save_resume = true;
-        }
-    }
+    /// `torrent_handle::remove_http_seed` — deprecated upstream
+    /// no-op (`remove_http_seed(std::string const&) {}`).
+    pub fn remove_http_seed(&mut self, _url: &str) {}
 
-    /// `torrent_handle::http_seeds` snapshot.
+    /// `torrent_handle::http_seeds` — upstream returns an empty
+    /// set (`http_seeds() const { return {}; }`).
     #[must_use]
     pub fn http_seeds(&self) -> &[String] {
-        &self.http_seeds
+        &[]
     }
 
     /// `set_peer_upload_limit` / `set_peer_download_limit` —

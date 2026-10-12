@@ -1,6 +1,7 @@
 # ADR-0023: Alert-surface completion & asynchronous result delivery (1.0 API)
 
-- Status: accepted — Phases K+L implemented (D1–D8); D9–D10 in Phase M
+- Status: accepted — implemented (Phases K/L/M); D10 resolved
+  differently than drafted (see below — upstream removed BEP-17)
 - Date: 2026-10-12
 - Deciders: port team
 - Complements: ADR-0004 (error handling), ADR-0008 (injected
@@ -269,14 +270,34 @@ NAT-PMP lifetime-0 map request. `Portmap` / `PortmapError` /
   ut_holepunch) keep their dedicated paths — refactoring them onto the
   generic seam is not required for parity.
 
-### D10 — BEP-17 `http_seed` (GetRight) fetch completion
+### D10 — BEP-17 `http_seed`: **upstream removed it — resolved
+differently than drafted**
 
-`net::web_seed` gains the `http_seed` endpoint kind: URL join is
-`base_url + file_path` (no `?piece=` query), `Range` headers
-identical, GetRight retry/redirect semantics from
-`http_seed_connection.cpp` (redirect updates seed URL, 4xx/503 →
-backoff `retry_web_seed`). `maybe_connect_web_seeds` handles both
-endpoint kinds; BEP-19 path unchanged.
+The draft assumed `http_seed_connection.cpp` still exists upstream.
+It does not: libtorrent 2.x ChangeLog states *"removed support for
+BEP 17 web seeds (in favor of BEP 19)"*, `web_seed_entry::type_t` is
+`TORRENT_DEPRECATED`, and `torrent_handle::{add,remove}_http_seed`/
+`http_seeds()` are literal no-ops / empty sets
+(`torrent_handle.cpp:682-684`). What upstream *actually* does, and
+what we ported verbatim:
+
+- `add_torrent_params::http_seeds` → `web_seed_entry{type=http_seed}`
+  pushed into `m_web_seeds` (`torrent_info.cpp:1640`) — fetched
+  through the same BEP-19 `web_peer_connection` path (the modern
+  request is already `GET <base>/<file_path>` + `Range`, i.e. the
+  GetRight wire shape).
+- `torrent_handle::{add,remove}_http_seed` = `{}` no-ops;
+  `http_seeds()` returns `{}` (deprecated-API contract preserved for
+  source compatibility).
+- `torrent::write_resume_data` folds **all** `m_web_seeds` into
+  `atp.url_seeds`; the `httpseeds` resume key is written by
+  `write_resume_data` only when the *client* populated
+  `atp.http_seeds` — `read_resume_data` never reads it back
+  (verified: only `url-list` is read).
+
+Ported: `Torrent::from_atp` merges `atp.http_seeds` into
+`web_seeds`; the handle methods are documented no-ops;
+`to_resume_data` writes `atp.url_seeds` from `web_seeds`.
 
 ### Deferred (with reason)
 

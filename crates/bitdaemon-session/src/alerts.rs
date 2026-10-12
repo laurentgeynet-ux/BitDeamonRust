@@ -1389,9 +1389,64 @@ impl AlertManager {
 
 /// `plugin`/`ses_extension` — session-level extension point.
 /// OnionBit attaches IPv8/peer-class plugins here.
+///
+/// When stored on a `Torrent` (via
+/// `TorrentHandle::add_extension`) the plugin plays the
+/// `torrent_plugin` role: the lifecycle hooks below are driven
+/// from the torrent's tick/peer paths (upstream
+/// `torrent_plugin.hpp`).
 pub trait SessionPlugin: Send + Sync {
     /// `plugin::on_alert` — every posted alert fans out here.
     fn on_alert(&self, _a: &Alert) {}
+
+    /// `torrent_plugin::new_connection` — a peer was added to the
+    /// torrent; returning a `PeerPlugin` attaches it to that
+    /// connection (upstream `peer_connection::add_extension`).
+    fn new_peer_connection(
+        &self,
+        _remote: &std::net::SocketAddr,
+    ) -> Option<std::sync::Arc<dyn PeerPlugin>> {
+        None
+    }
+
+    /// `torrent_plugin::on_piece_pass` — piece `index` verified.
+    fn on_piece_pass(&self, _index: PieceIndex) {}
+
+    /// `torrent_plugin::on_piece_failed` — piece `index` failed
+    /// hashing.
+    fn on_piece_failed(&self, _index: PieceIndex) {}
+
+    /// `torrent_plugin::on_files_checked` — storage check
+    /// completed (also invoked on `add_extension` when the torrent
+    /// was already checked).
+    fn on_files_checked(&self) {}
+
+    /// `torrent_plugin::on_pause` — torrent is pausing; returning
+    /// `true` vetoes the pause (first true wins, upstream iterates
+    /// and stops).
+    fn on_pause(&self) -> bool {
+        false
+    }
+
+    /// `torrent_plugin::tick` — driven once per session tick.
+    fn tick(&self) {}
+}
+
+/// `peer_plugin` — per-connection extension produced by
+/// `SessionPlugin::new_peer_connection` (upstream
+/// `peer_plugin.hpp` — scoped port: `on_message`/`on_tick`
+/// cover the consumer-facing hooks; the upstream per-message
+/// `on_*` family collapses into `on_message`). `Debug` is a
+/// supertrait so `PeerConn` can stay `#[derive(Debug)]`.
+pub trait PeerPlugin: Send + Sync + std::fmt::Debug {
+    /// `peer_plugin::on_*` message family — invoked for every
+    /// incoming wire message after it has been decoded
+    /// (`on_have`, `on_request`, `on_piece`, `on_bitfield`, …
+    /// upstream). The plugin observes, it cannot alter dispatch.
+    fn on_message(&self, _msg: &bitdaemon_net::peer_wire::PeerMessage) {}
+
+    /// `peer_plugin::tick` — driven once per session tick.
+    fn on_tick(&self) {}
 }
 
 #[cfg(test)]

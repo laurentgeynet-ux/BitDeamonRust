@@ -1531,28 +1531,23 @@ impl TorrentHandle {
         self.set_ssl_certificate(cert, key, dh);
     }
 
-    /// `torrent_handle::add_http_seed` — BEP-17 endpoint.
-    pub fn add_http_seed(&self, url: String) {
-        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.add_http_seed(url);
-        }
-    }
+    /// `torrent_handle::add_http_seed` — **deprecated upstream
+    /// no-op**: libtorrent 2.x removed BEP-17 fetching; upstream's
+    /// method body is literally `add_http_seed(std::string const&)
+    /// {}`. Kept for API parity; use `add_url_seed` for working
+    /// web seeds (`atp.http_seeds` from torrent_info still merges
+    /// into the BEP-19 fetch path at add time).
+    pub fn add_http_seed(&self, _url: String) {}
 
-    /// `torrent_handle::remove_http_seed`.
-    pub fn remove_http_seed(&self, url: &str) {
-        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.remove_http_seed(url);
-        }
-    }
+    /// `torrent_handle::remove_http_seed` — deprecated upstream
+    /// no-op.
+    pub fn remove_http_seed(&self, _url: &str) {}
 
-    /// `torrent_handle::http_seeds` snapshot.
+    /// `torrent_handle::http_seeds` — upstream returns an empty
+    /// set unconditionally.
     #[must_use]
     pub fn http_seeds(&self) -> Vec<String> {
-        lock(&self.session)
-            .torrents
-            .get(&self.info_hash)
-            .map(|t| t.http_seeds().to_vec())
-            .unwrap_or_default()
+        Vec::new()
     }
 
     /// `torrent_handle::set_peer_upload_limit`.
@@ -1731,12 +1726,15 @@ impl TorrentHandle {
             })
     }
 
-    /// `torrent_handle::add_extension` — register a per-torrent
-    /// plugin factory (`torrent_plugin` upstream; `SessionPlugin` is
-    /// our extension point).
+    /// `torrent_handle::add_extension` — invoke the factory
+    /// immediately (upstream `add_extension_fun`: the plugin is
+    /// constructed now, then `torrent::add_extension` walks every
+    /// existing connection through `new_connection` and replays
+    /// `on_files_checked` when the storage check already ran).
     pub fn add_extension(&self, ext: crate::torrent::ExtensionFactory) {
+        let plugin = ext(self);
         if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.extensions.push(ext);
+            t.add_extension_plugin(plugin);
         }
     }
 

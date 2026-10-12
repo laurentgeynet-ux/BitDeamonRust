@@ -1212,6 +1212,12 @@ impl Session {
     pub fn set_paused(&mut self, ih: &Sha1Hash, paused: bool, out: &mut Vec<SessionOut>) {
         let mut changed = false;
         if let Some(t) = self.torrents.get_mut(ih) {
+            // `torrent_plugin::on_pause` — a `true` reply vetoes the
+            // pause (upstream `torrent::set_paused` iterates
+            // `m_extensions` and returns early).
+            if paused && !t.paused && t.extensions.iter().any(|e| e.on_pause()) {
+                return;
+            }
             changed = t.paused != paused;
             t.paused = paused;
         }
@@ -2331,6 +2337,17 @@ impl Session {
         let post_stats = self.alerts.should_post(AlertCategory::STATS);
         for (ih, t) in &mut self.torrents {
             t.update_rates(now);
+            // `torrent_plugin::tick` + `peer_plugin::tick` —
+            // upstream `torrent::second_tick` fires them for every
+            // torrent regardless of want_peers.
+            for ext in &t.extensions {
+                ext.tick();
+            }
+            for c in t.peers.values_mut() {
+                for p in &c.plugins {
+                    p.on_tick();
+                }
+            }
             // `torrent::second_tick` — `stats_alert` rides the
             // per-second counters refresh (category-gated upstream
             // the same way).
