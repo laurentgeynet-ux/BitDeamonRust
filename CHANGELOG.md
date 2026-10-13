@@ -9,6 +9,51 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- `disk::disk_io`: ported upstream `prepare_read` — read jobs now
+  consult the write cache once, past the fence gate. Fully cached
+  requests (including unaligned spans across two 16 KiB blocks) are
+  served with no disk I/O; a span with only one side cached is
+  converted to `partial_read` reading only the missing side. Fixes a
+  real correctness hole too: reads of regions whose data lived only
+  in the dirty cache used to hit the file and fail
+  (`UnexpectedEof`/short reads), now they are served from cache like
+  upstream. `disk_cache::get2` added for the two-block consult.
+- `disk::disk_io`: `async_write` now passes `is_blocked` like
+  upstream — a write arriving while a fence is up is parked and
+  inserted into the cache at repost, instead of racing the exclusive
+  job (`clear_piece` reset / storage teardown). Parked writes return
+  `false` (no back-pressure signal) and still count against
+  `write_blocks`. `job::write` no longer reaches the pool
+  (`do_job(write)` is `TORRENT_ASSERT_FAIL` upstream).
+- `disk::disk_io`: `abort_jobs` also drains jobs parked inside the
+  per-torrent fence (`take_blocked`) — their handlers used to be
+  dropped silently on shutdown.
+- `disk::disk_io`: reworked the fence repost path to upstream's
+  in-lock discipline — the repost callback (invoked while
+  `has_fence` is held) now runs only the pure cache consults
+  (`insert_write` for writes, `prepare_read` for reads); pool
+  dispatch, flush scheduling and completions are deferred until the
+  lock drops, exactly like upstream's `repost_state`. The previous
+  shape re-entered `is_blocked` for flush jobs inside the callback —
+  a real deadlock on the non-recursive fence mutex.
+- `disk::disk_io`: ported upstream `m_fence_flush` — a stacked fence
+  waiting on writes that were just reposted into the cache now
+  drains the storage's whole dirty cache via `Flush` jobs counted
+  outstanding *past* `is_blocked` (like upstream's dedicated
+  fence-flush pass on a generic thread). Previously the fence ran
+  with those blocks still dirty; `delete_files`/`move_storage` could
+  observe a storage missing data that a parked write had supplied.
+- `disk::disk_io`: `async_write`'s `FLUSH_PIECE` flag is now honored
+  — a `force_flush`-flagged piece drains all its dirty runs on
+  insert regardless of the watermark (upstream's first flush pass),
+  not only when every block has arrived.
+- `disk::disk_io`: `async_read` rejects `length <= 0` / `start < 0`
+  inline with `invalid_request` (`Operation::FileRead`), like
+  upstream — the job never enters the queue.
+- `core::create_torrent`: `CreateFlags` now carries the deprecated
+  upstream bits `OPTIMIZE_ALIGNMENT`/`OPTIMIZE` (0_bit),
+  `MERKLE` (1_bit) and `MUTABLE_TORRENT_SUPPORT` (4_bit) for API
+  parity — all no-ops like upstream ≥ 2.0.
 - `session::peer_conn` & `torrent::drive_peer`: in-flight requests were
   tracked in `request_queue` instead of `download_queue` upon transmission,
   causing `check_request_timeouts` to wipe active downloads on 2s inactivity

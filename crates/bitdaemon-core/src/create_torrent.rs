@@ -24,8 +24,23 @@ use crate::path::{combine_path, has_parent_path, lsplit_path};
 pub struct CreateFlags(pub u32);
 
 impl CreateFlags {
+    /// `create_torrent::optimize_alignment` — deprecated upstream
+    /// (`0_bit`): no effect since 2.0, v2 layouts are always
+    /// canonical/padded. Kept for API parity; honoring it is a no-op.
+    pub const OPTIMIZE_ALIGNMENT: Self = Self(1 << 0);
+    /// `create_torrent::optimize` — deprecated alias of
+    /// [`Self::OPTIMIZE_ALIGNMENT`] upstream.
+    pub const OPTIMIZE: Self = Self(1 << 0);
+    /// `create_torrent::merkle` — deprecated upstream (`1_bit`):
+    /// merkle trees are a v2-only mechanism upstream removed with
+    /// the v1.4.x "merkle" torrent format. No effect here.
+    pub const MERKLE: Self = Self(1 << 1);
     /// `create_torrent::modification_time`.
     pub const MODIFICATION_TIME: Self = Self(1 << 2);
+    /// `create_torrent::mutable_torrent_support` — deprecated
+    /// upstream (`4_bit`): BEP 46 mutable torrents are v1-only; the
+    /// flag is accepted but has no effect. Kept for API parity.
+    pub const MUTABLE_TORRENT_SUPPORT: Self = Self(1 << 4);
     /// `create_torrent::symlinks`.
     pub const SYMLINKS: Self = Self(1 << 3);
     /// `create_torrent::v2_only`.

@@ -105,6 +105,9 @@ pub struct WriteJob {
     pub offset: i32,
     /// `buffer_size`.
     pub buffer_size: u16,
+    /// upstream `j->flags & flush_piece` — the caller asked for an
+    /// immediate flush once the block lands in the cache.
+    pub force_flush: bool,
 }
 
 /// `job::hash` — SHA-1 over a whole piece (+ block SHA-256s).

@@ -87,6 +87,29 @@ struct PieceGate {
     blocked: VecDeque<Box<DiskJob>>,
 }
 
+/// What `gate_consult` decided for a job past the fence — the
+/// deferred side-effects run after the caller releases any fence
+/// mutex (upstream defers exactly these out of its in-lock repost
+/// callback: pool dispatch, flush scheduling, completions).
+enum PostGate {
+    /// satisfied read — complete through the normal path.
+    Done(Box<DiskJob>),
+    /// write landed in the cache — completes normally; `loc` needs
+    /// deferred flush scheduling (`schedule_flush`); `extra` are
+    /// `m_fence_flush` drains already counted outstanding — they
+    /// still need the deferred pool dispatch.
+    Inserted(
+        Box<DiskJob>,
+        crate::disk_cache::PieceLocation,
+        crate::disk_pool::JobQueue,
+    ),
+    /// dispatch to the job pool (deferred — `immediate_execute`
+    /// would re-enter the fence through `job_complete`).
+    Pool(Box<DiskJob>),
+    /// consumed (parked in the piece gate).
+    Parked,
+}
+
 /// `pread_disk_io` — positioned-I/O disk orchestrator.
 pub struct PreadDiskIo {
     storages: Mutex<HashMap<StorageIndex, Arc<StorageEntry>>>,
@@ -403,6 +426,9 @@ impl PreadDiskIo {
         drained.append(&mut self.flush_pool.drain_jobs());
         // hash jobs parked behind the piece gate never reached the
         // pool — drain them too so their completions still post.
+        // Same for jobs parked inside the per-torrent fence (writes
+        // waiting on a clear_piece/move, fence jobs queued behind an
+        // active fence): their handlers must still run.
         for e in self
             .storages
             .lock()
@@ -417,6 +443,11 @@ impl PreadDiskIo {
             {
                 drained.append(&mut g.blocked);
             }
+            let mut blocked = e.fence.take_blocked();
+            for _ in 0..blocked.len() {
+                self.fence_counters.dec_blocked();
+            }
+            drained.append(&mut blocked);
         }
         for j in &mut drained {
             crate::disk_completed::abort(j);
@@ -434,9 +465,12 @@ impl PreadDiskIo {
     /// every erase).
     fn job_done(&self, j: &mut DiskJob) {
         match &mut j.action {
-            JobKind::Write(_) => {
-                self.num_blocks_written.fetch_add(1, Ordering::Relaxed);
-                self.num_write_ops.fetch_add(1, Ordering::Relaxed);
+            // a write that errored before reaching the cache (aborted
+            // while parked behind a fence) releases its back-pressure
+            // slot; one that was inserted keeps its slot until the
+            // Flush retires the block — upstream `m_blocks` counts
+            // cached blocks, so decrements live in the Flush arm.
+            JobKind::Write(_) if j.error.is_err() => {
                 let level = self.write_blocks.fetch_sub(1, Ordering::Relaxed) - 1;
                 self.back_pressure.check_buffer_level(level);
             }
@@ -563,7 +597,12 @@ impl PreadDiskIo {
         j.storage = idx;
         if let Some(entry) = self.storage(idx) {
             if let Some(j) = entry.fence.is_blocked(j, &self.fence_counters) {
-                self.gate_or_enqueue(&entry, j);
+                // upstream `add_job`: satisfied at the consult point
+                // (cache-hit read / cache-inserted write) — complete
+                // through the normal bookkeeping path.
+                if let Some(done) = self.gate_or_enqueue(&entry, j) {
+                    self.add_completed_job(done, Some(&entry));
+                }
             }
         } else {
             // no storage — job is stale; complete it aborted
@@ -624,32 +663,59 @@ impl PreadDiskIo {
         }
     }
 
-    /// Piece-gate routing after the fence check: writes register
-    /// against their piece; hash jobs for a piece with in-flight
-    /// writes queue behind them instead of racing the file.
-    fn gate_or_enqueue(&self, entry: &StorageEntry, j: Box<DiskJob>) {
-        // a coalesced flush touches every piece in `spans`; write
-        // jobs register on their single piece, hash jobs park behind
-        // any in-flight write on theirs.
+    /// The pure consult — safe under the fence mutex: only cache and
+    /// piece-gate ops, never a pool push, a flush enqueue or a
+    /// completion (upstream's in-lock repost callback does exactly
+    /// this much). `fence_up` is `has_fence()` sampled by the caller —
+    /// inside the repost callback the lock is already held, so it is
+    /// handed in from `job_complete`'s repost.
+    fn gate_consult(&self, e: &StorageEntry, mut j: Box<DiskJob>, fence_up: bool) -> PostGate {
+        // a write that made it past the fence lands in the cache now —
+        // fresh or reposted alike. With a stacked fence still raised,
+        // upstream's `m_fence_flush` drains the storage right away so
+        // the queued fence observes durable files; those flush jobs
+        // are counted outstanding past `is_blocked` (a parked job
+        // can't hold a fence — it must run *before* it).
+        if matches!(j.action, JobKind::Write(_)) {
+            let loc = self.insert_write(e, &mut j);
+            let mut extra = JobQueue::new();
+            if fence_up {
+                for fj in self.flush_for_fence(e, j.storage) {
+                    // `account_outstanding` already applied in
+                    // `flush_for_fence`; the consult registers the
+                    // in-flight write against the piece gate — a Flush
+                    // only ever lands on `Pool`.
+                    if let PostGate::Pool(j) = self.gate_consult(e, fj, fence_up) {
+                        extra.push_back(j);
+                    }
+                }
+            }
+            return PostGate::Inserted(j, loc, extra);
+        }
+        // the read-side consult point (`prepare_read`): full cache
+        // hits complete without any disk I/O, one-sided spanning hits
+        // become `PartialRead` for the missing side.
+        if matches!(j.action, JobKind::Read(_)) && prepare_read(e, &mut j) {
+            return PostGate::Done(j);
+        }
+        // a coalesced flush touches every piece in `spans`; hash jobs
+        // park behind any in-flight write on their piece.
         let pieces: Vec<i32> = match &j.action {
-            JobKind::Write(w) => vec![w.piece.0],
             JobKind::Flush(f) => f.spans.iter().map(|s| s.0.0).collect(),
             JobKind::Hash(h) => vec![h.piece.0],
             JobKind::Hash2(h) => vec![h.piece.0],
             _ => Vec::new(),
         };
         if pieces.is_empty() {
-            self.enqueue(j);
-            return;
+            return PostGate::Pool(j);
         }
-        let is_write = matches!(j.action, JobKind::Write(_) | JobKind::Flush(_));
-        let mut gate = entry.piece_gate.lock().unwrap_or_else(|e| e.into_inner());
+        let is_write = matches!(j.action, JobKind::Flush(_));
+        let mut gate = e.piece_gate.lock().unwrap_or_else(|x| x.into_inner());
         if is_write {
             for p in pieces {
                 gate.entry(p).or_default().writes += 1;
             }
-            drop(gate);
-            self.enqueue(j);
+            PostGate::Pool(j)
         } else if pieces
             .iter()
             .any(|p| gate.get(p).is_some_and(|g| g.writes > 0))
@@ -657,10 +723,180 @@ impl PreadDiskIo {
             let p = pieces[0];
             tracing::debug!(piece = p, "piece_gate: hash parked behind writes");
             gate.entry(p).or_default().blocked.push_back(j);
+            PostGate::Parked
         } else {
-            drop(gate);
-            self.enqueue(j);
+            PostGate::Pool(j)
         }
+    }
+
+    /// Post-fence routing for jobs NOT under the fence mutex —
+    /// `add_job`'s happy path and the `piece_gate` release path:
+    /// consult, then run the deferred side-effects inline.
+    /// Returns the job back when it completed inline — the caller must
+    /// run it through the normal completion path.
+    fn gate_or_enqueue(&self, entry: &StorageEntry, j: Box<DiskJob>) -> Option<Box<DiskJob>> {
+        match self.gate_consult(entry, j, entry.fence.has_fence()) {
+            PostGate::Done(j) => Some(j),
+            PostGate::Inserted(j, loc, extra) => {
+                self.flush_after_insert(entry, std::iter::once(loc));
+                for x in extra {
+                    self.enqueue(x);
+                }
+                Some(j)
+            }
+            PostGate::Pool(j) => {
+                self.enqueue(j);
+                None
+            }
+            PostGate::Parked => None,
+        }
+    }
+
+    /// `pread_disk_io::insert_write` — the pure cache insert of a
+    /// write job's block (upstream: the write "job" is complete once
+    /// the block sits in the store buffer; the flush is a separate,
+    /// coalesced mechanism). Safe under the fence mutex — cache ops
+    /// only. Returns the inserted location for deferred flush
+    /// scheduling.
+    fn insert_write(
+        &self,
+        entry: &StorageEntry,
+        j: &mut DiskJob,
+    ) -> crate::disk_cache::PieceLocation {
+        let JobKind::Write(w) = &mut j.action else {
+            return (j.storage, PieceIndex(-1));
+        };
+        let (piece_size, piece_size2) = {
+            let st = entry.storage.read().unwrap_or_else(|e| e.into_inner());
+            let fs = st.files();
+            (
+                i64::from(if entry.v1 {
+                    fs.piece_size(w.piece)
+                } else {
+                    fs.piece_size2(w.piece)
+                }),
+                i64::from(fs.piece_size2(w.piece)),
+            )
+        };
+        let block_idx =
+            usize::try_from(w.offset / crate::disk_cache::DEFAULT_BLOCK_SIZE as i32).unwrap_or(0);
+        let data = {
+            let want = usize::from(w.buffer_size);
+            match w.buf.data() {
+                Some(b) => b[..want.min(b.len())].to_vec(),
+                None => Vec::new(),
+            }
+        };
+        let force_flush = w.force_flush;
+        let loc = (j.storage, w.piece);
+        let mut cache = entry.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(
+            loc,
+            block_idx,
+            Some(data),
+            force_flush,
+            crate::disk_cache::PieceParams {
+                piece_size,
+                piece_size2,
+                v1: entry.v1,
+                v2: entry.v2,
+            },
+        );
+        // clear `has_write_job` so a flush can take the block.
+        cache.write_job_done(loc, block_idx, false);
+        loc
+    }
+
+    /// `try_flush_blocks`/`schedule_flush` — flush selection after an
+    /// insert. Enqueues `Flush` jobs through `add_job`, so it must run
+    /// off the fence mutex (upstream defers `schedule_flush` out of
+    /// the repost callback for the same reason).
+    fn flush_after_insert(
+        &self,
+        entry: &StorageEntry,
+        inserted: impl IntoIterator<Item = crate::disk_cache::PieceLocation>,
+    ) {
+        let mut runs = Vec::new();
+        {
+            let mut cache = entry.cache.lock().unwrap_or_else(|e| e.into_inner());
+            for loc in inserted {
+                // upstream's first flush pass: complete pieces flush as
+                // one contiguous `writev`; `force_flush_flag` pieces
+                // (the `flush_piece` write flag, or hashed) drain all
+                // their dirty runs regardless of the watermark.
+                let Some(p) = cache.piece(loc) else {
+                    continue;
+                };
+                let complete = p.blocks.iter().all(|b| b.buf.is_some() || b.flushed);
+                let forced = p.flags & crate::disk_cache::piece_flags::FORCE_FLUSH != 0;
+                if complete {
+                    if let Some(run) = cache.take_flush_run(loc) {
+                        runs.push((loc, run.0, vec![(loc.1, run.0, run.1.len())], run.1));
+                    }
+                } else if forced {
+                    for (first, bufs) in cache.take_all_runs(loc) {
+                        runs.push((loc, first, vec![(loc.1, first, bufs.len())], bufs));
+                    }
+                }
+            }
+            // upstream `check_buffer_level`/`try_flush_blocks`: above
+            // the high watermark (or while the exceeded flag is
+            // sticky) keep flushing runs until the cache drains to the
+            // low watermark.
+            while let Some(low) = self.back_pressure.should_flush(cache.num_cached_blocks) {
+                if cache.num_cached_blocks <= low {
+                    break;
+                }
+                // upstream `flush_to_disk` order: complete/hashed
+                // pieces first (large contiguous writes), then the
+                // piece with the most contiguous dirty blocks, then
+                // the oldest partial run — `coalesce_writes` extends
+                // each run across piece boundaries so write-through
+                // writes stay large.
+                let Some(run) = cache.take_coalesced(128) else {
+                    break;
+                };
+                runs.push(run);
+            }
+        }
+        for (run_loc, first, spans, bufs) in runs {
+            self.add_job(
+                run_loc.0,
+                self.mk_job(JobKind::Flush(crate::disk_job::FlushJob {
+                    piece: run_loc.1,
+                    first_block: first,
+                    spans,
+                    bufs,
+                })),
+            );
+        }
+    }
+
+    /// Upstream `m_fence_flush`/`flush_storage` — drain the storage's
+    /// whole write cache when a stacked fence is waiting on
+    /// just-inserted blocks. Each run becomes a `Flush` job counted
+    /// outstanding *past* `is_blocked` (a parked job can't hold the
+    /// fence — it must run before it, like upstream's dedicated
+    /// fence-flush pass on a generic thread).
+    fn flush_for_fence(&self, e: &StorageEntry, storage: StorageIndex) -> JobQueue {
+        let runs = e
+            .cache
+            .lock()
+            .unwrap_or_else(|x| x.into_inner())
+            .take_all_storage_runs();
+        runs.into_iter()
+            .map(|((_s, piece), first, bufs)| {
+                let mut fj = self.mk_job(JobKind::Flush(crate::disk_job::FlushJob {
+                    piece,
+                    first_block: first,
+                    spans: vec![(piece, first, bufs.len())],
+                    bufs,
+                }));
+                fj.storage = storage;
+                e.fence.account_outstanding(&mut fj);
+                fj
+            })
+            .collect()
     }
 
     /// Pool routing — upstream `job::thread_type()`: `hash`/`hash2`
@@ -744,15 +980,19 @@ impl PreadDiskIo {
     fn add_completed_jobs(&self, mut jobs: JobQueue, entry: Option<&StorageEntry>) {
         // fence bookkeeping: for each completed job on this storage,
         // repost blocked jobs — *before* the job lands on completions,
-        // matching upstream ordering.
+        // matching upstream ordering. Iterated as a worklist so a job
+        // satisfied inline at repost (cache-hit read, cache-inserted
+        // write) completes through the same bookkeeping without
+        // recursing back into `job_complete`.
         let mut done = JobQueue::new();
-        for mut j in jobs.drain(..) {
+        let mut work: VecDeque<Box<DiskJob>> = std::mem::take(&mut jobs);
+        while let Some(mut j) = work.pop_front() {
             if let Some(e) = entry {
-                // piece gate: a completed write (or coalesced flush)
-                // may release hash jobs queued behind it — a spanning
-                // flush decrements every piece it covered.
+                // piece gate: a completed flush (which may span
+                // pieces) releases hash jobs queued behind it —
+                // upstream's hasher never observes a piece whose
+                // writes haven't landed.
                 let gate_pieces: Vec<i32> = match &j.action {
-                    JobKind::Write(w) => vec![w.piece.0],
                     JobKind::Flush(f) => f.spans.iter().map(|s| s.0.0).collect(),
                     _ => Vec::new(),
                 };
@@ -773,25 +1013,50 @@ impl PreadDiskIo {
                     for bj in released {
                         // parked jobs already passed the fence once —
                         // they carry IN_PROGRESS and stay counted in
-                        // `outstanding`, so they go straight to the pool;
-                        // re-entering add_job would double-account them
-                        // (and trip the fence's debug_assert).
-                        self.enqueue(bj);
+                        // `outstanding`, so they re-enter at the
+                        // post-fence consult point like reposts;
+                        // re-entering add_job would double-account
+                        // them (and trip the fence's debug_assert).
+                        if let Some(done_j) = self.gate_or_enqueue(e, bj) {
+                            work.push_back(done_j);
+                        }
                     }
                 }
-                let mut reposted = Vec::new();
-                e.fence.job_complete(&mut j, &mut |bj| reposted.push(bj));
-                for bj in reposted {
-                    let pool = self.job_pool(&bj);
-                    pool.push_back(bj);
-                    pool.submit_jobs();
+                // the repost callback fires while `has_fence` is held
+                // (upstream's in-lock repost) — only the pure consult
+                // may run inside; pool dispatch, flush scheduling and
+                // completions are deferred until it returns.
+                let mut repost_pool: Vec<Box<DiskJob>> = Vec::new();
+                let mut repost_locs: Vec<crate::disk_cache::PieceLocation> = Vec::new();
+                let mut repost_done: Vec<Box<DiskJob>> = Vec::new();
+                e.fence.job_complete(&mut j, &mut |bj, fence_up| match self
+                    .gate_consult(e, bj, fence_up)
+                {
+                    PostGate::Done(j) => repost_done.push(j),
+                    PostGate::Inserted(j, loc, extra) => {
+                        repost_locs.push(loc);
+                        repost_pool.extend(extra);
+                        repost_done.push(j);
+                    }
+                    PostGate::Pool(j) => repost_pool.push(j),
+                    PostGate::Parked => {}
+                });
+                // deferred, in upstream order: `schedule_flush` for
+                // the inserted blocks, the inline completions re-enter
+                // the completion path (they can lower further fences),
+                // then the pool dispatch.
+                if !repost_locs.is_empty() {
+                    self.flush_after_insert(e, repost_locs);
+                }
+                work.extend(repost_done);
+                for bj in repost_pool {
+                    self.enqueue(bj);
                 }
             }
             self.job_done(&mut j);
             done.push_back(j);
         }
         self.completed.append(done);
-        let _ = &mut jobs;
     }
 
     /// `perform_job` — execute on the disk thread.
@@ -911,10 +1176,25 @@ impl PreadDiskIo {
                 cache,
                 self.read_no_cache.load(Ordering::Relaxed),
             ),
-            JobKind::PartialRead(r) => {
-                partial_read_job(st, r, self.read_no_cache.load(Ordering::Relaxed))
+            JobKind::PartialRead(r) => partial_read_job(
+                st,
+                r,
+                j.storage,
+                cache,
+                self.read_no_cache.load(Ordering::Relaxed),
+            ),
+            // upstream `do_job(write)` is `TORRENT_ASSERT_FAIL` — a
+            // write never reaches the pool: `gate_or_enqueue` folds
+            // it into the cache at the post-fence consult point.
+            // Reaching here is a bug, not a code path.
+            JobKind::Write(_) => {
+                debug_assert!(false, "write job reached perform_job");
+                StorageError::new(
+                    std::io::Error::other("write job reached perform_job"),
+                    FileIndex(-1),
+                    Operation::FileWrite,
+                )
             }
-            JobKind::Write(w) => write_job(st, w, self.write_no_cache.load(Ordering::Relaxed)),
             JobKind::Flush(f) => {
                 // coalesced region write — contiguous `store_buffer`
                 // blocks concatenated into one syscall (ADR-0012);
@@ -1124,8 +1404,140 @@ fn read_job(
     }
 }
 
-fn partial_read_job(st: &dyn DiskStorage, r: &mut PartialReadJob, no_cache: bool) -> StorageError {
-    // unaligned read into buf at buffer_offset (upstream semantics)
+/// `pread_disk_io::prepare_read` — the single point a read job
+/// consults the write cache, run once the job is past the fence gate
+/// so it always sees the current cache:
+///
+/// - fully cached request → buffer filled, returns true (the caller
+///   completes the job — no disk I/O at all);
+/// - unaligned request spanning two `default_block_size` blocks with
+///   only one side cached → that side is copied into the buffer and
+///   the job is turned into `JobKind::PartialRead` for the missing
+///   side (returns false — the caller enqueues it);
+/// - nothing cached → returns false (a plain `Read` executes;
+///   `read_job` still overlays dirty blocks that land before it runs).
+fn prepare_read(e: &StorageEntry, j: &mut DiskJob) -> bool {
+    const BS: i32 = crate::disk_cache::DEFAULT_BLOCK_SIZE as i32;
+    let JobKind::Read(r) = &mut j.action else {
+        return false;
+    };
+    let loc = (j.storage, r.piece);
+    // upstream derives the cache coordinates the same way: the cache
+    // is indexed by `default_block_size` blocks, the request may be
+    // unaligned.
+    let block_offset = r.offset - r.offset % BS;
+    let block_idx = usize::try_from(r.offset / BS).unwrap_or(0);
+    let read_offset = r.offset - block_offset;
+    let buf_len = r.buf.data().map_or(0, <[u8]>::len);
+    let size = usize::from(r.buffer_size).min(buf_len);
+
+    if read_offset + r.buffer_size as i32 > BS {
+        // unaligned, spans two blocks — either, both or neither may
+        // be in the cache (`disk_cache::get2`).
+        let len1 = usize::try_from(BS - read_offset).unwrap_or(0);
+        let ro = usize::try_from(read_offset).unwrap_or(0);
+        let (have1, have2) = {
+            let g = e.cache.lock().unwrap_or_else(|x| x.into_inner());
+            let (b1, b2) = g.get2(loc, block_idx);
+            // a cached entry shorter than the range it would serve
+            // can't happen upstream (`TORRENT_ASSERT_VAL`) — treat a
+            // short block as a miss rather than panic.
+            let have1 = b1.is_some_and(|s| s.len() >= ro + len1);
+            let have2 = b2.is_some_and(|s| s.len() >= size - len1);
+            if !have1 && !have2 {
+                return false;
+            }
+            let Some(buf) = r.buf.data_mut() else {
+                // upstream: no_memory/`alloc_cache_piece`, fatal —
+                // the job completes with the error.
+                j.error = StorageError::new(
+                    std::io::Error::from(std::io::ErrorKind::OutOfMemory),
+                    FileIndex(-1),
+                    Operation::AllocCachePiece,
+                );
+                return true;
+            };
+            if let Some(s) = b1 {
+                if have1 {
+                    buf[..len1].copy_from_slice(&s[ro..ro + len1]);
+                }
+            }
+            if let Some(s) = b2 {
+                if have2 {
+                    buf[len1..size].copy_from_slice(&s[..size - len1]);
+                }
+            }
+            (have1, have2)
+        };
+        if have1 && have2 {
+            return true;
+        }
+        // one side served, one missing — turn the job into a
+        // `partial_read` for the missing side. This is the only
+        // place `PartialRead` jobs are created (upstream comment).
+        let piece = r.piece;
+        let offset = r.offset;
+        let handler = std::mem::replace(&mut r.handler, Box::new(|_, _| {}));
+        let buf = std::mem::replace(
+            &mut r.buf,
+            crate::disk_buffer_pool::DiskBufferHolder::empty(),
+        );
+        let (buffer_offset, missing_size, missing_offset) = if have1 {
+            // first side cached → read the remainder past `len1`.
+            (
+                u16::try_from(len1).unwrap_or(0),
+                u16::try_from(size - len1).unwrap_or(0),
+                block_offset + BS,
+            )
+        } else {
+            // second side cached → read `len1` bytes at offset 0.
+            (0, u16::try_from(len1).unwrap_or(0), offset)
+        };
+        j.action = JobKind::PartialRead(PartialReadJob {
+            handler,
+            buf,
+            buffer_offset,
+            buffer_size: missing_size,
+            piece,
+            offset: missing_offset,
+        });
+        return false;
+    }
+
+    // an aligned request inside one block.
+    let g = e.cache.lock().unwrap_or_else(|x| x.into_inner());
+    let Some(c) = g.get(loc, block_idx) else {
+        return false;
+    };
+    let ro = usize::try_from(read_offset).unwrap_or(0);
+    if c.len() < ro + size {
+        return false;
+    }
+    let Some(buf) = r.buf.data_mut() else {
+        j.error = StorageError::new(
+            std::io::Error::from(std::io::ErrorKind::OutOfMemory),
+            FileIndex(-1),
+            Operation::AllocCachePiece,
+        );
+        return true;
+    };
+    buf[..size].copy_from_slice(&c[ro..ro + size]);
+    true
+}
+
+fn partial_read_job(
+    st: &dyn DiskStorage,
+    r: &mut PartialReadJob,
+    storage: StorageIndex,
+    cache: &Mutex<crate::disk_cache::DiskCache>,
+    no_cache: bool,
+) -> StorageError {
+    // upstream `do_job(partial_read)`: read only the missing side —
+    // into `buf` at `buffer_offset` — the cached side was prefilled
+    // when the job was converted at the fence gate. The cache isn't
+    // consulted again upstream; we do overlay the read range so a
+    // dirty block that landed between the gate consult and this
+    // read still wins over stale file bytes.
     let Some(buf) = r.buf.data_mut() else {
         return StorageError::new(
             std::io::Error::from(std::io::ErrorKind::OutOfMemory),
@@ -1142,35 +1554,24 @@ fn partial_read_job(st: &dyn DiskStorage, r: &mut PartialReadJob, no_cache: bool
         read_mode(no_cache),
         false,
     ) {
-        Ok(_) => StorageError::default(),
-        Err(e) => e,
-    }
-}
-
-fn write_job(st: &dyn DiskStorage, w: &mut WriteJob, no_cache: bool) -> StorageError {
-    let Some(buf) = w.buf.data() else {
-        return StorageError::new(
-            std::io::Error::from(std::io::ErrorKind::InvalidInput),
-            FileIndex(-1),
-            Operation::FileWrite,
-        );
-    };
-    let want = usize::from(w.buffer_size).min(buf.len());
-    // upstream `mmap_storage`: `disk_io_write_mode=disable_os_cache`
-    // ORs `open_mode::no_cache` into the file open flags.
-    let mode = if no_cache {
-        OpenMode::WRITE | OpenMode::NO_CACHE
-    } else {
-        OpenMode::WRITE
-    };
-    match st.write(&buf[..want], w.piece, i64::from(w.offset), mode) {
         Ok(n) => {
-            w.buffer_size = u16::try_from(n).unwrap_or(0);
+            let n = usize::try_from(n).unwrap_or(0);
+            overlay_cached(
+                cache,
+                storage,
+                r.piece,
+                i64::from(r.offset),
+                &mut buf[off..off + n],
+            );
             StorageError::default()
         }
         Err(e) => e,
     }
 }
+
+// upstream has no `do_job(write)` — `TORRENT_ASSERT_FAIL`; a write
+// job's only destination is the cache insert at the post-fence
+// consult point (`add_write_to_cache`).
 
 fn hash_job(
     st: &dyn DiskStorage,
@@ -1414,6 +1815,20 @@ impl DiskIo for PreadDiskIo {
         handler: Box<dyn FnOnce(crate::disk_buffer_pool::DiskBufferHolder, StorageError) + Send>,
         flags: u8,
     ) {
+        // upstream `async_read` rejects empty/negative requests
+        // inline (`errors::invalid_request`, `operation_t::file_read`)
+        // before the job is even queued.
+        if r.length <= 0 || r.start < 0 {
+            handler(
+                crate::disk_buffer_pool::DiskBufferHolder::empty(),
+                StorageError::new(
+                    std::io::Error::from(std::io::ErrorKind::InvalidInput),
+                    FileIndex(-1),
+                    Operation::FileRead,
+                ),
+            );
+            return;
+        }
         let buf = self.buffer_pool.allocate_buffer("read");
         let length = r.length;
         let j = self.mk_job(JobKind::Read(ReadJob {
@@ -1434,14 +1849,16 @@ impl DiskIo for PreadDiskIo {
         buf: crate::disk_buffer_pool::DiskBufferHolder,
         o: Option<Arc<dyn DiskObserver>>,
         handler: Box<dyn FnOnce(StorageError) + Send>,
-        _flags: u8,
+        flags: u8,
     ) -> bool {
-        // upstream `mmap_disk_io::async_write`: the block lands in the
-        // per-storage cache (`store_buffer`/`disk_cache`) and the
-        // caller completes once it's safely held — the *flush* to
-        // files is a separate, coalesced mechanism (ADR-0012). The
-        // bool return only signals the peer to stop requesting until
-        // the cache drains below the low watermark.
+        // upstream `pread_disk_io::async_write`: the write job carries
+        // its buffer through the fence check — a raised fence parks it
+        // (`is_blocked`) because inserting into the cache now would
+        // race the exclusive job: `clear_piece` resets the entry,
+        // storage-wide fences tear the storage down. Reposted writes
+        // are inserted into the cache when the fence lowers. With no
+        // fence the block lands in the write cache inline and the job
+        // completes through the completed queue like everything else.
         let Some(entry) = self.storage(storage) else {
             handler(StorageError::new(
                 std::io::Error::from(std::io::ErrorKind::NotFound),
@@ -1450,83 +1867,47 @@ impl DiskIo for PreadDiskIo {
             ));
             return false;
         };
-        let (piece_size, piece_size2) = {
-            let st = entry.storage.read().unwrap_or_else(|e| e.into_inner());
-            let fs = st.files();
-            (
-                i64::from(fs.piece_size(r.piece)),
-                i64::from(fs.piece_size2(r.piece)),
-            )
-        };
-        let block_idx =
-            usize::try_from(r.start / crate::disk_cache::DEFAULT_BLOCK_SIZE as i32).unwrap_or(0);
-        let data = {
-            let b = buf.data();
-            let want = usize::try_from(r.length).unwrap_or(0);
-            let n = want.min(b.map_or(0, |b| b.len()));
-            b.map_or_else(Vec::new, |b| b[..n].to_vec())
-        };
+        // upstream asserts the request is one block-aligned block —
+        // the wire layer guarantees it.
+        debug_assert_eq!(r.start % crate::disk_cache::DEFAULT_BLOCK_SIZE as i32, 0);
+        debug_assert!(r.length <= crate::disk_cache::DEFAULT_BLOCK_SIZE as i32);
+        let mut j = self.mk_job(JobKind::Write(WriteJob {
+            handler,
+            buf,
+            piece: r.piece,
+            offset: r.start,
+            buffer_size: u16::try_from(r.length).unwrap_or(u16::MAX),
+            force_flush: flags & io_flags::FLUSH_PIECE == io_flags::FLUSH_PIECE,
+        }));
+        j.storage = storage;
+        // upstream `m_abort`: a write submitted during shutdown is
+        // aborted directly — it can't be counted outstanding, its
+        // completion would never drain.
+        if self.abort.load(Ordering::Relaxed) {
+            crate::disk_completed::abort(&mut j);
+            self.completed.push(j);
+            return false;
+        }
+        // counted at submit (upstream notes the parked path escapes
+        // the cache's back-pressure — counting here closes that gap:
+        // parked writes still push the level).
         let level = self.write_blocks.fetch_add(1, Ordering::Relaxed) + 1;
         let pressure = self.back_pressure.has_back_pressure(level, o);
-        let mut cache = entry.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let loc = (storage, r.piece);
-        cache.insert(
-            loc,
-            block_idx,
-            Some(data),
-            false,
-            crate::disk_cache::PieceParams {
-                piece_size,
-                piece_size2,
-                v1: entry.v1,
-                v2: entry.v2,
-            },
-        );
-        // the upstream write "job" is complete once the block sits in
-        // the cache — clear `has_write_job` so the flush can take it.
-        cache.write_job_done(loc, block_idx, false);
-        // upstream `try_flush_blocks`: a piece whose blocks all arrived
-        // flushes as one contiguous `writev`; over-limit caches flush
-        // whatever contiguous dirty run exists.
-        let piece_full = cache
-            .piece(loc)
-            .is_some_and(|p| p.blocks.iter().all(|b| b.buf.is_some() || b.flushed));
-        // upstream `check_buffer_level`/`try_flush_blocks`: above the
-        // high watermark (or while the exceeded flag is sticky) keep
-        // flushing runs until the cache drains to the low watermark;
-        // a complete piece always flushes as one contiguous run.
-        let mut runs = Vec::new();
-        if piece_full && let Some(run) = cache.take_flush_run(loc) {
-            runs.push((loc, run.0, vec![(loc.1, run.0, run.1.len())], run.1));
-        }
-        while let Some(low) = self.back_pressure.should_flush(cache.num_cached_blocks) {
-            if cache.num_cached_blocks <= low {
-                break;
+        match entry.fence.is_blocked(j, &self.fence_counters) {
+            // parked behind the fence — upstream's `false` (the peer
+            // keeps writing; the block lands on repost).
+            None => false,
+            Some(j) => {
+                // past the fence — `gate_or_enqueue` folds the write
+                // into the cache (upstream `insert_write`), schedules
+                // the flush passes, and the job completes through the
+                // normal path (fence bookkeeping + counters).
+                if let Some(done) = self.gate_or_enqueue(&entry, j) {
+                    self.add_completed_job(done, Some(&entry));
+                }
+                pressure
             }
-            // upstream `flush_to_disk` order: complete/hashed pieces
-            // first (large contiguous writes), then the piece with
-            // the most contiguous dirty blocks, then the oldest
-            // partial run — `coalesce_writes` extends each run across
-            // piece boundaries so write-through writes stay large.
-            let Some(run) = cache.take_coalesced(128) else {
-                break;
-            };
-            runs.push(run);
         }
-        drop(cache);
-        for (run_loc, first, spans, bufs) in runs {
-            self.add_job(
-                storage,
-                self.mk_job(JobKind::Flush(crate::disk_job::FlushJob {
-                    piece: run_loc.1,
-                    first_block: first,
-                    spans,
-                    bufs,
-                })),
-            );
-        }
-        handler(StorageError::default());
-        pressure
     }
 
     fn async_hash(

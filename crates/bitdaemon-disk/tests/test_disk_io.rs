@@ -88,6 +88,7 @@ fn write_job(piece: i32, fill: u8, io: &PreadDiskIo, done: Arc<AtomicUsize>) -> 
             piece: PieceIndex(piece),
             offset: 0,
             buffer_size: 1024,
+            force_flush: false,
         }),
     })
 }
@@ -246,7 +247,8 @@ fn immediate_execute_round_trip() {
     io.add_job(StorageIndex(0), j);
 
     // 0 threads → immediate_execute ran the jobs; completions pending
-    assert_eq!(io.completed().call_job_handlers(), 2);
+    // (write → cache-insert → piece-full flush + read = 3 completed jobs)
+    assert_eq!(io.completed().call_job_handlers(), 3);
     assert_eq!(done.load(Ordering::Relaxed), 2);
     assert_eq!(got.lock().unwrap()[..4], [0xAB; 4]);
     io.abort_jobs(true);
@@ -313,7 +315,8 @@ fn hash_job_computes_piece_sha1() {
         }),
     );
 
-    assert_eq!(io.completed().call_job_handlers(), 2);
+    // write → cache-insert → piece-full flush + hash = 3 completions
+    assert_eq!(io.completed().call_job_handlers(), 3);
     // sha1(1024 * 0x11)
     use sha1::{Digest as _, Sha1};
     let expect = Sha1::digest([0x11u8; 1024]);
@@ -650,6 +653,562 @@ fn flush_error_restores_buffers() {
         assert!(std::time::Instant::now() < deadline, "data never flushed");
         std::thread::sleep(Duration::from_millis(5));
     }
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// `prepare_read` — read-side cache consult (upstream `pread_disk_io`)
+// ---------------------------------------------------------------------------
+
+/// one 64 KiB piece = four 16 KiB cache blocks — big enough for
+/// spanning (unaligned) read coverage, unlike `make_fs`'s 1 KiB pieces.
+fn make_fs_big() -> FileStorage {
+    let mut fs = FileStorage::new();
+    fs.set_name(b"t");
+    fs.set_piece_length(0x10000);
+    fs.add_file(None, b"t/a.bin", 0x8000, FileFlags::NONE, 0, b"", None)
+        .unwrap();
+    fs.add_file(None, b"t/b.bin", 0x8000, FileFlags::NONE, 0, b"", None)
+        .unwrap();
+    fs.set_num_pieces(1);
+    fs
+}
+
+/// `async_write` through the production path — the block lands in the
+/// write cache and completes through the queue.
+fn aw(io: &PreadDiskIo, start: i32, length: i32, fill: u8, done: Arc<AtomicUsize>) -> bool {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::DiskIo;
+    let mut buf = io.buffer_pool().allocate_buffer("w");
+    for b in buf.data_mut().unwrap() {
+        *b = fill;
+    }
+    let d = Arc::clone(&done);
+    io.async_write(
+        StorageIndex(0),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start,
+            length,
+        },
+        buf,
+        None,
+        Box::new(move |_| {
+            d.fetch_add(1, Ordering::Relaxed);
+        }),
+        0,
+    )
+}
+
+fn ar(io: &PreadDiskIo, start: i32, length: i32, got: Arc<Mutex<Vec<u8>>>, done: Arc<AtomicUsize>) {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::DiskIo;
+    let (g2, d2) = (Arc::clone(&got), Arc::clone(&done));
+    io.async_read(
+        StorageIndex(0),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start,
+            length,
+        },
+        Box::new(move |b, e| {
+            assert!(!e.is_err());
+            *g2.lock().unwrap() = b.data().unwrap_or(&[]).to_vec();
+            d2.fetch_add(1, Ordering::Relaxed);
+        }),
+        0,
+    );
+}
+
+fn wait_done(io: &PreadDiskIo, done: &AtomicUsize, n: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while done.load(Ordering::Relaxed) < n && std::time::Instant::now() < deadline {
+        io.completed().call_job_handlers();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(done.load(Ordering::Relaxed), n);
+}
+
+/// upstream `prepare_read`: an unaligned request spanning two cached
+/// blocks is served entirely from the write cache — no disk I/O.
+/// The data files deliberately do not exist, so any disk access
+/// would surface as an error.
+#[test]
+fn spanning_read_fully_cached_needs_no_disk() {
+    let d = dir("span_cache");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    let (io, _drained) = make_io(0);
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs_big(), &d)));
+
+    let done = Arc::new(AtomicUsize::new(0));
+    // two dirty blocks of a four-block piece → stays in the cache
+    aw(&io, 0, 0x4000, 0xAA, Arc::clone(&done));
+    aw(&io, 0x4000, 0x4000, 0xBB, Arc::clone(&done));
+
+    let got = Arc::new(Mutex::new(Vec::new()));
+    ar(&io, 0x2000, 0x4000, Arc::clone(&got), Arc::clone(&done));
+
+    wait_done(&io, &done, 3);
+    let got = got.lock().unwrap();
+    assert!(got.len() >= 0x4000);
+    assert!(got[..0x2000].iter().all(|&b| b == 0xAA));
+    assert!(got[0x2000..0x4000].iter().all(|&b| b == 0xBB));
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// upstream `prepare_read` one-sided hit → `partial_read`: the cached
+/// side is prefilled at the gate, only the missing side is read from
+/// disk.
+#[test]
+fn spanning_read_one_side_cached_runs_partial_read() {
+    let d = dir("span_partial");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    std::fs::write(d.join("t/a.bin"), vec![0xCCu8; 0x8000]).unwrap();
+    std::fs::write(d.join("t/b.bin"), vec![0xCCu8; 0x8000]).unwrap();
+    let (io, _drained) = make_io(0);
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs_big(), &d)));
+
+    let done = Arc::new(AtomicUsize::new(0));
+    // only block 0 is dirty in the cache; block 1 exists on disk only
+    aw(&io, 0, 0x4000, 0xAA, Arc::clone(&done));
+
+    let got = Arc::new(Mutex::new(Vec::new()));
+    ar(&io, 0x2000, 0x4000, Arc::clone(&got), Arc::clone(&done));
+
+    wait_done(&io, &done, 2);
+    let got = got.lock().unwrap();
+    assert!(got.len() >= 0x4000);
+    // first half from the cached block, second half read off disk
+    assert!(got[..0x2000].iter().all(|&b| b == 0xAA));
+    assert!(got[0x2000..0x4000].iter().all(|&b| b == 0xCC));
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// upstream `prepare_read`: nothing cached → the spanning request
+/// stays a normal disk read.
+#[test]
+fn spanning_read_uncached_reads_disk() {
+    let d = dir("span_uncached");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    std::fs::write(d.join("t/a.bin"), vec![0x77u8; 0x8000]).unwrap();
+    std::fs::write(d.join("t/b.bin"), vec![0x88u8; 0x8000]).unwrap();
+    let (io, _drained) = make_io(0);
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs_big(), &d)));
+
+    let done = Arc::new(AtomicUsize::new(0));
+    let got = Arc::new(Mutex::new(Vec::new()));
+    ar(&io, 0x2000, 0x4000, Arc::clone(&got), Arc::clone(&done));
+
+    wait_done(&io, &done, 1);
+    let got = got.lock().unwrap();
+    assert!(got.len() >= 0x4000);
+    // piece 0 spans a.bin[0..0x8000] + b.bin[0..0x8000]; 0x2000..0x6000
+    // lands in a.bin only — all 0x77.
+    assert!(got[..0x4000].iter().all(|&b| b == 0x77));
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// an aligned request fully covered by a cached block is served from
+/// the cache — again with the data files absent to prove no disk I/O.
+#[test]
+fn aligned_read_served_from_cache() {
+    let d = dir("aligned_cache");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    let (io, _drained) = make_io(0);
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs_big(), &d)));
+
+    let done = Arc::new(AtomicUsize::new(0));
+    aw(&io, 0x4000, 0x4000, 0xDD, Arc::clone(&done));
+
+    let got = Arc::new(Mutex::new(Vec::new()));
+    ar(&io, 0x4000, 0x4000, Arc::clone(&got), Arc::clone(&done));
+
+    wait_done(&io, &done, 2);
+    let got = got.lock().unwrap();
+    assert!(got.len() >= 0x4000);
+    assert!(got[..0x4000].iter().all(|&b| b == 0xDD));
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// upstream `async_read`: `errors::invalid_request` on empty or
+/// negative requests — the job never reaches the queue.
+#[test]
+fn invalid_read_request_fails_fast() {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::DiskIo;
+
+    let d = dir("invalid_read");
+    let (io, _drained) = make_io(0);
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs(), &d)));
+
+    for (start, length) in [(0i32, 0i32), (-1, 16), (0, -16)] {
+        let hit = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hit);
+        io.async_read(
+            StorageIndex(0),
+            PeerRequest {
+                piece: PieceIndex(0),
+                start,
+                length,
+            },
+            Box::new(move |_, e| {
+                assert!(e.is_err());
+                h.fetch_add(1, Ordering::Relaxed);
+            }),
+            0,
+        );
+        // inline completion — never queued
+        assert_eq!(hit.load(Ordering::Relaxed), 1);
+    }
+    assert_eq!(io.completed().pending(), 0);
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// upstream `async_write`/`is_blocked`: a write submitted while a
+/// fence is up is *parked* (returns false) — inserting into the cache
+/// immediately would race the exclusive job. When the fence lowers
+/// the repost inserts it: the subsequent read is served from the
+/// cache (files absent → a disk read would fail).
+#[test]
+fn write_parked_behind_fence_inserts_on_repost() {
+    use std::sync::Barrier;
+
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::DiskIo;
+    use bitdaemon_disk::open_mode::OpenMode;
+    use bitdaemon_disk::storage::{DiskStorage, MoveFlags};
+    use bitdaemon_disk::storage_error::StorageResult;
+
+    // `release_files` is a fence job — hold it mid-flight so the
+    // fence stays raised while the write arrives.
+    struct GateRel {
+        inner: PreadStorage,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+    impl DiskStorage for GateRel {
+        fn set_storage_index(&self, idx: StorageIndex) {
+            self.inner.set_storage_index(idx);
+        }
+        fn files(&self) -> &FileStorage {
+            self.inner.files()
+        }
+        fn file_priorities(&self) -> &[DownloadPriority] {
+            self.inner.file_priorities()
+        }
+        fn read(
+            &self,
+            buf: &mut [u8],
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+            volatile: bool,
+        ) -> StorageResult<i64> {
+            self.inner.read(buf, piece, offset, mode, volatile)
+        }
+        fn write(
+            &self,
+            buf: &[u8],
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+        ) -> StorageResult<i64> {
+            self.inner.write(buf, piece, offset, mode)
+        }
+        fn hash_with(
+            &self,
+            feed: &mut dyn FnMut(&[u8]),
+            len: i64,
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+            volatile: bool,
+        ) -> StorageResult<i64> {
+            self.inner
+                .hash_with(feed, len, piece, offset, mode, volatile)
+        }
+        fn release_files(&self) -> StorageResult<()> {
+            self.entered.wait();
+            self.release.wait();
+            self.inner.release_files()
+        }
+        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> StorageResult<(u8, PathBuf)> {
+            unimplemented!()
+        }
+        fn delete_files(&self, _o: u8) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn rename_file(&mut self, _i: FileIndex, _n: &[u8]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn set_file_priority(&mut self, _p: &[DownloadPriority]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn verify_resume_data(
+            &self,
+            _h: &bitdaemon_common::bitfield::Bitfield,
+            _s: bool,
+            _l: &[PathBuf],
+        ) -> StorageResult<bool> {
+            unimplemented!()
+        }
+    }
+
+    let d = dir("fence_write");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    let (io, _drained) = make_io(1);
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    io.insert_storage(
+        StorageIndex(0),
+        Box::new(GateRel {
+            inner: storage(&make_fs_big(), &d),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+    );
+
+    // raise the fence — release_files executes on the worker and
+    // parks at `release`, holding the fence.
+    let rf_done = Arc::new(AtomicUsize::new(0));
+    let rfd = Arc::clone(&rf_done);
+    io.async_release_files(
+        StorageIndex(0),
+        Box::new(move || {
+            rfd.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    entered.wait();
+
+    // fence up → the write parks, returns false like upstream.
+    let done = Arc::new(AtomicUsize::new(0));
+    let mut buf = io.buffer_pool().allocate_buffer("w");
+    for b in buf.data_mut().unwrap() {
+        *b = 0xE5;
+    }
+    let d2 = Arc::clone(&done);
+    let pressure = io.async_write(
+        StorageIndex(0),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start: 0x8000,
+            length: 0x4000,
+        },
+        buf,
+        None,
+        Box::new(move |_| {
+            d2.fetch_add(1, Ordering::Relaxed);
+        }),
+        0,
+    );
+    assert!(!pressure, "parked write must report no back-pressure");
+    assert_eq!(
+        done.load(Ordering::Relaxed),
+        0,
+        "parked write must not complete"
+    );
+
+    // let the fence job finish — the repost inserts the block into
+    // the cache and completes the write through the queue.
+    release.wait();
+    wait_done(&io, &done, 1);
+    wait_done(&io, &rf_done, 1);
+
+    // the block landed in the cache at repost — the read is served
+    // without touching disk (the data files do not exist).
+    let got = Arc::new(Mutex::new(Vec::new()));
+    ar(&io, 0x8000, 0x4000, Arc::clone(&got), Arc::clone(&done));
+    wait_done(&io, &done, 2);
+    let got = got.lock().unwrap();
+    assert!(got.len() >= 0x4000);
+    assert!(got[..0x4000].iter().all(|&b| b == 0xE5));
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn stacked_fence_flushes_reposted_write_before_running() {
+    use std::sync::Barrier;
+
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::DiskIo;
+    use bitdaemon_disk::open_mode::OpenMode;
+    use bitdaemon_disk::storage::{DiskStorage, MoveFlags};
+    use bitdaemon_disk::storage_error::StorageResult;
+
+    // `release_files` is a fence job. Its first invocation holds the
+    // fence at a barrier while a write and a *stacked* fence queue
+    // behind it; the second invocation is the stacked fence itself —
+    // it samples the data file: upstream's `m_fence_flush` must have
+    // drained the reposted write's block to disk before the fence can
+    // run (upstream writes stay outstanding until flushed; the port
+    // drains them as jobs counted outstanding past `is_blocked`).
+    struct StackRel {
+        inner: PreadStorage,
+        calls: AtomicUsize,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+        probed: Arc<Mutex<Option<Vec<u8>>>>,
+    }
+    impl DiskStorage for StackRel {
+        fn set_storage_index(&self, idx: StorageIndex) {
+            self.inner.set_storage_index(idx);
+        }
+        fn files(&self) -> &FileStorage {
+            self.inner.files()
+        }
+        fn file_priorities(&self) -> &[DownloadPriority] {
+            self.inner.file_priorities()
+        }
+        fn read(
+            &self,
+            buf: &mut [u8],
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+            volatile: bool,
+        ) -> StorageResult<i64> {
+            self.inner.read(buf, piece, offset, mode, volatile)
+        }
+        fn write(
+            &self,
+            buf: &[u8],
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+        ) -> StorageResult<i64> {
+            self.inner.write(buf, piece, offset, mode)
+        }
+        fn hash_with(
+            &self,
+            feed: &mut dyn FnMut(&[u8]),
+            len: i64,
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+            volatile: bool,
+        ) -> StorageResult<i64> {
+            self.inner
+                .hash_with(feed, len, piece, offset, mode, volatile)
+        }
+        fn release_files(&self) -> StorageResult<()> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                self.entered.wait();
+                self.release.wait();
+            } else {
+                // stacked fence running — the reposted write's block
+                // must already be durable.
+                let mut buf = vec![0u8; 0x4000];
+                let r =
+                    self.inner
+                        .read(&mut buf, PieceIndex(0), 0x8000, OpenMode::READ_ONLY, false);
+                *self.probed.lock().unwrap() = r.ok().map(|_| buf);
+            }
+            self.inner.release_files()
+        }
+        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> StorageResult<(u8, PathBuf)> {
+            unimplemented!()
+        }
+        fn delete_files(&self, _o: u8) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn rename_file(&mut self, _i: FileIndex, _n: &[u8]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn set_file_priority(&mut self, _p: &[DownloadPriority]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn verify_resume_data(
+            &self,
+            _h: &bitdaemon_common::bitfield::Bitfield,
+            _s: bool,
+            _l: &[PathBuf],
+        ) -> StorageResult<bool> {
+            unimplemented!()
+        }
+    }
+
+    let d = dir("stacked_fence");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    let (io, _drained) = make_io(1);
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let probed = Arc::new(Mutex::new(None));
+    io.insert_storage(
+        StorageIndex(0),
+        Box::new(StackRel {
+            inner: storage(&make_fs_big(), &d),
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            probed: Arc::clone(&probed),
+        }),
+    );
+
+    // F1 raises the fence and holds it mid-flight.
+    let f1_done = Arc::new(AtomicUsize::new(0));
+    let f1d = Arc::clone(&f1_done);
+    io.async_release_files(
+        StorageIndex(0),
+        Box::new(move || {
+            f1d.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    entered.wait();
+
+    // the write parks behind F1.
+    let done = Arc::new(AtomicUsize::new(0));
+    let mut buf = io.buffer_pool().allocate_buffer("w");
+    for b in buf.data_mut().unwrap() {
+        *b = 0xE5;
+    }
+    let d2 = Arc::clone(&done);
+    io.async_write(
+        StorageIndex(0),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start: 0x8000,
+            length: 0x4000,
+        },
+        buf,
+        None,
+        Box::new(move |_| {
+            d2.fetch_add(1, Ordering::Relaxed);
+        }),
+        0,
+    );
+
+    // F2 stacks behind F1 — its release_files will probe the file.
+    let f2_done = Arc::new(AtomicUsize::new(0));
+    let f2d = Arc::clone(&f2_done);
+    io.async_release_files(
+        StorageIndex(0),
+        Box::new(move || {
+            f2d.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+
+    // F1 finishes → repost inserts the write under a still-raised
+    // stacked fence → the fence-flush drains it to disk → F2 runs.
+    release.wait();
+    wait_done(&io, &f2_done, 1);
+    wait_done(&io, &done, 1);
+    wait_done(&io, &f1_done, 1);
+
+    let probed = probed.lock().unwrap();
+    let buf = probed
+        .as_ref()
+        .expect("stacked fence probed the file before running");
+    assert!(
+        buf.iter().all(|&b| b == 0xE5),
+        "fence flush must land the reposted write before the fence runs"
+    );
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();
 }

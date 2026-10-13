@@ -379,6 +379,18 @@ impl DiskCache {
             .and_then(|b| b.data())
     }
 
+    /// `disk_cache::get2` — fetch two adjacent blocks for a spanning
+    /// (unaligned) read; `get` covers the aligned case.
+    #[must_use]
+    pub fn get2(&self, loc: PieceLocation, block_idx: usize) -> (Option<&[u8]>, Option<&[u8]>) {
+        self.pieces.get(&loc).map_or((None, None), |p| {
+            (
+                p.blocks.get(block_idx).and_then(|b| b.data()),
+                p.blocks.get(block_idx + 1).and_then(|b| b.data()),
+            )
+        })
+    }
+
     /// mark a write job finished — upstream `blocks[i].write_state`
     /// bookkeeping + `flushed_cursor` advance.
     pub fn write_job_done(&mut self, loc: PieceLocation, block_idx: usize, flushed: bool) {

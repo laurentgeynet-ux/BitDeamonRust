@@ -83,6 +83,15 @@ impl DiskJobFence {
         self.lock().blocked.len()
     }
 
+    /// `take_blocked` — drain `m_blocked_jobs` for teardown (abort /
+    /// storage removal): parked jobs' handlers still need to run, so
+    /// the caller completes each of them aborted.
+    #[must_use]
+    pub fn take_blocked(&self) -> VecDeque<Box<DiskJob>> {
+        let mut g = self.lock();
+        std::mem::take(&mut g.blocked)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HasFence> {
         self.has_fence.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -133,10 +142,14 @@ impl DiskJobFence {
     }
 
     /// `job_complete(j, repost)` — the fence-mutex variant. Returns the
-    /// number of jobs handed to `repost`.
+    /// number of jobs handed to `repost`. The callback fires *while
+    /// still holding `has_fence`* (upstream's in-lock repost) — only
+    /// pure cache consults are safe inside it; the second argument is
+    /// `g.fence != 0` at repost time, since querying `has_fence` from
+    /// inside the callback would re-enter the lock.
     pub fn job_complete<F>(&self, j: &mut DiskJob, repost: &mut F) -> i32
     where
-        F: FnMut(Box<DiskJob>),
+        F: FnMut(Box<DiskJob>, bool),
     {
         let mut g = self.lock();
 
@@ -157,7 +170,7 @@ impl DiskJobFence {
                         bj.flags |= job_flags::IN_PROGRESS;
                         self.outstanding.fetch_add(1, Ordering::Relaxed);
                         ret += 1;
-                        repost(bj);
+                        repost(bj, g.fence != 0);
                     } else {
                         g.blocked.push_front(bj);
                     }
@@ -166,7 +179,7 @@ impl DiskJobFence {
                 bj.flags |= job_flags::IN_PROGRESS;
                 self.outstanding.fetch_add(1, Ordering::Relaxed);
                 ret += 1;
-                repost(bj);
+                repost(bj, g.fence != 0);
             }
             return ret;
         }
@@ -180,7 +193,19 @@ impl DiskJobFence {
         debug_assert!(bj.flags & job_flags::FENCE != 0);
         bj.flags |= job_flags::IN_PROGRESS;
         self.outstanding.fetch_add(1, Ordering::Relaxed);
-        repost(bj);
+        repost(bj, true);
         1
+    }
+
+    /// Mark `j` `in_progress` and count it outstanding *without* the
+    /// blocked-queue check — for jobs that must run while the fence is
+    /// up: upstream's `m_fence_flush` drains a storage whose stacked
+    /// fence waits on writes the repost just inserted, and those
+    /// flushes run on a generic thread past `is_blocked` like this.
+    /// Callable under the fence mutex (atomics only, no lock).
+    pub fn account_outstanding(&self, j: &mut DiskJob) {
+        debug_assert!(j.flags & job_flags::IN_PROGRESS == 0);
+        j.flags |= job_flags::IN_PROGRESS;
+        self.outstanding.fetch_add(1, Ordering::Relaxed);
     }
 }

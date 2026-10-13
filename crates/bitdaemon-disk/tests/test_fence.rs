@@ -63,18 +63,18 @@ fn fence_blocks_and_drains_in_order() {
 
     // j1 completes — fence still up, nothing reposted
     let mut reposted = Vec::new();
-    let n = fence.job_complete(&mut j1, &mut |j| reposted.push(j));
+    let n = fence.job_complete(&mut j1, &mut |j, _up| reposted.push(j));
     assert_eq!(n, 0);
 
     // j2 completes — the fence job is reposted (alone)
-    let n = fence.job_complete(&mut j2, &mut |j| reposted.push(j));
+    let n = fence.job_complete(&mut j2, &mut |j, _up| reposted.push(j));
     assert_eq!(n, 1);
     assert_eq!(reposted.len(), 1);
     assert!(reposted[0].flags & 1 != 0, "reposted job is the fence");
 
     // fence completes → queued read reposted
     let mut fj = reposted.pop().unwrap();
-    let n = fence.job_complete(&mut fj, &mut |j| reposted.push(j));
+    let n = fence.job_complete(&mut fj, &mut |j, _up| reposted.push(j));
     assert_eq!(n, 1);
     assert!(!fence.has_fence());
     assert_eq!(
@@ -106,13 +106,13 @@ fn second_fence_rearms() {
     assert_eq!(fence.num_blocked(), 2);
 
     let mut reposted = Vec::new();
-    fence.job_complete(&mut j1, &mut |j| reposted.push(j));
+    fence.job_complete(&mut j1, &mut |j, _up| reposted.push(j));
     // first fence reposted
     assert_eq!(reposted.len(), 1);
     let mut f1 = reposted.pop().unwrap();
 
     // completing first fence hits the second fence — re-armed, reposted alone
-    let n = fence.job_complete(&mut f1, &mut |j| reposted.push(j));
+    let n = fence.job_complete(&mut f1, &mut |j, _up| reposted.push(j));
     assert_eq!(n, 1);
     assert!(reposted[0].flags & 1 != 0);
     assert!(fence.has_fence());

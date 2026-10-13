@@ -177,6 +177,11 @@ pub fn hard_link(src: &Path, dst: &Path) -> io::Result<()> {
 /// byte copy of `src` after return; on failure `dst` may not exist.
 /// We try hard-link first (cheap, same-fs case) then fall back to a
 /// real copy — matching upstream's preference order.
+/// (Upstream's *manual* fallback path sizes its copy buffer from
+/// `PhysicalBytesPerSectorForPerformance`; that sizing exists so a
+/// userspace copy loop doesn't read-modify-write sectors — `fs::copy`
+/// delegates to `CopyFile`/copy-offload, which is already
+/// sector-aware in-kernel, so the manual path has nothing to port.)
 pub fn copy_file(src: &Path, dst: &Path) -> io::Result<()> {
     if hard_link(src, dst).is_ok() {
         return Ok(());
