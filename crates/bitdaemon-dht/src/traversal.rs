@@ -231,7 +231,9 @@ impl Traversal {
                         !self.peer4_prefixes.insert(p)
                     }
                     IpAddr::V6(a) => {
-                        let p = u64::from_be_bytes(a.octets()[..8].try_into().expect("8"));
+                        let o = a.octets();
+                        let p =
+                            u64::from_be_bytes([o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]]);
                         !self.peer6_prefixes.insert(p)
                     }
                 };

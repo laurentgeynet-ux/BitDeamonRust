@@ -15,6 +15,7 @@
 //! storage constructor — the job machinery lives in `bitdaemon-disk`,
 //! so this crate exports a `StorageFactory` ([`mmap_storage_constructor`]).
 
+use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -248,7 +249,13 @@ impl MmapStorage {
                     && self.use_partfile(file_index)
                 {
                     let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
-                    let pf = g.as_ref().expect("partfile exists for dont_download files");
+                    let Some(pf) = g.as_ref() else {
+                        return Err(StorageError::new(
+                            io::Error::new(io::ErrorKind::NotFound, "part file not open"),
+                            file_index,
+                            Operation::PartfileRead,
+                        ));
+                    };
                     let map = self.files.map_file(file_index, file_offset, 0);
                     let n = pf
                         .read(buf, map.piece, map.start)
@@ -287,7 +294,13 @@ impl MmapStorage {
                     && self.use_partfile(file_index)
                 {
                     let mut g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
-                    let pf = g.as_mut().expect("partfile exists for dont_download files");
+                    let Some(pf) = g.as_mut() else {
+                        return Err(StorageError::new(
+                            io::Error::new(io::ErrorKind::NotFound, "part file not open"),
+                            file_index,
+                            Operation::PartfileWrite,
+                        ));
+                    };
                     let map = self.files.map_file(file_index, file_offset, 0);
                     let n = pf
                         .write(buf, map.piece, map.start)
@@ -331,7 +344,13 @@ impl MmapStorage {
                     && self.use_partfile(file_index)
                 {
                     let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
-                    let pf = g.as_ref().expect("partfile exists for dont_download files");
+                    let Some(pf) = g.as_ref() else {
+                        return Err(StorageError::new(
+                            io::Error::new(io::ErrorKind::NotFound, "part file not open"),
+                            file_index,
+                            Operation::PartfileRead,
+                        ));
+                    };
                     let map = self.files.map_file(file_index, file_offset, 0);
                     let data = pf
                         .hash_feed(map.piece, map.start, buf.len())

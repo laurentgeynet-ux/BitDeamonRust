@@ -22,19 +22,17 @@ use crate::settings::{SessionParams, SessionSettings};
 /// `write_session_params` — the params dict, upstream key layout.
 #[must_use]
 pub fn write_session_params(sp: &SessionParams) -> Entry {
-    let mut e = Entry::Dict(Default::default());
-    let d = e.dict_mut().expect("dict");
+    let mut d = bitdaemon_bencode::Dictionary::new();
 
     d.insert(b"dht".to_vec(), dht_save_state(&sp.dht_settings));
     d.insert(b"dht state".to_vec(), save_dht_state(&sp.dht_state));
     d.insert(b"settings".to_vec(), save_settings_to_dict(&sp.settings));
 
-    let mut ext = Entry::Dict(Default::default());
-    let m = ext.dict_mut().expect("dict");
+    let mut m = bitdaemon_bencode::Dictionary::new();
     for (k, v) in &sp.ext_state {
         m.insert(k.clone(), Entry::String(v.clone()));
     }
-    d.insert(b"extensions".to_vec(), ext);
+    d.insert(b"extensions".to_vec(), Entry::Dict(m));
 
     let (v4, v6) = sp.ip_filter.export_filter();
     if !v4.is_empty() {
@@ -60,7 +58,7 @@ pub fn write_session_params(sp: &SessionParams) -> Entry {
         d.insert(b"ip_filter6".to_vec(), Entry::List(l));
     }
 
-    e
+    Entry::Dict(d)
 }
 
 /// `write_session_params_buf`.
@@ -294,8 +292,7 @@ impl SettingInt for bitdaemon_net::proxy::ProxyType {
 #[must_use]
 pub fn save_settings_to_dict(s: &SessionSettings) -> Entry {
     let dflt = SessionSettings::default();
-    let mut e = Entry::Dict(Default::default());
-    let d = e.dict_mut().expect("dict");
+    let mut d = bitdaemon_bencode::Dictionary::new();
 
     macro_rules! put {
         ($f:ident, $k:literal, str) => {
@@ -821,7 +818,7 @@ pub fn save_settings_to_dict(s: &SessionSettings) -> Entry {
     // BitDaemon extensions
     put!(web_seed_blocks_per_tick, b"web_seed_blocks_per_tick", i32);
     put!(save_resume_data_interval, b"save_resume_data_interval", sec);
-    e
+    Entry::Dict(d)
 }
 
 /// `load_pack_from_dict` — applies known keys; unknown keys are

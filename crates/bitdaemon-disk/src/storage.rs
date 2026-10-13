@@ -330,7 +330,15 @@ impl PreadStorage {
                     && self.use_partfile(file_index)
                 {
                     let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
-                    let pf = g.as_ref().expect("partfile exists for dont_download files");
+                    let Some(pf) = g.as_ref() else {
+                        // invariant kept by `initialize`/`set_file_priority`
+                        // (upstream relies on `TORRENT_ASSERT(m_part_file)`)
+                        return Err(StorageError::new(
+                            io::Error::new(io::ErrorKind::NotFound, "part file not open"),
+                            file_index,
+                            Operation::PartfileRead,
+                        ));
+                    };
                     let map = self.files.map_file(file_index, file_offset, 0);
                     let n = pf
                         .read(buf, map.piece, map.start)
@@ -399,7 +407,13 @@ impl PreadStorage {
                 {
                     self.need_partfile();
                     let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
-                    let pf = g.as_ref().expect("partfile allocated on demand");
+                    let Some(pf) = g.as_ref() else {
+                        return Err(StorageError::new(
+                            io::Error::new(io::ErrorKind::NotFound, "part file not open"),
+                            file_index,
+                            Operation::PartfileWrite,
+                        ));
+                    };
                     let map = self.files.map_file(file_index, file_offset, 0);
                     let n = pf
                         .write(buf, map.piece, map.start)
@@ -447,7 +461,13 @@ impl PreadStorage {
                     && self.use_partfile(file_index)
                 {
                     let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
-                    let pf = g.as_ref().expect("partfile exists for dont_download files");
+                    let Some(pf) = g.as_ref() else {
+                        return Err(StorageError::new(
+                            io::Error::new(io::ErrorKind::NotFound, "part file not open"),
+                            file_index,
+                            Operation::PartfileRead,
+                        ));
+                    };
                     let map = self.files.map_file(file_index, file_offset, 0);
                     let data = pf
                         .hash_feed(map.piece, map.start, buf.len())

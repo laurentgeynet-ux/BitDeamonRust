@@ -97,7 +97,10 @@ pub fn verify_message<'a>(
                 return false;
             }
             stack.pop();
-            msg = stack.last().expect("stack").clone();
+            let Some(top) = stack.last() else {
+                return false;
+            };
+            msg = top.clone();
         }
         i += 1;
     }

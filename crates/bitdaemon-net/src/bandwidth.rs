@@ -294,7 +294,10 @@ impl BandwidthManager {
         let mut i = 0;
         while i < self.queue.len() {
             if self.queue[i].peer.is_disconnecting() {
-                let mut req = self.queue.remove(i).expect("in bounds");
+                let Some(mut req) = self.queue.remove(i) else {
+                    i += 1;
+                    continue;
+                };
                 self.queued_bytes -= req.request_size - req.assigned;
                 for ch in &req.channels {
                     ch.return_quota(req.assigned);
@@ -332,7 +335,10 @@ impl BandwidthManager {
                 || (self.queue[i].ttl <= 0 && self.queue[i].assigned > 0)
             {
                 a += self.queue[i].request_size - self.queue[i].assigned;
-                done.push(self.queue.remove(i).expect("in bounds"));
+                match self.queue.remove(i) {
+                    Some(r) => done.push(r),
+                    None => i += 1,
+                }
             } else {
                 i += 1;
             }

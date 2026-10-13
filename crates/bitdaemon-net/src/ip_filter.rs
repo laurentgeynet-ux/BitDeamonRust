@@ -184,7 +184,9 @@ impl<A: FilterAddr> FilterImpl<A> {
         }
 
         if i == first {
-            *self.access_list.get_mut(&i).expect("entry i") = flags;
+            if let Some(v) = self.access_list.get_mut(&i) {
+                *v = flags;
+            }
         } else if first_access != flags {
             self.access_list.insert(first, flags);
         }

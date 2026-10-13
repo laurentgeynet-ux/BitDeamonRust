@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
-use bitdaemon_bencode::{BdecodeNode, Entry};
+use bitdaemon_bencode::{BdecodeNode, Dictionary, Entry};
 use bitdaemon_net::socket_io::{Cursor, read_endpoint};
 
 use crate::node_id::{NodeId, distance_exp, generate_prefix_mask, generate_random_id};
@@ -144,8 +144,8 @@ impl Lookup {
         } else {
             *self.algo_target()
         };
-        let mut e = Entry::Dict(Default::default());
-        let mut a = Entry::Dict(Default::default());
+        let mut em = Dictionary::new();
+        let mut am = Dictionary::new();
         let mut sent_hash = None;
         match self.kind {
             LookupKind::Bootstrap => {
@@ -153,10 +153,7 @@ impl Lookup {
                 // change mid-bootstrap), and flag_initial targets
                 // get `a.bs = 1` so the router knows we're
                 // bootstrapping, not collateral traffic.
-                e.dict_mut()
-                    .expect("dict")
-                    .insert("q".into(), Entry::String(b"get_peers".to_vec()));
-                let am = a.dict_mut().expect("dict");
+                em.insert("q".into(), Entry::String(b"get_peers".to_vec()));
                 am.insert(
                     "info_hash".into(),
                     Entry::String(target.as_bytes().to_vec()),
@@ -167,17 +164,11 @@ impl Lookup {
                 }
             }
             LookupKind::FindData => {
-                e.dict_mut()
-                    .expect("dict")
-                    .insert("q".into(), Entry::String(b"find_node".to_vec()));
-                a.dict_mut()
-                    .expect("dict")
-                    .insert("target".into(), Entry::String(target.as_bytes().to_vec()));
+                em.insert("q".into(), Entry::String(b"find_node".to_vec()));
+                am.insert("target".into(), Entry::String(target.as_bytes().to_vec()));
             }
             LookupKind::GetPeers | LookupKind::ObfuscatedGetPeers => {
-                let d = e.dict_mut().expect("dict");
-                d.insert("q".into(), Entry::String(b"get_peers".to_vec()));
-                let am = a.dict_mut().expect("dict");
+                em.insert("q".into(), Entry::String(b"get_peers".to_vec()));
                 let mut hash = target;
                 if self.kind == LookupKind::ObfuscatedGetPeers
                     && let Some(id) = entry.id
@@ -206,16 +197,12 @@ impl Lookup {
                     LookupKind::SampleInfohashes => b"sample_infohashes",
                     _ => b"put",
                 };
-                e.dict_mut()
-                    .expect("dict")
-                    .insert("q".into(), Entry::String(q.to_vec()));
-                a.dict_mut()
-                    .expect("dict")
-                    .insert("target".into(), Entry::String(target.as_bytes().to_vec()));
+                em.insert("q".into(), Entry::String(q.to_vec()));
+                am.insert("target".into(), Entry::String(target.as_bytes().to_vec()));
             }
         }
-        e.dict_mut().expect("dict").insert("a".into(), a);
-        (e, sent_hash)
+        em.insert("a".into(), Entry::Dict(am));
+        (Entry::Dict(em), sent_hash)
     }
 
     fn algo_target(&self) -> &NodeId {
@@ -249,8 +236,9 @@ impl Lookup {
                     for i in 0..values.list_size() {
                         let p = values.list_at(i);
                         if p.string_length() == 6 {
-                            out.peers
-                                .push(read_compact(p.string_value(), false).unwrap());
+                            if let Ok(ep) = read_compact(p.string_value(), false) {
+                                out.peers.push(ep);
+                            }
                         } else if p.string_length() == 18 {
                             if let Ok(ep) = read_compact(p.string_value(), true) {
                                 out.peers.push(ep);

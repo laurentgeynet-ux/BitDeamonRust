@@ -128,10 +128,15 @@ impl DiskIoThreadPool {
     fn spawn_thread(self: &Arc<Self>) {
         let pool = Arc::clone(self);
         let worker = Arc::clone(&self.worker);
-        let handle = thread::Builder::new()
+        // a failed spawn leaves the queue short a worker rather than
+        // killing the session — the next `job_queued` retries.
+        let Ok(handle) = thread::Builder::new()
             .name("bitdaemon-disk".to_string())
             .spawn(move || worker(pool))
-            .expect("spawn disk thread");
+        else {
+            tracing::error!("failed to spawn disk worker thread");
+            return;
+        };
         self.threads
             .lock()
             .unwrap_or_else(|e| e.into_inner())

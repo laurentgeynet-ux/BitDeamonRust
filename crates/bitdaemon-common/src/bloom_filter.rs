@@ -63,14 +63,14 @@ impl<const N: usize> BloomFilter<N> {
     /// `find(k)` — may false-positive, never false-negative.
     #[must_use]
     pub fn find(&self, k: &Sha1Hash) -> bool {
-        let key: &[u8; 4] = k.as_bytes()[..4].try_into().expect("sha1 is 20 bytes");
-        has_bits(key, &self.bits, N)
+        let b = k.as_bytes();
+        has_bits(&[b[0], b[1], b[2], b[3]], &self.bits, N)
     }
 
     /// `set(k)`.
     pub fn set(&mut self, k: &Sha1Hash) {
-        let key: &[u8; 4] = k.as_bytes()[..4].try_into().expect("sha1 is 20 bytes");
-        set_bits(key, &mut self.bits, N);
+        let b = k.as_bytes();
+        set_bits(&[b[0], b[1], b[2], b[3]], &mut self.bits, N);
     }
 
     /// `to_string()` — raw filter bytes (upstream serializes as a

@@ -367,9 +367,10 @@ impl DhtStorage {
             );
             self.counters.immutable_data += 1;
         }
-        let i = self.immutable.get_mut(target).expect("inserted");
-        i.last_seen = Instant::now();
-        touch(&mut i.ips, &mut i.num_announcers, addr);
+        if let Some(i) = self.immutable.get_mut(target) {
+            i.last_seen = Instant::now();
+            touch(&mut i.ips, &mut i.num_announcers, addr);
+        }
     }
 
     /// `get_mutable_item_seq`.
@@ -425,17 +426,17 @@ impl DhtStorage {
                 },
             );
             self.counters.mutable_data += 1;
-        } else {
-            let item = self.mutable.get_mut(target).expect("exists");
+        } else if let Some(item) = self.mutable.get_mut(target) {
             if item.seq < put.seq {
                 item.value = put.value.to_vec();
                 item.seq = put.seq;
                 item.sig = *put.sig;
             }
         }
-        let i = self.mutable.get_mut(target).expect("present");
-        i.last_seen = Instant::now();
-        touch(&mut i.ips, &mut i.num_announcers, put.addr);
+        if let Some(i) = self.mutable.get_mut(target) {
+            i.last_seen = Instant::now();
+            touch(&mut i.ips, &mut i.num_announcers, put.addr);
+        }
     }
 
     /// `get_infohashes_sample` (BEP-51) — refreshes the sample set

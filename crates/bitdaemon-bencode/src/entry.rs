@@ -214,14 +214,13 @@ impl Entry {
     }
 
     /// `operator[](key)` non-const — existing value or a fresh `Undefined`.
-    /// Requires the entry to be a dict (upstream asserts via `dict()`).
-    ///
-    /// # Panics
-    /// If `self` is not a `Dict`.
-    pub fn entry_mut(&mut self, key: &[u8]) -> &mut Entry {
+    /// Returns `None` when `self` is not a dict (upstream asserts via
+    /// `dict()`; callers that built the dict themselves can rely on the
+    /// invariant).
+    pub fn entry_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
         match self {
-            Self::Dict(d) => d.entry(key.to_vec()).or_insert(Entry::Undefined),
-            _ => panic!("entry_mut on non-dict entry"),
+            Self::Dict(d) => Some(d.entry(key.to_vec()).or_insert(Entry::Undefined)),
+            _ => None,
         }
     }
 

@@ -187,22 +187,26 @@ impl TorrentPeer {
         }
     }
 
-    /// `ipv4_peer(ep, connectable, src)`.
+    /// `ipv4_peer(ep, connectable, src)`. A misrouted v6 endpoint is
+    /// debug-asserted and stored as the v6 variant rather than
+    /// panicking — the `PeerAddr` family is determined by the address.
     #[must_use]
     pub fn new_v4(ep: SocketAddr, connectable: bool, src: PeerSourceFlags) -> Self {
-        let SocketAddr::V4(a) = ep else {
-            panic!("new_v4 requires an IPv4 endpoint");
-        };
-        Self::new(PeerAddr::V4(*a.ip()), a.port(), connectable, src)
+        debug_assert!(ep.is_ipv4(), "new_v4 requires an IPv4 endpoint");
+        match ep {
+            SocketAddr::V4(a) => Self::new(PeerAddr::V4(*a.ip()), a.port(), connectable, src),
+            SocketAddr::V6(a) => Self::new(PeerAddr::V6(*a.ip()), a.port(), connectable, src),
+        }
     }
 
-    /// `ipv6_peer(ep, connectable, src)`.
+    /// `ipv6_peer(ep, connectable, src)` — see [`Self::new_v4`].
     #[must_use]
     pub fn new_v6(ep: SocketAddr, connectable: bool, src: PeerSourceFlags) -> Self {
-        let SocketAddr::V6(a) = ep else {
-            panic!("new_v6 requires an IPv6 endpoint");
-        };
-        Self::new(PeerAddr::V6(*a.ip()), a.port(), connectable, src)
+        debug_assert!(ep.is_ipv6(), "new_v6 requires an IPv6 endpoint");
+        match ep {
+            SocketAddr::V6(a) => Self::new(PeerAddr::V6(*a.ip()), a.port(), connectable, src),
+            SocketAddr::V4(a) => Self::new(PeerAddr::V4(*a.ip()), a.port(), connectable, src),
+        }
     }
 
     /// `i2p_peer(dest, connectable, src)` — `port` is 0.

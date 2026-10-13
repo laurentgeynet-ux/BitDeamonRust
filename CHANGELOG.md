@@ -9,6 +9,32 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- Workspace-wide removal of `unwrap()`/`expect()`/`panic!` from shipped
+  code paths (AGENTS.md §4.3) — ~85 sites across bencode/common/dht/
+  disk/mmap/net/session. Invariant-by-construction sites were
+  restructured instead of merely tolerated: DHT query/reply builders now
+  construct `Dictionary` maps directly (no `dict_mut().expect`), the
+  768-bit DH prime is embedded as bytes (`BigUint::from_bytes_be`, no
+  runtime hex parse), fixed-size reads use `copy_from_slice`/byte
+  literals, and guarded lookups use `let-else`/entry APIs.
+- Real error paths now degrade instead of panicking: storage/mmap
+  part-file access returns `StorageError` (`NotFound`,
+  `partfile_read`/`partfile_write` op) when the `use_partfile`
+  invariant is broken; `crypto_receive_buffer::crypto_cut` is a no-op
+  with crypto tracking inactive; `bandwidth` queue removals and
+  `ip_filter` set surgery are graceful on absent entries;
+  `disk_pool::spawn_thread` logs and returns on spawn failure;
+  `disk_job_fence` returns `0` when a raised fence has no blocked jobs;
+  `lookups::on_reply` skips malformed compact peer entries instead of
+  unwrapping.
+- `bencode::entry::entry_mut` returns `Option<&mut Entry>` instead of
+  panicking on non-dict entries (breaking change — no in-tree callers).
+- `common::types::{PieceIndex,FileIndex}::get` debug-asserts on negative
+  indices and clamps to `0` in release (upstream uses `TORRENT_ASSERT`).
+- `net::torrent_peer::{new_v4,new_v6}` debug-assert the address family
+  and fall back to the correct `PeerAddr` variant instead of panicking.
+- `dht::dht_node::drive` tolerates `None` lookup slots (previously
+  `expect("checked")` could fire on a tombstoned index).
 - `disk::disk_io`: ported upstream `prepare_read` — read jobs now
   consult the write cache once, past the fence gate. Fully cached
   requests (including unaligned spans across two 16 KiB blocks) are

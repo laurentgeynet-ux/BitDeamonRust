@@ -306,9 +306,12 @@ impl<'a> CryptoReceiveBuffer<'a> {
     }
 
     /// `crypto_cut(size, packet_size)` — cut the crypto layer at the
-    /// current upper-layer position.
+    /// current upper-layer position. No-op when crypto tracking is
+    /// inactive (upstream `TORRENT_ASSERT(m_recv_pos.is_initialized())`).
     pub fn crypto_cut(&mut self, size: usize, packet_size: usize) {
-        let pos = self.recv_pos.expect("crypto active");
+        let Some(pos) = self.recv_pos else {
+            return;
+        };
         self.conn.cut(size, pos + packet_size, pos);
     }
 

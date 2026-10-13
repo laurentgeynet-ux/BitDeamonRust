@@ -11,11 +11,13 @@
 pub struct PieceIndex(pub i32);
 
 impl PieceIndex {
-    /// The wrapped index as `usize` (panics on negative — same class of bug
-    /// upstream catches with `TORRENT_ASSERT`).
+    /// The wrapped index as `usize`. Negative indices are a bug class
+    /// upstream catches with `TORRENT_ASSERT` — debug-asserted here and
+    /// clamped to `0` in release so a stray sentinel can't panic.
     #[must_use]
     pub fn get(self) -> usize {
-        usize::try_from(self.0).expect("negative piece index")
+        debug_assert!(self.0 >= 0, "negative piece index");
+        usize::try_from(self.0).unwrap_or(0)
     }
 
     /// Next piece index (`operator++` on the strong typedef).
@@ -48,10 +50,12 @@ impl std::fmt::Display for PieceIndex {
 pub struct FileIndex(pub i32);
 
 impl FileIndex {
-    /// The wrapped index as `usize`.
+    /// The wrapped index as `usize` (debug-asserts on negative, clamps
+    /// to `0` in release — same contract as `PieceIndex::get`).
     #[must_use]
     pub fn get(self) -> usize {
-        usize::try_from(self.0).expect("negative file index")
+        debug_assert!(self.0 >= 0, "negative file index");
+        usize::try_from(self.0).unwrap_or(0)
     }
 }
 

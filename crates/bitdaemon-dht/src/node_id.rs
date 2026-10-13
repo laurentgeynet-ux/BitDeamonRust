@@ -83,9 +83,13 @@ pub fn generate_id_impl(ip: &IpAddr, r: u32) -> NodeId {
     // `crc32c_32(memcpy<u32>(ip))` on little-endian reads ip[0] into
     // the low byte — i.e. LE word order
     let c = if ip.len() == 4 {
-        crc32c_32(u32::from_le_bytes(ip[..4].try_into().expect("4")))
+        let mut w = [0u8; 4];
+        w.copy_from_slice(&ip[..4]);
+        crc32c_32(u32::from_le_bytes(w))
     } else {
-        crc32c(&u64::from_le_bytes(ip[..8].try_into().expect("8")).to_ne_bytes())
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&ip[..8]);
+        crc32c(&u64::from_le_bytes(w).to_ne_bytes())
     };
 
     let mut id = NodeId::default();

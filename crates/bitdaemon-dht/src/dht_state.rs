@@ -134,8 +134,7 @@ fn save_nodes(nodes: &[SocketAddr]) -> Entry {
 /// "nodes6":[…]}`.
 #[must_use]
 pub fn save_dht_state(state: &DhtState) -> Entry {
-    let mut ret = Entry::Dict(Default::default());
-    let d = ret.dict_mut().expect("dict");
+    let mut d = bitdaemon_bencode::Dictionary::new();
     let nids: Vec<Entry> = state
         .nids
         .iter()
@@ -153,5 +152,5 @@ pub fn save_dht_state(state: &DhtState) -> Entry {
     if !state.nodes6.is_empty() {
         d.insert(b"nodes6".to_vec(), save_nodes(&state.nodes6));
     }
-    ret
+    Entry::Dict(d)
 }

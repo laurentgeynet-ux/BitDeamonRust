@@ -189,7 +189,9 @@ impl DiskJobFence {
         }
 
         // fence up, nothing outstanding → run the fence job now
-        let mut bj = g.blocked.pop_front().expect("fence w/o blocked jobs");
+        let Some(mut bj) = g.blocked.pop_front() else {
+            return 0;
+        };
         debug_assert!(bj.flags & job_flags::FENCE != 0);
         bj.flags |= job_flags::IN_PROGRESS;
         self.outstanding.fetch_add(1, Ordering::Relaxed);

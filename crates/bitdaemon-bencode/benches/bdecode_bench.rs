@@ -26,9 +26,10 @@ fn bench_decode(c: &mut Criterion) {
 
 fn bench_encode(c: &mut Criterion) {
     let mut e = bitdaemon_bencode::Entry::Dict(Default::default());
-    let info = e.entry_mut(b"info");
-    *info.entry_mut(b"length") = 10_485_760i64.into();
-    *info.entry_mut(b"name") = "ubuntu.iso".into();
+    let info = e.entry_mut(b"info").expect("dict");
+    *info = bitdaemon_bencode::Entry::Dict(Default::default());
+    *info.entry_mut(b"length").expect("dict") = 10_485_760i64.into();
+    *info.entry_mut(b"name").expect("dict") = "ubuntu.iso".into();
     c.bench_function("bencode/entry", |b| {
         b.iter(|| bitdaemon_bencode::bencode(black_box(&e)));
     });

@@ -137,8 +137,7 @@ pub fn dht_load_state(e: &BdecodeNode<'_>, sett: &mut DhtSettings) {
 /// `dht_save_state` — writes the `dht` dict.
 #[must_use]
 pub fn dht_save_state(settings: &DhtSettings) -> Entry {
-    let mut e = Entry::Dict(Default::default());
-    let d = e.dict_mut().expect("dict");
+    let mut d = bitdaemon_bencode::Dictionary::new();
     let mut i = |k: &[u8], v: i64| {
         d.insert(k.to_vec(), Entry::Int(v));
     };
@@ -177,5 +176,5 @@ pub fn dht_save_state(settings: &DhtSettings) -> Entry {
     // max_infohashes_sample_count, prefer_verified_node_ids) are read
     // but never written — `dht_save_state` here is that function, so
     // keep the output set identical for .session byte-compat.
-    e
+    Entry::Dict(d)
 }

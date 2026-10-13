@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use bitdaemon_bencode::{BdecodeNode, Entry, bdecode_checked};
+use bitdaemon_bencode::{BdecodeNode, Dictionary, Entry, bdecode_checked};
 use bitdaemon_net::socket_io::endpoint_to_bytes;
 use sha1::{Digest as _, Sha1};
 
@@ -207,9 +207,8 @@ impl DhtNode {
         h.update(addr.ip().to_string().as_bytes());
         h.update(self.secret[0]);
         h.update(ih.as_bytes());
-        h.finalize()[..WRITE_TOKEN_SIZE]
-            .try_into()
-            .expect("4 bytes")
+        let f = h.finalize();
+        [f[0], f[1], f[2], f[3]]
     }
 
     /// `verify_token` — accepts either secret generation.
@@ -272,7 +271,9 @@ impl DhtNode {
         // build the query dicts under the lookup borrow, then send
         let mut to_send: Vec<(Entry, SocketAddr, u64, Option<NodeId>)> = Vec::new();
         {
-            let l = self.lookups[idx].as_mut().expect("checked");
+            let Some(l) = self.lookups.get_mut(idx).and_then(Option::as_mut) else {
+                return;
+            };
             let mut picked: Vec<(usize, SocketAddr)> = Vec::new();
             l.algo.add_requests(&hooks, |i, entry| {
                 picked.push((i, entry.ep));
@@ -289,7 +290,9 @@ impl DhtNode {
         let outbox = &mut self.outbox;
         let events = &mut self.events;
         for (e, ep, tag, sent) in to_send {
-            let l = self.lookups[idx].as_ref().expect("checked");
+            let Some(l) = self.lookups.get(idx).and_then(Option::as_ref) else {
+                continue;
+            };
             tracing::trace!(%ep, kind = ?l.kind, "dht invoke");
             // `dht_observer::outgoing_get_peers` — upstream hooks
             // `get_peers::invoke`/`obfuscated_get_peers::invoke`.
@@ -340,14 +343,14 @@ impl DhtNode {
         let ip = root.dict_find_string_value(b"ip", b"");
         match ip.len() {
             4 => {
-                self.ip_votes.push(std::net::IpAddr::from(
-                    <[u8; 4]>::try_from(ip).expect("len"),
-                ));
+                let mut a = [0u8; 4];
+                a.copy_from_slice(ip);
+                self.ip_votes.push(std::net::IpAddr::from(a));
             }
             16 => {
-                self.ip_votes.push(std::net::IpAddr::from(
-                    <[u8; 16]>::try_from(ip).expect("len"),
-                ));
+                let mut a = [0u8; 16];
+                a.copy_from_slice(ip);
+                self.ip_votes.push(std::net::IpAddr::from(a));
             }
             _ => {}
         }
@@ -595,10 +598,9 @@ impl DhtNode {
     /// reserved tag space; timeouts decode to `usize::MAX` and are
     /// ignored by the lookup machinery.
     pub fn add_node(&mut self, ep: SocketAddr) {
-        let mut e = Entry::Dict(Default::default());
-        e.dict_mut()
-            .expect("dict")
-            .insert("q".into(), Entry::String(b"ping".to_vec()));
+        let mut em = Dictionary::new();
+        em.insert("q".into(), Entry::String(b"ping".to_vec()));
+        let e = Entry::Dict(em);
         let our_id = self.id;
         let ro = self.settings.read_only;
         let v6 = self.v6;
@@ -614,16 +616,12 @@ impl DhtNode {
     /// (a `direct_request` upstream, not a traversal). The reply
     /// lands as `DhtEvent::Direct` keyed by the returned tag.
     pub fn sample_infohashes(&mut self, ep: SocketAddr, target: NodeId) -> u64 {
-        let mut e = Entry::Dict(Default::default());
-        e.dict_mut()
-            .expect("dict")
-            .insert("q".into(), Entry::String(b"sample_infohashes".to_vec()));
-        let mut a = Entry::Dict(Default::default());
-        a.dict_mut()
-            .expect("dict")
-            .insert("target".into(), Entry::String(target.as_bytes().to_vec()));
-        e.dict_mut().expect("dict").insert("a".into(), a);
-        self.direct_request(e, ep)
+        let mut em = Dictionary::new();
+        em.insert("q".into(), Entry::String(b"sample_infohashes".to_vec()));
+        let mut am = Dictionary::new();
+        am.insert("target".into(), Entry::String(target.as_bytes().to_vec()));
+        em.insert("a".into(), Entry::Dict(am));
+        self.direct_request(Entry::Dict(em), ep)
     }
 
     /// `node::direct_request` (`kademlia/direct_request`) — send a
@@ -664,17 +662,11 @@ impl DhtNode {
         from: SocketAddr,
         tid: Vec<u8>,
     ) -> (Vec<u8>, SocketAddr) {
-        let mut e = Entry::Dict(Default::default());
-        {
-            let d = e.dict_mut().expect("dict");
-            d.insert("t".into(), Entry::String(tid));
-            d.insert("y".into(), Entry::String(b"r".to_vec()));
-        }
-        let mut reply = Entry::Dict(Default::default());
-        reply
-            .dict_mut()
-            .expect("dict")
-            .insert("id".into(), Entry::String(self.id.as_bytes().to_vec()));
+        let mut em = Dictionary::new();
+        em.insert("t".into(), Entry::String(tid));
+        em.insert("y".into(), Entry::String(b"r".to_vec()));
+        let mut reply = Dictionary::new();
+        reply.insert("id".into(), Entry::String(self.id.as_bytes().to_vec()));
 
         let q = root.dict_find_string_value(b"q", b"");
         let arg = root.dict_find_dict(b"a");
@@ -683,22 +675,22 @@ impl DhtNode {
             b"ping" => {}
             b"find_node" => {
                 if !arg.is_valid() {
-                    return self.error(from, e, b"invalid find_node");
+                    return self.error(from, em, b"invalid find_node");
                 }
                 let t = arg.dict_find_string(b"target");
                 if !t.is_valid() || t.string_length() != 20 {
-                    return self.error(from, e, b"invalid find_node");
+                    return self.error(from, em, b"invalid find_node");
                 }
                 let target = NodeId::from_bytes(t.string_value()).unwrap_or_default();
                 self.write_nodes(&target, &arg, &mut reply);
             }
             b"get_peers" => {
                 if !arg.is_valid() {
-                    return self.error(from, e, b"invalid get_peers");
+                    return self.error(from, em, b"invalid get_peers");
                 }
                 let ih = arg.dict_find_string(b"info_hash");
                 if !ih.is_valid() || ih.string_length() != 20 {
-                    return self.error(from, e, b"invalid get_peers");
+                    return self.error(from, em, b"invalid get_peers");
                 }
                 let info_hash = Sha1Hash::from_bytes(ih.string_value()).unwrap_or_default();
                 // `dht_observer::get_peers` — surfaced as
@@ -715,13 +707,10 @@ impl DhtNode {
                     // full — withhold token to widen the perimeter
                 } else {
                     let tok = self.generate_token(&from, &info_hash);
-                    reply
-                        .dict_mut()
-                        .expect("dict")
-                        .insert("token".into(), Entry::String(tok.to_vec()));
+                    reply.insert("token".into(), Entry::String(tok.to_vec()));
                 }
                 if !r.peers.is_empty() {
-                    reply.dict_mut().expect("dict").insert(
+                    reply.insert(
                         "values".into(),
                         Entry::List(
                             r.peers
@@ -732,32 +721,26 @@ impl DhtNode {
                     );
                 }
                 if let Some(bf) = r.bfpe {
-                    reply
-                        .dict_mut()
-                        .expect("dict")
-                        .insert("BFpe".into(), Entry::String(bf));
+                    reply.insert("BFpe".into(), Entry::String(bf));
                 }
                 if let Some(bf) = r.bfsd {
-                    reply
-                        .dict_mut()
-                        .expect("dict")
-                        .insert("BFsd".into(), Entry::String(bf));
+                    reply.insert("BFsd".into(), Entry::String(bf));
                 }
             }
             b"announce_peer" => {
                 if !arg.is_valid() {
-                    return self.error(from, e, b"invalid announce_peer");
+                    return self.error(from, em, b"invalid announce_peer");
                 }
                 let ih = arg.dict_find_string(b"info_hash");
                 let tok = arg.dict_find_string(b"token");
                 let port = arg.dict_find_int(b"port");
                 if !ih.is_valid() || ih.string_length() != 20 || !tok.is_valid() || !port.is_valid()
                 {
-                    return self.error(from, e, b"invalid announce_peer");
+                    return self.error(from, em, b"invalid announce_peer");
                 }
                 let info_hash = Sha1Hash::from_bytes(ih.string_value()).unwrap_or_default();
                 if !self.verify_token(tok.string_value(), &info_hash, &from) {
-                    return self.error(from, e, b"invalid token");
+                    return self.error(from, em, b"invalid token");
                 }
                 let implied = arg.dict_find_int_value(b"implied_port", 0) != 0;
                 let p = if implied {
@@ -783,66 +766,56 @@ impl DhtNode {
             }
             b"get" => {
                 if !arg.is_valid() {
-                    return self.error(from, e, b"invalid get");
+                    return self.error(from, em, b"invalid get");
                 }
                 let t = arg.dict_find_string(b"target");
                 if !t.is_valid() || t.string_length() != 20 {
-                    return self.error(from, e, b"invalid get");
+                    return self.error(from, em, b"invalid get");
                 }
                 let target = NodeId::from_bytes(t.string_value()).unwrap_or_default();
                 let tok = self.generate_token(&from, &target);
-                reply
-                    .dict_mut()
-                    .expect("dict")
-                    .insert("token".into(), Entry::String(tok.to_vec()));
+                reply.insert("token".into(), Entry::String(tok.to_vec()));
                 self.write_nodes(&target, &arg, &mut reply);
                 let seq = arg.dict_find_int_value(b"seq", -1);
                 if let Some(v) = self.storage.get_immutable_item(&target) {
-                    reply
-                        .dict_mut()
-                        .expect("dict")
-                        .insert("v".into(), Entry::Preformatted(v.to_vec()));
+                    reply.insert("v".into(), Entry::Preformatted(v.to_vec()));
                 } else if let Some(m) = self.storage.get_mutable_item(&target, seq, true) {
-                    let d = reply.dict_mut().expect("dict");
-                    d.insert("seq".into(), Entry::Int(m.seq));
+                    reply.insert("seq".into(), Entry::Int(m.seq));
                     if let Some(val) = m.value {
-                        d.insert("v".into(), Entry::Preformatted(val.to_vec()));
+                        reply.insert("v".into(), Entry::Preformatted(val.to_vec()));
                     }
                     if !m.key.is_empty() {
-                        d.insert("k".into(), Entry::String(m.key.to_vec()));
-                        d.insert("sig".into(), Entry::String(m.sig.to_vec()));
+                        reply.insert("k".into(), Entry::String(m.key.to_vec()));
+                        reply.insert("sig".into(), Entry::String(m.sig.to_vec()));
                     }
                 }
             }
             b"put" => {
                 if !arg.is_valid() {
-                    return self.error(from, e, b"invalid put");
+                    return self.error(from, em, b"invalid put");
                 }
                 match self.handle_put(&arg, &from) {
                     Ok(()) => {}
-                    Err(m) => return self.error(from, e, m),
+                    Err(m) => return self.error(from, em, m),
                 }
             }
             b"sample_infohashes" => {
                 if !arg.is_valid() {
-                    return self.error(from, e, b"invalid sample_infohashes");
+                    return self.error(from, em, b"invalid sample_infohashes");
                 }
                 let t = arg.dict_find_string(b"target");
                 if !t.is_valid() || t.string_length() != 20 {
-                    return self.error(from, e, b"invalid sample_infohashes");
+                    return self.error(from, em, b"invalid sample_infohashes");
                 }
                 let target = NodeId::from_bytes(t.string_value()).unwrap_or_default();
                 let (interval, num, samples) = self.storage.get_infohashes_sample();
-                {
-                    let d = reply.dict_mut().expect("dict");
-                    d.insert("interval".into(), Entry::Int(interval.into()));
-                    d.insert("num".into(), Entry::Int(num as i64));
-                    let mut blob = Vec::new();
-                    for s in samples {
-                        blob.extend_from_slice(s.as_bytes());
-                    }
-                    d.insert("samples".into(), Entry::String(blob));
+                reply.insert("interval".into(), Entry::Int(interval.into()));
+                reply.insert("num".into(), Entry::Int(num as i64));
+                let mut blob = Vec::new();
+                for s in samples {
+                    blob.extend_from_slice(s.as_bytes());
                 }
+                reply.insert("samples".into(), Entry::String(blob));
                 self.write_nodes(&target, &arg, &mut reply);
             }
             _ => {
@@ -858,16 +831,16 @@ impl DhtNode {
                     if t.len() == 20 {
                         let target = NodeId::from_bytes(t).unwrap_or_default();
                         self.write_nodes(&target, &arg, &mut reply);
-                        e.dict_mut().expect("dict").insert("r".into(), reply);
-                        return (bitdaemon_bencode::bencode(&e), from);
+                        em.insert("r".into(), Entry::Dict(reply));
+                        return (bitdaemon_bencode::bencode(&Entry::Dict(em)), from);
                     }
                 }
-                return self.error(from, e, b"unknown q");
+                return self.error(from, em, b"unknown q");
             }
         }
 
-        e.dict_mut().expect("dict").insert("r".into(), reply);
-        (bitdaemon_bencode::bencode(&e), from)
+        em.insert("r".into(), Entry::Dict(reply));
+        (bitdaemon_bencode::bencode(&Entry::Dict(em)), from)
     }
 
     /// `put` handling — immutable and mutable (BEP-44) variants.
@@ -924,7 +897,7 @@ impl DhtNode {
 
     /// `write_nodes_entries` — our protocol only (the tracker maps
     /// `want` to sibling nodes upstream; single-node here).
-    fn write_nodes(&mut self, target: &NodeId, _arg: &BdecodeNode<'_>, reply: &mut Entry) {
+    fn write_nodes(&mut self, target: &NodeId, _arg: &BdecodeNode<'_>, reply: &mut Dictionary) {
         let nodes = self.table.find_node(target, false, 0);
         let mut blob = Vec::new();
         for n in nodes {
@@ -933,20 +906,21 @@ impl DhtNode {
             blob.extend_from_slice(&endpoint_to_bytes(n.endpoint));
         }
         let key: &[u8] = if self.v6 { b"nodes6" } else { b"nodes" };
-        reply
-            .dict_mut()
-            .expect("dict")
-            .insert(key.into(), Entry::String(blob));
+        reply.insert(key.into(), Entry::String(blob));
     }
 
-    fn error(&self, from: SocketAddr, mut e: Entry, msg: &'static [u8]) -> (Vec<u8>, SocketAddr) {
-        let d = e.dict_mut().expect("dict");
-        d.insert("y".into(), Entry::String(b"e".to_vec()));
-        d.insert(
+    fn error(
+        &self,
+        from: SocketAddr,
+        mut e: Dictionary,
+        msg: &'static [u8],
+    ) -> (Vec<u8>, SocketAddr) {
+        e.insert("y".into(), Entry::String(b"e".to_vec()));
+        e.insert(
             "e".into(),
             Entry::List(vec![Entry::Int(203), Entry::String(msg.to_vec())]),
         );
-        (bitdaemon_bencode::bencode(&e), from)
+        (bitdaemon_bencode::bencode(&Entry::Dict(e)), from)
     }
 
     /// `node::announce` second phase — send `announce_peer` to
@@ -966,25 +940,21 @@ impl DhtNode {
             let Some(token) = write_tokens(nid) else {
                 continue;
             };
-            let mut e = Entry::Dict(Default::default());
-            let d = e.dict_mut().expect("dict");
-            d.insert("q".into(), Entry::String(b"announce_peer".to_vec()));
-            let mut a = Entry::Dict(Default::default());
-            {
-                let am = a.dict_mut().expect("dict");
-                am.insert(
-                    "info_hash".into(),
-                    Entry::String(info_hash.as_bytes().to_vec()),
-                );
-                am.insert("port".into(), Entry::Int(i64::from(port)));
-                am.insert("token".into(), Entry::String(token));
-                am.insert("seed".into(), Entry::Int(i64::from(seed)));
-                if implied_port {
-                    am.insert("implied_port".into(), Entry::Int(1));
-                }
+            let mut em = Dictionary::new();
+            em.insert("q".into(), Entry::String(b"announce_peer".to_vec()));
+            let mut am = Dictionary::new();
+            am.insert(
+                "info_hash".into(),
+                Entry::String(info_hash.as_bytes().to_vec()),
+            );
+            am.insert("port".into(), Entry::Int(i64::from(port)));
+            am.insert("token".into(), Entry::String(token));
+            am.insert("seed".into(), Entry::Int(i64::from(seed)));
+            if implied_port {
+                am.insert("implied_port".into(), Entry::Int(1));
             }
-            d.insert("a".into(), a);
-            self.send_query(e, *ep, u64::MAX);
+            em.insert("a".into(), Entry::Dict(am));
+            self.send_query(Entry::Dict(em), *ep, u64::MAX);
         }
     }
 
@@ -997,25 +967,21 @@ impl DhtNode {
         targets: Vec<(SocketAddr, Vec<u8>)>,
     ) {
         for (ep, token) in targets {
-            let mut e = Entry::Dict(Default::default());
-            let d = e.dict_mut().expect("dict");
-            d.insert("q".into(), Entry::String(b"put".to_vec()));
-            let mut a = Entry::Dict(Default::default());
-            {
-                let am = a.dict_mut().expect("dict");
-                am.insert("v".into(), Entry::Preformatted(value.to_vec()));
-                am.insert("token".into(), Entry::String(token));
-                if let Some((pk, seq, sig, salt)) = mutable {
-                    am.insert("k".into(), Entry::String(pk.to_vec()));
-                    am.insert("seq".into(), Entry::Int(seq));
-                    am.insert("sig".into(), Entry::String(sig.to_vec()));
-                    if !salt.is_empty() {
-                        am.insert("salt".into(), Entry::String(salt.to_vec()));
-                    }
+            let mut em = Dictionary::new();
+            em.insert("q".into(), Entry::String(b"put".to_vec()));
+            let mut am = Dictionary::new();
+            am.insert("v".into(), Entry::Preformatted(value.to_vec()));
+            am.insert("token".into(), Entry::String(token));
+            if let Some((pk, seq, sig, salt)) = mutable {
+                am.insert("k".into(), Entry::String(pk.to_vec()));
+                am.insert("seq".into(), Entry::Int(seq));
+                am.insert("sig".into(), Entry::String(sig.to_vec()));
+                if !salt.is_empty() {
+                    am.insert("salt".into(), Entry::String(salt.to_vec()));
                 }
             }
-            d.insert("a".into(), a);
-            self.send_query(e, ep, u64::MAX);
+            em.insert("a".into(), Entry::Dict(am));
+            self.send_query(Entry::Dict(em), ep, u64::MAX);
         }
     }
 
@@ -1162,26 +1128,24 @@ impl DhtNode {
     /// `find_node` into `get_peers` for the extra `values` chance).
     fn send_single_refresh(&mut self, bucket: usize, nid: NodeId, ep: SocketAddr) {
         let _ = nid;
-        let mut e = Entry::Dict(Default::default());
-        {
-            let d = e.dict_mut().expect("dict");
-            d.insert("y".into(), Entry::String(b"q".to_vec()));
-            if self.table.is_full(bucket) {
-                d.insert("q".into(), Entry::String(b"ping".to_vec()));
-            } else {
-                d.insert("q".into(), Entry::String(b"get_peers".to_vec()));
-                // upstream: `generate_prefix_mask(bucket + 1)`, random
-                // id keeping our leading `bucket + 1` bits.
-                let mask = crate::node_id::generate_prefix_mask(bucket as i32 + 1);
-                let target = (crate::node_id::generate_secret_id() & !mask) | (self.id & mask);
-                let mut a = Entry::Dict(Default::default());
-                a.dict_mut().expect("dict").insert(
-                    "info_hash".into(),
-                    Entry::String(target.as_bytes().to_vec()),
-                );
-                d.insert("a".into(), a);
-            }
+        let mut em = Dictionary::new();
+        em.insert("y".into(), Entry::String(b"q".to_vec()));
+        if self.table.is_full(bucket) {
+            em.insert("q".into(), Entry::String(b"ping".to_vec()));
+        } else {
+            em.insert("q".into(), Entry::String(b"get_peers".to_vec()));
+            // upstream: `generate_prefix_mask(bucket + 1)`, random
+            // id keeping our leading `bucket + 1` bits.
+            let mask = crate::node_id::generate_prefix_mask(bucket as i32 + 1);
+            let target = (crate::node_id::generate_secret_id() & !mask) | (self.id & mask);
+            let mut am = Dictionary::new();
+            am.insert(
+                "info_hash".into(),
+                Entry::String(target.as_bytes().to_vec()),
+            );
+            em.insert("a".into(), Entry::Dict(am));
         }
+        let e = Entry::Dict(em);
         let our_id = self.id;
         let ro = self.settings.read_only;
         let v6 = self.v6;

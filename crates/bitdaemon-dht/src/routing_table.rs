@@ -68,8 +68,10 @@ pub fn mostly_verified_nodes(b: &[NodeEntry]) -> bool {
 pub fn compare_ip_cidr(lhs: &IpAddr, rhs: &IpAddr) -> bool {
     match (lhs, rhs) {
         (IpAddr::V6(l), IpAddr::V6(r)) => {
-            let l = u64::from_be_bytes(l.octets()[..8].try_into().expect("8"));
-            let r = u64::from_be_bytes(r.octets()[..8].try_into().expect("8"));
+            // /64 prefix = first 8 octets
+            let (lo, ro) = (l.octets(), r.octets());
+            let l = u64::from_be_bytes([lo[0], lo[1], lo[2], lo[3], lo[4], lo[5], lo[6], lo[7]]);
+            let r = u64::from_be_bytes([ro[0], ro[1], ro[2], ro[3], ro[4], ro[5], ro[6], ro[7]]);
             l ^ r == 0
         }
         (IpAddr::V4(l), IpAddr::V4(r)) => {

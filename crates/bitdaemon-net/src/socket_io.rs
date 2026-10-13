@@ -64,7 +64,9 @@ impl<'a> Cursor<'a> {
     /// `read_uint64`.
     pub fn read_u64(&mut self) -> io::Result<u64> {
         let b = self.read_bytes(8)?;
-        Ok(u64::from_be_bytes(b.try_into().expect("8 bytes")))
+        Ok(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
 
     /// Read `n` bytes.
@@ -110,14 +112,14 @@ pub fn write_address(a: IpAddr, out: &mut Vec<u8>) {
 pub fn read_address(cur: &mut Cursor<'_>, v6: bool) -> io::Result<IpAddr> {
     if v6 {
         let b = cur.read_bytes(16)?;
-        Ok(IpAddr::V6(Ipv6Addr::from(
-            <[u8; 16]>::try_from(b).expect("16 bytes"),
-        )))
+        let mut o = [0u8; 16];
+        o.copy_from_slice(b);
+        Ok(IpAddr::V6(Ipv6Addr::from(o)))
     } else {
         let b = cur.read_bytes(4)?;
-        Ok(IpAddr::V4(Ipv4Addr::from(
-            <[u8; 4]>::try_from(b).expect("4 bytes"),
-        )))
+        let mut o = [0u8; 4];
+        o.copy_from_slice(b);
+        Ok(IpAddr::V4(Ipv4Addr::from(o)))
     }
 }
 
