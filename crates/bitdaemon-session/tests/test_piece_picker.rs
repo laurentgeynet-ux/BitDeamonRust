@@ -633,7 +633,7 @@ fn pipeline_drains_queue() {
     }
     pl.request_queue.push(PendingBlock::new(pb(1, 0)));
     pl.request_queue.push(PendingBlock::new(pb(1, 1)));
-    let reqs = pl.send_block_requests(&t, 0, 1000, |_| false);
+    let reqs = pl.send_block_requests(&t, 0, 1000, false, |_| false);
     // desired_queue_size = 4 → only 4 blocks sent (first queue drain)
     assert_eq!(reqs.len(), 4);
     assert_eq!(pl.download_queue.len(), 4);
@@ -651,7 +651,7 @@ fn pipeline_merges_large() {
         pl.request_queue.push(PendingBlock::new(pb(0, i)));
     }
     pl.request_queue.push(PendingBlock::new(pb(1, 0)));
-    let reqs = pl.send_block_requests(&t, 0, 0, |_| false);
+    let reqs = pl.send_block_requests(&t, 0, 0, false, |_| false);
     // all 5 contiguous blocks merge into ONE request of 5*16k
     assert_eq!(reqs.len(), 1);
     assert_eq!(reqs[0].length, 5 * 0x4000);
@@ -678,7 +678,7 @@ fn pipeline_timeout() {
 fn desired_queue_aimd() {
     let mut pl = PeerPipeline::new(3, 10, 250);
     // slow-start: +1 per piece
-    pl.on_piece_received(0);
+    pl.on_piece_received(0, 0, 0x4000);
     assert_eq!(pl.desired_queue_size, 5);
     // snubbed → 1
     pl.snubbed = true;
@@ -712,7 +712,16 @@ fn peer_conn_drive() {
     let t = tctx();
     let ft = FakeTorrent;
     let mut stats = Stats([0; 16]);
-    let (invoked, _end, reqs) = conn.drive_requests(&mut picker, &t, &ft, 0, 0, 0, &mut stats);
+    let (invoked, _end, reqs, _queued) = conn.drive_requests(
+        &mut picker,
+        &t,
+        &ft,
+        PickerOptions::RAREST_FIRST,
+        0,
+        0,
+        0,
+        &mut stats,
+    );
     assert!(invoked);
     // desired_queue_size = 4 → 4 wire requests, marked in picker
     assert_eq!(reqs.len(), 4);

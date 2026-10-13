@@ -21,13 +21,13 @@ fn bitfield_then_have() {
     let mut eff = Vec::new();
     // bitfield of 10 pieces, peer has piece 0 and 1
     let bits = bytes::Bytes::from(vec![0b1100_0000u8, 0]);
-    c.dispatch(&PeerMessage::Bitfield(bits), 10, &mut eff);
+    c.dispatch(&PeerMessage::Bitfield(bits), 10, 0x4000, &mut eff);
     assert!(c.bitfield_received);
     assert_eq!(c.num_pieces, 2);
     assert!(matches!(eff[0], PeerEffect::RefcountBulk(_, true)));
 
     eff.clear();
-    c.dispatch(&PeerMessage::Have(PieceIndex(2)), 10, &mut eff);
+    c.dispatch(&PeerMessage::Have(PieceIndex(2)), 10, 0x4000, &mut eff);
     assert_eq!(c.num_pieces, 3);
     assert!(
         eff.iter()
@@ -45,7 +45,6 @@ fn choke_aborts_unsent_requests() {
         },
         false,
         false,
-        0,
     );
     c.add_request(
         PieceBlock {
@@ -54,10 +53,9 @@ fn choke_aborts_unsent_requests() {
         },
         false,
         false,
-        0,
     );
     let mut eff = Vec::new();
-    c.dispatch(&PeerMessage::Choke, 10, &mut eff);
+    c.dispatch(&PeerMessage::Choke, 10, 0x4000, &mut eff);
     assert!(c.peer_choked);
     assert_eq!(eff.len(), 2, "both queued requests aborted: {eff:?}");
 }
@@ -69,7 +67,7 @@ fn piece_marks_download_and_requests_more() {
         piece_index: PieceIndex(3),
         block_index: 0,
     };
-    c.add_request(b, false, false, 0);
+    c.add_request(b, false, false);
     // simulate the block was sent (moved to download queue by
     // send_block_requests) — push it directly
     c.pipeline
@@ -83,6 +81,7 @@ fn piece_marks_download_and_requests_more() {
             data: bytes::Bytes::from_static(&[1u8; 16]),
         },
         10,
+        0x4000,
         &mut eff,
     );
     assert!(
@@ -102,7 +101,7 @@ fn invalid_request_rejected_and_alerted() {
         start: 0,
         length: 0x4000,
     };
-    c.dispatch(&PeerMessage::Request(req), 10, &mut eff);
+    c.dispatch(&PeerMessage::Request(req), 10, 0x4000, &mut eff);
     // upstream `incoming_request`: write_reject_request +
     // invalid_request_alert, num_invalid_requests += 1 — no
     // disconnect until >300 invalid requests while choked.
@@ -121,12 +120,12 @@ fn valid_request_queues_for_upload() {
         start: 0x4000,
         length: 0x4000,
     };
-    c.dispatch(&PeerMessage::Request(r), 10, &mut eff);
+    c.dispatch(&PeerMessage::Request(r), 10, 0x4000, &mut eff);
     assert_eq!(c.upload_queue.len(), 1);
     assert!(matches!(eff[0], PeerEffect::ReadRequest(_)));
     // cancel removes it
     eff.clear();
-    c.dispatch(&PeerMessage::Cancel(r), 10, &mut eff);
+    c.dispatch(&PeerMessage::Cancel(r), 10, 0x4000, &mut eff);
     assert!(c.upload_queue.is_empty());
     assert!(matches!(eff[0], PeerEffect::CancelRequest(_)));
 }

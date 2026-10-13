@@ -123,7 +123,15 @@ fn smart_ban_disconnects_corrupt_peer() {
     // peer 7 wasn't a downloader → no CRC recorded, no ban, but the
     // piece is restored/re-failed through the normal path
     let mut out = Vec::new();
-    t.piece_verified_ban(PieceIndex(0), 16384, false, &mut out, addr, digest);
+    t.piece_verified_ban(
+        PieceIndex(0),
+        16384,
+        false,
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &mut out,
+        addr,
+        digest,
+    );
     assert!(
         out.iter()
             .any(|e| matches!(e, TorrentEffect::PieceFailed(_)))

@@ -381,7 +381,8 @@ impl Engine {
             known_ihs: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
             queue_time: 3,
             request_timeout: 60,
-            max_out_request_queue: 2000,
+            // `settings_pack::max_out_request_queue` default.
+            max_out_request_queue: 500,
             connection_speed: 30,
             upload_limiter: Arc::new(RateLimiter::new(0)),
             download_limiter: Arc::new(RateLimiter::new(0)),
@@ -1896,8 +1897,10 @@ impl Engine {
         self.download_limiter.set_limit(s.download_rate_limit);
         self.queue_time = s.request_queue_time.as_secs() as i32;
         self.request_timeout = s.request_timeout.as_secs() as i32;
-        self.max_out_request_queue =
-            s.max_allowed_in_request_queue.clamp(0, i32::from(u16::MAX)) as u16;
+        // `m_max_out_request_queue` reads `max_out_request_queue`,
+        // not `max_allowed_in_request_queue` (different knob —
+        // upstream keeps them separate).
+        self.max_out_request_queue = s.max_out_request_queue.clamp(0, i32::from(u16::MAX)) as u16;
         self.connection_speed = s.connection_speed;
         slock(&self.session).apply_settings(s);
     }

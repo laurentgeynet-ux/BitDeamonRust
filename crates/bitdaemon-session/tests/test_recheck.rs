@@ -240,7 +240,12 @@ fn piece_deadline_and_read_piece() {
 
     // verify piece 2 → removed from critical + ReadPiece effect
     let mut eff = Vec::new();
-    t.piece_verified(PieceIndex(2), true, &mut eff);
+    t.piece_verified(
+        PieceIndex(2),
+        true,
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &mut eff,
+    );
     assert!(!t.time_critical.contains_key(&PieceIndex(2)));
     assert!(eff.iter().any(|e| matches!(
         e,
@@ -446,7 +451,12 @@ fn v2_hash_request_serve_and_add() {
 
     // receive the same hashes → trees accept → piece verifies
     let mut out = Vec::new();
-    t.on_hashes(&req, &piece_roots, &mut out);
+    t.on_hashes(
+        &req,
+        &piece_roots,
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &mut out,
+    );
     let _ = out;
 }
 

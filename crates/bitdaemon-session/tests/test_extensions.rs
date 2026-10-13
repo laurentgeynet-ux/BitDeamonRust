@@ -108,8 +108,18 @@ fn add_extension_instantiates_and_sees_lifecycle() {
     assert_eq!(rec.files_checked.load(Ordering::Relaxed), 1);
 
     // `piece_verified` pass/fail → on_piece_pass/on_piece_failed.
-    t.piece_verified(PieceIndex(0), true, &mut out);
-    t.piece_verified(PieceIndex(1), false, &mut out);
+    t.piece_verified(
+        PieceIndex(0),
+        true,
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &mut out,
+    );
+    t.piece_verified(
+        PieceIndex(1),
+        false,
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &mut out,
+    );
     assert_eq!(rec.piece_pass.load(Ordering::Relaxed), 1);
     assert_eq!(rec.piece_fail.load(Ordering::Relaxed), 1);
 

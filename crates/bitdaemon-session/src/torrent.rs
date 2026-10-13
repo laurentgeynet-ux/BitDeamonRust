@@ -82,6 +82,65 @@ pub enum TorrentEffect {
     Alert(crate::alerts::Alert),
 }
 
+/// The `PipelineTorrent` view `send_block_requests` needs — the
+/// `t->*` accessors upstream calls on the torrent while pumping a
+/// peer's request queue.
+struct PipelineView<'a> {
+    /// `t->torrent_file().piece_length()`.
+    piece_length: i64,
+    /// `t->block_size()`.
+    block_size: i32,
+    /// `t->torrent_file().files()` — present iff `valid_metadata()`.
+    files: Option<&'a bitdaemon_core::FileStorage>,
+    /// `t->graceful_pause()`.
+    graceful_pause: bool,
+    /// `t->upload_mode()`.
+    upload_mode: bool,
+    /// `state() == checking_files || checking_resume_data ||
+    /// downloading_metadata` — requests stay queued in these states.
+    data_requests_blocked: bool,
+    /// `t->has_picker()` — seeds have none; their queued blocks drop
+    /// without the `is_downloaded` invariant check.
+    has_picker: bool,
+}
+
+impl crate::peer_pipeline::PipelineTorrent for PipelineView<'_> {
+    fn block_size(&self) -> i32 {
+        self.block_size
+    }
+    fn piece_length(&self) -> i64 {
+        self.piece_length
+    }
+    fn piece_size_for_req(&self, piece: PieceIndex) -> i32 {
+        self.files.map_or_else(
+            || self.piece_length.min(i64::from(i32::MAX)) as i32,
+            |f| f.piece_size(piece),
+        )
+    }
+    fn to_req(&self, b: PieceBlock, piece_size: i32) -> PeerRequest {
+        // `torrent::to_req` — clamp to the real piece size so the
+        // tail block of a truncated piece stays in bounds.
+        let start = b.block_index * self.block_size;
+        PeerRequest {
+            piece: b.piece_index,
+            start,
+            length: (piece_size - start).min(self.block_size),
+        }
+    }
+    fn graceful_pause(&self) -> bool {
+        self.graceful_pause
+    }
+    fn upload_mode(&self) -> bool {
+        self.upload_mode
+    }
+    fn data_requests_blocked(&self) -> bool {
+        self.data_requests_blocked
+    }
+    fn has_picker(&self) -> bool {
+        self.has_picker
+    }
+}
+
 /// `torrent` — one swarm.
 pub struct Torrent {
     /// `m_torrent_file->info_hash()`.
@@ -1559,6 +1618,16 @@ impl Torrent {
         self.seeding || self.finished || self.seed_mode
     }
 
+    /// `t->block_size()` — `min(piece_length, 0x4000)` once metadata
+    /// is known (`torrent.hpp:982`), `0x4000` before.
+    fn block_size(&self) -> i32 {
+        if self.files.is_some() {
+            self.piece_length.min(0x4000) as i32
+        } else {
+            0x4000
+        }
+    }
+
     /// `add_peer` (swarm entry, not connection) — tracker/PEX/DHT/
     /// LSD feed. Returns the `PeerList` index.
     pub fn add_swarm_peer(
@@ -1958,7 +2027,7 @@ impl Torrent {
                         p.abort_download(b, key);
                     }
                 }
-                PeerEffect::MaybePick => self.drive_peer(peer_id, out),
+                PeerEffect::MaybePick => self.drive_peer(peer_id, s, out),
                 PeerEffect::ExtHandshake => {
                     // peer just advertised ut_metadata — ask right away
                     self.metadata_tick_peer(peer_id, out);
@@ -2139,7 +2208,7 @@ impl Torrent {
             }
             PeerMessage::Hashes { req, hashes } => {
                 if self.hash_protocol_ok(peer_id) {
-                    self.on_hashes(req, hashes, out);
+                    self.on_hashes(req, hashes, s, out);
                 } else {
                     self.peer_error_effect(peer_id, "hashes on non-v2 connection", out);
                 }
@@ -2172,6 +2241,7 @@ impl Torrent {
                 }
             }
         }
+        let block_size = self.block_size();
         if let Some(c) = self.peers.get_mut(&peer_id) {
             c.last_active = now;
             if let PeerMessage::Piece { data, .. } = msg {
@@ -2186,7 +2256,7 @@ impl Torrent {
             for p in &c.plugins {
                 p.on_message(msg);
             }
-            c.dispatch(msg, self.num_pieces, &mut effects);
+            c.dispatch(msg, self.num_pieces, block_size, &mut effects);
         }
         self.apply_peer_effects(peer_id, effects, s, out);
     }
@@ -2257,6 +2327,7 @@ impl Torrent {
         &mut self,
         req: &bitdaemon_net::peer_wire::HashRequestWire,
         hashes: &[bitdaemon_common::Sha256Hash],
+        s: &crate::settings::SessionSettings,
         out: &mut Vec<TorrentEffect>,
     ) {
         let Some(fs) = self.files.clone() else {
@@ -2282,11 +2353,11 @@ impl Torrent {
         // the served chunk is no longer throttled
         self.hash_requests_sent.remove(&(f.0, req.index));
         for (piece, _blocks) in result.hash_failed {
-            self.piece_verified(piece, false, out);
+            self.piece_verified(piece, false, s, out);
         }
         for piece in result.hash_passed {
             if !self.have.get_bit(piece.0 as usize) {
-                self.piece_verified(piece, true, out);
+                self.piece_verified(piece, true, s, out);
             }
         }
     }
@@ -2563,12 +2634,31 @@ impl Torrent {
         }
     }
 
-    pub fn drive_peer(&mut self, peer_id: u64, out: &mut Vec<TorrentEffect>) {
-        // the full drive needs picker + pipeline borrow — collect
-        // requests then translate to effects
+    /// `request_a_block` + `send_block_requests` — the production
+    /// request drive. Picked blocks queue on the conn (busy-capped,
+    /// time-critical front-inserted) then drain to wire `Request`
+    /// messages through the shared pipeline — identical ordering to
+    /// upstream's `second_tick`/`do_request_blocks` path.
+    pub fn drive_peer(
+        &mut self,
+        peer_id: u64,
+        s: &crate::settings::SessionSettings,
+        out: &mut Vec<TorrentEffect>,
+    ) {
         if self.picker.is_none() {
             return;
         }
+        let block_size = self.block_size();
+        let (send_buffer_size, now_ms, rate) = match self.peers.get(&peer_id) {
+            // a peer that announced no pieces has nothing pickable —
+            // upstream's `m_have_piece` mask filters the same way.
+            // A *choked* peer is still driven: `request_a_block`
+            // itself restricts the mask to `allowed_fast` (BEP-6).
+            Some(c) if c.peer_pieces.size() > 0 => {
+                (c.send_buffer, c.now_ms, i64::from(c.rate_down_speed))
+            }
+            _ => return,
+        };
         let mut opts = if self.sequential {
             PickerOptions::RAREST_FIRST | PickerOptions::SEQUENTIAL
         } else {
@@ -2577,157 +2667,95 @@ impl Torrent {
         if !self.time_critical.is_empty() {
             opts = opts | PickerOptions::TIME_CRITICAL;
         }
-        // build peer ctx from an immutable snapshot first
-        let (
-            key,
-            allowed_fast,
-            suggested,
-            peer_pieces,
-            peer_choked,
-            outstanding,
-            desired_queue_size,
-            payload_rate,
-        ) = {
-            let Some(c) = self.peers.get(&peer_id) else {
-                return;
-            };
-            if c.peer_choked || c.peer_pieces.size() == 0 {
-                return;
-            }
-            (
-                c.peer_key(),
-                c.allowed_fast.clone(),
-                c.suggested_pieces.clone(),
-                c.peer_pieces.clone(),
-                c.peer_choked,
-                c.outstanding(),
-                c.pipeline.desired_queue_size(),
-                i64::from(c.rate_down_speed),
-            )
-        };
         // v2 hash exchange — request missing tree layers alongside
         // data requests (upstream `maybe_send_hash_request`).
         if !self.merkle_trees.is_empty() {
             self.maybe_send_hash_request(peer_id, out);
         }
-        let mut picked = Vec::new();
-        // simple drive: ask the picker for blocks this peer has
-        let mut pc_stats = crate::piece_picker::NullPickerStats;
         let tctx = crate::request_blocks::TorrentRequestCtx {
             is_seed: self.is_seed(),
             upload_mode: self.upload_mode,
-            valid_metadata: true,
-            files_checked: true,
-            // graceful pause stops picking new blocks
+            valid_metadata: self.files.is_some(),
+            files_checked: self.files_checked,
             graceful_pause: self.graceful_pause,
-            time_critical_mode: false,
+            time_critical_mode: !self.time_critical.is_empty(),
             num_peers: self.peers.len() as i32,
-            whole_pieces_threshold: 0,
-            strict_end_game_mode: false,
+            whole_pieces_threshold: s.whole_pieces_threshold,
+            strict_end_game_mode: s.strict_end_game_mode,
             piece_length: self.piece_length,
-            block_size: 0x4000,
+            block_size,
         };
-        let pctx = crate::request_blocks::PeerRequestCtx {
-            no_download: false,
-            disconnecting: false,
-            desired_queue_size,
-            outstanding: &outstanding,
-            prefer_contiguous_blocks: 0,
-            download_payload_rate: payload_rate,
-            peer_choked,
-            allowed_fast: &allowed_fast,
-            peer_pieces: &peer_pieces,
-            peer_key: key,
-            picker_options: opts,
-            suggested_pieces: &suggested,
+        let view = PipelineView {
+            piece_length: self.piece_length,
+            block_size,
+            files: self.files.as_deref(),
+            graceful_pause: self.graceful_pause,
+            upload_mode: self.upload_mode,
+            // `checking_files || checking_resume_data ||
+            // downloading_metadata` — metadata-less torrents never
+            // reach this point (no picker), so `checking` is the
+            // live case.
+            data_requests_blocked: self.checking,
+            has_picker: self.picker.is_some(),
         };
-        let Some(p) = self.picker.as_mut() else {
-            return;
+        let mut pc_stats = crate::piece_picker::NullPickerStats;
+        let (invoked, _endgame, reqs, queued) = {
+            let (Some(p), Some(c)) = (self.picker.as_mut(), self.peers.get_mut(&peer_id)) else {
+                return;
+            };
+            c.drive_requests(
+                p,
+                &tctx,
+                &view,
+                opts,
+                rate,
+                send_buffer_size,
+                now_ms,
+                &mut pc_stats,
+            )
         };
-        let (_invoked, eg) = crate::request_blocks::request_a_block_out(
-            p,
-            &tctx,
-            &pctx,
-            &mut pc_stats,
-            |b, busy| {
-                picked.push((b, busy));
-                true
-            },
-        );
         // `request_blocks` upstream posts `picker_log_alert` — the
         // picker's interesting-block set for this decision.
-        if !picked.is_empty() {
+        if invoked && !queued.is_empty() {
             let mut bits = vec![0u8; (self.num_pieces.max(0) as usize).div_ceil(8)];
-            for (b, _) in &picked {
+            for b in &queued {
                 let i = b.piece_index.0 as usize;
                 if i / 8 < bits.len() {
                     bits[i / 8] |= 1 << (7 - (i % 8));
                 }
             }
-            let remote = self
-                .peers
-                .get(&peer_id)
-                .and_then(|c| c.remote)
-                .map_or_else(String::new, |ep| ep.to_string());
-            let _ = remote;
             out.push(TorrentEffect::Alert(crate::alerts::Alert::PickerLog {
                 ih: self.info_hash,
                 picker_flags: 0,
                 blocks: bits,
             }));
         }
-        if let Some(e) = eg
-            && let Some(c2) = self.peers.get_mut(&peer_id)
-        {
-            // `m_endgame_mode` — drives `desired_queue_size()` → 1
-            // and lets the picker serve busy blocks.
-            c2.pipeline.endgame = e;
+        let remote = self
+            .peers
+            .get(&peer_id)
+            .and_then(|c| c.remote)
+            .map_or_else(String::new, |ep| ep.to_string());
+        // `peer_connection::add_request` posts
+        // `block_downloading_alert` once the block is marked
+        // downloading in the picker.
+        for b in &queued {
+            out.push(TorrentEffect::Alert(
+                crate::alerts::Alert::BlockDownloading {
+                    ih: self.info_hash,
+                    remote: remote.clone(),
+                    piece: b.piece_index,
+                    block: b.block_index as u32,
+                },
+            ));
         }
-        for (b, busy) in picked {
-            if self
-                .picker
-                .as_mut()
-                .is_some_and(|p| p.mark_as_downloading(b, key, opts))
-            {
-                let now_ms = self.now_ms;
-                let start = b.block_index * 0x4000;
-                let psize = self.files.as_ref().map_or(self.piece_length, |f| {
-                    i64::from(f.piece_size(b.piece_index))
-                });
-                let req_len = (psize - i64::from(start)).min(0x4000) as i32;
-                if let Some(c2) = self.peers.get_mut(&peer_id) {
-                    c2.send_request(b, busy, false, req_len, now_ms);
-                }
-                // `peer_connection::add_request` posts
-                // `block_downloading_alert` once the block is
-                // marked downloading in the picker.
-                let remote = self
-                    .peers
-                    .get(&peer_id)
-                    .and_then(|c| c.remote)
-                    .map_or_else(String::new, |ep| ep.to_string());
-                out.push(TorrentEffect::Alert(
-                    crate::alerts::Alert::BlockDownloading {
-                        ih: self.info_hash,
-                        remote,
-                        piece: b.piece_index,
-                        block: b.block_index as u32,
-                    },
-                ));
-                // upstream
-                // clamp la longueur a  — le
-                // dernier bloc d'une piece partielle n'est jamais
-                // 0x4000 (les pairs stricts droppent une requete
-                // hors limites).
-                out.push(TorrentEffect::SendTo {
-                    peer: peer_id,
-                    msg: PeerMessage::Request(PeerRequest {
-                        piece: b.piece_index,
-                        start,
-                        length: req_len,
-                    }),
-                });
-            }
+        for req in reqs {
+            // `to_req` already clamped the length to the real piece
+            // size — the tail block of a truncated piece is never a
+            // full block (strict peers drop out-of-bounds requests).
+            out.push(TorrentEffect::SendTo {
+                peer: peer_id,
+                msg: PeerMessage::Request(req),
+            });
         }
     }
 
@@ -2953,6 +2981,7 @@ impl Torrent {
         &mut self,
         piece: PieceIndex,
         passed: bool,
+        s: &crate::settings::SessionSettings,
         out: &mut Vec<TorrentEffect>,
     ) {
         // the hash job landed either way — clear `dp.hashing`
@@ -3054,7 +3083,7 @@ impl Torrent {
             }
             out.push(TorrentEffect::PieceFailed(piece));
             for id in self.peers.keys().copied().collect::<Vec<_>>() {
-                self.drive_peer(id, out);
+                self.drive_peer(id, s, out);
             }
         }
     }
@@ -3066,11 +3095,13 @@ impl Torrent {
     /// `read_digest` re-reads a block's SHA-1 from storage (the
     /// session performs the disk read; `None` = skip, like upstream
     /// ignoring read errors). Bans become `DisconnectPeer` effects.
+    #[allow(clippy::too_many_arguments)]
     pub fn piece_verified_ban(
         &mut self,
         piece: PieceIndex,
         piece_size: i64,
         passed: bool,
+        s: &crate::settings::SessionSettings,
         out: &mut Vec<TorrentEffect>,
         addr: impl FnMut(u64) -> std::net::IpAddr,
         mut read_digest: impl FnMut(PieceBlock) -> Option<Sha1Hash>,
@@ -3105,7 +3136,7 @@ impl Torrent {
                 });
             }
         }
-        self.piece_verified(piece, passed, out);
+        self.piece_verified(piece, passed, s, out);
     }
 
     /// Build the per-file v2 merkle trees from `piece_layers`
@@ -3623,71 +3654,174 @@ impl Torrent {
     /// slow-start ends. Upstream keeps the outstanding requests
     /// (cancelling them causes re-pick churn and sawtooth rates);
     /// they're still refunded if the peer later disconnects.
-    pub fn check_request_timeouts(&mut self, out: &mut Vec<TorrentEffect>) {
+    /// `peer_connection::second_tick` → `snub_peer` — a peer whose
+    /// in-flight requests outlive `request_timeout` (or whose piece
+    /// progress stalls past `piece_timeout`) gets snubbed: queue
+    /// target collapses to 1, unsent requests return to the picker,
+    /// and the last eligible in-flight block times out so another
+    /// peer can pick it. Parole peers keep their pipeline.
+    ///
+    /// Upstream additionally gates both detectors on
+    /// `m_quota[download_channel] > 0` — BitDaemon doesn't meter the
+    /// per-peer download quota yet, so that gate is elided (the
+    /// detectors then run whenever requests are in flight).
+    pub fn check_request_timeouts(
+        &mut self,
+        s: &crate::settings::SessionSettings,
+        out: &mut Vec<TorrentEffect>,
+    ) {
         let now_ms = self.now_ms;
         if now_ms <= 0 {
             return;
         }
+        let piece_timeout_ms = s.piece_timeout.as_millis() as i64;
+        // ctx for the (usually vacuous) replacement pick inside
+        // snub_peer — same settings-driven values as `drive_peer`.
+        let block_size = self.block_size();
+        let tctx = crate::request_blocks::TorrentRequestCtx {
+            is_seed: self.is_seed(),
+            upload_mode: self.upload_mode,
+            valid_metadata: self.files.is_some(),
+            files_checked: self.files_checked,
+            graceful_pause: self.graceful_pause,
+            time_critical_mode: !self.time_critical.is_empty(),
+            num_peers: self.peers.len() as i32,
+            whole_pieces_threshold: s.whole_pieces_threshold,
+            strict_end_game_mode: s.strict_end_game_mode,
+            piece_length: self.piece_length,
+            block_size,
+        };
+        let opts = PickerOptions::RAREST_FIRST;
+        let view = PipelineView {
+            piece_length: self.piece_length,
+            block_size,
+            files: self.files.as_deref(),
+            graceful_pause: self.graceful_pause,
+            upload_mode: self.upload_mode,
+            data_requests_blocked: self.checking,
+            has_picker: self.picker.is_some(),
+        };
         for (peer_id, c) in self.peers.iter_mut() {
-            let _ = peer_id;
-            let idle = c.pipeline.request_queue.is_empty() && c.pipeline.download_queue.is_empty();
-            if c.pipeline.requested_ms == 0 || idle {
+            // upstream only snubs peers with requests actually in
+            // flight (`m_download_queue`); the send buffer quota
+            // gate is elided (see fn docs).
+            if c.pipeline.download_queue.is_empty() {
                 continue;
             }
-            if now_ms - c.pipeline.requested_ms <= c.pipeline.request_timeout() * 1000 {
+            let request_timed_out = c.pipeline.requested_ms != 0
+                && now_ms - c.pipeline.requested_ms > c.pipeline.request_timeout() * 1000;
+            let piece_timed_out = now_ms - c.pipeline.last_piece_ms > piece_timeout_ms;
+            if !request_timed_out && !piece_timed_out {
                 continue;
             }
-            let remote = c.remote.map_or_else(String::new, |ep| ep.to_string());
-            // `peer_connection::snub_peer` — snub (idempotent),
-            // wipe unsent requests, and free the last eligible
-            // in-flight block so another peer can pick it.
+            // `snub_peer` — the flag flips once (alert included);
+            // the collapse to a single outstanding request happens
+            // every pass.
             if !c.pipeline.snubbed {
                 c.pipeline.snubbed = true;
+                c.pipeline.slow_start = false;
                 out.push(TorrentEffect::Alert(crate::alerts::Alert::PeerSnubbed {
                     ih: self.info_hash,
-                    remote: remote.clone(),
+                    remote: c.remote.map_or_else(String::new, |ep| ep.to_string()),
                 }));
             }
-            c.pipeline.slow_start = false;
-            let key = c.peer_key();
-            let unsent: Vec<PieceBlock> = c
+            c.pipeline.desired_queue_size = 1;
+            // upstream keeps a parole peer's pipeline untouched.
+            if c.on_parole {
+                continue;
+            }
+            let Some(p) = self.picker.as_mut() else {
+                continue;
+            };
+            // wipe unsent requests — upstream pops back-to-front.
+            c.pipeline.queued_time_critical = 0;
+            while let Some(pb) = c.pipeline.request_queue.pop() {
+                p.abort_download(pb.block, c.peer_key());
+            }
+            // time out the *last* eligible in-flight block — but
+            // only when its piece has no free blocks left for other
+            // peers; while free blocks remain there's nothing to
+            // unblock and the request stands.
+            if let Some(i) = c
                 .pipeline
-                .request_queue
-                .drain(..)
-                .map(|b| b.block)
-                .collect();
-            if let Some(p) = self.picker.as_mut() {
-                for b in unsent {
-                    p.abort_download(b, key);
-                }
-                // only the *last* eligible request each pass — and
-                // only when no free blocks remain in its piece
-                // (upstream: no point cancelling while other
-                // blocks can still complete the piece).
-                if let Some(i) = c
-                    .pipeline
-                    .download_queue
-                    .iter()
-                    .rposition(|b| !b.timed_out && !b.not_wanted)
-                {
-                    let r = c.pipeline.download_queue[i].block;
-                    let free = p.blocks_in_piece(r.piece_index)
-                        - i32::from(p.piece_info(r.piece_index).finished)
-                        - i32::from(p.piece_info(r.piece_index).writing)
-                        - i32::from(p.piece_info(r.piece_index).requested);
-                    if free <= 0 {
-                        c.pipeline.download_queue[i].timed_out = true;
-                        p.abort_download(r, key);
-                        // `peer_connection::snub_peer` posts
-                        // `block_timeout_alert` per freed block.
-                        out.push(TorrentEffect::Alert(crate::alerts::Alert::BlockTimeout {
-                            ih: self.info_hash,
-                            remote: remote.clone(),
-                            piece: r.piece_index,
-                            block: r.block_index as u32,
-                        }));
+                .download_queue
+                .iter()
+                .rposition(|b| !b.timed_out && !b.not_wanted)
+            {
+                let r = c.pipeline.download_queue[i].block;
+                let info = p.piece_info(r.piece_index);
+                let free = p.blocks_in_piece(r.piece_index)
+                    - i32::from(info.finished)
+                    - i32::from(info.writing)
+                    - i32::from(info.requested);
+                if free <= 0 {
+                    out.push(TorrentEffect::Alert(crate::alerts::Alert::BlockTimeout {
+                        ih: self.info_hash,
+                        remote: c.remote.map_or_else(String::new, |ep| ep.to_string()),
+                        piece: r.piece_index,
+                        block: r.block_index as u32,
+                    }));
+                    // pick a replacement *before* freeing the stalled
+                    // block so the picker can't just re-pick it.
+                    // Note: `desired_queue_size()` still reports 1
+                    // while snubbed, so with an in-flight request
+                    // this pick typically finds nothing — verbatim
+                    // upstream behavior.
+                    c.pipeline.desired_queue_size = 2;
+                    let key = c.peer_key();
+                    let outstanding = c.outstanding();
+                    let disconnecting = c.disconnecting;
+                    let rate = i64::from(c.rate_down_speed);
+                    let mut ctx = c.request_ctx(false, disconnecting, rate);
+                    ctx.outstanding = &outstanding;
+                    ctx.picker_options = opts;
+                    let mut picked: Vec<(PieceBlock, bool)> = Vec::new();
+                    let mut pc_stats = crate::piece_picker::NullPickerStats;
+                    let (_invoked, eg) = crate::request_blocks::request_a_block_out(
+                        p,
+                        &tctx,
+                        &ctx,
+                        &mut pc_stats,
+                        |b, busy| {
+                            picked.push((b, busy));
+                            true
+                        },
+                    );
+                    if let Some(e) = eg {
+                        c.pipeline.endgame = e;
                     }
+                    for (b, busy) in picked {
+                        if p.mark_as_downloading(b, key, opts) && !c.add_request(b, busy, false) {
+                            p.abort_download(b, key);
+                        }
+                    }
+                    c.pipeline.desired_queue_size = 1;
+                    c.pipeline.download_queue[i].timed_out = true;
+                    p.abort_download(r, key);
                 }
+            }
+            // upstream ends `snub_peer` with send_block_requests —
+            // drains whatever the queues still allow and wires any
+            // replacement that was picked.
+            let disconnecting = c.disconnecting;
+            let send_buffer = c.send_buffer;
+            let now = c.now_ms;
+            let key = c.peer_key();
+            let reqs =
+                c.pipeline
+                    .send_block_requests(&view, send_buffer, now, disconnecting, |b| {
+                        if p.is_downloaded(b) {
+                            p.abort_download(b, key);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+            for req in reqs {
+                out.push(TorrentEffect::SendTo {
+                    peer: *peer_id,
+                    msg: PeerMessage::Request(req),
+                });
             }
         }
     }
@@ -3699,6 +3833,7 @@ impl Torrent {
     fn cancel_non_critical(&mut self, out: &mut Vec<TorrentEffect>) {
         let critical: std::collections::BTreeSet<PieceIndex> =
             self.time_critical.keys().copied().collect();
+        let block_size = i64::from(self.block_size());
         for (id, c) in self.peers.iter_mut() {
             let mut removed = Vec::new();
             for q in [
@@ -3716,9 +3851,9 @@ impl Torrent {
             }
             let key = c.peer_key();
             for b in removed {
-                //  doit miroirer la requete emise — meme
-                // clamp de longueur que .
-                let start = b.block_index * 0x4000;
+                // the cancel mirrors the emitted request — same
+                // length clamp to the real piece size.
+                let start = i64::from(b.block_index) * block_size;
                 let psize = self.files.as_ref().map_or(self.piece_length, |f| {
                     i64::from(f.piece_size(b.piece_index))
                 });
@@ -3726,8 +3861,8 @@ impl Torrent {
                     peer: *id,
                     msg: PeerMessage::Cancel(PeerRequest {
                         piece: b.piece_index,
-                        start,
-                        length: (psize - i64::from(start)).min(0x4000) as i32,
+                        start: start as i32,
+                        length: (psize - start).min(block_size) as i32,
                     }),
                 });
                 if let Some(p) = self.picker.as_mut() {
@@ -4033,6 +4168,7 @@ impl Torrent {
             self.now_ms += now.saturating_duration_since(prev).as_millis() as i64;
         }
         let now_ms = self.now_ms;
+        let block_size = self.block_size();
         for c in self.peers.values_mut() {
             c.now_ms = now_ms;
         }
@@ -4085,11 +4221,11 @@ impl Torrent {
                         ((i64::from(c.rate_up_speed) * 4 + i64::from(current_up)) / 5) as i32
                     };
                     // upstream `second_tick` slow-start exit: the
-                    // rate stopped growing (prev + 5 K slack >=
-                    // current) after reaching minimum pipeline depth → hand over to rate-based AIMD.
+                    // rate stopped growing (prev + 5 KiB slack >=
+                    // current) → hand over to rate-based AIMD. No
+                    // minimum pipeline depth — upstream has none.
                     if c.pipeline.slow_start
                         && !c.peer_choked
-                        && c.pipeline.desired_queue_size >= 8
                         && c.down_delta_prev > 0
                         && c.down_delta_prev + 5000 >= down_delta
                     {
@@ -4100,7 +4236,7 @@ impl Torrent {
                     // request queue target follows the measured
                     // download rate (queue_time × rate / block).
                     c.pipeline
-                        .update_desired_queue_size(i64::from(c.rate_down_speed), 0x4000);
+                        .update_desired_queue_size(i64::from(c.rate_down_speed), block_size);
                 }
             }
         }
@@ -4421,13 +4557,17 @@ impl Torrent {
     /// upstream refreshes `m_time_critical_pieces` into peer requests
     /// every tick for deadline pieces; we nudge every connected peer
     /// (the request pipeline prioritizes deadline blocks already).
-    pub fn request_time_critical_pieces(&mut self, out: &mut Vec<TorrentEffect>) {
+    pub fn request_time_critical_pieces(
+        &mut self,
+        s: &crate::settings::SessionSettings,
+        out: &mut Vec<TorrentEffect>,
+    ) {
         if self.time_critical.is_empty() {
             return;
         }
         let ids: Vec<u64> = self.peers.keys().copied().collect();
         for id in ids {
-            self.drive_peer(id, out);
+            self.drive_peer(id, s, out);
         }
     }
 

@@ -33,6 +33,7 @@ fn peer_bitfield_refcounts_picker() {
     c.dispatch(
         &PeerMessage::Bitfield(bytes::Bytes::from(vec![0b1100_0000u8])),
         8,
+        0x4000,
         &mut eff,
     );
     t.add_peer(1, c);
@@ -68,7 +69,12 @@ fn piece_verified_broadcasts_have() {
     t.add_peer(1, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
     t.add_peer(2, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
     let mut out = Vec::new();
-    t.piece_verified(PieceIndex(0), true, &mut out);
+    t.piece_verified(
+        PieceIndex(0),
+        true,
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &mut out,
+    );
     // PiecePassed + have to both peers
     assert!(
         out.iter()
@@ -94,9 +100,19 @@ fn all_pieces_makes_seed() {
     let mut t = torrent(2);
     t.init_picker(true);
     let mut out = Vec::new();
-    t.piece_verified(PieceIndex(0), true, &mut out);
+    t.piece_verified(
+        PieceIndex(0),
+        true,
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &mut out,
+    );
     assert!(!t.finished);
-    t.piece_verified(PieceIndex(1), true, &mut out);
+    t.piece_verified(
+        PieceIndex(1),
+        true,
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &mut out,
+    );
     assert!(t.finished && t.is_seed());
     assert!(out.iter().any(|e| matches!(e, TorrentEffect::BecameSeed)));
 }
@@ -128,7 +144,12 @@ fn failed_piece_restores() {
     let mut t = torrent(3);
     t.init_picker(true);
     let mut out = Vec::new();
-    t.piece_verified(PieceIndex(1), false, &mut out);
+    t.piece_verified(
+        PieceIndex(1),
+        false,
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &mut out,
+    );
     assert!(
         out.iter()
             .any(|e| matches!(e, TorrentEffect::PieceFailed(i) if *i == PieceIndex(1)))

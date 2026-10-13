@@ -1891,6 +1891,7 @@ impl Session {
                 piece,
                 piece_size,
                 passed,
+                &self.settings,
                 &mut eff,
                 |peer| {
                     addrs
@@ -2625,7 +2626,7 @@ impl Session {
                 t.metadata_tick(&mut eff);
                 t.pex_tick(Instant::now(), &mut eff);
                 for id in t.peers.keys().copied().collect::<Vec<_>>() {
-                    t.drive_peer(id, &mut eff);
+                    t.drive_peer(id, &self.settings, &mut eff);
                     // `peer_connection::second_tick` tail —
                     // `fill_send_buffer` admits queued requests once
                     // the send buffer drained (covers stalls where
@@ -2634,7 +2635,7 @@ impl Session {
                 }
                 // `peer_connection::second_tick` — snub + refund
                 // blocks stuck past `request_timeout`.
-                t.check_request_timeouts(&mut eff);
+                t.check_request_timeouts(&self.settings, &mut eff);
                 // `peer_connection::second_tick` super-seed
                 // recovery — peers uninterested >10 s get a fresh
                 // leaked piece.

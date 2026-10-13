@@ -130,6 +130,17 @@ pub trait PipelineTorrent {
     fn upload_mode(&self) -> bool {
         false
     }
+    /// `state() == checking_files || checking_resume_data ||
+    /// downloading_metadata` — the torrent can't download in these
+    /// states, so requests stay queued.
+    fn data_requests_blocked(&self) -> bool {
+        false
+    }
+    /// `t->has_picker()` — seeds have none; their queued blocks are
+    /// dropped without checking `is_downloaded`.
+    fn has_picker(&self) -> bool {
+        true
+    }
 }
 
 /// The request pipeline state of `peer_connection` (request queue →
@@ -220,27 +231,52 @@ impl PeerPipeline {
                 i64::from(self.queue_time) * download_payload_rate / i64::from(block_size);
             self.desired_queue_size = desired.clamp(0, i64::from(u16::MAX)) as u16;
         }
-        // clamp can't invert when `max_out_request_queue` is set
-        // below `MIN_REQUEST_QUEUE` — the cap wins (upstream floors
-        // `max_out_request_queue` at MIN too).
-        self.desired_queue_size = self.desired_queue_size.clamp(
-            (MIN_REQUEST_QUEUE as u16).min(self.max_out_request_queue),
-            self.max_out_request_queue,
-        );
+        // upstream order: cap first, then floor — the floor wins,
+        // so the result is always ≥ `MIN_REQUEST_QUEUE` even when
+        // `max_out_request_queue` is set below it.
+        if self.desired_queue_size > self.max_out_request_queue {
+            self.desired_queue_size = self.max_out_request_queue;
+        }
+        if self.desired_queue_size < MIN_REQUEST_QUEUE as u16 {
+            self.desired_queue_size = MIN_REQUEST_QUEUE as u16;
+        }
     }
 
-    /// Slow-start bump (`incoming_piece`: `m_slow_start` ⇒ +1) plus
-    /// the RTT sample (`m_request_time.add_sample`) and the snub
-    /// reset — data arrived, the peer isn't stalling.
-    pub fn on_piece_received(&mut self, now_ms: i64) {
+    /// Early `incoming_piece` bookkeeping, run for *every* `piece`
+    /// message (requested or not): slow-start bumps the queue target
+    /// and `update_desired_queue_size` re-clamps it — including the
+    /// snubbed collapse back to 1 — so a snubbed peer can never grow
+    /// its target mid-piece.
+    pub fn on_piece_received(&mut self, now_ms: i64, download_payload_rate: i64, block_size: i32) {
         if self.slow_start {
-            self.desired_queue_size += 1;
+            self.desired_queue_size = self.desired_queue_size.saturating_add(1);
         }
-        if self.last_request_ms != 0 && now_ms > self.last_request_ms {
-            self.request_time.add_sample(now_ms - self.last_request_ms);
-        }
-        self.snubbed = false;
+        self.update_desired_queue_size(download_payload_rate, block_size);
+        // `m_last_piece` is stamped per fragment upstream — piece
+        // granularity is the finest we see.
         self.last_piece_ms = now_ms;
+    }
+
+    /// `if (now - m_requested < request_timeout() && m_snubbed)
+    /// m_snubbed = false` — a *timely* block un-snubs the peer; a
+    /// late one keeps it snubbed. Returns whether this call cleared
+    /// the flag (drives `peer_unsnubbed_alert`).
+    pub fn maybe_unsnub(&mut self, now_ms: i64) -> bool {
+        if self.snubbed && now_ms - self.requested_ms < self.request_timeout() * 1000 {
+            self.snubbed = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `m_request_time.add_sample(now - m_requested)` — samples the
+    /// request→block RTT. Called with `requested_ms` still holding
+    /// the value from before the caller re-arms it.
+    pub fn add_request_time_sample(&mut self, now_ms: i64) {
+        if self.requested_ms != 0 && now_ms > self.requested_ms {
+            self.request_time.add_sample(now_ms - self.requested_ms);
+        }
     }
 
     /// `request_timeout()` — mean+4σ ms → seconds, capped by the
@@ -270,26 +306,34 @@ impl PeerPipeline {
     /// into the picker for the "arrived anyway" case: it must check
     /// `is_downloaded` and call `abort_download` — returning true
     /// drops the block without sending.
+    ///
+    /// `disconnecting` is upstream `m_disconnecting`. The queue-depth
+    /// checks compare against the raw `m_desired_queue_size` member
+    /// (not `desired_queue_size()`, which collapses to 1 in endgame
+    /// /snub) — identical to upstream.
     pub fn send_block_requests<T: PipelineTorrent>(
         &mut self,
         t: &T,
         send_buffer_size: usize,
         now_ms: i64,
+        disconnecting: bool,
         mut already_downloaded: impl FnMut(PieceBlock) -> bool,
     ) -> Vec<PeerRequest> {
-        if t.graceful_pause() || t.upload_mode() {
+        if disconnecting || t.graceful_pause() || t.data_requests_blocked() {
             return Vec::new();
         }
-        if self.download_queue.len() as i32 >= self.desired_queue_size() {
+        if self.download_queue.len() as i32 >= i32::from(self.desired_queue_size) || t.upload_mode()
+        {
             return Vec::new();
         }
+        let has_picker = t.has_picker();
 
         let mut out = Vec::new();
         let empty_download_queue = self.download_queue.is_empty();
         let mut send_offset = send_buffer_size as u32;
 
         while !self.request_queue.is_empty()
-            && ((self.download_queue.len() as i32) < self.desired_queue_size()
+            && ((self.download_queue.len() as i32) < i32::from(self.desired_queue_size)
                 || self.queued_time_critical > 0)
         {
             let mut block = self.request_queue.remove(0);
@@ -297,9 +341,9 @@ impl PeerPipeline {
                 self.queued_time_critical -= 1;
             }
 
-            // arrived "unexpectedly" (timed-out re-request that came
-            // anyway): don't send it
-            if already_downloaded(block.block) {
+            // seeds have no picker — upstream drops the block without
+            // the is_downloaded/abort invariant check
+            if !has_picker || already_downloaded(block.block) {
                 continue;
             }
 
@@ -323,7 +367,10 @@ impl PeerPipeline {
                         merger.piece_size()
                     };
                     let bs = merger.merge(front.block, next_sz);
-                    let block = self.request_queue.remove(0);
+                    let mut block = self.request_queue.remove(0);
+                    // merged blocks share the run's send-buffer
+                    // offset — the request hasn't been written yet.
+                    block.send_buffer_offset = send_offset;
                     self.download_queue.push(block);
                     if self.queued_time_critical > 0 {
                         self.queued_time_critical -= 1;
@@ -340,6 +387,11 @@ impl PeerPipeline {
             self.last_request_ms = now_ms;
             out.push(r);
         }
+
+        // upstream stamps `m_last_piece` unconditionally at the end
+        // of send_block_requests_impl — request progress counts as
+        // piece activity for the `piece_timeout` detector.
+        self.last_piece_ms = now_ms;
 
         if !self.download_queue.is_empty() && empty_download_queue {
             self.requested_ms = now_ms;

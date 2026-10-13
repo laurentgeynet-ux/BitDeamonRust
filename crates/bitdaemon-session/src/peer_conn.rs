@@ -83,6 +83,15 @@ pub struct PeerConn {
     pub outgoing: bool,
     /// `is_connecting()` — handshake not yet complete.
     pub connecting: bool,
+    /// `m_disconnecting` — a disconnect has been issued; upstream
+    /// keeps the object alive until the send buffer drains and gates
+    /// the request pipeline on it. Our actor tears the conn down the
+    /// same tick, so this only flips in tests / drain paths.
+    pub disconnecting: bool,
+    /// `on_parole` — pieces from this peer get piece-at-a-time hash
+    /// checks; a parole peer keeps its request queue on choke and is
+    /// never snubbed (upstream `peer_connection::on_parole`).
+    pub on_parole: bool,
     /// `!in_handshake()` — the peer's BitTorrent handshake landed.
     pub handshake_done: bool,
     /// `received_listen_port` — peer shared its listen port.
@@ -192,7 +201,11 @@ pub struct PeerConn {
 impl PeerConn {
     /// New connection for a torrent of `num_pieces` pieces.
     #[must_use]
-    pub fn new(num_pieces: usize, pipeline: PeerPipeline, now_ms: i64) -> Self {
+    pub fn new(num_pieces: usize, mut pipeline: PeerPipeline, now_ms: i64) -> Self {
+        // upstream `m_last_piece` defaults to the connect time —
+        // `piece_timeout` measures progress *since connect*, not
+        // since epoch, or a fresh conn would look stalled.
+        pipeline.last_piece_ms = now_ms;
         Self {
             peer_id: None,
             peer_pieces: Bitfield::with_size(num_pieces),
@@ -248,6 +261,8 @@ impl PeerConn {
             i2p: None,
             outgoing: false,
             connecting: true,
+            disconnecting: false,
+            on_parole: false,
             handshake_done: false,
             received_listen_port: false,
             peer_listen_port: None,
@@ -436,10 +451,17 @@ impl PeerConn {
 
     /// `incoming_choke` — also abandons unsent requests
     /// (`clear_request_queue`); the blocks are returned so the
-    /// picker can `abort_download` them.
+    /// picker can `abort_download` them. Upstream keeps the queue
+    /// intact for parole peers (`clear_request_queue` early-outs on
+    /// `peer_info_struct() == nullptr || !on_parole` — only parole
+    /// peers with a picker entry skip the wipe).
     pub fn on_choke_with_aborts(&mut self) -> Vec<PieceBlock> {
         self.peer_choked = true;
         self.pipeline.endgame = false;
+        if self.on_parole {
+            return Vec::new();
+        }
+        self.pipeline.queued_time_critical = 0;
         self.pipeline
             .request_queue
             .drain(..)
@@ -463,31 +485,39 @@ impl PeerConn {
     }
 
     /// `incoming_reject_request` — the block is freed; the caller
-    /// `abort_download`s it in the picker and re-picks.
-    pub fn on_reject(&mut self, r: &PeerRequest) -> PieceBlock {
+    /// `abort_download`s it in the picker and re-picks. `block_size`
+    /// is the torrent's request block size (`t->block_size()`).
+    pub fn on_reject(&mut self, r: &PeerRequest, block_size: i32) -> PieceBlock {
         let block = PieceBlock {
             piece_index: r.piece,
-            block_index: r.start / 0x4000,
+            block_index: r.start / block_size,
         };
         let _ = self.cancel_request(block);
         block
     }
 
-    /// `incoming_piece` bookkeeping — slow-start growth, pipeline
-    /// counters, queue removal. Returns the block.
-    pub fn on_piece(&mut self, r: &PeerRequest) -> PieceBlock {
+    /// `incoming_piece` bookkeeping for a *requested* block — queue
+    /// removal, RTT sample, timeout re-arm. The slow-start/clamp and
+    /// un-snub parts live in `PeerPipeline::on_piece_received` /
+    /// `maybe_unsnub`, which dispatch runs earlier in upstream's
+    /// order. `block_size` is the torrent's `t->block_size()`.
+    pub fn on_piece(&mut self, r: &PeerRequest, block_size: i32) -> PieceBlock {
         let block = PieceBlock {
             piece_index: r.piece,
-            block_index: r.start / 0x4000,
+            block_index: r.start / block_size,
         };
-        self.pipeline.on_piece_received(self.now_ms);
         let _ = self.cancel_request(block);
         self.pipeline.outstanding_bytes =
             (self.pipeline.outstanding_bytes - i64::from(r.length)).max(0);
-        // upstream `incoming_piece`: while requests remain, the next
-        // expected block gets a fresh timeout window — `m_requested`
-        // is the last-receive watermark, not the queue's age.
-        if !self.pipeline.request_queue.is_empty() || !self.pipeline.download_queue.is_empty() {
+        // upstream `incoming_piece`: sample `now - m_requested`
+        // *before* re-arming it below.
+        self.pipeline.add_request_time_sample(self.now_ms);
+        // while requests remain in flight, the next expected block
+        // gets a fresh timeout window — the re-arm keys off the
+        // download queue only (`m_requested` is set when the queue
+        // went non-empty and here on every completion with
+        // requests still outstanding).
+        if !self.pipeline.download_queue.is_empty() {
             self.pipeline.requested_ms = self.now_ms;
         }
         block
@@ -510,11 +540,13 @@ impl PeerConn {
 
     /// `dispatch` — route a decoded wire message. Returns the
     /// side-effects the torrent layer must run (picker updates,
-    /// disk writes, uploads).
+    /// disk writes, uploads). `block_size` is the torrent's
+    /// `t->block_size()` for mapping byte offsets to block indices.
     pub fn dispatch(
         &mut self,
         msg: &bitdaemon_net::peer_wire::PeerMessage,
         num_pieces: i32,
+        block_size: i32,
         eff: &mut Vec<PeerEffect>,
     ) {
         use bitdaemon_net::peer_wire::PeerMessage as M;
@@ -609,9 +641,17 @@ impl PeerConn {
                     start: offset,
                     length: data.len() as i32,
                 };
+                // upstream `incoming_piece` runs the slow-start bump
+                // + `update_desired_queue_size` before checking
+                // whether the block was even requested.
+                self.pipeline.on_piece_received(
+                    self.now_ms,
+                    i64::from(self.rate_down_speed),
+                    block_size,
+                );
                 let block = PieceBlock {
                     piece_index: r.piece,
-                    block_index: r.start / 0x4000,
+                    block_index: r.start / block_size,
                 };
                 if !self.was_requested(&r) {
                     // upstream counts unsolicited blocks as invalid
@@ -621,19 +661,19 @@ impl PeerConn {
                     eff.push(PeerEffect::UnwantedBlock(block));
                     return;
                 }
-                // `incoming_piece` clears snub on data arrival.
-                if self.pipeline.snubbed {
-                    self.pipeline.snubbed = false;
+                // `incoming_piece` clears snub only when the block
+                // arrived inside the request-timeout window.
+                if self.pipeline.maybe_unsnub(self.now_ms) {
                     eff.push(PeerEffect::Unsnub);
                 }
-                let block = self.on_piece(&r);
+                let block = self.on_piece(&r, block_size);
                 eff.push(PeerEffect::MarkDownloaded(block));
                 eff.push(PeerEffect::BlockFinished(block));
                 eff.push(PeerEffect::DiskWrite(r, data.to_vec()));
                 eff.push(PeerEffect::MaybePick);
             }
             M::RejectRequest(r) => {
-                let b = self.on_reject(&r);
+                let b = self.on_reject(&r, block_size);
                 eff.push(PeerEffect::AbortDownload(b));
                 eff.push(PeerEffect::MaybePick);
             }
@@ -719,42 +759,35 @@ impl PeerConn {
         }
     }
 
-    /// `add_request(pb, flags)` — queue a picked block. `now_ms`
-    /// stamps `m_requested` when the wire queue goes empty→non-empty
-    /// (request timeout) and `m_last_request` (RTT sampling).
-    pub fn add_request(&mut self, block: PieceBlock, busy: bool, time_critical: bool, now_ms: i64) {
-        if self.pipeline.request_queue.is_empty() && self.pipeline.download_queue.is_empty() {
-            self.pipeline.requested_ms = now_ms;
+    /// `add_request(pb, flags)` — queue a picked block. Returns
+    /// false when a *busy* (already requested elsewhere) block would
+    /// join a pipeline that already has a busy request — upstream
+    /// allows at most one busy request per peer, except in
+    /// time-critical mode. `m_requested`/`m_last_request` are stamped
+    /// when the request hits the wire (`send_block_requests`), not
+    /// here.
+    pub fn add_request(&mut self, block: PieceBlock, busy: bool, time_critical: bool) -> bool {
+        if busy && !time_critical {
+            let busy_in_flight = self.pipeline.download_queue.iter().any(|b| b.busy)
+                || self.pipeline.request_queue.iter().any(|b| b.busy);
+            if busy_in_flight {
+                return false;
+            }
         }
-        self.pipeline.last_request_ms = now_ms;
         let mut pb = PendingBlock::new(block);
         pb.busy = busy;
         pb.time_critical = time_critical;
         if time_critical {
+            // critical requests jump ahead of everything already
+            // queued, but stay behind earlier criticals.
+            let pos = (self.pipeline.queued_time_critical as usize)
+                .min(self.pipeline.request_queue.len());
+            self.pipeline.request_queue.insert(pos, pb);
             self.pipeline.queued_time_critical += 1;
+        } else {
+            self.pipeline.request_queue.push(pb);
         }
-        self.pipeline.request_queue.push(pb);
-    }
-
-    /// `send_request(pb, flags, len, now_ms)` — record an issued wire request
-    /// in `download_queue` (in-flight awaiting payload).
-    pub fn send_request(
-        &mut self,
-        block: PieceBlock,
-        busy: bool,
-        time_critical: bool,
-        length: i32,
-        now_ms: i64,
-    ) {
-        if self.pipeline.download_queue.is_empty() {
-            self.pipeline.requested_ms = now_ms;
-        }
-        self.pipeline.last_request_ms = now_ms;
-        let mut pb = PendingBlock::new(block);
-        pb.busy = busy;
-        pb.time_critical = time_critical;
-        self.pipeline.outstanding_bytes += i64::from(length);
-        self.pipeline.download_queue.push(pb);
+        true
     }
 
     /// Cancel an outstanding request (`peer_connection::cancel_block`
@@ -774,6 +807,12 @@ impl PeerConn {
             .position(|b| b.block == block)
         {
             self.pipeline.request_queue.remove(pos);
+            // the time-critical prefix shrinks when a block inside
+            // it is removed (upstream `cancel_block` decrements
+            // `m_queued_time_critical` the same way).
+            if pos < self.pipeline.queued_time_critical as usize {
+                self.pipeline.queued_time_critical -= 1;
+            }
         } else {
             return false;
         }
@@ -831,53 +870,83 @@ impl PeerConn {
         })
     }
 
-    /// Drive the picker → request queue → wire for this peer.
-    /// Returns `(invoked, endgame, wire_requests)`.
+    /// Drive the picker → request queue → wire for this peer
+    /// (`request_a_block` + `send_block_requests` in upstream order).
+    /// `opts` is `picker_options()` for `mark_as_downloading`.
+    /// Returns `(invoked, endgame, wire_requests, newly_queued)` —
+    /// callers post `block_downloading_alert` for each queued block.
     #[allow(clippy::too_many_arguments)]
     pub fn drive_requests<T: crate::peer_pipeline::PipelineTorrent>(
         &mut self,
         picker: &mut PiecePicker,
         t: &TorrentRequestCtx,
         torrent: &T,
+        opts: crate::piece_picker::PickerOptions,
         rate: i64,
         send_buffer_size: usize,
         now_ms: i64,
         pc: &mut dyn PickerStats,
-    ) -> (bool, Option<bool>, Vec<bitdaemon_common::PeerRequest>) {
+    ) -> (
+        bool,
+        Option<bool>,
+        Vec<bitdaemon_common::PeerRequest>,
+        Vec<PieceBlock>,
+    ) {
         let peer_key = self.peer_key();
-        let opts = crate::piece_picker::PickerOptions::RAREST_FIRST;
         let outstanding = self.outstanding();
-        let mut ctx = self.request_ctx(false, false, rate);
+        let disconnecting = self.disconnecting;
+        let time_critical_mode = t.time_critical_mode;
+        let mut ctx = self.request_ctx(false, disconnecting, rate);
         ctx.outstanding = &outstanding;
-        // Rust: the picker is already borrowed by request_a_block —
-        // collect picks and mark them right after the call (upstream's
-        // add_request does it inline; ordering is equivalent because
-        // the marks only matter across pick_pieces invocations)
+        ctx.picker_options = opts;
+        // The busy cap runs inside the pick loop like upstream's
+        // `add_request` does; `picked` stands in for the request-queue
+        // prefix since marks land only after the call returns.
         let mut picked: Vec<(PieceBlock, bool)> = Vec::new();
         let (invoked, endgame) =
             crate::request_blocks::request_a_block_out(picker, t, &ctx, pc, |b, busy| {
+                if busy && !time_critical_mode {
+                    let busy_in_flight = picked.iter().any(|&(_, pbusy)| pbusy)
+                        || self.pipeline.download_queue.iter().any(|p| p.busy)
+                        || self.pipeline.request_queue.iter().any(|p| p.busy);
+                    if busy_in_flight {
+                        return false;
+                    }
+                }
                 picked.push((b, busy));
                 true
             });
-        for (b, busy) in picked {
-            if picker.mark_as_downloading(b, peer_key, opts) {
-                self.add_request(b, busy, false, now_ms);
-            }
-        }
         if let Some(e) = endgame {
+            // `m_endgame_mode` — upstream sets it inside
+            // request_a_block, before the marks land.
             self.pipeline.endgame = e;
         }
-        let reqs = self
-            .pipeline
-            .send_block_requests(torrent, send_buffer_size, now_ms, |b| {
+        let mut queued = Vec::new();
+        for (b, busy) in picked {
+            if picker.mark_as_downloading(b, peer_key, opts) {
+                if self.add_request(b, busy, false) {
+                    queued.push(b);
+                } else {
+                    // lost the busy-cap race vs blocks marked above
+                    picker.abort_download(b, peer_key);
+                }
+            }
+        }
+        let reqs = self.pipeline.send_block_requests(
+            torrent,
+            send_buffer_size,
+            now_ms,
+            disconnecting,
+            |b| {
                 if picker.is_downloaded(b) {
                     picker.abort_download(b, peer_key);
                     true
                 } else {
                     false
                 }
-            });
-        (invoked, endgame, reqs)
+            },
+        );
+        (invoked, endgame, reqs, queued)
     }
 
     /// `write_handshake` — the 68-byte BitTorrent handshake with the

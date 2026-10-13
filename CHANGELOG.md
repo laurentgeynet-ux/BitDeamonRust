@@ -9,6 +9,41 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- Request-pipeline alignment with `peer_connection.cpp`/`request_blocks.cpp`
+  (`session::{peer_pipeline,peer_conn,torrent}`): `drive_peer` now routes
+  through `request_queue` → `send_block_requests` like upstream
+  (`send_block_requests_impl`) instead of short-circuiting to the wire —
+  a single request path. `send_block_requests` gained the upstream gates
+  (`disconnecting`, `graceful_pause`, checking/metadata states,
+  `!has_picker` seed drop, upload_mode) and compares the raw
+  `m_desired_queue_size` member (not the endgame/snub-collapsed
+  accessor). `add_request` enforces the one-busy-request cap and
+  front-inserts time-critical blocks at `queued_time_critical`.
+- Snub semantics now mirror `snub_peer`/`second_tick`: only in-flight
+  requests (`download_queue`) trigger timeouts, parole peers keep their
+  pipeline, `queued_time_critical` resets on every queue drain, the
+  last eligible block times out only when its piece has no free blocks,
+  the replacement pick runs before the abort (verbatim upstream
+  ordering), `piece_timeout` (20 s) detector added, and un-snubbing is
+  windowed to `now - m_requested < request_timeout()` instead of
+  clearing on any block arrival.
+- RTT/queue accounting fixes: request-time samples use
+  `now - m_requested` (not `m_last_request`), `m_requested` re-arms on
+  `download_queue` only, slow-start bumps re-clamp immediately through
+  `update_desired_queue_size`, the `max_out_request_queue < 2` clamp
+  order now matches upstream (floor wins), merged large-block requests
+  share the run's `send_buffer_offset`, and `m_last_piece` is stamped
+  at connect, per piece, and after each send (drives `piece_timeout`).
+- Choked peers can now pick `allowed_fast` pieces (BEP-6): the drive
+  early-return on `peer_choked` is gone — `request_a_block` restricts
+  the mask itself, as upstream does.
+- `block_size()` is metadata-aware (`min(piece_length, 16 KiB)`,
+  `torrent.hpp:982`): `block_index` reconstruction in dispatch/
+  `on_piece`/`on_reject`, cancel mirrors, AIMD block size and
+  `TorrentRequestCtx` all use it instead of a hardcoded `0x4000`.
+- Engine wiring bug: `max_out_request_queue` was fed from
+  `max_allowed_in_request_queue` (default 2000 vs upstream 500) —
+  now reads the right setting.
 - Workspace-wide removal of `unwrap()`/`expect()`/`panic!` from shipped
   code paths (AGENTS.md §4.3) — ~85 sites across bencode/common/dht/
   disk/mmap/net/session. Invariant-by-construction sites were
