@@ -206,6 +206,13 @@ pub trait DiskIo: Send + Sync {
         DiskQueueStats::default()
     }
 
+    /// cumulative count of failed cache flushes — the session posts a
+    /// `file_error_alert` per increment (upstream `handle_disk_error`
+    /// path). Default: 0.
+    fn flush_error_count(&self) -> i64 {
+        0
+    }
+
     /// `settings_updated`.
     fn settings_updated(&self);
 }

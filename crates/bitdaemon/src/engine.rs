@@ -2214,27 +2214,37 @@ impl Engine {
                 // upstream `on_receive`: probe as plaintext, fall back
                 // to MSE per `in_enc_policy` (the 20 probe bytes are
                 // re-interpreted as the DH key head).
-                let (pe, skeys) = {
+                let (pe, hs_timeout, skeys) = {
                     let ses = slock(&session);
                     (
                         ses.pe_settings,
+                        ses.settings.handshake_timeout,
                         ses.torrents
                             .keys()
                             .map(|ih| (bitdaemon_net::pe_crypto::stream_key_hash(ih), *ih))
                             .collect::<std::collections::HashMap<_, _>>(),
                     )
                 };
-                let hs = bitdaemon_net::bt_peer_conn::run_handshake_responder_auto(
-                    &mut s,
-                    &pid,
-                    dht,
-                    true,
-                    |ih| known.lock().unwrap_or_else(|e| e.into_inner()).contains(ih),
-                    pe.in_enc_policy,
-                    |sk| skeys.get(sk).copied(),
-                    |provide| crypto_select(provide, pe),
+                // upstream bounds the accept-side handshake by
+                // `settings_pack::handshake_timeout` — a silent peer
+                // must not wedge the accept loop for everyone else.
+                let hs = tokio::time::timeout(
+                    hs_timeout,
+                    bitdaemon_net::bt_peer_conn::run_handshake_responder_auto(
+                        &mut s,
+                        &pid,
+                        dht,
+                        true,
+                        |ih| known.lock().unwrap_or_else(|e| e.into_inner()).contains(ih),
+                        pe.in_enc_policy,
+                        |sk| skeys.get(sk).copied(),
+                        |provide| crypto_select(provide, pe),
+                    ),
                 )
-                .await;
+                .await
+                .unwrap_or(Err(
+                    bitdaemon_net::bt_peer_conn::PeerConnError::Protocol("handshake timeout"),
+                ));
                 match hs {
                     Ok((hs, rc4, encrypted)) => {
                         let _ = tx.send(DialDone {

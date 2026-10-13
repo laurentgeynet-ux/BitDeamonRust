@@ -502,3 +502,154 @@ fn disabled_backend_completes_noop() {
     );
     assert_eq!(hit.load(Ordering::Relaxed), 1);
 }
+
+/// real-swarm catch (Ubuntu 6.5 GiB swarm): a flush whose `write`
+/// fails must NOT mark its blocks `flushed` — `run_flushed` used to
+/// retire them unconditionally, leaving verified pieces with
+/// never-written zero holes on disk. The buffers must return to the
+/// cache and retry instead.
+#[test]
+fn flush_error_restores_buffers() {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::DiskIo;
+    use bitdaemon_disk::open_mode::OpenMode;
+    use bitdaemon_disk::storage::{DiskStorage, MoveFlags};
+    use bitdaemon_disk::storage_error::{Operation, StorageError, StorageResult};
+    use std::sync::atomic::AtomicBool;
+
+    struct FlakyStorage {
+        inner: PreadStorage,
+        fail_once: AtomicBool,
+    }
+    impl DiskStorage for FlakyStorage {
+        fn set_storage_index(&self, idx: StorageIndex) {
+            self.inner.set_storage_index(idx);
+        }
+        fn files(&self) -> &FileStorage {
+            self.inner.files()
+        }
+        fn file_priorities(&self) -> &[DownloadPriority] {
+            self.inner.file_priorities()
+        }
+        fn read(
+            &self,
+            buf: &mut [u8],
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+            volatile: bool,
+        ) -> StorageResult<i64> {
+            self.inner.read(buf, piece, offset, mode, volatile)
+        }
+        fn write(
+            &self,
+            buf: &[u8],
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+        ) -> StorageResult<i64> {
+            if self.fail_once.swap(false, Ordering::Relaxed) {
+                return Err(StorageError::new(
+                    std::io::Error::other("flaky"),
+                    FileIndex(0),
+                    Operation::FileWrite,
+                ));
+            }
+            self.inner.write(buf, piece, offset, mode)
+        }
+        fn hash_with(
+            &self,
+            feed: &mut dyn FnMut(&[u8]),
+            len: i64,
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+            volatile: bool,
+        ) -> StorageResult<i64> {
+            self.inner
+                .hash_with(feed, len, piece, offset, mode, volatile)
+        }
+        fn release_files(&self) -> StorageResult<()> {
+            self.inner.release_files()
+        }
+        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> StorageResult<(u8, PathBuf)> {
+            unimplemented!()
+        }
+        fn delete_files(&self, _o: u8) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn rename_file(&mut self, _i: FileIndex, _n: &[u8]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn set_file_priority(&mut self, _p: &[DownloadPriority]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn verify_resume_data(
+            &self,
+            _h: &bitdaemon_common::bitfield::Bitfield,
+            _s: bool,
+            _l: &[PathBuf],
+        ) -> StorageResult<bool> {
+            unimplemented!()
+        }
+    }
+
+    let d = dir("flaky");
+    let (io, _drained) = make_io(2);
+    io.insert_storage(
+        StorageIndex(0),
+        Box::new(FlakyStorage {
+            inner: storage(&make_fs(), &d),
+            fail_once: AtomicBool::new(true),
+        }),
+    );
+
+    // one full piece (1024 B = 1 cached block) → piece_full → flush job
+    let mut buf = io.buffer_pool().allocate_buffer("t");
+    buf.data_mut().unwrap()[..1024].fill(0x5A);
+    let hit = Arc::new(AtomicUsize::new(0));
+    let h = Arc::clone(&hit);
+    io.async_write(
+        StorageIndex(0),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start: 0,
+            length: 1024,
+        },
+        buf,
+        None,
+        Box::new(move |_| {
+            h.fetch_add(1, Ordering::Relaxed);
+        }),
+        0,
+    );
+
+    // the first flush attempt must fail; the block goes back dirty
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while DiskIo::flush_error_count(&*io) == 0 && std::time::Instant::now() < deadline {
+        io.completed().call_job_handlers();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(DiskIo::flush_error_count(&*io), 1);
+
+    // retry — buffers restored, so the second attempt lands the data
+    io.flush_all();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        io.completed().call_job_handlers();
+        let a = std::fs::read(d.join("t/a.bin")).unwrap_or_default();
+        let b = std::fs::read(d.join("t/b.bin")).unwrap_or_default();
+        // piece 0 spans a.bin[0..1000] + b.bin[0..24]
+        if a.len() == 1000
+            && a.iter().all(|&x| x == 0x5A)
+            && b.len() >= 24
+            && b[..24].iter().all(|&x| x == 0x5A)
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "data never flushed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}

@@ -392,6 +392,9 @@ pub struct Session {
     /// last tick's disk back-pressure state — `performance_alert`
     /// fires on the rising edge only.
     prev_disk_bp: bool,
+    /// last seen failed-flush count — `file_error_alert` fires per
+    /// increment (upstream `handle_disk_error`).
+    prev_flush_errors: i64,
     /// `m_auto_manage_time_scaler` — ticks until the next
     /// auto-manage pass; `add_torrent` forces 0 (immediate).
     auto_manage_scaler: i32,
@@ -567,6 +570,7 @@ impl Default for Session {
             stats_header_posted: false,
             torrent_prev_states: std::collections::BTreeMap::new(),
             prev_disk_bp: false,
+            prev_flush_errors: 0,
             dht_port: None,
             dht_last_announce: std::collections::BTreeMap::new(),
             auto_manage_scaler: 0,
@@ -2545,6 +2549,21 @@ impl Session {
             });
         }
         self.prev_disk_bp = disk_bp;
+        // upstream `handle_disk_error` — a failed cache flush is a
+        // file_error_alert per occurrence; the buffers were restored
+        // to the cache and retry at the next flush opportunity.
+        let flush_errs = self.disk.as_ref().map_or(0, |d| d.flush_error_count());
+        if flush_errs > self.prev_flush_errors {
+            self.alerts.post(Alert::FileError {
+                ih: Sha1Hash::default(),
+                path: String::new(),
+                error: format!(
+                    "disk flush failed (x{})",
+                    flush_errs - self.prev_flush_errors
+                ),
+            });
+        }
+        self.prev_flush_errors = flush_errs;
         for ih in ihs {
             let mut eff = Vec::new();
             if let Some(t) = self.torrents.get_mut(&ih) {

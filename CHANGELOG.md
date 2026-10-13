@@ -9,6 +9,22 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- `disk_io::job_done`: `JobKind::Flush` retired its cached blocks via
+  `run_flushed` **unconditionally** — a failed (or aborted) region
+  write left blocks flagged `flushed` without bytes on disk: silent
+  holes inside hash-verified pieces (8 corrupted pieces observed on a
+  6.5 GiB real-swarm Ubuntu ISO download; interior zero blocks).
+  Upstream `flush_piece` only sets `is_flushed` after a successful
+  `writev`; on error the buffers now return to the cache via
+  `DiskCache::restore_run` and retry at the next watermark/expiry
+  flush. `DiskIo::flush_error_count` feeds a session-tick
+  `file_error_alert` (upstream `handle_disk_error` path). Covered by
+  `flush_error_restores_buffers`.
+- `engine::start_acceptor_at`: the inbound responder handshake ran
+  unbounded — a peer that connected and stayed silent (or a stalled
+  reconnect) wedged the accept loop permanently; later inbound
+  connections were accepted but never reached `DialDone`. Now bounded
+  by `settings_pack::handshake_timeout` (10 s), matching upstream.
 - `torrent::build_merkle_trees`: iterating `file_range()` called
   `file_num_blocks`/`root` on `.pad/N` pad files (multi-file hybrid
   torrents), hitting their `!pad_file` debug_assert — pads now get an

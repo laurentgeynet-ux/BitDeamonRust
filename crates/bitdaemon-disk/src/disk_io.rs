@@ -118,6 +118,10 @@ pub struct PreadDiskIo {
     num_write_ops: std::sync::atomic::AtomicI64,
     /// `counters::num_read_ops`.
     num_read_ops: std::sync::atomic::AtomicI64,
+    /// `disk_io_error` count — failed cache flushes; the session
+    /// surfaces them as `file_error_alert` (upstream
+    /// `handle_disk_error`).
+    flush_errors: std::sync::atomic::AtomicI64,
     /// extra `OpenMode` bits pushed to every storage at
     /// `new_torrent` (upstream `open_file` reads
     /// `enable_set_file_valid_data`/`no_atime_storage` from
@@ -181,6 +185,7 @@ impl PreadDiskIo {
             num_blocks_hashed: std::sync::atomic::AtomicI64::new(0),
             num_write_ops: std::sync::atomic::AtomicI64::new(0),
             num_read_ops: std::sync::atomic::AtomicI64::new(0),
+            flush_errors: std::sync::atomic::AtomicI64::new(0),
             write_no_cache: AtomicBool::new(false),
             read_no_cache: AtomicBool::new(false),
             cache_expiry: std::sync::atomic::AtomicU64::new(60),
@@ -380,8 +385,8 @@ impl PreadDiskIo {
     /// slot and release observers when the level drains below the
     /// low watermark (upstream `disk_cache::check_buffer_level` on
     /// every erase).
-    fn job_done(&self, j: &DiskJob) {
-        match &j.action {
+    fn job_done(&self, j: &mut DiskJob) {
+        match &mut j.action {
             JobKind::Write(_) => {
                 self.num_blocks_written.fetch_add(1, Ordering::Relaxed);
                 self.num_write_ops.fetch_add(1, Ordering::Relaxed);
@@ -389,20 +394,35 @@ impl PreadDiskIo {
                 self.back_pressure.check_buffer_level(level);
             }
             JobKind::Flush(f) => {
-                // a completed (or aborted) flush retires its cached
-                // blocks and drains the buffer level (ADR-0012/0013).
+                // upstream `flush_piece` retires blocks only after a
+                // successful `writev` — on error (or abort) the buffers
+                // go back to the cache so the next watermark/expiry
+                // flush retries them instead of leaving un-written
+                // holes under a `flushed` flag (silent corruption).
                 if let Some(e) = self.storage(j.storage) {
-                    e.cache
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .run_flushed(
+                    let mut cache = e.cache.lock().unwrap_or_else(|p| p.into_inner());
+                    if j.error.is_ok() {
+                        cache.run_flushed(
                             (j.storage, f.piece),
                             usize::try_from(f.first_block).unwrap_or(0),
                             f.bufs.len(),
                         );
+                        self.num_blocks_written
+                            .fetch_add(f.bufs.len() as i64, Ordering::Relaxed);
+                    } else {
+                        tracing::error!(
+                            piece = f.piece.0,
+                            error = %j.error,
+                            "flush failed; buffers restored to cache for retry"
+                        );
+                        self.flush_errors.fetch_add(1, Ordering::Relaxed);
+                        cache.restore_run(
+                            (j.storage, f.piece),
+                            usize::try_from(f.first_block).unwrap_or(0),
+                            std::mem::take(&mut f.bufs),
+                        );
+                    }
                 }
-                self.num_blocks_written
-                    .fetch_add(f.bufs.len() as i64, Ordering::Relaxed);
                 self.num_write_ops.fetch_add(1, Ordering::Relaxed);
                 let level = self
                     .write_blocks
@@ -460,7 +480,7 @@ impl PreadDiskIo {
         if self.abort.load(Ordering::Relaxed) {
             let mut j = j;
             crate::disk_completed::abort(&mut j);
-            self.job_done(&j);
+            self.job_done(&mut j);
             self.completed.push(j);
             return;
         }
@@ -474,7 +494,7 @@ impl PreadDiskIo {
             // no storage — job is stale; complete it aborted
             let mut j = j;
             crate::disk_completed::abort(&mut j);
-            self.job_done(&j);
+            self.job_done(&mut j);
             self.completed.push(j);
         }
     }
@@ -484,7 +504,7 @@ impl PreadDiskIo {
         if self.abort.load(Ordering::Relaxed) {
             let mut j = j;
             crate::disk_completed::abort(&mut j);
-            self.job_done(&j);
+            self.job_done(&mut j);
             self.completed.push(j);
             return;
         }
@@ -522,7 +542,7 @@ impl PreadDiskIo {
             None => {
                 let mut j = j;
                 crate::disk_completed::abort(&mut j);
-                self.job_done(&j);
+                self.job_done(&mut j);
                 self.completed.push(j);
             }
         }
@@ -664,7 +684,7 @@ impl PreadDiskIo {
                     pool.submit_jobs();
                 }
             }
-            self.job_done(&j);
+            self.job_done(&mut j);
             done.push_back(j);
         }
         self.completed.append(done);
@@ -1510,6 +1530,10 @@ impl DiskIo for PreadDiskIo {
 
     fn write_queue_exceeded(&self) -> bool {
         self.back_pressure.exceeded()
+    }
+
+    fn flush_error_count(&self) -> i64 {
+        self.flush_errors.load(Ordering::Relaxed)
     }
 
     /// `pread_disk_io::update_stats_counters` (ADR-0017).

@@ -334,6 +334,25 @@ impl DiskCache {
         Some((loc, first, bufs))
     }
 
+    /// Put a failed flush's buffers back — upstream `flush_piece`
+    /// only sets `is_flushed` after a successful `writev`; a region
+    /// whose write failed stays dirty so the next `take_*_run`
+    /// retries it. Blocks already re-inserted (a duplicate write
+    /// landed while the flush was in flight) keep their newer buffer.
+    pub fn restore_run(&mut self, loc: PieceLocation, first: usize, bufs: Vec<Vec<u8>>) {
+        let Some(p) = self.pieces.get_mut(&loc) else {
+            return;
+        };
+        for (i, buf) in bufs.into_iter().enumerate() {
+            if let Some(b) = p.blocks.get_mut(first + i)
+                && b.buf.is_none()
+            {
+                b.buf = Some(buf);
+                b.has_write_job = false;
+            }
+        }
+    }
+
     /// Every dirty run across the whole cache — used before a
     /// storage-level fence (move/delete) raises.
     pub fn take_all_storage_runs(&mut self) -> Vec<(PieceLocation, i32, Vec<Vec<u8>>)> {
