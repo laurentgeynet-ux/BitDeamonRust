@@ -398,4 +398,22 @@ impl PeerPipeline {
         }
         out
     }
+
+    /// `on_send_data` — `bytes` were popped from the front of the
+    /// send buffer: shift every in-flight request's
+    /// `send_buffer_offset` down; an offset inside the written span
+    /// means the request has fully left the buffer.
+    pub fn on_send_data(&mut self, bytes: usize) {
+        let n = u32::try_from(bytes).unwrap_or(u32::MAX);
+        for b in &mut self.download_queue {
+            if b.send_buffer_offset == NOT_IN_BUFFER {
+                continue;
+            }
+            if b.send_buffer_offset < n {
+                b.send_buffer_offset = NOT_IN_BUFFER;
+            } else {
+                b.send_buffer_offset -= n;
+            }
+        }
+    }
 }

@@ -94,6 +94,14 @@ impl RateLimiter {
             .store(bytes_per_sec, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// `m_quota[download_channel] > 0` — the channel had budget
+    /// left this tick (unlimited ⇒ always). Gates request-timeout
+    /// snubbing upstream; fed to `Session::set_download_quota_available`.
+    pub fn quota_available(&self) -> bool {
+        self.limit.load(std::sync::atomic::Ordering::Relaxed) <= 0
+            || self.tokens.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
     /// `update_quota` — grant one `dt_ms` worth of tokens (cap = 1s).
     pub fn refill(&self, dt_ms: i64) {
         let limit = self.limit.load(std::sync::atomic::Ordering::Relaxed);
@@ -737,6 +745,10 @@ impl Engine {
         // refresh the acceptor's known info-hash set
         *self.known_ihs.lock().unwrap_or_else(|e| e.into_inner()) =
             slock(&self.session).torrents.keys().copied().collect();
+        // `m_quota[download_channel] > 0` — the per-conn quota
+        // upstream's bw_manager hands out; our single bucket is the
+        // approximation — a starved channel skips snub checks.
+        slock(&self.session).set_download_quota_available(self.download_limiter.quota_available());
         slock(&self.session).tick(&mut out);
         slock(&self.session).tracker_announce_due(now, 0, &mut out);
         self.dispatch(out).await;

@@ -185,6 +185,10 @@ pub struct Torrent {
     /// (`web_peer_connection` bumps availability for every piece
     /// on connect — the seed serves the full payload).
     web_seed_refcounted: bool,
+    /// last synced count of conns with a non-empty download queue —
+    /// the session applies its delta to `num_peers_down_requests`
+    /// (upstream incs/decs at every `m_download_queue` transition).
+    pub down_request_peers: i64,
     /// `m_peer_list` — known swarm members (tracker/PEX/DHT/LSD/
     /// resume candidates). Upstream stores `torrent_peer`s owned by
     /// the list; ours are `TorrentPeer`s in `PeerList`.
@@ -553,6 +557,7 @@ impl Torrent {
             web_seed_idx: 0,
             web_seed_outstanding: std::collections::BTreeSet::new(),
             web_seed_refcounted: false,
+            down_request_peers: 0,
             peer_list: bitdaemon_net::peer_list::PeerList::default(),
             storage,
             num_seeds: 0,
@@ -1457,6 +1462,9 @@ impl Torrent {
         if c.pipeline.endgame {
             flags = flags.with(PeerFlags::ENDGAME_MODE);
         }
+        if c.on_parole {
+            flags = flags.with(PeerFlags::ON_PAROLE);
+        }
         if c.num_pieces >= self.num_pieces {
             flags = flags.with(PeerFlags::SEED);
         }
@@ -1480,8 +1488,15 @@ impl Torrent {
             receive_buffer_size: 0,
             used_receive_buffer: 0,
             receive_buffer_watermark: 0,
-            num_hashfails: 0,
-            download_queue_length: c.pipeline.download_queue.len() as i32,
+            num_hashfails: c
+                .remote
+                .or(remote)
+                .and_then(|ep| self.peer_index(ep))
+                .map_or(0, |i| i32::from(self.peer_list.peers()[i].hashfails)),
+            // upstream: `download_queue().size() + m_request_queue
+            // .size()` — sent *and* unsent requests.
+            download_queue_length: (c.pipeline.download_queue.len()
+                + c.pipeline.request_queue.len()) as i32,
             timed_out_requests: c
                 .pipeline
                 .download_queue
@@ -1489,8 +1504,17 @@ impl Torrent {
                 .filter(|b| b.timed_out)
                 .count() as i32,
             busy_requests: c.pipeline.download_queue.iter().filter(|b| b.busy).count() as i32,
-            requests_in_buffer: c.pipeline.request_queue.len() as i32,
-            target_dl_queue_length: i32::from(c.pipeline.desired_queue_size),
+            // upstream counts `download_queue` entries whose request
+            // message is still sitting in the send buffer.
+            requests_in_buffer: c
+                .pipeline
+                .download_queue
+                .iter()
+                .filter(|b| b.send_buffer_offset != crate::peer_pipeline::NOT_IN_BUFFER)
+                .count() as i32,
+            // upstream exposes the `desired_queue_size()` accessor —
+            // the endgame/snubbed collapse to 1 is part of the value.
+            target_dl_queue_length: c.pipeline.desired_queue_size(),
             upload_queue_length: c.upload_queue.len() as i32,
             failcount: 0,
             downloading_piece_index: c
@@ -1778,6 +1802,13 @@ impl Torrent {
     /// attach time (`peer_connection::init`).
     pub fn add_peer(&mut self, id: u64, mut conn: PeerConn) {
         if let Some(remote) = conn.remote {
+            // upstream `on_parole()` reads the `torrent_peer` flag
+            // live — mirror it onto the conn at attach (a peer that
+            // failed hash checks on a previous connection comes back
+            // on parole).
+            if let Some(i) = self.peer_index(remote) {
+                conn.on_parole = self.peer_list.peers()[i].on_parole;
+            }
             for ext in &self.extensions {
                 if let Some(pp) = ext.new_peer_connection(&remote) {
                     conn.plugins.push(pp);
@@ -1785,6 +1816,24 @@ impl Torrent {
             }
         }
         self.peers.insert(id, conn);
+    }
+
+    /// `num_peers_down_requests` bookkeeping — recompute this
+    /// torrent's share (conns with a non-empty `download_queue`)
+    /// and apply the delta to the session-wide counter. A removed
+    /// conn simply drops out of the count — matching upstream's
+    /// `disconnect` decrement.
+    pub fn sync_down_requests(&mut self, counters: &crate::counters::Counters) {
+        let n = self
+            .peers
+            .values()
+            .filter(|c| !c.pipeline.download_queue.is_empty())
+            .count() as i64;
+        let delta = n - self.down_request_peers;
+        if delta != 0 {
+            self.down_request_peers = n;
+            counters.add(crate::counters::Counter::NumPeersDownRequests, delta);
+        }
     }
 
     /// `peer_disconnected` — refcount down everything it had and
@@ -1806,6 +1855,109 @@ impl Torrent {
             }
         }
         let _ = eff;
+    }
+
+    /// resolve a picker's downloader key (`block_info.peer`,
+    /// `peer_key()`) back to its live connection id.
+    fn conn_by_key(&self, key: u64) -> Option<u64> {
+        self.peers
+            .iter()
+            .find_map(|(id, c)| (c.peer_key() == Some(key)).then_some(*id))
+    }
+
+    /// `piece_finished`'s trust loop — every peer that contributed
+    /// blocks to a *passing* piece clears parole and gains a trust
+    /// point (cap 8). Upstream's `received_valid_data` only fires
+    /// peer-plugin hooks here; ours live on the torrent plugin list
+    /// already (`on_piece_pass`).
+    fn reward_downloader(&mut self, key: u64) {
+        let Some(id) = self.conn_by_key(key) else {
+            // downloader disconnected — upstream still updates the
+            // `torrent_peer` (it outlives conns); our picker key is
+            // conn-derived so the map is lost. Documented gap.
+            return;
+        };
+        if let Some(c) = self.peers.get_mut(&id) {
+            c.on_parole = false;
+        }
+        if let Some(remote) = self.peers.get(&id).and_then(|c| c.remote)
+            && let Some(i) = self.peer_index(remote)
+        {
+            let p = &mut self.peer_list.peers_mut()[i];
+            p.on_parole = false;
+            p.trust_points = (p.trust_points + 1).min(8);
+        }
+    }
+
+    /// `penalize_peers` — parole + trust/hashfail bookkeeping on the
+    /// peers that served a *failed* piece. `known_bad` is upstream's
+    /// certainty flag (`peers.size() == 1 || !blocks.empty()`): a
+    /// certain culprit is banned outright, repeat offenders
+    /// (`trust_points <= -7`) always are.
+    fn penalize_peers(
+        &mut self,
+        downloaders: &[Option<u64>],
+        payload_blocks: i32,
+        known_bad: bool,
+        s: &crate::settings::SessionSettings,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        let mut seen = std::collections::BTreeSet::new();
+        // upstream only penalizes payload-block downloaders when the
+        // bad-block CRCs aren't identified.
+        for key in downloaders
+            .iter()
+            .take(payload_blocks.max(0) as usize)
+            .flatten()
+        {
+            if *key == Self::WEB_SEED_PEER || !seen.insert(*key) {
+                continue;
+            }
+            let key = *key;
+            // `web_peer_connection::received_invalid_data` declines
+            // the disconnect (the file gets marked un-had instead) —
+            // our web seeds aren't `torrent_peer`s, so they're never
+            // in `downloaders` under a real key anyway; the guard is
+            // for clarity.
+            let allow_disconnect = true;
+            let Some(id) = self.conn_by_key(key) else {
+                continue;
+            };
+            let Some(remote) = self.peers.get(&id).and_then(|c| c.remote) else {
+                continue;
+            };
+            if let Some(c) = self.peers.get_mut(&id)
+                && s.use_parole_mode
+            {
+                c.on_parole = true;
+            }
+            let Some(i) = self.peer_index(remote) else {
+                continue;
+            };
+            let ban = {
+                let p = &mut self.peer_list.peers_mut()[i];
+                if s.use_parole_mode {
+                    p.on_parole = true;
+                }
+                // decrease more than we increase — keeps the allowed
+                // fail/pass ratio low (upstream −2/+1).
+                p.trust_points = (p.trust_points - 2).max(-7);
+                p.hashfails = p.hashfails.saturating_add(1);
+                p.trust_points <= -7 || (known_bad && allow_disconnect)
+            };
+            if ban {
+                self.peer_list.ban_peer(i);
+                out.push(TorrentEffect::Alert(crate::alerts::Alert::PeerBan {
+                    ih: self.info_hash,
+                    ip: remote,
+                }));
+                self.remove_peer(id, out);
+                out.push(TorrentEffect::DisconnectPeer {
+                    peer: id,
+                    reason: "too many corrupt pieces",
+                });
+            }
+        }
     }
 
     /// `peer_connection::fill_send_buffer` — issue disk reads for the
@@ -2797,7 +2949,7 @@ impl Torrent {
             whole_pieces_threshold: 0,
             strict_end_game_mode: false,
             piece_length: self.piece_length,
-            block_size: 0x4000,
+            block_size: self.block_size(),
         };
         let allowed_fast = Vec::new();
         let suggested = Vec::new();
@@ -2832,7 +2984,13 @@ impl Torrent {
         if !got || picked.is_empty() {
             return None;
         }
-        let mut reqs = Vec::with_capacity(picked.len());
+        // `request_large_blocks` — upstream's `web_peer_connection`
+        // coalesces the contiguous run into one byte-range request
+        // per file span; a run may cross a piece boundary
+        // (`request_merger` tracks torrent-space offsets and
+        // `map_block` resolves them).
+        let block_size = self.block_size();
+        let mut reqs: Vec<PeerRequest> = Vec::with_capacity(picked.len());
         for (b, _busy) in picked {
             if !self.picker.as_mut().is_some_and(|p| {
                 p.mark_as_downloading(b, Some(Self::WEB_SEED_PEER), PickerOptions::RAREST_FIRST)
@@ -2843,11 +3001,21 @@ impl Torrent {
             if !(0..self.num_pieces).contains(&b.piece_index.0) {
                 continue;
             }
-            let start = b.block_index * 0x4000;
+            let start = b.block_index * block_size;
             let piece_size = self.files.as_ref().map_or(self.piece_length, |f| {
                 i64::from(f.piece_size(b.piece_index))
             });
-            let length = (piece_size - i64::from(start)).min(0x4000) as i32;
+            let length = (piece_size - i64::from(start)).min(i64::from(block_size)) as i32;
+            let off = i64::from(b.piece_index.0) * self.piece_length + i64::from(start);
+            if let Some(last) = reqs.last_mut() {
+                let last_end = i64::from(last.piece.0) * self.piece_length
+                    + i64::from(last.start)
+                    + i64::from(last.length);
+                if last_end == off {
+                    last.length += length;
+                    continue;
+                }
+            }
             reqs.push(PeerRequest {
                 piece: b.piece_index,
                 start,
@@ -2862,41 +3030,91 @@ impl Torrent {
         Some((url, reqs))
     }
 
-    /// one web-seed block arrived — `mark_as_writing` + emit the
-    /// disk write (the same path a wire `Piece` takes).
+    /// Expand a (possibly merged — `request_large_blocks`) web-seed
+    /// request into the `PieceBlock`s it covers. A range may cross
+    /// a piece boundary.
+    fn web_seed_blocks(&self, req: &PeerRequest) -> Vec<PieceBlock> {
+        let piece_length = self.piece_length;
+        let block_size = i64::from(self.block_size());
+        let mut out = Vec::new();
+        let mut off = i64::from(req.piece.0) * piece_length + i64::from(req.start);
+        let mut rem = i64::from(req.length);
+        while rem > 0 && piece_length > 0 && block_size > 0 {
+            let piece_index = (off / piece_length) as i32;
+            let block_index = ((off % piece_length) / block_size) as i32;
+            let psize = self.files.as_ref().map_or(self.piece_length, |f| {
+                i64::from(f.piece_size(PieceIndex(piece_index)))
+            });
+            let bs = (psize - i64::from(block_index) * block_size)
+                .min(block_size)
+                .min(rem);
+            if bs <= 0 {
+                break;
+            }
+            out.push(bitdaemon_common::types::PieceBlock {
+                piece_index: PieceIndex(piece_index),
+                block_index,
+            });
+            off += bs;
+            rem -= bs;
+        }
+        out
+    }
+
+    /// one web-seed request's data arrived — slice it back into the
+    /// covered blocks (upstream `web_peer_connection` consumes its
+    /// `m_requests` per pending_block), then `mark_as_writing` +
+    /// emit a disk write each — the same path a wire `Piece` takes.
     pub fn on_web_seed_block(
         &mut self,
         req: PeerRequest,
         data: Vec<u8>,
         out: &mut Vec<TorrentEffect>,
     ) {
-        let b = bitdaemon_common::types::PieceBlock {
-            piece_index: req.piece,
-            block_index: req.start / 0x4000,
-        };
-        self.web_seed_outstanding.remove(&b);
-        if let Some(p) = self.picker.as_mut() {
-            p.mark_as_writing(b, Some(Self::WEB_SEED_PEER));
+        let block_size = i64::from(self.block_size());
+        let blocks = self.web_seed_blocks(&req);
+        let mut data_off = 0usize;
+        for b in blocks {
+            let psize = self.files.as_ref().map_or(self.piece_length, |f| {
+                i64::from(f.piece_size(b.piece_index))
+            });
+            let start = i64::from(b.block_index) * block_size;
+            let bs = ((psize - start).min(block_size) as usize).min(data.len() - data_off);
+            if bs == 0 {
+                break;
+            }
+            self.web_seed_outstanding.remove(&b);
+            if let Some(p) = self.picker.as_mut() {
+                p.mark_as_writing(b, Some(Self::WEB_SEED_PEER));
+            }
+            out.push(TorrentEffect::DiskWrite {
+                peer: Self::WEB_SEED_PEER,
+                req: PeerRequest {
+                    piece: b.piece_index,
+                    start: (i64::from(b.block_index) * block_size) as i32,
+                    length: bs as i32,
+                },
+                data: data[data_off..data_off + bs].to_vec(),
+            });
+            data_off += bs;
+            if data_off >= data.len() {
+                break;
+            }
         }
-        out.push(TorrentEffect::DiskWrite {
-            peer: Self::WEB_SEED_PEER,
-            req,
-            data,
-        });
     }
 
     /// a web-seed fetch failed — release the blocks so they can be
     /// re-requested from a real peer or another seed (`web_seed`
-    /// `fail_count`→`abort_download` upstream path).
+    /// `fail_count`→`abort_download` upstream path). Merged
+    /// (`request_large_blocks`) requests expand to all blocks they
+    /// covered.
     pub fn on_web_seed_error(&mut self, reqs: &[PeerRequest]) {
         for r in reqs {
-            let b = bitdaemon_common::types::PieceBlock {
-                piece_index: r.piece,
-                block_index: r.start / 0x4000,
-            };
-            self.web_seed_outstanding.remove(&b);
-            if let Some(p) = self.picker.as_mut() {
-                p.abort_download(b, Some(Self::WEB_SEED_PEER));
+            for b in self.web_seed_blocks(r) {
+                self.web_seed_outstanding.remove(&b);
+                if let Some(p) = self.picker.as_mut() {
+                    p.abort_download(b, Some(Self::WEB_SEED_PEER));
+                }
             }
         }
     }
@@ -3004,6 +3222,21 @@ impl Torrent {
                 .map_or(self.piece_length, |f| i64::from(f.piece_size(piece)));
         }
         if passed {
+            // upstream `piece_finished` — trust/parole update on
+            // every peer that contributed blocks, collected from
+            // the picker *before* `piece_passed` clears them.
+            let downloaders = self
+                .picker
+                .as_ref()
+                .map(|p| p.get_downloaders(piece))
+                .unwrap_or_default();
+            let mut seen = std::collections::BTreeSet::new();
+            for key in downloaders.into_iter().flatten() {
+                if key == Self::WEB_SEED_PEER || !seen.insert(key) {
+                    continue;
+                }
+                self.reward_downloader(key);
+            }
             if (piece.0 as usize) < self.have.size() && !self.have.get_bit(piece.0 as usize) {
                 self.have.set_bit(piece.0 as usize);
                 // `total_done` — last piece counts its tail size,
@@ -3111,7 +3344,11 @@ impl Torrent {
                 .smart_ban
                 .on_piece_passed(piece, piece_size, &mut read_digest)
             {
-                if let BanDecision::Ban(peer) = d {
+                // `Ban` carries the picker's downloader key — map it
+                // back to a live conn before disconnecting.
+                if let BanDecision::Ban(key) = d
+                    && let Some(peer) = self.conn_by_key(key)
+                {
                     self.remove_peer(peer, out);
                     out.push(TorrentEffect::DisconnectPeer {
                         peer,
@@ -3125,16 +3362,39 @@ impl Torrent {
                 .as_ref()
                 .map(|p| p.get_downloaders(piece))
                 .unwrap_or_default();
-            if let BanDecision::Ban(peer) =
+            let payload_blocks = self
+                .picker
+                .as_ref()
+                .map_or(0, |p| p.payload_blocks_in_piece(piece));
+            let decision =
                 self.smart_ban
-                    .on_piece_failed(piece, piece_size, &downloaders, addr, read_digest)
-            {
-                self.remove_peer(peer, out);
-                out.push(TorrentEffect::DisconnectPeer {
-                    peer,
-                    reason: "smart_ban: corrupt block",
-                });
-            }
+                    .on_piece_failed(piece, piece_size, &downloaders, addr, read_digest);
+            // upstream `on_piece_finished` — penalize every peer
+            // that served payload blocks for this piece. With
+            // identified bad blocks (`!blocks.empty()` upstream) only
+            // their senders are penalized — our smart_ban reports the
+            // culprit key directly. Certainty: lone downloader
+            // (`peers.size() == 1`) or an identified culprit.
+            let culprit_set;
+            let (set, known_bad) = if let BanDecision::Ban(key) = decision {
+                if let Some(peer) = self.conn_by_key(key) {
+                    self.remove_peer(peer, out);
+                    out.push(TorrentEffect::DisconnectPeer {
+                        peer,
+                        reason: "smart_ban: corrupt block",
+                    });
+                }
+                culprit_set = [Some(key)];
+                (&culprit_set[..], true)
+            } else {
+                let unique = downloaders
+                    .iter()
+                    .flatten()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                (&downloaders[..], unique == 1)
+            };
+            self.penalize_peers(set, payload_blocks, known_bad, s, out);
         }
         self.piece_verified(piece, passed, s, out);
     }
@@ -3661,13 +3921,18 @@ impl Torrent {
     /// and the last eligible in-flight block times out so another
     /// peer can pick it. Parole peers keep their pipeline.
     ///
-    /// Upstream additionally gates both detectors on
-    /// `m_quota[download_channel] > 0` — BitDaemon doesn't meter the
-    /// per-peer download quota yet, so that gate is elided (the
-    /// detectors then run whenever requests are in flight).
+    /// `download_quota_ok` stands in for upstream's per-conn
+    /// `m_quota[download_channel] > 0` gate — BitDaemon meters one
+    /// global bucket rather than per-conn quota, so the session
+    /// passes whether the download channel had any budget this tick.
+    ///
+    /// The endgame branch mirrors `second_tick`'s 5 s retry: once a
+    /// strict-endgame peer drains both queues it re-picks (a busy
+    /// block may have freed) and re-stamps `m_last_request`.
     pub fn check_request_timeouts(
         &mut self,
         s: &crate::settings::SessionSettings,
+        download_quota_ok: bool,
         out: &mut Vec<TorrentEffect>,
     ) {
         let now_ms = self.now_ms;
@@ -3702,10 +3967,45 @@ impl Torrent {
             has_picker: self.picker.is_some(),
         };
         for (peer_id, c) in self.peers.iter_mut() {
-            // upstream only snubs peers with requests actually in
-            // flight (`m_download_queue`); the send buffer quota
-            // gate is elided (see fn docs).
-            if c.pipeline.download_queue.is_empty() {
+            // `peer_connection::second_tick` — strict endgame with
+            // both queues drained retries the pick every 5 s; a
+            // busy block may have been released meanwhile. Runs
+            // before the timeout checks (upstream order) and is not
+            // quota-gated.
+            if c.pipeline.endgame
+                && c.interesting
+                && c.pipeline.download_queue.is_empty()
+                && c.pipeline.request_queue.is_empty()
+                && now_ms - c.pipeline.last_request_ms >= 5_000
+            {
+                c.pipeline.last_request_ms = now_ms;
+                if let Some(p) = self.picker.as_mut() {
+                    let (send_buffer, rate) = (c.send_buffer, i64::from(c.rate_down_speed));
+                    let mut pc_stats = crate::piece_picker::NullPickerStats;
+                    let (_invoked, _eg, reqs, _queued) = c.drive_requests(
+                        p,
+                        &tctx,
+                        &view,
+                        opts,
+                        rate,
+                        send_buffer,
+                        now_ms,
+                        &mut pc_stats,
+                    );
+                    for req in reqs {
+                        out.push(TorrentEffect::SendTo {
+                            peer: *peer_id,
+                            msg: PeerMessage::Request(req),
+                        });
+                    }
+                }
+            }
+            // `m_quota[download_channel] > 0` — upstream skips both
+            // timeout checks for a conn the bandwidth manager gave
+            // no download budget to this tick (a throttled peer
+            // can't be blamed for missing deadlines); ours is the
+            // global-limiter approximation.
+            if !download_quota_ok || c.pipeline.download_queue.is_empty() {
                 continue;
             }
             let request_timed_out = c.pipeline.requested_ms != 0

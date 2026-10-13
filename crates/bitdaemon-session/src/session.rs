@@ -297,6 +297,11 @@ pub struct Session {
     pub alerts: AlertManager,
     /// `m_stats_counters`.
     pub counters: Counters,
+    /// `m_quota[download_channel] > 0` approximation — the engine's
+    /// download limiter reports whether the channel had budget left
+    /// this tick; request/piece timeout snubbing is skipped while
+    /// the channel is starved (`peer_connection::second_tick`).
+    pub download_quota_ok: bool,
     /// `m_peer_id` — generated with the default fingerprint
     /// (`generate_peer_id`); used in announces and handshakes.
     pub peer_id: bitdaemon_common::PeerId,
@@ -533,6 +538,7 @@ impl Default for Session {
             write_gates: None,
             alerts: AlertManager::default(),
             counters: Counters::default(),
+            download_quota_ok: true,
             peer_id: bitdaemon_common::peer_id::generate_peer_id(b"-OB0001-"),
             listen_port: 6881,
             ssl_listen_port: 4433,
@@ -1882,10 +1888,13 @@ impl Session {
                 .files
                 .as_ref()
                 .map_or(t.piece_length, |f| i64::from(f.piece_size(piece)));
+            // downloader keys are `peer_key()` values (first 8 bytes
+            // of the remote peer-id), not conn ids — resolve through
+            // the conn's key, not its slot in `peers`.
             let addrs: std::collections::HashMap<u64, std::net::IpAddr> = t
                 .peers
-                .iter()
-                .filter_map(|(id, c)| c.remote.map(|a| (*id, a.ip())))
+                .values()
+                .filter_map(|c| Some((c.peer_key()?, c.remote?.ip())))
                 .collect();
             t.piece_verified_ban(
                 piece,
@@ -2635,7 +2644,7 @@ impl Session {
                 }
                 // `peer_connection::second_tick` — snub + refund
                 // blocks stuck past `request_timeout`.
-                t.check_request_timeouts(&self.settings, &mut eff);
+                t.check_request_timeouts(&self.settings, self.download_quota_ok, &mut eff);
                 // `peer_connection::second_tick` super-seed
                 // recovery — peers uninterested >10 s get a fresh
                 // leaked piece.
@@ -3393,6 +3402,13 @@ impl Session {
         }
     }
 
+    /// `m_quota[download_channel] > 0` — the download channel was
+    /// granted budget this tick. The engine's `RateLimiter` feeds
+    /// this; it gates the snub checks in `check_request_timeouts`.
+    pub fn set_download_quota_available(&mut self, ok: bool) {
+        self.download_quota_ok = ok;
+    }
+
     /// Queue `msg` to `peer` — charges its wire size to the peer's
     /// `send_buffer` so `fill_send_buffer`'s watermark sees queued
     /// bytes (upstream `append_to_send_buffer`).
@@ -3425,6 +3441,10 @@ impl Session {
         if let Some(t) = self.torrents.get_mut(ih) {
             if let Some(c) = t.peers.get_mut(&peer) {
                 c.send_buffer = c.send_buffer.saturating_sub(bytes);
+                // `on_send_data` — shift the in-flight requests'
+                // `send_buffer_offset`s down by the drained bytes
+                // (`requests_in_buffer` tracks what's still queued).
+                c.pipeline.on_send_data(bytes);
             }
             t.fill_send_buffer(peer, &self.settings, &mut eff);
         }
@@ -3432,6 +3452,12 @@ impl Session {
     }
 
     fn route(&mut self, ih: Sha1Hash, effects: Vec<TorrentEffect>, out: &mut Vec<SessionOut>) {
+        // `num_peers_down_requests` — conns with a non-empty
+        // download_queue; synced once per event batch (upstream
+        // incs/decs at each queue transition site).
+        if let Some(t) = self.torrents.get_mut(&ih) {
+            t.sync_down_requests(&self.counters);
+        }
         self.dispatch_disk(ih, &effects);
         for e in effects {
             match e {

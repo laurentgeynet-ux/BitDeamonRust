@@ -7,8 +7,36 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added
+
+- `on_parole`/`trust_points`/`hashfails` wiring — `piece_finished`'s
+  trust loop and `penalize_peers` are now live: a passing piece clears
+  parole and bumps trust (+1, cap 8) on every contributing peer; a
+  failed piece marks downloaders on parole (`use_parole_mode`), costs
+  2 trust points (floor −7), and bans repeat offenders or a certain
+  culprit (`peer_ban_alert` + `peer_list.ban_peer` + disconnect).
+  Parole peers pick with `on_parole | prioritize_partials`, snubbed
+  peers with `reverse`, matching upstream `picker_options()`.
+- Web seeds now honor `request_large_blocks` (`web_peer_connection`):
+  contiguous picked blocks coalesce into a single HTTP byte-range
+  request — piece-boundary crossings included — and responses slice
+  back into per-block `mark_as_writing` + `DiskWrite`s.
+- `num_peers_down_requests` accounting (peers with a non-empty
+  download queue), endgame 5 s re-pick via `m_last_request`, and the
+  `m_quota[download_channel] > 0` gate on the timeout detectors
+  (approximated by the global download bucket) in
+  `check_request_timeouts`.
+
 ### Fixed
 
+- `peer_info` queue fields now match upstream: `download_queue_length`
+  counts sent *and* unsent requests, `requests_in_buffer` counts
+  requests still sitting in the send buffer (drained via
+  `on_send_data`), `num_hashfails` reads the real peer-list entry, and
+  `target_dl_queue_length` uses the endgame/snub-collapsed accessor.
+- Downloader attribution resolves picker keys (`peer_key()`) back to
+  live connections — `smart_ban` bans/disconnects and the trust/parole
+  updates now reach the right peer instead of looking up conn ids.
 - Request-pipeline alignment with `peer_connection.cpp`/`request_blocks.cpp`
   (`session::{peer_pipeline,peer_conn,torrent}`): `drive_peer` now routes
   through `request_queue` → `send_block_requests` like upstream

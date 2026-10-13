@@ -896,6 +896,20 @@ impl PeerConn {
         let outstanding = self.outstanding();
         let disconnecting = self.disconnecting;
         let time_critical_mode = t.time_critical_mode;
+        // `picker_options()` — parole peers pick `on_parole |
+        // prioritize_partials` (pieces only they touched first);
+        // snubbed peers pick `reverse` so they converge on the
+        // same common pieces.
+        let mut opts = opts;
+        if self.on_parole {
+            opts = opts
+                | crate::piece_picker::PickerOptions::ON_PAROLE
+                | crate::piece_picker::PickerOptions::PRIORITIZE_PARTIALS;
+        }
+        if self.pipeline.snubbed && opts.contains(crate::piece_picker::PickerOptions::RAREST_FIRST)
+        {
+            opts = opts | crate::piece_picker::PickerOptions::REVERSE;
+        }
         let mut ctx = self.request_ctx(false, disconnecting, rate);
         ctx.outstanding = &outstanding;
         ctx.picker_options = opts;
