@@ -9,6 +9,8 @@
 //! the poster is injected — session wiring supplies the channel to its
 //! event loop (direct call for tests).
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 /// `disk_observer` — notified when the write queue drains below the
@@ -160,5 +162,71 @@ impl BackPressure {
             std::mem::take(&mut g.observers)
         };
         (self.poster)(cbs);
+    }
+}
+
+/// `peer_connection::m_channel_state[download_channel] & bw_disk` —
+/// per-connection read gate, *not* the global [`BackPressure`] above.
+/// Upstream blocks a peer's socket reads only while **that peer**
+/// has an outstanding disk write in flight that was submitted while
+/// the queue was over its limit; the gate clears the moment that
+/// peer's own write completes, regardless of the global queue level.
+/// Our previous design shared one flag cleared only once the whole
+/// queue drained to the low watermark — every peer froze for as long
+/// as the slowest piece of the burst took, which on a seek-bound HDD
+/// could be several seconds per cycle. Keyed by `(info_hash, peer)`
+/// so unrelated torrents/peers never share a gate.
+pub struct PeerWriteGates<K> {
+    inner: Mutex<HashMap<K, Arc<AtomicBool>>>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone> Default for PeerWriteGates<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> PeerWriteGates<K> {
+    /// `back_pressure(ios)` equivalent — an empty gate table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The connection's gate, created on first use. The engine's read
+    /// pump polls `gate(key).load(Relaxed)`; the session actor flips
+    /// it from [`Self::set_blocked`]/completion bookkeeping.
+    #[must_use]
+    pub fn gate(&self, key: K) -> Arc<AtomicBool> {
+        Arc::clone(
+            self.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(key)
+                .or_insert_with(|| Arc::new(AtomicBool::new(false))),
+        )
+    }
+
+    /// Block `key`'s reads — called when a block it sent us was
+    /// handed to a disk write queue that was over its limit.
+    pub fn set_blocked(&self, key: K) {
+        self.gate(key).store(true, Ordering::Relaxed);
+    }
+
+    /// Unblock `key` — called once *that peer's* own outstanding
+    /// write bytes return to zero (upstream `on_disk_write_complete`).
+    pub fn clear_blocked(&self, key: K) {
+        self.gate(key).store(false, Ordering::Relaxed);
+    }
+
+    /// Drop the entry on disconnect so the table doesn't grow
+    /// unbounded across the session's lifetime.
+    pub fn remove(&self, key: &K) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
     }
 }

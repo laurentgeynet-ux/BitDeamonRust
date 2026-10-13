@@ -48,6 +48,7 @@ impl PeerConnector for TokioTcpConnector {
     ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>> {
         Box::pin(async move {
             let s = TcpStream::connect(addr).await?;
+            let _ = s.set_nodelay(true);
             Ok(Box::new(s) as BoxedPeerStream)
         })
     }
@@ -80,6 +81,7 @@ impl PeerAcceptor for TokioTcpAcceptor {
     fn accept(self: Arc<Self>) -> AcceptFut {
         Box::pin(async move {
             let (s, remote) = self.listener.accept().await?;
+            let _ = s.set_nodelay(true);
             Ok((Box::new(s) as BoxedPeerStream, Some(remote)))
         })
     }

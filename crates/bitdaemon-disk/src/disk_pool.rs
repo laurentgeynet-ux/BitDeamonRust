@@ -47,6 +47,22 @@ struct PoolInner {
     queued: JobQueue,
     abort: bool,
     threads_to_exit: i64,
+    /// `disk_job_pool` per-kind job counts — maintained on push/pop so
+    /// `queue_stats` never walks the queue under the worker lock.
+    queued_writes: usize,
+    queued_hashes: usize,
+    queued_other: usize,
+}
+
+/// per-kind bucket used by `queue_stats` (upstream `m_jobs[]` split:
+/// writes get their own counter, hash jobs theirs, the rest lumped).
+fn kind_slot(j: &crate::disk_job::DiskJob) -> usize {
+    use crate::disk_job::JobKind;
+    match j.action {
+        JobKind::Write(_) => 0,
+        JobKind::Hash(_) | JobKind::Hash2(_) => 1,
+        _ => 2,
+    }
 }
 
 /// `aux::disk_io_thread_pool`. Generic over the worker function —
@@ -73,6 +89,9 @@ impl DiskIoThreadPool {
                 queued: VecDeque::new(),
                 abort: false,
                 threads_to_exit: 0,
+                queued_writes: 0,
+                queued_hashes: 0,
+                queued_other: 0,
             }),
             job_cond: Condvar::new(),
             threads: Mutex::new(Vec::new()),
@@ -147,22 +166,30 @@ impl DiskIoThreadPool {
 
     /// `append(jobs)` + `push_back` + `pop_front` — the queue is under
     /// the pool mutex upstream ("must be held"); Rust folds it in.
+    /// The per-kind counters ride along so stats never rescan.
     pub fn push_back(&self, j: Box<DiskJob>) {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .queued
-            .push_back(j);
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match kind_slot(&j) {
+            0 => g.queued_writes += 1,
+            1 => g.queued_hashes += 1,
+            _ => g.queued_other += 1,
+        }
+        g.queued.push_back(j);
     }
 
     /// `pop_front`.
     #[must_use]
     pub fn pop_front(&self) -> Option<Box<DiskJob>> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .queued
-            .pop_front()
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let j = g.queued.pop_front();
+        if let Some(j) = &j {
+            match kind_slot(j) {
+                0 => g.queued_writes = g.queued_writes.saturating_sub(1),
+                1 => g.queued_hashes = g.queued_hashes.saturating_sub(1),
+                _ => g.queued_other = g.queued_other.saturating_sub(1),
+            }
+        }
+        j
     }
 
     /// `queue_size`.
@@ -175,13 +202,21 @@ impl DiskIoThreadPool {
             .len()
     }
 
-    /// `submit_jobs` — wake workers and spawn as needed.
+    /// `submit_jobs` — wake workers and spawn as needed. The wake is
+    /// conditional: at high enqueue rates every push used to
+    /// `notify_all` even when all workers were already running —
+    /// thousands of spurious wakeups per second (observed as
+    /// machine-wide stutter on a 25 k-block burst). Workers re-check
+    /// `queued` under the lock before sleeping, so a running pool
+    /// needs no signal at all.
     pub fn submit_jobs(self: &Arc<Self>) {
         let n = self.queue_size();
         if n == 0 {
             return;
         }
-        self.job_cond.notify_all();
+        if self.num_idle.load(Ordering::Relaxed) > 0 {
+            self.job_cond.notify_all();
+        }
         self.job_queued(n);
     }
 
@@ -315,6 +350,14 @@ impl DiskIoThreadPool {
         self.threads.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
+    /// `(writes, hashes, other)` queued-job counts — O(1) counterpart
+    /// of walking `queued` for `queue_stats`.
+    #[must_use]
+    pub fn kind_counts(&self) -> (usize, usize, usize) {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        (g.queued_writes, g.queued_hashes, g.queued_other)
+    }
+
     /// `visit_jobs` — inspect queued jobs (abort scan).
     pub fn visit_jobs<F: FnMut(&DiskJob)>(&self, mut f: F) {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -325,7 +368,11 @@ impl DiskIoThreadPool {
 
     /// Drain all queued jobs (abort path).
     pub fn drain_jobs(&self) -> JobQueue {
-        std::mem::take(&mut self.inner.lock().unwrap_or_else(|e| e.into_inner()).queued)
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.queued_writes = 0;
+        g.queued_hashes = 0;
+        g.queued_other = 0;
+        std::mem::take(&mut g.queued)
     }
 
     /// `m_min_idle_threads` reset happens in `reap_idle_threads`;

@@ -184,6 +184,13 @@ pub trait DiskIo: Send + Sync {
     /// read/hash jobs open files with `no_cache` (ADR-0015).
     fn set_read_no_cache(&self, _v: bool) {}
 
+    /// perf probe (temporary) — cumulative `(flush µs, flush jobs,
+    /// completion-path µs, st.write µs, flushed bytes, WriteFile µs)`
+    /// spent by disk workers.
+    fn flush_perf(&self) -> (u64, u64, u64, u64, u64, u64) {
+        (0, 0, 0, 0, 0, 0)
+    }
+
     /// `settings_pack::cache_expiry` — seconds a dirty block may sit
     /// in the write cache before the periodic flush (upstream 60).
     fn set_cache_expiry(&self, _secs: u64) {}

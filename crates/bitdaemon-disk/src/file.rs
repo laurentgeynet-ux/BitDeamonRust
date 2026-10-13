@@ -27,6 +27,47 @@ impl FileHandle {
     /// `set_len` after open, matching `file_handle`'s ctor behavior
     /// of extending the file when `mode & write`.
     pub fn open(name: &Path, size: u64, mode: OpenMode) -> io::Result<Self> {
+        let file = Self::open_with_options(name, mode)?;
+        #[cfg(windows)]
+        {
+            // upstream file.cpp:578 — FSCTL_SET_SPARSE on write opens
+            // marked sparse; failure tolerated (non-NTFS volumes).
+            if mode.contains(OpenMode::WRITE) && mode.contains(OpenMode::SPARSE) {
+                win32::set_sparse(&file);
+            }
+        }
+        #[cfg(unix)]
+        {
+            // upstream file.cpp — post-open cache hints:
+            // F_NOCACHE/F_NODIRECT (apple), fadvise(SEQUENTIAL).
+            if mode.contains(OpenMode::NO_CACHE) {
+                posix::set_nocache(&file);
+            }
+            if mode.contains(OpenMode::SEQUENTIAL_ACCESS) {
+                posix::fadvise_sequential(&file);
+            }
+        }
+        // Upstream does NOT extend sparse files — they grow organically
+        // at each write (sparse holes read as zero without VDL cost).
+        // Only non-sparse (allocate-mode) files are sized up-front; on
+        // Windows `set_len` sets EOF without advancing the Valid Data
+        // Length, so `SetFileValidData` is what actually skips the
+        // per-write synchronous zero-fill (file.cpp:585-600).
+        if mode.contains(OpenMode::WRITE) && size > 0 && !mode.contains(OpenMode::SPARSE) {
+            file.set_len(size)?;
+            #[cfg(windows)]
+            {
+                if mode.contains(OpenMode::ALLOW_SET_FILE_VALID_DATA) {
+                    win32::set_file_valid_data(&file, size);
+                }
+            }
+        }
+        Ok(Self { file })
+    }
+
+    /// `OpenOptions` for `mode` — shared by the primary open and the
+    /// extra cursor lanes (Windows).
+    fn open_with_options(name: &Path, mode: OpenMode) -> io::Result<File> {
         let mut opts = OpenOptions::new();
         opts.read(true);
         if mode.contains(OpenMode::WRITE) {
@@ -83,45 +124,14 @@ impl FileHandle {
                 opts.attributes(FILE_ATTRIBUTE_HIDDEN);
             }
         }
-        let file = opts.open(name)?;
-        #[cfg(windows)]
-        {
-            // upstream file.cpp:578 — FSCTL_SET_SPARSE on write opens
-            // marked sparse; failure tolerated (non-NTFS volumes).
-            if mode.contains(OpenMode::WRITE) && mode.contains(OpenMode::SPARSE) {
-                win32::set_sparse(&file);
-            }
-        }
-        #[cfg(unix)]
-        {
-            // upstream file.cpp — post-open cache hints:
-            // F_NOCACHE/F_NODIRECT (apple), fadvise(SEQUENTIAL).
-            if mode.contains(OpenMode::NO_CACHE) {
-                posix::set_nocache(&file);
-            }
-            if mode.contains(OpenMode::SEQUENTIAL_ACCESS) {
-                posix::fadvise_sequential(&file);
-            }
-        }
-        // Upstream does NOT extend sparse files — they grow organically
-        // at each write (sparse holes read as zero without VDL cost).
-        // Only non-sparse (allocate-mode) files are sized up-front; on
-        // Windows `set_len` sets EOF without advancing the Valid Data
-        // Length, so `SetFileValidData` is what actually skips the
-        // per-write synchronous zero-fill (file.cpp:585-600).
-        if mode.contains(OpenMode::WRITE) && size > 0 && !mode.contains(OpenMode::SPARSE) {
-            file.set_len(size)?;
-            #[cfg(windows)]
-            {
-                if mode.contains(OpenMode::ALLOW_SET_FILE_VALID_DATA) {
-                    win32::set_file_valid_data(&file, size);
-                }
-            }
-        }
-        Ok(Self { file })
+        opts.open(name)
     }
 
-    /// Access the underlying `File`.
+    /// Access the underlying `File`. Positioned I/O on it is
+    /// thread-safe on every platform: `pread`/`pwrite` on unix, and
+    /// `ReadFile`/`WriteFile` with an `OVERLAPPED` offset on Windows
+    /// (`win32::pread`/`pwrite`) — neither touches the shared file
+    /// pointer, so no lock is needed (upstream file.cpp:198/234).
     #[must_use]
     pub fn file(&self) -> &File {
         &self.file
@@ -158,8 +168,7 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::FileExt;
-        file.seek_read(buf, offset)
+        win32::pread(file, buf, offset)
     }
 }
 
@@ -171,8 +180,7 @@ fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::FileExt;
-        file.seek_write(buf, offset)
+        win32::pwrite(file, buf, offset)
     }
 }
 
@@ -340,19 +348,97 @@ pub fn sync_file(file: &File, _offset: u64, _len: u64) -> io::Result<()> {
 /// best-effort (errors ignored like upstream).
 #[cfg(windows)]
 #[allow(unsafe_code)]
-mod win32 {
+pub(crate) mod win32 {
     use std::fs::File;
+    use std::io;
     use std::os::windows::io::AsRawHandle;
     use std::sync::Once;
-    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, HANDLE};
     use windows_sys::Win32::Security::{
         AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_MANAGE_VOLUME_NAME,
         SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
     };
     use windows_sys::Win32::Storage::FileSystem::SetFileValidData;
+    use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_SPARSE;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// Positioned read — `file.cpp:198` upstream: `ReadFile` with the
+    /// byte offset inside `OVERLAPPED`. The operation runs at the
+    /// given offset without touching the handle's shared file
+    /// pointer, so concurrent calls on one handle are race-free (the
+    /// Windows equivalent of POSIX `pread`). Returns `Ok(0)` at EOF
+    /// (`ERROR_HANDLE_EOF`), matching `FileExt::seek_read`.
+    pub fn pread(file: &File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+        let mut ol: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // only the byte-offset variant is set (hEvent stays null).
+        ol.Anonymous.Anonymous.Offset = (offset & 0xffff_ffff) as u32;
+        ol.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+        let mut n: u32 = 0;
+        let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        // SAFETY: `buf` is a valid writable slice that outlives the
+        // call; `ol` is a valid `OVERLAPPED` for the call's duration;
+        // the handle was opened synchronously so the call blocks
+        // until the transfer completes.
+        let ok = unsafe {
+            ReadFile(
+                file.as_raw_handle() as HANDLE,
+                buf.as_mut_ptr(),
+                len,
+                &mut n,
+                &mut ol,
+            )
+        };
+        if ok != 0 {
+            return Ok(n as usize);
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+            return Ok(0);
+        }
+        Err(err)
+    }
+
+    /// perf probe (temporary) — cumulative µs inside `WriteFile`
+    /// itself, isolating kernel time (dirty-page throttle etc.) from
+    /// the surrounding storage code.
+    pub static OS_WRITE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// Positioned write — `file.cpp:234` upstream: `WriteFile` with
+    /// the byte offset inside `OVERLAPPED`; race-free under
+    /// concurrency (POSIX `pwrite` equivalent — see [`pread`]).
+    pub fn pwrite(file: &File, buf: &[u8], offset: u64) -> io::Result<usize> {
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+        let mut ol: OVERLAPPED = unsafe { std::mem::zeroed() };
+        // only the offset variant is set (hEvent stays null).
+        ol.Anonymous.Anonymous.Offset = (offset & 0xffff_ffff) as u32;
+        ol.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+        let mut n: u32 = 0;
+        let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        let t = std::time::Instant::now();
+        // SAFETY: `buf` is a valid readable slice that outlives the
+        // call; `ol` is a valid `OVERLAPPED` for the call's duration;
+        // synchronous handle → the call blocks until completion.
+        let ok = unsafe {
+            WriteFile(
+                file.as_raw_handle() as HANDLE,
+                buf.as_ptr(),
+                len,
+                &mut n,
+                &mut ol,
+            )
+        };
+        OS_WRITE_US.fetch_add(
+            t.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        if ok != 0 {
+            return Ok(n as usize);
+        }
+        Err(io::Error::last_os_error())
+    }
 
     /// `file.cpp:578` — `DeviceIoControl(FSCTL_SET_SPARSE)`. Errors
     /// ignored upstream (non-NTFS volume, permission) — same here.

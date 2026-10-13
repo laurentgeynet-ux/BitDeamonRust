@@ -21,6 +21,7 @@ use bitdaemon_common::types::{FileIndex, PeerRequest, PieceIndex, StorageIndex};
 use bitdaemon_common::{Bitfield, Sha1Hash};
 use bitdaemon_core::file_storage::RenamedFiles;
 use bitdaemon_dht::dht_tracker::DhtTracker;
+use bitdaemon_disk::back_pressure::PeerWriteGates;
 use bitdaemon_disk::disk_buffer_pool::DiskBufferHolder;
 use bitdaemon_disk::disk_interface::DiskIo;
 use bitdaemon_disk::storage::StorageParams;
@@ -285,6 +286,13 @@ pub struct Session {
     pub dht: DhtTracker,
     /// `m_disk_thread` — injected backend (`StorageFactory` seam).
     pub disk: Option<Arc<dyn DiskIo>>,
+    /// `peer_info::bw_disk` registry shared with the engine's socket
+    /// pumps — a per-`(info_hash, peer)` read gate, set while that
+    /// peer's own disk write is in flight over the queue limit and
+    /// cleared the moment it completes (ADR: replaces the old global
+    /// freeze-until-low-watermark gate that stalled every peer for as
+    /// long as the slowest flush in a burst took).
+    pub write_gates: Option<Arc<PeerWriteGates<(Sha1Hash, u64)>>>,
     /// `m_alert_manager`.
     pub alerts: AlertManager,
     /// `m_stats_counters`.
@@ -433,6 +441,10 @@ pub enum DiskCompleted {
     Write {
         /// torrent.
         ih: Sha1Hash,
+        /// the peer that sent this block (`on_disk_write_complete`'s
+        /// `this` upstream) — clears its `bw_disk` read gate once its
+        /// own `outstanding_writing_bytes` drains to zero.
+        peer: u64,
         /// block written.
         req: PeerRequest,
         /// job result.
@@ -518,6 +530,7 @@ impl Default for Session {
             torrents: BTreeMap::new(),
             dht: DhtTracker::default(),
             disk: None,
+            write_gates: None,
             alerts: AlertManager::default(),
             counters: Counters::default(),
             peer_id: bitdaemon_common::peer_id::generate_peer_id(b"-OB0001-"),
@@ -690,7 +703,22 @@ impl Session {
                         });
                     }
                 }
-                DiskCompleted::Write { ih, req, err } => {
+                DiskCompleted::Write { ih, peer, req, err } => {
+                    // `on_disk_write_complete` clears `m_outstanding_writing_bytes`
+                    // (and the `bw_disk` read gate once it hits zero)
+                    // unconditionally — success or error, the write is
+                    // no longer in flight for this peer.
+                    if let Some(t) = self.torrents.get_mut(&ih)
+                        && let Some(p) = t.peers.get_mut(&peer)
+                    {
+                        p.outstanding_writing_bytes =
+                            (p.outstanding_writing_bytes - i64::from(req.length)).max(0);
+                        if p.outstanding_writing_bytes == 0
+                            && let Some(gates) = &self.write_gates
+                        {
+                            gates.clear_blocked((ih, peer));
+                        }
+                    }
                     if err.is_err() {
                         self.alerts.post(Alert::FileError {
                             ih,
@@ -942,24 +970,37 @@ impl Session {
                         0,
                     );
                 }
-                TorrentEffect::DiskWrite { req, data } => {
+                TorrentEffect::DiskWrite { peer, req, data } => {
                     let Some(t) = self.torrents.get(&ih) else {
                         continue;
                     };
                     let storage = t.storage;
-                    let req = *req;
+                    let (peer, req) = (*peer, *req);
                     let tx = self.disk_tx.clone();
                     let holder = DiskBufferHolder::from_owned(data.clone());
-                    disk.async_write(
+                    // `incoming_piece`'s `exceeded` — the disk queue
+                    // was already over its limit when this block was
+                    // handed off; unlike the global cache watermark,
+                    // only THIS peer gets held back, and only until
+                    // its own write (tracked below) lands.
+                    let exceeded = disk.async_write(
                         storage,
                         req,
                         holder,
                         None,
                         Box::new(move |err| {
-                            let _ = tx.send(DiskCompleted::Write { ih, req, err });
+                            let _ = tx.send(DiskCompleted::Write { ih, peer, req, err });
                         }),
                         0,
                     );
+                    if let Some(t) = self.torrents.get_mut(&ih)
+                        && let Some(p) = t.peers.get_mut(&peer)
+                    {
+                        p.outstanding_writing_bytes += i64::from(req.length);
+                        if exceeded && let Some(gates) = &self.write_gates {
+                            gates.set_blocked((ih, peer));
+                        }
+                    }
                 }
                 TorrentEffect::ReadPiece { piece } => {
                     // `torrent::read_piece` — whole piece buffer
@@ -1029,6 +1070,13 @@ impl Session {
         io.set_read_no_cache(self.settings.disk_io_read_mode.bypasses_os_cache());
         io.set_cache_expiry(self.settings.cache_expiry.as_secs());
         self.disk = Some(io);
+    }
+
+    /// Share the per-peer `bw_disk` gate table with the engine — the
+    /// same `Arc` must be handed to both sides (the engine's socket
+    /// pumps poll it, this actor flips it from write submit/complete).
+    pub fn set_write_gates(&mut self, gates: Arc<PeerWriteGates<(Sha1Hash, u64)>>) {
+        self.write_gates = Some(gates);
     }
 
     /// `add_torrent` — insert (or replace) a swarm.
@@ -1785,6 +1833,10 @@ impl Session {
         let mut off = 0i32;
         for chunk in data.chunks(16384) {
             eff.push(TorrentEffect::DiskWrite {
+                // `add_piece` injects data out-of-band (no peer sent
+                // it) — the same sentinel web-seed writes use, since
+                // neither has a socket pump to gate.
+                peer: crate::torrent::Torrent::WEB_SEED_PEER,
                 req: bitdaemon_common::types::PeerRequest {
                     piece,
                     start: off,

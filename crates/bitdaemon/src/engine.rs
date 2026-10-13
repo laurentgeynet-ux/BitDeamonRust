@@ -308,6 +308,17 @@ pub struct Engine {
     /// and calls `drain_disk_completed` instead of batching to the
     /// 1 Hz tick.
     disk_notify: Arc<tokio::sync::Notify>,
+    /// disk backend handle.
+    disk: Option<Arc<dyn bitdaemon_disk::disk_interface::DiskIo>>,
+    /// `peer_info::bw_disk` gate table, shared with the session —
+    /// each pump polls its own `(ih, peer)` entry to stop reading the
+    /// socket while *its* block is queued on an over-limit disk
+    /// (upstream `peer_connection::can_read` returning false closes
+    /// the TCP window for that peer only; the gate clears the moment
+    /// that peer's own write lands, not when the whole queue drains).
+    write_gates: Option<
+        Arc<bitdaemon_disk::back_pressure::PeerWriteGates<(bitdaemon_common::Sha1Hash, u64)>>,
+    >,
     /// `m_peer_ssl_ctx` SNI dispatch — per-info-hash `CertifiedKey`
     /// map for SSL-torrent listen sockets (`ssl_server_name_callback`
     /// upstream). Fed by [`Self::refresh_ssl_certs`].
@@ -383,7 +394,28 @@ impl Engine {
             ssl_roots: Arc::new(bitdaemon_net::ssl_stream::SslTorrentRoots::new()),
             pending_out: Vec::new(),
             disk_notify: Arc::new(tokio::sync::Notify::new()),
+            disk: None,
+            write_gates: None,
         }
+    }
+
+    /// `session_impl::set_disk_io` — the CLI hands the same backend
+    /// it puts in `SessionParams` so peer pumps can consult the
+    /// write-queue back-pressure level.
+    pub fn set_disk(&mut self, disk: Arc<dyn bitdaemon_disk::disk_interface::DiskIo>) {
+        self.disk = Some(disk);
+    }
+
+    /// Share the per-peer `bw_disk` gate table — the CLI hands the
+    /// same `Arc` to the session (`Session::set_write_gates`) so both
+    /// sides read/write the same entries.
+    pub fn set_write_gates(
+        &mut self,
+        gates: Arc<
+            bitdaemon_disk::back_pressure::PeerWriteGates<(bitdaemon_common::Sha1Hash, u64)>,
+        >,
+    ) {
+        self.write_gates = Some(gates);
     }
 
     /// handle for the disk completion queue's drain poster —
@@ -2654,6 +2686,7 @@ impl Engine {
         let dl = self.download_limiter.clone();
         let tul = self.torrent_up_limiters.get(&ih).cloned();
         let tdl = self.torrent_down_limiters.get(&ih).cloned();
+        let write_gates = self.write_gates.clone();
         // one task owns the stream: select between inbound decode and
         // outbound encode (upstream's per-connection pump). Reads go
         // through `read_buf` + a persistent buffer — `read_message`'s
@@ -2663,9 +2696,29 @@ impl Engine {
         let h = tokio::spawn(async move {
             let mut buf = bytes::BytesMut::with_capacity(256 * 1024);
             let mut rc4 = rc4;
+            let gate = write_gates.as_ref().map(|g| g.gate((ih, peer)));
             'pump: loop {
                 tokio::select! {
-                    r = tokio::io::AsyncReadExt::read_buf(&mut s, &mut buf) => {
+                    // `peer_connection::can_read` — while *this* peer
+                    // has a block queued on an over-limit disk, its
+                    // socket is not read at all, closing the TCP
+                    // window so it stops sending more; the gate
+                    // clears the instant that peer's own write lands
+                    // (upstream `on_disk_write_complete`), not when
+                    // the whole cache drains — a slow/seek-bound disk
+                    // no longer freezes every unrelated peer for the
+                    // duration of the burst.
+                    r = async {
+                        while gate.as_ref().is_some_and(|g| {
+                            g.load(std::sync::atomic::Ordering::Relaxed)
+                        }) {
+                            tokio::time::sleep(
+                                std::time::Duration::from_millis(10),
+                            )
+                            .await;
+                        }
+                        tokio::io::AsyncReadExt::read_buf(&mut s, &mut buf).await
+                    } => {
                         match r {
                             Ok(0) => {
                                 debug!(peer = peer, remote = ?remote, err = %"eof", "peer read error, dropping");
@@ -2781,6 +2834,9 @@ impl Engine {
                         }
                     }
                 }
+            }
+            if let Some(g) = &write_gates {
+                g.remove(&(ih, peer));
             }
             let _ = gone_tx.send((ih, peer));
         });

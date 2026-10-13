@@ -41,8 +41,14 @@ pub enum TorrentEffect {
     /// `dht_tracker::add_node` — a peer announced its DHT port;
     /// ping the node into the routing table.
     DhtNode(std::net::SocketAddr),
-    /// write a downloaded block.
-    DiskWrite { req: PeerRequest, data: Vec<u8> },
+    /// write a downloaded block. `peer` is the connection that sent
+    /// it (upstream `incoming_piece`'s `this`) — drives the per-peer
+    /// `bw_disk` read gate, not just completion routing.
+    DiskWrite {
+        peer: u64,
+        req: PeerRequest,
+        data: Vec<u8>,
+    },
     /// verify a piece's hash (`verify_piece` — resume restore and
     /// post-write verification).
     DiskHash { piece: PieceIndex },
@@ -1811,7 +1817,11 @@ impl Torrent {
                     }
                 }
                 PeerEffect::DiskWrite(req, data) => {
-                    out.push(TorrentEffect::DiskWrite { req, data });
+                    out.push(TorrentEffect::DiskWrite {
+                        peer: peer_id,
+                        req,
+                        data,
+                    });
                 }
                 PeerEffect::ReadRequest(req) => {
                     // super-seeding: requests outside the piece we
@@ -2608,9 +2618,8 @@ impl Torrent {
             upload_mode: self.upload_mode,
             valid_metadata: true,
             files_checked: true,
-            // disk back-pressure behaves like a request pause:
-            // no new picks while the write queue is above the cap.
-            graceful_pause: self.graceful_pause || self.disk_back_pressure,
+            // graceful pause stops picking new blocks
+            graceful_pause: self.graceful_pause,
             time_critical_mode: false,
             num_peers: self.peers.len() as i32,
             whole_pieces_threshold: 0,
@@ -2681,8 +2690,13 @@ impl Torrent {
                 .is_some_and(|p| p.mark_as_downloading(b, key, opts))
             {
                 let now_ms = self.now_ms;
+                let start = b.block_index * 0x4000;
+                let psize = self.files.as_ref().map_or(self.piece_length, |f| {
+                    i64::from(f.piece_size(b.piece_index))
+                });
+                let req_len = (psize - i64::from(start)).min(0x4000) as i32;
                 if let Some(c2) = self.peers.get_mut(&peer_id) {
-                    c2.add_request(b, busy, false, now_ms);
+                    c2.send_request(b, busy, false, req_len, now_ms);
                 }
                 // `peer_connection::add_request` posts
                 // `block_downloading_alert` once the block is
@@ -2705,16 +2719,12 @@ impl Torrent {
                 // dernier bloc d'une piece partielle n'est jamais
                 // 0x4000 (les pairs stricts droppent une requete
                 // hors limites).
-                let start = b.block_index * 0x4000;
-                let psize = self.files.as_ref().map_or(self.piece_length, |f| {
-                    i64::from(f.piece_size(b.piece_index))
-                });
                 out.push(TorrentEffect::SendTo {
                     peer: peer_id,
                     msg: PeerMessage::Request(PeerRequest {
                         piece: b.piece_index,
                         start,
-                        length: (psize - i64::from(start)).min(0x4000) as i32,
+                        length: req_len,
                     }),
                 });
             }
@@ -2753,9 +2763,7 @@ impl Torrent {
             upload_mode: false,
             valid_metadata: true,
             files_checked: true,
-            // disk back-pressure behaves like a request pause:
-            // no new picks while the write queue is above the cap.
-            graceful_pause: self.graceful_pause || self.disk_back_pressure,
+            graceful_pause: self.graceful_pause,
             time_critical_mode: false,
             num_peers: (self.peers.len() + 1) as i32,
             whole_pieces_threshold: 0,
@@ -2842,7 +2850,11 @@ impl Torrent {
         if let Some(p) = self.picker.as_mut() {
             p.mark_as_writing(b, Some(Self::WEB_SEED_PEER));
         }
-        out.push(TorrentEffect::DiskWrite { req, data });
+        out.push(TorrentEffect::DiskWrite {
+            peer: Self::WEB_SEED_PEER,
+            req,
+            data,
+        });
     }
 
     /// a web-seed fetch failed — release the blocks so they can be
@@ -4041,21 +4053,43 @@ impl Torrent {
         if let Some(prev_t) = self.stat_sample {
             let dt = (now - prev_t).as_secs_f64();
             if dt > 0.0 {
-                self.down_rate = (down as f64 / dt) as i64;
-                self.up_rate = (up as f64 / dt) as i64;
-                // per-peer `stat::rate()` — bytes/sec over the tick.
+                let current_torrent_down = (down as f64 / dt) as i64;
+                let current_torrent_up = (up as f64 / dt) as i64;
+                self.down_rate = if self.down_rate == 0 {
+                    current_torrent_down
+                } else {
+                    (self.down_rate * 4 + current_torrent_down) / 5
+                };
+                self.up_rate = if self.up_rate == 0 {
+                    current_torrent_up
+                } else {
+                    (self.up_rate * 4 + current_torrent_up) / 5
+                };
+                // per-peer `stat::rate()` — 5-second exponential moving average
+                // matching upstream `stat_channel::second_tick` (`m_5_sec_average = m_5_sec_average * 4 / 5 + sample / 5`).
                 for c in self.peers.values_mut() {
                     let down_delta = c.stat_down_total - c.last_down_total;
-                    c.rate_down_speed =
+                    let current_down =
                         (down_delta as f64 / dt).clamp(0.0, f64::from(i32::MAX)) as i32;
-                    c.rate_up_speed = ((c.stat_up_total - c.last_up_total) as f64 / dt)
+                    let current_up = ((c.stat_up_total - c.last_up_total) as f64 / dt)
                         .clamp(0.0, f64::from(i32::MAX))
                         as i32;
+                    c.rate_down_speed = if c.rate_down_speed == 0 {
+                        current_down
+                    } else {
+                        ((i64::from(c.rate_down_speed) * 4 + i64::from(current_down)) / 5) as i32
+                    };
+                    c.rate_up_speed = if c.rate_up_speed == 0 {
+                        current_up
+                    } else {
+                        ((i64::from(c.rate_up_speed) * 4 + i64::from(current_up)) / 5) as i32
+                    };
                     // upstream `second_tick` slow-start exit: the
                     // rate stopped growing (prev + 5 K slack >=
-                    // current) → hand over to rate-based AIMD.
+                    // current) after reaching minimum pipeline depth → hand over to rate-based AIMD.
                     if c.pipeline.slow_start
                         && !c.peer_choked
+                        && c.pipeline.desired_queue_size >= 8
                         && c.down_delta_prev > 0
                         && c.down_delta_prev + 5000 >= down_delta
                     {

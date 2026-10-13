@@ -209,10 +209,16 @@ pub struct ClearPieceJob {
 /// folds this into `disk_io_thread`'s cache flush. Drains a
 /// contiguous `store_buffer` region through one `writev`.
 pub struct FlushJob {
-    /// `piece`.
+    /// `piece` — the first piece covered (routing + gate key).
     pub piece: PieceIndex,
     /// index of the first block covered.
     pub first_block: i32,
+    /// `coalesce_writes` — when a run reaches the end of its piece and
+    /// the next piece starts dirty at block 0, the two are contiguous
+    /// in file space and upstream flushes them in a single writev.
+    /// `spans` splits `bufs` back into `(piece, first_block, n_bufs)`
+    /// for completion bookkeeping; empty for a single-piece flush.
+    pub spans: Vec<(PieceIndex, i32, usize)>,
     /// contiguous block buffers (≤ 16 KiB each, last may be short).
     pub bufs: Vec<Vec<u8>>,
 }

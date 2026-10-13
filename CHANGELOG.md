@@ -9,6 +9,31 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- `session::peer_conn` & `torrent::drive_peer`: in-flight requests were
+  tracked in `request_queue` instead of `download_queue` upon transmission,
+  causing `check_request_timeouts` to wipe active downloads on 2s inactivity
+  ticks and discard subsequent incoming blocks as unsolicited
+  (`unwanted_block_alert`). Transmitted requests now enter `download_queue`
+  via `PeerConn::send_request`, keeping the pipeline active and ensuring
+  unsnubbing on piece arrival.
+- `session::torrent`: removed swarm-wide `disk_back_pressure` freeze from
+  `TorrentRequestCtx::graceful_pause`, resolving sawtoothing and throughput
+  collapses caused by global picking halts during disk write bursts.
+  Back-pressure is now managed per-peer via `PeerWriteGates` socket reading
+  suspension.
+- `session::torrent`: smoothed `rate_down_speed` and `rate_up_speed` using
+  upstream libtorrent's 5-second exponential moving average (`stat_channel::second_tick`)
+  to prevent single-tick instantaneous drops from collapsing `desired_queue_size`
+  to minimum bounds, and guarded slow-start exit until reaching minimum queue
+  depth (`desired_queue_size >= 8`).
+- `net::os_transports`: enabled `TCP_NODELAY` on connected and accepted TCP
+  streams in `TokioTcpConnector` and `TokioTcpAcceptor`, eliminating Nagle
+  algorithm transmission delays on 17-byte request frames.
+- `disk::file` (Windows): implemented `win32::pread` and `win32::pwrite`
+  using `OVERLAPPED` offsets, removing file pointer locks for concurrent
+  I/O; enabled OS write cache and sparse mode default in `bitdaemon-cli`
+  to avoid synchronous zero-fill stalls on non-elevated NTFS writes.
+
 - `disk_io::job_done`: `JobKind::Flush` retired its cached blocks via
   `run_flushed` **unconditionally** — a failed (or aborted) region
   write left blocks flagged `flushed` without bytes on disk: silent

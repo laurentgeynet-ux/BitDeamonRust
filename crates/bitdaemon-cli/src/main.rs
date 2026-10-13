@@ -112,11 +112,27 @@ struct Args {
     #[arg(long, default_value_t = 1)]
     hashing_threads: i64,
 
+    /// Dedicated flush-write threads (not an upstream setting — one
+    /// physical write at a time avoids concurrent seeks on a
+    /// rotating disk; raise it on SSD/NVMe where parallel writers
+    /// don't fight a single head, or set 0 to use `--aio-threads`
+    /// like every other job).
+    #[arg(long, default_value_t = 1)]
+    flush_threads: i64,
+
     /// Disable `SetFileValidData` on non-sparse file extension
     /// (Windows; enabled by default for qBittorrent parity —
     /// upstream `enable_set_file_valid_data`, ADR-0022).
     #[arg(long)]
     no_set_file_valid_data: bool,
+
+    /// Allocation mode `[sparse|allocate]` — upstream `client_test
+    /// -a`. Default `sparse`: allocated regions grow organically, so
+    /// out-of-order writes never trigger NTFS synchronous zero-fill
+    /// (`allocate` without the SeManageVolume privilege stalls to
+    /// ~60 writes/s on a large file).
+    #[arg(long, value_parser = ["sparse", "allocate"], default_value = "sparse")]
+    allocation: String,
 
     /// SSL-torrent server certificate PEM (upstream
     /// `set_ssl_certificate` cert path).
@@ -191,7 +207,11 @@ enum EncLevelArg {
     Both,
 }
 
-fn load_atp(arg: &str, save_path: &std::path::Path) -> anyhow::Result<AddTorrentParams> {
+fn load_atp(
+    arg: &str,
+    save_path: &std::path::Path,
+    mode: bitdaemon::core::StorageMode,
+) -> anyhow::Result<AddTorrentParams> {
     let mut atp = if arg.starts_with("magnet:") {
         parse_magnet(arg.as_bytes()).map_err(|e| anyhow::anyhow!("magnet: {e}"))?
     } else {
@@ -199,7 +219,7 @@ fn load_atp(arg: &str, save_path: &std::path::Path) -> anyhow::Result<AddTorrent
         load_torrent(&buf).map_err(|e| anyhow::anyhow!("torrent: {e}"))?
     };
     atp.save_path = save_path.as_os_str().as_encoded_bytes().to_vec();
-    atp.storage_mode = bitdaemon::core::StorageMode::Allocate;
+    atp.storage_mode = mode;
     Ok(atp)
 }
 
@@ -211,6 +231,11 @@ async fn main() -> anyhow::Result<()> {
         args.resume.is_none() || args.torrent.len() == 1,
         "--resume only pairs with a single positional torrent"
     );
+    let mode = if args.allocation == "allocate" {
+        bitdaemon::core::StorageMode::Allocate
+    } else {
+        bitdaemon::core::StorageMode::Sparse
+    };
     let mut atps = Vec::new();
     for entry in &args.torrent {
         let mut atp = if let Some(resume) = &args.resume {
@@ -223,7 +248,7 @@ async fn main() -> anyhow::Result<()> {
             // a resume without an embedded info dict still needs metadata
             // from the positional .torrent/magnet
             if a.ti.is_none() {
-                let base = load_atp(entry, &args.save_path)?;
+                let base = load_atp(entry, &args.save_path, mode)?;
                 a.ti = base.ti;
                 a.info_hashes = base.info_hashes;
                 if a.trackers.is_empty() {
@@ -231,10 +256,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             a.save_path = args.save_path.as_os_str().as_encoded_bytes().to_vec();
-            a.storage_mode = bitdaemon::core::StorageMode::Allocate;
+            a.storage_mode = mode;
             a
         } else {
-            load_atp(entry, &args.save_path)?
+            load_atp(entry, &args.save_path, mode)?
         };
         if args.seed {
             atp.flags |= bitdaemon::common::flags::TorrentFlags::SEED_MODE;
@@ -297,6 +322,16 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(move || n.notify_one())
     });
     disk.set_hash_threads(args.hashing_threads);
+    disk.set_flush_threads(args.flush_threads);
+    eng.set_disk(disk.clone());
+    // `peer_info::bw_disk` per-peer gate table — shared between the
+    // engine's socket pumps (which poll it) and the session actor
+    // (which flips it from write submit/complete). A peer's reads
+    // pause only while *its own* block is queued on an over-limit
+    // disk, not the whole swarm (upstream `peer_connection::can_read`).
+    let write_gates = Arc::new(bitdaemon::disk::back_pressure::PeerWriteGates::new());
+    eng.set_write_gates(write_gates.clone());
+    slock(&eng.session).set_write_gates(write_gates);
     {
         use bitdaemon::disk::open_mode::OpenMode;
         let mut extra = OpenMode::NO_ATIME;
@@ -334,6 +369,13 @@ async fn main() -> anyhow::Result<()> {
     if args.no_os_cache {
         slock(&eng.session).settings.disk_io_write_mode =
             bitdaemon::session::settings::DiskIoMode::DisableOsCache;
+    } else {
+        // qBittorrent defaults `disk_io_write_mode` to
+        // `enable_os_cache` even on Windows (upstream default is
+        // `write_through`) — synchronous WriteFile calls at ~13 ms
+        // per scattered run were the throughput ceiling.
+        slock(&eng.session).settings.disk_io_write_mode =
+            bitdaemon::session::settings::DiskIoMode::EnableOsCache;
     }
     if args.no_os_read_cache {
         slock(&eng.session).settings.disk_io_read_mode =
@@ -600,8 +642,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(d) = &guard.disk {
                 let q = d.queue_stats();
+                let (fus, fn_, cus, wus, fbytes, osw) = d.flush_perf();
                 println!(
-                    "disk queue: w={} h={} other={} parked={} write_blocks={} cache={} unhashed={} bufs={} threads={} ro={} rb={} bp={}",
+                    "disk queue: w={} h={} other={} parked={} write_blocks={} cache={} unhashed={} bufs={} threads={} ro={} rb={} bp={} favg={:.2}ms wavg={:.2}ms fkb={} cavg={:.2}ms fn={} fb={}MiB osw={:.2}ms",
                     q.queued_writes,
                     q.queued_hashes,
                     q.queued_other,
@@ -614,6 +657,13 @@ async fn main() -> anyhow::Result<()> {
                     q.num_read_ops,
                     q.num_blocks_read,
                     d.write_queue_exceeded(),
+                    fus as f64 / 1000.0 / (fn_.max(1) as f64),
+                    wus as f64 / 1000.0 / (fn_.max(1) as f64),
+                    fbytes / 1024 / (fn_.max(1)),
+                    cus as f64 / 1000.0 / (fn_.max(1) as f64),
+                    fn_,
+                    fbytes / 1024 / 1024,
+                    osw as f64 / 1000.0 / (fn_.max(1) as f64),
                 );
             }
             for (ih, t) in &guard.torrents {

@@ -120,6 +120,12 @@ pub struct PeerConn {
     /// `m_reading_bytes` — payload bytes of disk reads in flight for
     /// this peer (issued, completion not yet drained).
     pub reading_bytes: usize,
+    /// `m_outstanding_writing_bytes` — payload bytes of blocks this
+    /// peer sent us that are queued for a disk write, not yet
+    /// confirmed landed. Drives the per-peer `bw_disk` read gate
+    /// (`peer_conn::PeerWriteGates`): unlike the global disk-queue
+    /// watermark, a peer is only held back by *its own* writes.
+    pub outstanding_writing_bytes: i64,
     /// `m_num_invalid_requests`.
     pub num_invalid_requests: i32,
     /// `m_num_pieces` — total pieces the peer announced.
@@ -216,6 +222,7 @@ impl PeerConn {
             upload_queue: Vec::new(),
             send_buffer: 0,
             reading_bytes: 0,
+            outstanding_writing_bytes: 0,
             num_invalid_requests: 0,
             num_pieces: 0,
             connect_ms: now_ms,
@@ -475,6 +482,8 @@ impl PeerConn {
         };
         self.pipeline.on_piece_received(self.now_ms);
         let _ = self.cancel_request(block);
+        self.pipeline.outstanding_bytes =
+            (self.pipeline.outstanding_bytes - i64::from(r.length)).max(0);
         // upstream `incoming_piece`: while requests remain, the next
         // expected block gets a fresh timeout window — `m_requested`
         // is the last-receive watermark, not the queue's age.
@@ -727,6 +736,27 @@ impl PeerConn {
         self.pipeline.request_queue.push(pb);
     }
 
+    /// `send_request(pb, flags, len, now_ms)` — record an issued wire request
+    /// in `download_queue` (in-flight awaiting payload).
+    pub fn send_request(
+        &mut self,
+        block: PieceBlock,
+        busy: bool,
+        time_critical: bool,
+        length: i32,
+        now_ms: i64,
+    ) {
+        if self.pipeline.download_queue.is_empty() {
+            self.pipeline.requested_ms = now_ms;
+        }
+        self.pipeline.last_request_ms = now_ms;
+        let mut pb = PendingBlock::new(block);
+        pb.busy = busy;
+        pb.time_critical = time_critical;
+        self.pipeline.outstanding_bytes += i64::from(length);
+        self.pipeline.download_queue.push(pb);
+    }
+
     /// Cancel an outstanding request (`peer_connection::cancel_block`
     /// shape — timed out or rejected).
     pub fn cancel_request(&mut self, block: PieceBlock) -> bool {
@@ -750,6 +780,7 @@ impl PeerConn {
         // `m_requested` — re-arm the timeout on the remaining head.
         if self.pipeline.download_queue.is_empty() && self.pipeline.request_queue.is_empty() {
             self.pipeline.requested_ms = 0;
+            self.pipeline.outstanding_bytes = 0;
         }
         true
     }

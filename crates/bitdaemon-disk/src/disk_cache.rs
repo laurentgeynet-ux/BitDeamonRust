@@ -24,6 +24,16 @@ pub const DEFAULT_BLOCK_SIZE: i64 = 0x4000;
 /// `piece_location` — the cache key.
 pub type PieceLocation = (StorageIndex, PieceIndex);
 
+/// [`DiskCache::take_coalesced`]'s return: `(job_loc, first_block,
+/// spans, bufs)` where `spans` splits `bufs` into per-piece
+/// `(piece, first_block, n_bufs)` runs.
+pub type CoalescedFlush = (
+    PieceLocation,
+    i32,
+    Vec<(PieceIndex, i32, usize)>,
+    Vec<Vec<u8>>,
+);
+
 /// `cached_block_entry`.
 #[derive(Debug)]
 pub struct CachedBlockEntry {
@@ -89,6 +99,23 @@ pub fn count_jobs(blocks: &[CachedBlockEntry]) -> u16 {
     blocks.iter().filter(|b| b.has_write_job).count() as u16
 }
 
+/// Longest contiguous run of flushable blocks (`buf` present, not
+/// flushed, no in-flight write) — the piece's `runs_index` score.
+#[must_use]
+fn best_dirty_run(p: &CachedPieceEntry) -> usize {
+    let mut best = 0;
+    let mut cur = 0;
+    for b in &p.blocks {
+        if b.buf.is_some() && !b.flushed && !b.has_write_job {
+            cur += 1;
+            best = best.max(cur);
+        } else {
+            cur = 0;
+        }
+    }
+    best
+}
+
 /// `cached_piece_entry`.
 #[derive(Debug)]
 pub struct CachedPieceEntry {
@@ -139,6 +166,40 @@ pub struct InsertResult {
 #[derive(Debug, Default)]
 pub struct DiskCache {
     pieces: HashMap<PieceLocation, CachedPieceEntry>,
+    /// `m_lru` — dirty pieces in oldest-first order; `take_oldest_run`
+    /// drains from the front instead of scanning the whole map on
+    /// every block (upstream keeps the same linked list). Stale
+    /// entries (fully flushed / removed) are skipped lazily.
+    lru: std::collections::VecDeque<PieceLocation>,
+    /// Pieces with every block present (downloaded or hashed) —
+    /// upstream's `force_flush`/`cheap` passes: they yield large
+    /// contiguous runs (up to a whole piece) so they are flushed
+    /// *before* random partial-piece runs, which produce small
+    /// scattered writes that throttle the disk. Stale entries are
+    /// skipped lazily like `lru`.
+    ready: std::collections::VecDeque<PieceLocation>,
+    /// Upstream's ordered `get<1>` index — pieces ranked by their
+    /// longest contiguous dirty run (`hasher_cursor - flushed_cursor`
+    /// upstream; our whole-piece hasher can't rank hashed partials,
+    /// so the largest flushable run is the closest equivalent).
+    /// `run_len` holds each piece's current score; `runs_index` is
+    /// `(score, loc)` ordered so `next_back` is the best candidate.
+    run_len: HashMap<PieceLocation, usize>,
+    runs_index: std::collections::BTreeSet<(usize, PieceLocation)>,
+    /// Elevator (SCAN disk-scheduling) index: every piece location
+    /// with at least one flushable dirty block, ordered by piece
+    /// index (a monotonic proxy for file offset — pieces lay out
+    /// sequentially in the backing file(s)). On a seek-bound rotating
+    /// disk, draining the cache in LRU/largest-run order jumps the
+    /// head across the whole file on every flush; sweeping ascending
+    /// piece order instead keeps consecutive flushes close together,
+    /// the same trick kernel I/O schedulers use. Entries are removed
+    /// lazily by [`Self::take_elevator_run`]/[`Self::remove_piece`].
+    dirty_sorted: std::collections::BTreeSet<PieceLocation>,
+    /// Where the last elevator flush left off — the next sweep
+    /// resumes just past it, wrapping to the lowest piece index once
+    /// past the end (classic "look"/SCAN cycle, not back-and-forth).
+    scan_head: Option<PieceLocation>,
     /// `m_blocks` — blocks whose buffers the cache (or the v2 queue)
     /// owns; feeds `back_pressure`.
     pub num_cached_blocks: i64,
@@ -196,6 +257,15 @@ impl DiskCache {
                 unhashed: 0,
             }
         });
+        // first dirty buffer on this piece → join the lru so
+        // `take_oldest_run` finds it in O(1) (upstream `m_lru`).
+        let had_dirty = piece.blocks.iter().any(|x| x.buf.is_some());
+        if !had_dirty && buf.is_some() {
+            self.lru.push_back(loc);
+        }
+        if buf.is_some() {
+            self.dirty_sorted.insert(loc);
+        }
         if let Some(b) = piece.blocks.get_mut(block_idx) {
             // `m_num_unhashed` counts cached blocks the hasher has
             // not consumed — only a freshly landed buffer adds one;
@@ -206,6 +276,12 @@ impl DiskCache {
             }
             b.buf = buf;
             b.has_write_job = true;
+        }
+        // the piece just became complete (every block buffered or
+        // already flushed) → candidate for a large contiguous flush
+        // before partial pieces (upstream `force_flush` pass).
+        if piece.blocks.iter().all(|b| b.buf.is_some() || b.flushed) {
+            self.ready.push_back(loc);
         }
         if params.v2 {
             piece.v2_pending += 1;
@@ -223,6 +299,7 @@ impl DiskCache {
         {
             ret.need_hasher_kick = true;
         }
+        self.refresh_run_index(loc);
         ret
     }
 
@@ -257,6 +334,40 @@ impl DiskCache {
         if let Some(p) = self.pieces.remove(&loc) {
             self.num_unhashed -= i64::from(p.unhashed);
         }
+        if let Some(o) = self.run_len.remove(&loc) {
+            self.runs_index.remove(&(o, loc));
+        }
+        self.dirty_sorted.remove(&loc);
+    }
+
+    /// Recompute the piece's `runs_index` score after any mutation of
+    /// its flushable-block set.
+    fn refresh_run_index(&mut self, loc: PieceLocation) {
+        let Some(p) = self.pieces.get(&loc) else {
+            if let Some(o) = self.run_len.remove(&loc) {
+                self.runs_index.remove(&(o, loc));
+            }
+            return;
+        };
+        let n = best_dirty_run(p);
+        match self.run_len.get(&loc).copied() {
+            Some(o) if o == n => {}
+            Some(o) => {
+                self.runs_index.remove(&(o, loc));
+                if n > 0 {
+                    self.runs_index.insert((n, loc));
+                    self.run_len.insert(loc, n);
+                } else {
+                    self.run_len.remove(&loc);
+                }
+            }
+            None => {
+                if n > 0 {
+                    self.runs_index.insert((n, loc));
+                    self.run_len.insert(loc, n);
+                }
+            }
+        }
     }
 
     /// read-side lookup — the block's cached bytes.
@@ -283,6 +394,7 @@ impl DiskCache {
             p.flushed_cursor = compute_flushed_cursor(&p.blocks);
             p.num_jobs -= 1;
         }
+        self.refresh_run_index(loc);
     }
 
     /// `try_flush_blocks` — take the first contiguous run of dirty,
@@ -306,7 +418,156 @@ impl DiskCache {
             b.has_write_job = true;
             bufs.push(buf);
         }
-        (!bufs.is_empty()).then_some((start as i32, bufs))
+        let out = (!bufs.is_empty()).then_some((start as i32, bufs));
+        self.refresh_run_index(loc);
+        out
+    }
+
+    /// Take the piece's *longest* contiguous run of dirty,
+    /// not-in-flight blocks — backing [`Self::take_largest_run`]
+    /// (upstream's ordered `get<1>` pass writes the most
+    /// contiguous span first).
+    fn take_longest_run(&mut self, loc: PieceLocation) -> Option<(i32, Vec<Vec<u8>>)> {
+        let p = self.pieces.get_mut(&loc)?;
+        let mut best_start = 0usize;
+        let mut best_len = 0usize;
+        let mut cur_start = 0usize;
+        let mut cur_len = 0usize;
+        for (i, b) in p.blocks.iter().enumerate() {
+            if b.buf.is_some() && !b.flushed && !b.has_write_job {
+                if cur_len == 0 {
+                    cur_start = i;
+                }
+                cur_len += 1;
+                if cur_len > best_len {
+                    best_len = cur_len;
+                    best_start = cur_start;
+                }
+            } else {
+                cur_len = 0;
+            }
+        }
+        if best_len == 0 {
+            return None;
+        }
+        let mut bufs = Vec::with_capacity(best_len);
+        for b in &mut p.blocks[best_start..best_start + best_len] {
+            let Some(buf) = b.buf.take() else {
+                break;
+            };
+            b.has_write_job = true;
+            bufs.push(buf);
+        }
+        let out = (!bufs.is_empty()).then_some((best_start as i32, bufs));
+        self.refresh_run_index(loc);
+        out
+    }
+
+    /// One run from the piece with the largest contiguous dirty span
+    /// — upstream's ordered flush pass ("flush pieces that have the
+    /// most contiguous blocks"). Bigger writes coalesce into
+    /// near-sequential disk traffic instead of scattered 2-3-block
+    /// writes. Skips stale index entries lazily.
+    pub fn take_largest_run(&mut self) -> Option<(PieceLocation, i32, Vec<Vec<u8>>)> {
+        while let Some(&(len, loc)) = self.runs_index.iter().next_back() {
+            self.runs_index.remove(&(len, loc));
+            self.run_len.remove(&loc);
+            if let Some((first, bufs)) = self.take_longest_run(loc) {
+                return Some((loc, first, bufs));
+            }
+        }
+        None
+    }
+
+    /// Elevator/SCAN pick: the lowest dirty piece location whose index
+    /// is `>= scan_head`, wrapping to the overall lowest once past the
+    /// end — a monotonic sweep instead of the LRU/largest-run order's
+    /// essentially random jumps. Not upstream (libtorrent doesn't
+    /// distinguish disk media), but a standard disk-scheduling
+    /// technique and the dominant lever for seek-bound rotating
+    /// disks: on an HDD, `fkb`-sized (tens of KiB) concurrent writes
+    /// from several threads at scattered offsets cost one seek each —
+    /// sweeping ascending keeps consecutive flushes close together.
+    /// Stale/emptied entries are dropped lazily like the other
+    /// indices.
+    pub fn take_elevator_run(&mut self) -> Option<(PieceLocation, i32, Vec<Vec<u8>>)> {
+        loop {
+            let probe = self.scan_head.map_or_else(
+                || self.dirty_sorted.iter().next().copied(),
+                |head| {
+                    self.dirty_sorted
+                        .range(head..)
+                        .next()
+                        .or_else(|| self.dirty_sorted.iter().next())
+                        .copied()
+                },
+            );
+            let loc = probe?;
+            if let Some((first, bufs)) = self.take_flush_run(loc) {
+                // resume just past this piece next sweep; if it's
+                // still dirty (a gap/in-flight write left more
+                // behind), the next `range(head..)` call finds it
+                // again naturally without special-casing.
+                self.scan_head = Some((loc.0, PieceIndex(loc.1.0 + 1)));
+                return Some((loc, first, bufs));
+            }
+            // emptied/stale — drop it and keep sweeping.
+            self.dirty_sorted.remove(&loc);
+        }
+    }
+
+    /// `coalesce_writes` — take one run (ready → elevator sweep →
+    /// largest → oldest) then extend it across piece boundaries: a
+    /// run ending at a piece's last block followed by the next
+    /// piece's dirty blocks starting at 0 is one contiguous file
+    /// region, flushed as a single writev like upstream builds its
+    /// iovec over the ordered dirty-block set. Stops at `max_blocks`
+    /// buffers or the first gap. Returns `(job_loc, first_block,
+    /// spans, bufs)` where `spans` splits `bufs` into per-piece
+    /// `(piece, first_block, n_bufs)` runs for `run_flushed`/
+    /// `restore_run` bookkeeping.
+    pub fn take_coalesced(&mut self, max_blocks: usize) -> Option<CoalescedFlush> {
+        let (job_loc, job_first, mut bufs) = self
+            .take_ready_run()
+            .or_else(|| self.take_elevator_run())
+            .or_else(|| self.take_largest_run())
+            .or_else(|| self.take_oldest_run())?;
+        let mut spans = vec![(job_loc.1, job_first, bufs.len())];
+        let mut end_loc = job_loc;
+        // exclusive block index just past the last buffer taken
+        let mut end = usize::try_from(job_first).unwrap_or(0) + bufs.len();
+        while bufs.len() < max_blocks {
+            // the run must reach the end of its piece to continue
+            let reaches_end = self
+                .pieces
+                .get(&end_loc)
+                .is_some_and(|p| end == p.blocks.len());
+            if !reaches_end {
+                break;
+            }
+            let next = (end_loc.0, PieceIndex(end_loc.1.0 + 1));
+            // …and the next piece must start dirty at block 0
+            let starts_at_zero = self.pieces.get(&next).is_some_and(|p| {
+                p.blocks
+                    .first()
+                    .is_some_and(|b| b.buf.is_some() && !b.flushed && !b.has_write_job)
+            });
+            if !starts_at_zero {
+                break;
+            }
+            let Some((nfirst, nbufs)) = self.take_flush_run(next) else {
+                break;
+            };
+            if nfirst != 0 {
+                self.restore_run(next, usize::try_from(nfirst).unwrap_or(0), nbufs);
+                break;
+            }
+            spans.push((next.1, nfirst, nbufs.len()));
+            end = nbufs.len();
+            end_loc = next;
+            bufs.extend(nbufs);
+        }
+        Some((job_loc, job_first, spans, bufs))
     }
 
     /// All dirty contiguous runs of `loc` (for fence-time full flush).
@@ -319,19 +580,57 @@ impl DiskCache {
         runs
     }
 
-    /// One dirty run from whichever piece holds one — the
-    /// over-limit drain step of `try_flush_blocks` (ADR-0013):
-    /// callers loop until the cache level reaches the low
-    /// watermark.
+    /// One dirty run from the oldest dirty piece — upstream
+    /// `oldest_dirty_piece()` walks `m_lru` front-to-back; scanning
+    /// the whole `pieces` map here made the over-limit drain
+    /// quadratic (thousands of entries per incoming block on a
+    /// 25 k-piece swarm). Stale lru entries are skipped lazily; a
+    /// piece still dirty after the taken run re-queues at the back.
     pub fn take_oldest_run(&mut self) -> Option<(PieceLocation, i32, Vec<Vec<u8>>)> {
-        let loc = self.pieces.iter().find_map(|(l, p)| {
-            p.blocks
-                .iter()
-                .any(|b| b.buf.is_some() && !b.flushed && !b.has_write_job)
-                .then_some(*l)
-        })?;
-        let (first, bufs) = self.take_flush_run(loc)?;
-        Some((loc, first, bufs))
+        while let Some(loc) = self.lru.pop_front() {
+            let Some((first, bufs)) = self.take_flush_run(loc) else {
+                continue;
+            };
+            // still dirty (another run behind a gap/in-flight
+            // write) → re-queue so it isn't starved.
+            let still_dirty = self.pieces.get(&loc).is_some_and(|p| {
+                p.blocks
+                    .iter()
+                    .any(|b| b.buf.is_some() && !b.flushed && !b.has_write_job)
+            });
+            if still_dirty {
+                self.lru.push_back(loc);
+            }
+            return Some((loc, first, bufs));
+        }
+        None
+    }
+
+    /// One dirty run from the oldest *complete* piece — upstream's
+    /// optimistic/`force_flush` pass flushes fully-arrived (or
+    /// hashed) pieces first because they coalesce into large
+    /// contiguous writes. Returns `None` when no complete piece is
+    /// queued; the caller falls back to [`Self::take_oldest_run`]
+    /// (the "expensive" partial-piece pass).
+    pub fn take_ready_run(&mut self) -> Option<(PieceLocation, i32, Vec<Vec<u8>>)> {
+        while let Some(loc) = self.ready.pop_front() {
+            let Some((first, bufs)) = self.take_flush_run(loc) else {
+                continue;
+            };
+            // still complete with more dirty blocks behind a
+            // gap/in-flight write → re-queue at the back.
+            let still_ready = self.pieces.get(&loc).is_some_and(|p| {
+                p.blocks.iter().all(|b| b.buf.is_some() || b.flushed)
+                    && p.blocks
+                        .iter()
+                        .any(|b| b.buf.is_some() && !b.flushed && !b.has_write_job)
+            });
+            if still_ready {
+                self.ready.push_back(loc);
+            }
+            return Some((loc, first, bufs));
+        }
+        None
     }
 
     /// Put a failed flush's buffers back — upstream `flush_piece`
@@ -340,17 +639,24 @@ impl DiskCache {
     /// retries it. Blocks already re-inserted (a duplicate write
     /// landed while the flush was in flight) keep their newer buffer.
     pub fn restore_run(&mut self, loc: PieceLocation, first: usize, bufs: Vec<Vec<u8>>) {
-        let Some(p) = self.pieces.get_mut(&loc) else {
-            return;
-        };
-        for (i, buf) in bufs.into_iter().enumerate() {
-            if let Some(b) = p.blocks.get_mut(first + i)
-                && b.buf.is_none()
-            {
-                b.buf = Some(buf);
-                b.has_write_job = false;
+        let ready = {
+            let Some(p) = self.pieces.get_mut(&loc) else {
+                return;
+            };
+            for (i, buf) in bufs.into_iter().enumerate() {
+                if let Some(b) = p.blocks.get_mut(first + i)
+                    && b.buf.is_none()
+                {
+                    b.buf = Some(buf);
+                    b.has_write_job = false;
+                }
             }
+            p.blocks.iter().all(|b| b.buf.is_some() || b.flushed)
+        };
+        if ready {
+            self.ready.push_back(loc);
         }
+        self.refresh_run_index(loc);
     }
 
     /// Every dirty run across the whole cache — used before a
@@ -386,6 +692,8 @@ impl DiskCache {
         }
         if free {
             self.remove_piece(loc);
+        } else {
+            self.refresh_run_index(loc);
         }
     }
 
@@ -433,6 +741,16 @@ impl DiskCache {
             self.num_unhashed -= i64::from(p.unhashed);
             p.unhashed = 0;
             free = p.blocks.iter().all(|b| b.flushed);
+            // upstream `force_flush_flag` on hash-returned: a hashed
+            // piece with dirty blocks is flushed promptly, ahead of
+            // partial pieces.
+            if !free
+                && p.blocks
+                    .iter()
+                    .any(|b| b.buf.is_some() && !b.flushed && !b.has_write_job)
+            {
+                self.ready.push_back(loc);
+            }
         }
         if free {
             self.remove_piece(loc);
