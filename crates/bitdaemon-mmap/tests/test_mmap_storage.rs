@@ -88,8 +88,8 @@ fn pool_evicts_lru() {
     let pool = FileViewPool::new(1);
     let p1 = d.join("a.bin");
     let p2 = d.join("b.bin");
-    let v1 = pool.open(&p1, 64).unwrap();
-    let v2 = pool.open(&p2, 64).unwrap();
+    let v1 = pool.open(&p1, 64, OpenMode::WRITE).unwrap();
+    let v2 = pool.open(&p2, 64, OpenMode::WRITE).unwrap();
     assert_eq!(pool.len(), 1);
     // v1 still usable after eviction (shared mapping)
     v1.write_at(0, b"xy").unwrap();

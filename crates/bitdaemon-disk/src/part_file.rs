@@ -133,7 +133,7 @@ impl PartFile {
 
     fn open_file(&self, mode: OpenMode) -> io::Result<FileHandle> {
         let fnm = self.path.join(&self.name);
-        FileHandle::open(&fnm, 0, mode)
+        FileHandle::open(&fnm, 0, mode).map_err(|e| e.source)
     }
 
     fn lock(&self) -> MutexGuard<'_, Locked> {

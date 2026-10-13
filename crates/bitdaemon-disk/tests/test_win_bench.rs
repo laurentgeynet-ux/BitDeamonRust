@@ -72,7 +72,14 @@ fn sparse_pwrite_latency() {
     // same but non-sparse (allocate-style full file)
     let path2 = dir.join("bench_full.bin");
     let _ = std::fs::remove_file(&path2);
-    let handle2 = Arc::new(FileHandle::open(&path2, FILE_LEN, OpenMode::WRITE).expect("open"));
+    let handle2 = Arc::new(
+        FileHandle::open(
+            &path2,
+            FILE_LEN,
+            OpenMode::WRITE | OpenMode::TRUNCATE | OpenMode::ALLOW_SET_FILE_VALID_DATA,
+        )
+        .expect("open"),
+    );
     total_us.store(0, Ordering::Relaxed);
     max_us.store(0, Ordering::Relaxed);
     let t0 = Instant::now();

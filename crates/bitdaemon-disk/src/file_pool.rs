@@ -363,8 +363,8 @@ impl FilePool {
         match FileHandle::open(file_path, u64::try_from(size).unwrap_or(0), mode) {
             Ok(fh) => Ok(Arc::new(fh)),
             Err(e) => {
-                if !(mode.contains(OpenMode::WRITE) && e.kind() == io::ErrorKind::NotFound) {
-                    return Err(StorageError::new(e, file_index, Operation::FileOpen));
+                if !(mode.contains(OpenMode::WRITE) && e.source.kind() == io::ErrorKind::NotFound) {
+                    return Err(StorageError::new(e.source, file_index, e.operation));
                 }
                 if let Some(parent) = file_path.parent() {
                     fs::create_directories(parent)
@@ -372,7 +372,7 @@ impl FilePool {
                 }
                 FileHandle::open(file_path, u64::try_from(size).unwrap_or(0), mode)
                     .map(Arc::new)
-                    .map_err(|e2| StorageError::new(e2, file_index, Operation::FileOpen))
+                    .map_err(|e2| StorageError::new(e2.source, file_index, e2.operation))
             }
         }
     }

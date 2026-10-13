@@ -1069,6 +1069,7 @@ impl Session {
         io.set_write_no_cache(self.settings.disk_io_write_mode.bypasses_os_cache());
         io.set_read_no_cache(self.settings.disk_io_read_mode.bypasses_os_cache());
         io.set_cache_expiry(self.settings.cache_expiry.as_secs());
+        io.set_open_mode_extra(open_mode_extra(&self.settings));
         self.disk = Some(io);
     }
 
@@ -2391,6 +2392,7 @@ impl Session {
             d.set_write_no_cache(s.disk_io_write_mode.bypasses_os_cache());
             d.set_read_no_cache(s.disk_io_read_mode.bypasses_os_cache());
             d.set_cache_expiry(s.cache_expiry.as_secs());
+            d.set_open_mode_extra(open_mode_extra(&s));
         }
         self.alerts.set_queue_limit(s.alert_queue_size);
         // `update_alert_mask` — upstream hot-applies the persisted
@@ -4040,4 +4042,23 @@ impl Session {
     /// `Bitfield` re-export used by tests/callers.
     #[doc(hidden)]
     pub fn _bitfield_marker(_: &Bitfield) {}
+}
+
+/// `settings_pack` → extra `OpenMode` bits pushed into every storage's
+/// file opens (upstream `pread_storage::open_file` reads them live
+/// from `settings_interface`; we snapshot them per storage).
+fn open_mode_extra(s: &crate::settings::SessionSettings) -> bitdaemon_disk::open_mode::OpenMode {
+    use bitdaemon_disk::open_mode::OpenMode;
+    let mut m = OpenMode::NONE;
+    if s.no_atime_storage {
+        m |= OpenMode::NO_ATIME;
+    }
+    // upstream pread_storage.cpp:730-735 — `#ifdef _WIN32` only.
+    #[cfg(windows)]
+    if s.enable_set_file_valid_data {
+        m |= OpenMode::ALLOW_SET_FILE_VALID_DATA;
+    }
+    #[cfg(not(windows))]
+    let _ = s.enable_set_file_valid_data;
+    m
 }

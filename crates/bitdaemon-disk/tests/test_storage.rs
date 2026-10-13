@@ -170,24 +170,31 @@ fn verify_resume_seed_requires_sizes() {
 
 #[test]
 fn sparse_files_grow_organically_allocate_extends() {
-    // ADR-0022: sparse files are NOT extended to final size at open —
-    // upstream leaves them at 0 and writes extend them where data
-    // lands (FSCTL_SET_SPARSE handles zero-fill). Allocate mode still
-    // sizes the file up front.
+    // ADR-0022 + file.cpp:607-697: a sparse-mode file is still
+    // `ftruncate`d to its declared size on the first write-open —
+    // POSIX keeps a full `st_size` made of holes; Windows does not
+    // extend sparse files (FSCTL_SET_SPARSE + organic growth).
     let d = dir("sparse");
     let fs = make_fs();
     let prio = vec![DownloadPriority::DEFAULT; 2];
 
-    // sparse: write 24 bytes of b.bin (piece 0 tail) → on-disk size
-    // stays 24, not the declared 1000.
+    // write 24 bytes of b.bin (piece 0 tail)
     let st = storage(&fs, &d, &prio);
     st.set_storage_index(StorageIndex(0));
     st.write(&[7u8; 1024], PieceIndex(0), 0, OpenMode::WRITE)
         .unwrap();
     let len = stdfs::metadata(d.join("t/b.bin")).unwrap().len();
-    assert_eq!(len, 24, "sparse file must grow organically, got {len}");
+    #[cfg(unix)]
+    assert_eq!(
+        len, 1000,
+        "posix sparse: ftruncate sizes the file, got {len}"
+    );
+    #[cfg(windows)]
+    assert_eq!(len, 24, "windows sparse files grow organically, got {len}");
 
-    // allocate: same write → file is extended to its declared size.
+    // allocate: posix_fallocate reserves the declared size up front;
+    // on Windows upstream only extends when enable_set_file_valid_data
+    // is set (default off → organic growth, non-sparse zero-fill).
     let d2 = dir("alloc");
     let st2 = PreadStorage::new(
         StorageParams {
@@ -207,10 +214,73 @@ fn sparse_files_grow_organically_allocate_extends() {
     st2.write(&[7u8; 1024], PieceIndex(0), 0, OpenMode::WRITE)
         .unwrap();
     let len2 = stdfs::metadata(d2.join("t/b.bin")).unwrap().len();
-    assert_eq!(len2, 1000, "allocate file must be pre-sized, got {len2}");
+    #[cfg(unix)]
+    assert_eq!(len2, 1000, "posix_fallocate must pre-size, got {len2}");
+    #[cfg(windows)]
+    assert_eq!(len2, 24, "windows default grows organically, got {len2}");
+
+    // windows allocate + enable_set_file_valid_data → extended + SFVD.
+    #[cfg(windows)]
+    {
+        let d3 = dir("alloc_svfd");
+        let st3 = PreadStorage::new(
+            StorageParams {
+                files: &fs,
+                renamed: &RenamedFiles::default(),
+                path: d3.to_path_buf(),
+                part_file_dir: PathBuf::new(),
+                mode: bitdaemon_disk::storage::StorageMode::Allocate,
+                priorities: &prio,
+                info_hash: [7u8; 20],
+                v1: true,
+                v2: false,
+            },
+            Arc::new(FilePool::new(40)),
+        );
+        st3.set_storage_index(StorageIndex(0));
+        bitdaemon_disk::storage::DiskStorage::set_open_mode_extra(
+            &st3,
+            OpenMode::ALLOW_SET_FILE_VALID_DATA,
+        );
+        st3.write(&[7u8; 1024], PieceIndex(0), 0, OpenMode::WRITE)
+            .unwrap();
+        let len3 = stdfs::metadata(d3.join("t/b.bin")).unwrap().len();
+        assert_eq!(len3, 1000, "SFVD mode must pre-size, got {len3}");
+        stdfs::remove_dir_all(&d3).unwrap();
+    }
 
     stdfs::remove_dir_all(&d).unwrap();
     stdfs::remove_dir_all(&d2).unwrap();
+}
+
+/// `m_file_created` — the `truncate` resize must happen exactly once
+/// per file per session: after the first write-open, rewriting must
+/// not re-size the file (a manual shrink must survive further opens).
+#[test]
+fn truncate_happens_once_per_file() {
+    let d = dir("once");
+    let fs = make_fs();
+    let prio = vec![DownloadPriority::DEFAULT; 2];
+    let st = storage(&fs, &d, &prio);
+    st.set_storage_index(StorageIndex(0));
+    st.write(&[7u8; 1024], PieceIndex(0), 0, OpenMode::WRITE)
+        .unwrap();
+
+    // shrink below the declared size, then write again — a second
+    // `truncate` would grow it back to 1000; upstream must not.
+    let path = d.join("t/b.bin");
+    stdfs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(64)
+        .unwrap();
+    st.release_files().unwrap();
+    st.write(&[9u8; 4], PieceIndex(1), 0, OpenMode::WRITE)
+        .unwrap();
+    let len = stdfs::metadata(&path).unwrap().len();
+    assert_eq!(len, 64, "second open must not re-truncate, got {len}");
+    stdfs::remove_dir_all(&d).unwrap();
 }
 
 #[test]

@@ -76,10 +76,13 @@ on POSIX).
 **Phase N extension**: `file::posix` is the symmetric POSIX sibling
 (`#[cfg(unix)]`) holding `libc` calls for the advisory cache hints —
 `posix_fadvise(DONTNEED|SEQUENTIAL)` and apple `fcntl(F_NOCACHE|
-F_NODIRECT)`. `nix` was evaluated first: its `FcntlArg` does not
+F_NODIRECT)` — plus the allocation flags `posix_fallocate`, apple
+`fcntl(F_PREALLOCATE)` and linux `ioctl(FS_IOC_GETFLAGS|SETFLAGS)`
+for `no_cow`. `nix` was evaluated first: its `FcntlArg` does not
 expose `F_NOCACHE`/`F_NODIRECT`, so it would only cover fadvise —
 raw `libc` (already a workspace dependency) is the single mechanism.
-Every call is best-effort (upstream ignores hint failures).
+Every call is best-effort (upstream ignores hint failures); only
+`posix_fallocate` surfaces errors (`ENOSPC` → `file_fallocate`).
 
 Non-Windows platforms are otherwise unchanged — upstream's
 sparse/valid-data knobs are `#ifdef _WIN32` too; on POSIX `SPARSE`

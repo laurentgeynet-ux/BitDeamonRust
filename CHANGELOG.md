@@ -78,6 +78,29 @@ Until `1.0.0`, breaking changes may occur in any release.
   using `OVERLAPPED` offsets, removing file pointer locks for concurrent
   I/O; enabled OS write cache and sparse mode default in `bitdaemon-cli`
   to avoid synchronous zero-fill stalls on non-elevated NTFS writes.
+- `disk::file`/`disk::storage`: aligned file allocation with upstream
+  `file.cpp`/`pread_storage.cpp`. `open_mode::truncate` now means
+  "size to `file_size` once per session" (gated by `m_file_created`,
+  no longer mapped to `O_TRUNC`/`truncate(true)`); POSIX sparse-mode
+  files are `ftruncate`d to full length with holes (reads of unwritten
+  regions return zeros, and `verify_resume_data` no longer rejects
+  them for size mismatch); `storage_mode_allocate` now really reserves
+  blocks via `posix_fallocate` (and `F_PREALLOCATE` on macOS) so
+  `ENOSPC` surfaces at first write-open as `file_fallocate` —
+  `EINVAL`/`ENOTSUP` tolerated like upstream. Windows follows the
+  upstream gate: `SetFilePointerEx`+`SetEndOfFile`+`SetFileValidData`
+  only under `enable_set_file_valid_data` (default off → organic
+  growth with NTFS zero-fill), with `SeManageVolumePrivilege` acquired
+  before `CreateFileW` and the sparse attribute cleared on close when
+  no ranges were ever allocated. Added `no_cow` (`FS_NOCOW_FL`),
+  `O_NOATIME` retry-without on open failure, `executable`/`hidden`
+  file flags from `file_storage`, and `Operation::FileTruncate`/
+  `file_seek` error classification. `Session` now pushes
+  `no_atime_storage`/`enable_set_file_valid_data` into the disk layer
+  (`set_open_mode_extra`) at `set_disk` and `apply_settings` — live
+  storages included — instead of relying on `bitdaemon-cli`.
+  `bitdaemon-mmap` got the same once-only truncate/allocate/sparse
+  flow through `file::open_raw`.
 
 - `disk_io::job_done`: `JobKind::Flush` retired its cached blocks via
   `run_flushed` **unconditionally** — a failed (or aborted) region

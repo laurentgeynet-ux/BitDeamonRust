@@ -195,6 +195,13 @@ pub trait DiskIo: Send + Sync {
     /// in the write cache before the periodic flush (upstream 60).
     fn set_cache_expiry(&self, _secs: u64) {}
 
+    /// `settings_pack::enable_set_file_valid_data`/`no_atime_storage` —
+    /// extra `OpenMode` bits pushed into every storage's file opens.
+    /// Upstream reads them live from `settings_interface` inside
+    /// `pread_storage::open_file`; backends snapshot them per storage.
+    /// Default no-op for storages without tunable open flags.
+    fn set_open_mode_extra(&self, _mode: crate::open_mode::OpenMode) {}
+
     /// periodic flush of expired cache regions — called once per
     /// session tick (upstream's disk-thread flush timer).
     fn flush_expired(&self) {}

@@ -14,7 +14,9 @@ impl OpenMode {
     pub const WRITE: Self = Self::bit(0);
     /// `no_cache` — hint: don't keep data in the OS cache.
     pub const NO_CACHE: Self = Self::bit(1);
-    /// `truncate` — truncate to zero on open.
+    /// `truncate` — size the file to its declared `file_size` on this
+    /// open (added once per file per session, `m_file_created`);
+    /// never `O_TRUNC`/`TRUNCATE_EXISTING`.
     pub const TRUNCATE: Self = Self::bit(2);
     /// `no_atime` — don't update access time.
     pub const NO_ATIME: Self = Self::bit(3);

@@ -1787,9 +1787,22 @@ impl PreadDiskIo {
 
     /// `settings_pack::enable_set_file_valid_data` /
     /// `no_atime_storage` — extra `OpenMode` bits pushed to every
-    /// storage at `new_torrent`/`insert_storage` (ADR-0022).
+    /// storage at `new_torrent`/`insert_storage` (ADR-0022). Upstream
+    /// reads the settings live inside `open_file`, so we also
+    /// propagate to storages already constructed.
     pub fn set_open_mode_extra(&self, mode: crate::open_mode::OpenMode) {
         self.open_mode_extra.store(mode.bits(), Ordering::Relaxed);
+        for e in self
+            .storages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            e.storage
+                .read()
+                .unwrap_or_else(|e2| e2.into_inner())
+                .set_open_mode_extra(mode);
+        }
     }
 
     /// currently applied extra open flags.
@@ -2086,6 +2099,10 @@ impl DiskIo for PreadDiskIo {
 
     fn set_cache_expiry(&self, secs: u64) {
         PreadDiskIo::set_cache_expiry(self, secs);
+    }
+
+    fn set_open_mode_extra(&self, mode: crate::open_mode::OpenMode) {
+        PreadDiskIo::set_open_mode_extra(self, mode);
     }
 
     fn flush_expired(&self) {

@@ -19,13 +19,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use bitdaemon_common::types::{DownloadPriority, FileIndex, PieceIndex, StorageIndex};
-use bitdaemon_core::file_storage::{FileStorage, RenamedFiles};
+use bitdaemon_core::file_storage::{FileFlags, FileStorage, RenamedFiles};
 use bitdaemon_core::path::bytes_to_path;
 use bitdaemon_disk::open_mode::OpenMode;
 use bitdaemon_disk::part_file::PartFile;
 use bitdaemon_disk::readwrite::{readwrite_buf, readwrite_mut};
 use bitdaemon_disk::stat_cache::StatCache;
-use bitdaemon_disk::storage::{DiskStorage, MoveFlags, StorageParams, disk_status, remove_flags};
+use bitdaemon_disk::storage::{
+    DiskStorage, MoveFlags, StorageMode, StorageParams, disk_status, remove_flags,
+};
 use bitdaemon_disk::storage_error::{Operation, StorageError, StorageResult};
 use bitdaemon_disk::storage_utils;
 
@@ -39,6 +41,17 @@ pub struct MmapStorage {
     part_file_dir: PathBuf,
     part_file_name: PathBuf,
     pool: Arc<FileViewPool>,
+    /// `m_allocate_files` — `storage_mode_allocate`: reserve the
+    /// file's blocks (`posix_fallocate`/`SetFileValidData`) on its
+    /// first write-open.
+    allocate_files: bool,
+    /// `m_file_created` — files already sized to their final length
+    /// this session (upstream adds `open_mode::truncate` on the first
+    /// write-open only).
+    file_created: Mutex<Vec<bool>>,
+    /// `open_mode_extra` — settings-driven flags snapshot
+    /// (`allow_set_file_valid_data`, `no_atime`) pushed by `DiskIo`.
+    open_mode_extra: std::sync::atomic::AtomicU32,
     v1: bool,
     v2: bool,
     file_priority: Vec<DownloadPriority>,
@@ -67,6 +80,9 @@ impl MmapStorage {
             part_file_dir: params.part_file_dir,
             part_file_name: bytes_to_path(&name),
             pool,
+            allocate_files: params.mode == StorageMode::Allocate,
+            file_created: Mutex::new(vec![false; params.files.num_files() as usize]),
+            open_mode_extra: std::sync::atomic::AtomicU32::new(0),
             v1: params.v1,
             v2: params.v2,
             file_priority: params.priorities.to_vec(),
@@ -139,15 +155,54 @@ impl MmapStorage {
         self.save_path.join(bytes_to_path(&rel))
     }
 
-    /// `open_file` — pooled mapping honoring the rename overlay
-    /// (`file_view_pool::open_file`).
-    fn open_view(&self, index: FileIndex) -> Result<FileView, StorageError> {
-        self.pool
+    /// `mmap_storage::open_file` (mmap_storage.cpp:879-927) — same
+    /// mode resolution as `pread_storage::open_file`: the first
+    /// write-open of a file per session gets `truncate` (`m_file_created`),
+    /// `file_flags` → exec/hidden, sparse when `!m_allocate_files` or
+    /// priority 0; `extra_mode` folds in `no_atime`/
+    /// `allow_set_file_valid_data`.
+    fn open_file(&self, index: FileIndex, mode: OpenMode) -> Result<FileView, StorageError> {
+        let mut mode = mode | self.extra_mode();
+        if mode.contains(OpenMode::WRITE) && !mode.contains(OpenMode::TRUNCATE) {
+            let created = self.file_created.lock().unwrap_or_else(|e| e.into_inner());
+            if index.get() < created.len() && !created[index.get()] {
+                mode |= OpenMode::TRUNCATE;
+            }
+        }
+        let flags = self.files.file_flags(index);
+        if flags.contains(FileFlags::EXECUTABLE) {
+            mode |= OpenMode::EXECUTABLE;
+        }
+        if flags.contains(FileFlags::HIDDEN) {
+            mode |= OpenMode::HIDDEN;
+        }
+        if !self.allocate_files
+            || (index.get() < self.file_priority.len()
+                && self.file_priority[index.get()] == DownloadPriority::DONT_DOWNLOAD)
+        {
+            mode |= OpenMode::SPARSE;
+        }
+        let view = self
+            .pool
             .open(
                 &self.resolve_path(index),
                 self.files.file_size(index) as u64,
+                mode,
             )
-            .map_err(|e| StorageError::new(e, index, Operation::FileOpen))
+            .map_err(|e| StorageError::new(e, index, Operation::FileOpen))?;
+        if mode.contains(OpenMode::TRUNCATE) {
+            self.file_created.lock().unwrap_or_else(|e| e.into_inner())[index.get()] = true;
+        }
+        Ok(view)
+    }
+
+    /// settings-driven extra open flags snapshot (`extra_mode` —
+    /// upstream reads `settings_interface` inside `open_file`).
+    fn extra_mode(&self) -> OpenMode {
+        OpenMode::from_bits(
+            self.open_mode_extra
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn need_partfile(&self) {
@@ -175,7 +230,7 @@ impl MmapStorage {
         buffer: &mut [u8],
         piece: PieceIndex,
         offset: i64,
-        _mode: OpenMode,
+        mode: OpenMode,
         _volatile_read: bool,
     ) -> StorageResult<i64> {
         readwrite_mut(
@@ -200,7 +255,7 @@ impl MmapStorage {
                         .map_err(|e| StorageError::new(e, file_index, Operation::PartfileRead))?;
                     return Ok(usize::try_from(n).unwrap_or(0));
                 }
-                let view = self.open_view(file_index)?;
+                let view = self.open_file(file_index, mode)?;
                 let n = view
                     .read_at(u64::try_from(file_offset).unwrap_or(0), buf)
                     .map_err(|e| StorageError::new(e, file_index, Operation::FileRead))?;
@@ -216,7 +271,7 @@ impl MmapStorage {
         buffer: &[u8],
         piece: PieceIndex,
         offset: i64,
-        _mode: OpenMode,
+        mode: OpenMode,
     ) -> StorageResult<i64> {
         readwrite_buf(
             &self.files,
@@ -239,7 +294,7 @@ impl MmapStorage {
                         .map_err(|e| StorageError::new(e, file_index, Operation::PartfileWrite))?;
                     return Ok(usize::try_from(n).unwrap_or(0));
                 }
-                let view = self.open_view(file_index)?;
+                let view = self.open_file(file_index, mode | OpenMode::WRITE)?;
                 let n = view
                     .write_at(u64::try_from(file_offset).unwrap_or(0), buf)
                     .map_err(|e| StorageError::new(e, file_index, Operation::FileWrite))?;
@@ -255,7 +310,7 @@ impl MmapStorage {
         len: i64,
         piece: PieceIndex,
         offset: i64,
-        _mode: OpenMode,
+        mode: OpenMode,
         _volatile_read: bool,
     ) -> StorageResult<i64> {
         let mut scratch: Vec<u8> = Vec::new();
@@ -284,7 +339,7 @@ impl MmapStorage {
                     feed(&data);
                     return Ok(data.len());
                 }
-                let view = self.open_view(file_index)?;
+                let view = self.open_file(file_index, mode)?;
                 scratch.resize(buf.len(), 0);
                 let n = view
                     .read_at(u64::try_from(file_offset).unwrap_or(0), &mut scratch)
@@ -366,7 +421,7 @@ impl MmapStorage {
             &self.save_path,
             stat_cache_ptr,
             &self.file_priority,
-            |i| self.open_view(i).map(|_| ()),
+            |i| self.open_file(i, OpenMode::WRITE).map(|_| ()),
             |_target, _link| Ok(()),
             |_i, _size| {},
         )?;
@@ -429,7 +484,7 @@ impl MmapStorage {
 
             if old_prio == DownloadPriority::DONT_DOWNLOAD && new != DownloadPriority::DONT_DOWNLOAD
             {
-                let view = self.open_view(i)?;
+                let view = self.open_file(i, OpenMode::WRITE)?;
                 if self.use_partfile(i) {
                     let file_offset = self.files.file_offset(i);
                     let size = self.files.file_size(i);
@@ -556,6 +611,10 @@ impl DiskStorage for MmapStorage {
         links: &[PathBuf],
     ) -> StorageResult<bool> {
         MmapStorage::verify_resume_data(self, have_pieces, seed_mode, links)
+    }
+    fn set_open_mode_extra(&self, mode: OpenMode) {
+        self.open_mode_extra
+            .store(mode.bits(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 

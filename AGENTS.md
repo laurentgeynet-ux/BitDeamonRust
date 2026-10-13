@@ -39,8 +39,8 @@ crates/
   bitdaemon-net       peer wire, trackers, uTP, proxies, UPnP/NAT-PMP/LSD
   bitdaemon-dht       Mainline DHT (kademlia)
   bitdaemon-session   session/torrent actors, alerts, settings, choker
-  bitdaemon-mmap      mmap storage backend (feature-gated; sole
-                      unsafe-allowed crate — ADR-0010 §3)
+  bitdaemon-mmap      mmap storage backend (feature-gated;
+                      unsafe allowed for memmap2 — ADR-0010 §3)
   bitdaemon-sim       upstream simulation/ harness — deterministic
                       swarm tests over injected transports
   bitdaemon           facade: re-exports the public API
@@ -71,11 +71,15 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and an MSRV
 
 ## 4. Hard rules
 
-1. **`#![forbid(unsafe_code)]` everywhere.** No `unsafe` — *one
-   exception*: `bitdaemon-mmap` (ADR-0010 §3) may use `unsafe` for
-   `memmap2` inside its reviewed, feature-gated boundary; nothing
-   unsafe leaks into the public API. Dependencies using unsafe
-   internally are fine — *our* other crates do not.
+1. **`#![forbid(unsafe_code)]` everywhere.** No `unsafe` — *two
+   reviewed exceptions*: `bitdaemon-mmap` (ADR-0010 §3) may use
+   `unsafe` for `memmap2` inside its feature-gated boundary, and
+   `bitdaemon-disk` uses `#![deny]` with scoped `#[allow]` on
+   `file::{win32,posix}` for OS file controls (`FSCTL_SET_SPARSE`,
+   `SetFileValidData`, `posix_fallocate`, `posix_fadvise`,
+   `FS_NOCOW_FL`) that have no safe-std equivalent (ADR-0022 §3).
+   Nothing unsafe leaks into the public API. Dependencies using
+   unsafe internally are fine — *our* other crates do not.
 2. **No new dependency without an ADR note** in `docs/adr/0007-*` or a
    commit-message justification. Prefer crates ≥ 7 days old, pinned to
    minor versions in `[workspace.dependencies]`. See ADR-0007.

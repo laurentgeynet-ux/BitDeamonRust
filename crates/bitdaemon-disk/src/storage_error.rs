@@ -33,8 +33,11 @@ pub enum Operation {
     FileHardLink,
     /// `operation_t::file_fallocate`.
     FileFallocate,
-    /// `operation_t::file_fsync`.
+    /// `fsync`/`FlushFileBuffers` failure — our extension (upstream
+    /// reports it under `file`/`file_write`).
     FileFsync,
+    /// `operation_t::file_truncate` — `ftruncate`/`SetEndOfFile`.
+    FileTruncate,
     /// `operation_t::mkdir`.
     Mkdir,
     /// `operation_t::check_resume`.
@@ -47,10 +50,42 @@ pub enum Operation {
     PartfileRead,
     /// see above.
     PartfileMove,
-    /// see above.
+    /// recheck failures — our extension (upstream `check_resume`).
     CheckFiles,
-    /// `operation_t::save_resume_data`.
+    /// resume-data write failure — our extension.
     SaveResumeData,
+}
+
+impl Operation {
+    /// `operation_name()` — upstream alert text for this op
+    /// (alert.cpp `names[]`; `FileFsync` is our extension for sync
+    /// failures, upstream reports them under `file`).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::FileOpen => "file_open",
+            Self::FileRead => "file_read",
+            Self::FileWrite => "file_write",
+            Self::FileSeek => "file_seek",
+            Self::FileStat => "file_stat",
+            Self::FileRename => "file_rename",
+            Self::FileRemove => "file_remove",
+            Self::FileCopy => "file_copy",
+            Self::FileHardLink => "file_hard_link",
+            Self::FileFallocate => "file_fallocate",
+            Self::FileFsync => "file_fsync",
+            Self::FileTruncate => "file_truncate",
+            Self::Mkdir => "mkdir",
+            Self::CheckResume => "check_resume",
+            Self::AllocCachePiece => "alloc_cache_piece",
+            Self::PartfileWrite => "partfile_write",
+            Self::PartfileRead => "partfile_read",
+            Self::PartfileMove => "partfile_move",
+            Self::CheckFiles => "check_files",
+            Self::SaveResumeData => "save_resume_data",
+        }
+    }
 }
 
 /// `lt::storage_error` — which op failed, on which file, and the
@@ -92,8 +127,10 @@ impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{:?} on file {} failed: {}",
-            self.operation, self.file.0, self.io
+            "{} on file {} failed: {}",
+            self.operation.name(),
+            self.file.0,
+            self.io
         )
     }
 }

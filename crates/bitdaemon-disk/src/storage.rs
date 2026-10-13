@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use bitdaemon_common::types::{DownloadPriority, FileIndex, PieceIndex, StorageIndex};
-use bitdaemon_core::file_storage::{FileStorage, RenamedFiles};
+use bitdaemon_core::file_storage::{FileFlags, FileStorage, RenamedFiles};
 use bitdaemon_core::path::bytes_to_path;
 
 use crate::file::pwrite_all;
@@ -106,7 +106,9 @@ pub struct PreadStorage {
     part_file_dir: PathBuf,
     part_file_name: PathBuf,
     pool: Arc<FilePool>,
-    #[allow(dead_code)]
+    /// `m_allocate_files` — `storage_mode_allocate`: files are
+    /// physically reserved (`posix_fallocate`/`SetFileValidData`) on
+    /// their first write-open.
     allocate_files: bool,
     v1: bool,
     v2: bool,
@@ -115,7 +117,9 @@ pub struct PreadStorage {
     part_file: Mutex<Option<PartFile>>,
     stat_cache: StatCache,
     storage_index: Mutex<StorageIndex>,
-    #[allow(dead_code)]
+    /// `m_file_created` — which files have already been sized to their
+    /// final length this session (upstream adds `open_mode::truncate`
+    /// on the first write-open only).
     file_created: Mutex<Vec<bool>>,
     need_tick: std::sync::atomic::AtomicBool,
     /// `m_precomputed` — v2 block hashes saved by hash jobs for
@@ -225,29 +229,51 @@ impl PreadStorage {
     }
 
     /// `open_file` — pooled open honoring the rename overlay.
-    /// `pread_storage::open_file_impl` (pread_storage.cpp:760-768) —
-    /// resolves the effective `OpenMode` for `index`: sparse for
-    /// every file when `!m_allocate_files`, and for priority-0 files
-    /// unconditionally; `extra_mode` folds in settings-driven flags
-    /// (`allow_set_file_valid_data`, `no_atime`).
+    /// `pread_storage::open_file` (pread_storage.cpp:708-768): the
+    /// first write-open of a file per session gets `truncate` —
+    /// `file_handle` then sizes it to `file_size` and, when not
+    /// sparse, reserves the space (`posix_fallocate`/`SetFileValidData`);
+    /// `m_file_created` remembers it. `file_flags` → exec/hidden;
+    /// sparse for every file when `!m_allocate_files` and for
+    /// priority-0 files unconditionally; `extra_mode` folds in
+    /// settings-driven flags (`allow_set_file_valid_data`, `no_atime`).
     fn open_file(
         &self,
         index: FileIndex,
         mode: OpenMode,
     ) -> Result<Arc<crate::file::FileHandle>, StorageError> {
         let mut mode = mode | self.extra_mode();
+        if mode.contains(OpenMode::WRITE) && !mode.contains(OpenMode::TRUNCATE) {
+            let created = self.file_created.lock().unwrap_or_else(|e| e.into_inner());
+            if index.get() < created.len() && !created[index.get()] {
+                mode |= OpenMode::TRUNCATE;
+            }
+        }
+        let flags = self.files.file_flags(index);
+        if flags.contains(FileFlags::EXECUTABLE) {
+            mode |= OpenMode::EXECUTABLE;
+        }
+        if flags.contains(FileFlags::HIDDEN) {
+            mode |= OpenMode::HIDDEN;
+        }
         if !self.allocate_files
             || (index.get() < self.file_priority.len()
                 && self.file_priority[index.get()] == DownloadPriority::DONT_DOWNLOAD)
         {
             mode |= OpenMode::SPARSE;
         }
-        self.pool.open_file_at(
+        let handle = self.pool.open_file_at(
             (self.storage_index(), index),
             &self.resolve_path(index),
             self.files.file_size(index),
             mode,
-        )
+        )?;
+        if mode.contains(OpenMode::TRUNCATE) {
+            // sized once per session — upstream sets the bit after a
+            // successful open (pool hit or real open alike).
+            self.file_created.lock().unwrap_or_else(|e| e.into_inner())[index.get()] = true;
+        }
+        Ok(handle)
     }
 
     /// settings-driven extra open flags (upstream reads
