@@ -37,6 +37,7 @@ fn read_job(piece: i32) -> Box<DiskJob> {
             piece: PieceIndex(piece),
             offset: 0,
             volatile: false,
+            sequential: false,
         }),
     })
 }

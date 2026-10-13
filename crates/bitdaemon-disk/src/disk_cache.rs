@@ -18,20 +18,36 @@ use std::collections::HashMap;
 use bitdaemon_common::PieceIndex;
 use bitdaemon_common::types::StorageIndex;
 
+use crate::disk_job::DiskJob;
+
 /// `default_block_size` — 16 KiB blocks.
 pub const DEFAULT_BLOCK_SIZE: i64 = 0x4000;
 
 /// `piece_location` — the cache key.
 pub type PieceLocation = (StorageIndex, PieceIndex);
 
+/// A contiguous run taken for flushing: `(first_block, bufs,
+/// writers)` — `writers[i]` is the write job parked on the block
+/// `bufs[i]` came from (upstream `write_state == disk_job*`, moved
+/// out by `take_write_job`); `None` for blocks with no parked writer
+/// (e.g. a buffer restored after a failed flush). Aligned with `bufs`
+/// so [`DiskCache::restore_run`] can put both back.
+pub type TakenRun = (i32, Vec<Vec<u8>>, Vec<Option<Box<DiskJob>>>);
+
+/// [`DiskCache::take_oldest_run`]/located variants: `(loc,
+/// first_block, bufs, writers)`.
+pub type LocatedRun = (PieceLocation, i32, Vec<Vec<u8>>, Vec<Option<Box<DiskJob>>>);
+
 /// [`DiskCache::take_coalesced`]'s return: `(job_loc, first_block,
-/// spans, bufs)` where `spans` splits `bufs` into per-piece
-/// `(piece, first_block, n_bufs)` runs.
+/// spans, bufs, writers)` where `spans` splits `bufs` into per-piece
+/// `(piece, first_block, n_bufs)` runs and `writers` is aligned with
+/// `bufs`.
 pub type CoalescedFlush = (
     PieceLocation,
     i32,
     Vec<(PieceIndex, i32, usize)>,
     Vec<Vec<u8>>,
+    Vec<Option<Box<DiskJob>>>,
 );
 
 /// `cached_block_entry`.
@@ -41,11 +57,17 @@ pub struct CachedBlockEntry {
     pub buf: Option<Vec<u8>>,
     /// `is_flushed()` — already on disk.
     pub flushed: bool,
-    /// `get_write_job() != nullptr` — a write job is in flight.
+    /// `write_state == disk_buffer_ref` — the buffer is in flight
+    /// inside a flush job (not readable until it lands or returns).
     pub has_write_job: bool,
     /// `piece_hasher` result — block SHA-256 computed at flush time
     /// (ADR-0016); `hash2` jobs reuse it instead of re-reading.
     pub block_hash: Option<bitdaemon_common::Sha256Hash>,
+    /// `write_state == disk_job*` — the write job parked on this
+    /// block. Upstream completes it when the buffer is durable (or
+    /// aborts it when the piece is dropped); a flush takes it along
+    /// with the buffer.
+    pub writer: Option<Box<DiskJob>>,
 }
 
 impl CachedBlockEntry {
@@ -93,10 +115,15 @@ pub fn compute_flushed_cursor(blocks: &[CachedBlockEntry]) -> u16 {
     ret
 }
 
-/// `count_jobs` — blocks with an in-flight write job.
+/// `count_jobs` — blocks with a job attached: a parked writer
+/// (`write_state == disk_job*`) or an in-flight flush
+/// (`disk_buffer_ref`).
 #[must_use]
 pub fn count_jobs(blocks: &[CachedBlockEntry]) -> u16 {
-    blocks.iter().filter(|b| b.has_write_job).count() as u16
+    blocks
+        .iter()
+        .filter(|b| b.has_write_job || b.writer.is_some())
+        .count() as u16
 }
 
 /// Longest contiguous run of flushable blocks (`buf` present, not
@@ -205,6 +232,11 @@ pub struct DiskCache {
     pub num_cached_blocks: i64,
     /// `m_num_unhashed` — v1 blocks awaiting the hasher.
     pub num_unhashed: i64,
+    /// Write jobs superseded by a duplicate insert or evicted with
+    /// their piece — the cache can't complete jobs, so the caller
+    /// drains this queue and pushes them aborted onto the completed
+    /// queue (upstream `jobqueue_t& aborted` out-params).
+    pub orphans: std::collections::VecDeque<Box<DiskJob>>,
 }
 
 /// `piece_entry_params` — what `insert` needs to know about a job.
@@ -220,15 +252,36 @@ pub struct PieceParams {
     pub v2: bool,
 }
 
+/// Upstream asserts the cache is empty when it is destroyed
+/// (`~disk_cache` requires drained pieces). Dropping a parked write
+/// job silently would lose its handler invocation — drain any
+/// leftovers and complete them aborted, the same exit path
+/// `abort_jobs` uses.
+impl Drop for DiskCache {
+    fn drop(&mut self) {
+        for (_, mut p) in self.pieces.drain() {
+            for b in &mut p.blocks {
+                if let Some(mut w) = b.writer.take() {
+                    crate::disk_completed::abort(&mut w);
+                    w.call_callback();
+                }
+            }
+        }
+    }
+}
+
 impl DiskCache {
-    /// `insert(loc, block_idx, force_flush, params)` — register a
-    /// write block. `has_buffer` mirrors "the job carried a buffer"
-    /// (upstream moves it into the entry or the v2 queue).
+    /// `insert(loc, block_idx, writer, force_flush, params)` —
+    /// register a write block. `buf` mirrors "the job carried a
+    /// buffer"; `writer` is the write job parked on the block
+    /// (upstream `blk.write_state = write_job`) — it completes when
+    /// the block flushes.
     pub fn insert(
         &mut self,
         loc: PieceLocation,
         block_idx: usize,
         buf: Option<Vec<u8>>,
+        writer: Option<Box<DiskJob>>,
         force_flush: bool,
         params: PieceParams,
     ) -> InsertResult {
@@ -244,6 +297,7 @@ impl DiskCache {
                         flushed: false,
                         has_write_job: false,
                         block_hash: None,
+                        writer: None,
                     })
                     .collect(),
                 flushed_cursor: 0,
@@ -275,7 +329,19 @@ impl DiskCache {
                 self.num_unhashed += 1;
             }
             b.buf = buf;
-            b.has_write_job = true;
+            // upstream `blk.write_state = write_job` — the writer
+            // rides the block until a flush takes it (`take_write_job`)
+            // or the piece is torn down (`aborted`).
+            if let Some(w) = writer {
+                // a duplicate write on a block that still holds a
+                // parked writer: the older job is superseded — abort
+                // it rather than leak its completion (upstream
+                // overwrites write_state and aborts the old job)
+                if let Some(mut old) = b.writer.replace(w) {
+                    crate::disk_completed::abort(&mut old);
+                    self.orphans.push_back(old);
+                }
+            }
         }
         // the piece just became complete (every block buffered or
         // already flushed) → candidate for a large contiguous flush
@@ -303,6 +369,27 @@ impl DiskCache {
         ret
     }
 
+    /// Drain write jobs superseded/evicted since the last call —
+    /// caller completes them aborted (upstream `aborted` out-params).
+    pub fn take_orphans(&mut self) -> Vec<Box<DiskJob>> {
+        std::mem::take(&mut self.orphans).into_iter().collect()
+    }
+
+    /// Abort every writer still parked in the cache, queueing them
+    /// on `orphans` — teardown callers (`remove_torrent`,
+    /// `abort_jobs`) drain them through the completed queue so each
+    /// handler still runs exactly once.
+    pub fn abort_all_writers(&mut self) {
+        for p in self.pieces.values_mut() {
+            for b in &mut p.blocks {
+                if let Some(mut w) = b.writer.take() {
+                    crate::disk_completed::abort(&mut w);
+                    self.orphans.push_back(w);
+                }
+            }
+        }
+    }
+
     /// `try_clear_piece` — refuses while a write job or hashing is
     /// in flight; on success the piece is dropped and its buffers
     /// freed (returns the freed entry like upstream counts them).
@@ -320,19 +407,33 @@ impl DiskCache {
     }
 
     /// `free_piece` — bookkeeping when a piece leaves the cache.
-    pub fn free_piece(&mut self, loc: PieceLocation) {
+    /// Returns the number of cache blocks freed (for the caller's
+    /// `write_blocks` back-pressure accounting) — writers parked on
+    /// the piece are queued on `orphans`.
+    pub fn free_piece(&mut self, loc: PieceLocation) -> i64 {
+        let mut freed = 0i64;
         if let Some(p) = self.pieces.get(&loc) {
-            let freed = p.blocks.iter().filter(|b| b.buf.is_some()).count() as i64;
+            freed = p.blocks.iter().filter(|b| b.buf.is_some()).count() as i64;
             self.num_cached_blocks -= freed;
         }
         self.remove_piece(loc);
+        freed
     }
 
     /// Single removal point — settles the piece's `unhashed` tally
-    /// whatever the exit path (cleared, freed, fully flushed).
+    /// whatever the exit path (cleared, freed, fully flushed), and
+    /// moves any writer still parked on a block to `orphans`
+    /// (upstream `aborted.push_back(cbe.take_write_job())` in
+    /// `delete_cached_piece`).
     fn remove_piece(&mut self, loc: PieceLocation) {
-        if let Some(p) = self.pieces.remove(&loc) {
+        if let Some(mut p) = self.pieces.remove(&loc) {
             self.num_unhashed -= i64::from(p.unhashed);
+            for b in &mut p.blocks {
+                if let Some(mut w) = b.writer.take() {
+                    crate::disk_completed::abort(&mut w);
+                    self.orphans.push_back(w);
+                }
+            }
         }
         if let Some(o) = self.run_len.remove(&loc) {
             self.runs_index.remove(&(o, loc));
@@ -411,15 +512,17 @@ impl DiskCache {
 
     /// `try_flush_blocks` — take the first contiguous run of dirty,
     /// not-in-flight blocks of `loc` for a coalesced write. Buffers
-    /// are moved out; blocks are marked `has_write_job` until
-    /// [`Self::run_flushed`] retires them.
-    pub fn take_flush_run(&mut self, loc: PieceLocation) -> Option<(i32, Vec<Vec<u8>>)> {
+    /// are moved out *with their parked writers* (upstream
+    /// `take_write_job` per block); blocks are marked `has_write_job`
+    /// until [`Self::run_flushed`] retires them.
+    pub fn take_flush_run(&mut self, loc: PieceLocation) -> Option<TakenRun> {
         let p = self.pieces.get_mut(&loc)?;
         let start = p
             .blocks
             .iter()
             .position(|b| b.buf.is_some() && !b.flushed && !b.has_write_job)?;
         let mut bufs = Vec::new();
+        let mut writers = Vec::new();
         for b in &mut p.blocks[start..] {
             let Some(buf) = b.buf.take() else {
                 break;
@@ -428,9 +531,10 @@ impl DiskCache {
                 break;
             }
             b.has_write_job = true;
+            writers.push(b.writer.take());
             bufs.push(buf);
         }
-        let out = (!bufs.is_empty()).then_some((start as i32, bufs));
+        let out = (!bufs.is_empty()).then_some((start as i32, bufs, writers));
         self.refresh_run_index(loc);
         out
     }
@@ -439,7 +543,7 @@ impl DiskCache {
     /// not-in-flight blocks — backing [`Self::take_largest_run`]
     /// (upstream's ordered `get<1>` pass writes the most
     /// contiguous span first).
-    fn take_longest_run(&mut self, loc: PieceLocation) -> Option<(i32, Vec<Vec<u8>>)> {
+    fn take_longest_run(&mut self, loc: PieceLocation) -> Option<TakenRun> {
         let p = self.pieces.get_mut(&loc)?;
         let mut best_start = 0usize;
         let mut best_len = 0usize;
@@ -463,14 +567,16 @@ impl DiskCache {
             return None;
         }
         let mut bufs = Vec::with_capacity(best_len);
+        let mut writers = Vec::new();
         for b in &mut p.blocks[best_start..best_start + best_len] {
             let Some(buf) = b.buf.take() else {
                 break;
             };
             b.has_write_job = true;
+            writers.push(b.writer.take());
             bufs.push(buf);
         }
-        let out = (!bufs.is_empty()).then_some((best_start as i32, bufs));
+        let out = (!bufs.is_empty()).then_some((best_start as i32, bufs, writers));
         self.refresh_run_index(loc);
         out
     }
@@ -480,12 +586,12 @@ impl DiskCache {
     /// most contiguous blocks"). Bigger writes coalesce into
     /// near-sequential disk traffic instead of scattered 2-3-block
     /// writes. Skips stale index entries lazily.
-    pub fn take_largest_run(&mut self) -> Option<(PieceLocation, i32, Vec<Vec<u8>>)> {
+    pub fn take_largest_run(&mut self) -> Option<LocatedRun> {
         while let Some(&(len, loc)) = self.runs_index.iter().next_back() {
             self.runs_index.remove(&(len, loc));
             self.run_len.remove(&loc);
-            if let Some((first, bufs)) = self.take_longest_run(loc) {
-                return Some((loc, first, bufs));
+            if let Some((first, bufs, writers)) = self.take_longest_run(loc) {
+                return Some((loc, first, bufs, writers));
             }
         }
         None
@@ -502,7 +608,7 @@ impl DiskCache {
     /// sweeping ascending keeps consecutive flushes close together.
     /// Stale/emptied entries are dropped lazily like the other
     /// indices.
-    pub fn take_elevator_run(&mut self) -> Option<(PieceLocation, i32, Vec<Vec<u8>>)> {
+    pub fn take_elevator_run(&mut self) -> Option<LocatedRun> {
         loop {
             let probe = self.scan_head.map_or_else(
                 || self.dirty_sorted.iter().next().copied(),
@@ -515,13 +621,13 @@ impl DiskCache {
                 },
             );
             let loc = probe?;
-            if let Some((first, bufs)) = self.take_flush_run(loc) {
+            if let Some((first, bufs, writers)) = self.take_flush_run(loc) {
                 // resume just past this piece next sweep; if it's
                 // still dirty (a gap/in-flight write left more
                 // behind), the next `range(head..)` call finds it
                 // again naturally without special-casing.
                 self.scan_head = Some((loc.0, PieceIndex(loc.1.0 + 1)));
-                return Some((loc, first, bufs));
+                return Some((loc, first, bufs, writers));
             }
             // emptied/stale — drop it and keep sweeping.
             self.dirty_sorted.remove(&loc);
@@ -535,11 +641,11 @@ impl DiskCache {
     /// region, flushed as a single writev like upstream builds its
     /// iovec over the ordered dirty-block set. Stops at `max_blocks`
     /// buffers or the first gap. Returns `(job_loc, first_block,
-    /// spans, bufs)` where `spans` splits `bufs` into per-piece
-    /// `(piece, first_block, n_bufs)` runs for `run_flushed`/
-    /// `restore_run` bookkeeping.
+    /// spans, bufs, writers)` where `spans` splits `bufs` into
+    /// per-piece `(piece, first_block, n_bufs)` runs for
+    /// `run_flushed`/`restore_run` bookkeeping.
     pub fn take_coalesced(&mut self, max_blocks: usize) -> Option<CoalescedFlush> {
-        let (job_loc, job_first, mut bufs) = self
+        let (job_loc, job_first, mut bufs, mut writers) = self
             .take_ready_run()
             .or_else(|| self.take_elevator_run())
             .or_else(|| self.take_largest_run())
@@ -567,24 +673,27 @@ impl DiskCache {
             if !starts_at_zero {
                 break;
             }
-            let Some((nfirst, nbufs)) = self.take_flush_run(next) else {
+            let Some((nfirst, nbufs, nwriters)) = self.take_flush_run(next) else {
                 break;
             };
             if nfirst != 0 {
-                self.restore_run(next, usize::try_from(nfirst).unwrap_or(0), nbufs);
+                // the run didn't start at block 0 — put bufs *and*
+                // their parked writers back untouched
+                self.restore_run(next, usize::try_from(nfirst).unwrap_or(0), nbufs, nwriters);
                 break;
             }
             spans.push((next.1, nfirst, nbufs.len()));
             end = nbufs.len();
             end_loc = next;
             bufs.extend(nbufs);
+            writers.extend(nwriters);
         }
-        Some((job_loc, job_first, spans, bufs))
+        Some((job_loc, job_first, spans, bufs, writers))
     }
 
     /// All dirty contiguous runs of `loc` (for fence-time full flush).
     /// Repeatedly drains [`Self::take_flush_run`].
-    pub fn take_all_runs(&mut self, loc: PieceLocation) -> Vec<(i32, Vec<Vec<u8>>)> {
+    pub fn take_all_runs(&mut self, loc: PieceLocation) -> Vec<TakenRun> {
         let mut runs = Vec::new();
         while let Some(r) = self.take_flush_run(loc) {
             runs.push(r);
@@ -598,9 +707,9 @@ impl DiskCache {
     /// quadratic (thousands of entries per incoming block on a
     /// 25 k-piece swarm). Stale lru entries are skipped lazily; a
     /// piece still dirty after the taken run re-queues at the back.
-    pub fn take_oldest_run(&mut self) -> Option<(PieceLocation, i32, Vec<Vec<u8>>)> {
+    pub fn take_oldest_run(&mut self) -> Option<LocatedRun> {
         while let Some(loc) = self.lru.pop_front() {
-            let Some((first, bufs)) = self.take_flush_run(loc) else {
+            let Some((first, bufs, writers)) = self.take_flush_run(loc) else {
                 continue;
             };
             // still dirty (another run behind a gap/in-flight
@@ -613,7 +722,7 @@ impl DiskCache {
             if still_dirty {
                 self.lru.push_back(loc);
             }
-            return Some((loc, first, bufs));
+            return Some((loc, first, bufs, writers));
         }
         None
     }
@@ -624,9 +733,9 @@ impl DiskCache {
     /// contiguous writes. Returns `None` when no complete piece is
     /// queued; the caller falls back to [`Self::take_oldest_run`]
     /// (the "expensive" partial-piece pass).
-    pub fn take_ready_run(&mut self) -> Option<(PieceLocation, i32, Vec<Vec<u8>>)> {
+    pub fn take_ready_run(&mut self) -> Option<LocatedRun> {
         while let Some(loc) = self.ready.pop_front() {
-            let Some((first, bufs)) = self.take_flush_run(loc) else {
+            let Some((first, bufs, writers)) = self.take_flush_run(loc) else {
                 continue;
             };
             // still complete with more dirty blocks behind a
@@ -640,27 +749,51 @@ impl DiskCache {
             if still_ready {
                 self.ready.push_back(loc);
             }
-            return Some((loc, first, bufs));
+            return Some((loc, first, bufs, writers));
         }
         None
     }
 
-    /// Put a failed flush's buffers back — upstream `flush_piece`
-    /// only sets `is_flushed` after a successful `writev`; a region
-    /// whose write failed stays dirty so the next `take_*_run`
-    /// retries it. Blocks already re-inserted (a duplicate write
-    /// landed while the flush was in flight) keep their newer buffer.
-    pub fn restore_run(&mut self, loc: PieceLocation, first: usize, bufs: Vec<Vec<u8>>) {
+    /// Put a flush's buffers back — upstream `flush_piece` only sets
+    /// `is_flushed` after a successful `writev`; a region whose write
+    /// failed stays dirty so the next `take_*_run` retries it. Blocks
+    /// already re-inserted (a duplicate write landed while the flush
+    /// was in flight) keep their newer buffer. `writers` (aligned to
+    /// `bufs`) restores parked write jobs — used when a taken run is
+    /// put back unflushed; a *failed* flush completes its writers
+    /// with the error instead and passes an empty vec.
+    pub fn restore_run(
+        &mut self,
+        loc: PieceLocation,
+        first: usize,
+        bufs: Vec<Vec<u8>>,
+        mut writers: Vec<Option<Box<DiskJob>>>,
+    ) {
         let ready = {
             let Some(p) = self.pieces.get_mut(&loc) else {
                 return;
             };
             for (i, buf) in bufs.into_iter().enumerate() {
-                if let Some(b) = p.blocks.get_mut(first + i)
-                    && b.buf.is_none()
-                {
+                let Some(b) = p.blocks.get_mut(first + i) else {
+                    continue;
+                };
+                let w = writers.get_mut(i).and_then(Option::take);
+                if b.buf.is_none() {
                     b.buf = Some(buf);
                     b.has_write_job = false;
+                    // the run's job left the piece when the flush
+                    // completed — a writer put back re-parks it;
+                    // a bare buffer (failed flush) settles the count.
+                    if w.is_none() {
+                        p.num_jobs -= 1;
+                    }
+                    b.writer = w;
+                } else if let Some(mut w) = w {
+                    // the block was re-written while the run was
+                    // out — its new writer owns the slot; the old
+                    // job is superseded and completes aborted
+                    crate::disk_completed::abort(&mut w);
+                    self.orphans.push_back(w);
                 }
             }
             p.blocks.iter().all(|b| b.buf.is_some() || b.flushed)
@@ -673,12 +806,12 @@ impl DiskCache {
 
     /// Every dirty run across the whole cache — used before a
     /// storage-level fence (move/delete) raises.
-    pub fn take_all_storage_runs(&mut self) -> Vec<(PieceLocation, i32, Vec<Vec<u8>>)> {
+    pub fn take_all_storage_runs(&mut self) -> Vec<LocatedRun> {
         let locs: Vec<PieceLocation> = self.pieces.keys().copied().collect();
         let mut out = Vec::new();
         for loc in locs {
-            for (first, bufs) in self.take_all_runs(loc) {
-                out.push((loc, first, bufs));
+            for (first, bufs, writers) in self.take_all_runs(loc) {
+                out.push((loc, first, bufs, writers));
             }
         }
         out
@@ -686,15 +819,23 @@ impl DiskCache {
 
     /// Mark a flushed region durable — frees the buffers' cache
     /// slots, advances `flushed_cursor`, drops fully-flushed pieces.
+    /// The writers the flush carried were already moved onto the
+    /// `FlushJob` (`take_write_job`) and complete with it.
     pub fn run_flushed(&mut self, loc: PieceLocation, first: usize, len: usize) {
         let mut free = false;
+        let mut retired = 0i64;
         if let Some(p) = self.pieces.get_mut(&loc) {
             for b in p.blocks.iter_mut().skip(first).take(len) {
+                if b.has_write_job {
+                    p.num_jobs -= 1;
+                }
                 b.has_write_job = false;
                 b.flushed = true;
                 b.buf = None;
-                self.num_cached_blocks -= 1;
+                retired += 1;
             }
+            self.num_cached_blocks -= retired;
+            p.flushed_cursor = compute_flushed_cursor(&p.blocks);
             p.flushed_cursor = compute_flushed_cursor(&p.blocks);
             // the entry leaves the cache once every block is on disk —
             // except v2 pieces keep their (tiny) entry for the stored
@@ -771,10 +912,7 @@ impl DiskCache {
 
     /// `cache_expiry` sweep — every dirty run of pieces whose oldest
     /// block is older than `max_age` (upstream's periodic flush).
-    pub fn take_expired_runs(
-        &mut self,
-        max_age: std::time::Duration,
-    ) -> Vec<(PieceLocation, i32, Vec<Vec<u8>>)> {
+    pub fn take_expired_runs(&mut self, max_age: std::time::Duration) -> Vec<LocatedRun> {
         let locs: Vec<PieceLocation> = self
             .pieces
             .iter()
@@ -783,8 +921,8 @@ impl DiskCache {
             .collect();
         let mut out = Vec::new();
         for loc in locs {
-            for (first, bufs) in self.take_all_runs(loc) {
-                out.push((loc, first, bufs));
+            for (first, bufs, writers) in self.take_all_runs(loc) {
+                out.push((loc, first, bufs, writers));
             }
         }
         out
@@ -837,11 +975,11 @@ mod tests {
     fn insert_and_flags() {
         let mut c = DiskCache::default();
         let loc = (StorageIndex(0), PieceIndex(0));
-        let r = c.insert(loc, 0, Some(vec![1u8; 4]), false, params());
+        let r = c.insert(loc, 0, Some(vec![1u8; 4]), None, false, params());
         assert!(r.need_hasher_kick); // block 0 == hasher_cursor
         assert_eq!(c.num_cached_blocks, 1);
         assert_eq!(c.num_unhashed, 1);
-        let r = c.insert(loc, 1, Some(vec![2u8; 4]), false, params());
+        let r = c.insert(loc, 1, Some(vec![2u8; 4]), None, false, params());
         assert!(!r.need_hasher_kick);
         assert_eq!(c.piece(loc).unwrap().num_jobs, 2);
     }
@@ -850,8 +988,8 @@ mod tests {
     fn write_done_advances_cursor() {
         let mut c = DiskCache::default();
         let loc = (StorageIndex(0), PieceIndex(1));
-        c.insert(loc, 0, Some(vec![0; 4]), false, params());
-        c.insert(loc, 1, Some(vec![0; 4]), false, params());
+        c.insert(loc, 0, Some(vec![0; 4]), None, false, params());
+        c.insert(loc, 1, Some(vec![0; 4]), None, false, params());
         c.write_job_done(loc, 0, true);
         assert_eq!(c.piece(loc).unwrap().flushed_cursor, 1);
         assert_eq!(c.num_cached_blocks, 1);
@@ -863,23 +1001,79 @@ mod tests {
         assert!(c.is_empty());
     }
 
+    /// a write job parked on a block — `write_state = disk_job*`.
+    fn parked_write() -> Box<DiskJob> {
+        Box::new(DiskJob {
+            storage: StorageIndex(u32::MAX),
+            flags: 0,
+            ret: 0,
+            error: crate::storage_error::StorageError::default(),
+            action: crate::disk_job::JobKind::Write(crate::disk_job::WriteJob {
+                handler: Box::new(|_| {}),
+                buf: crate::disk_buffer_pool::DiskBufferHolder::empty(),
+                piece: PieceIndex(0),
+                offset: 0,
+                buffer_size: 0,
+                force_flush: false,
+            }),
+        })
+    }
+
     #[test]
     fn clear_refuses_pending() {
         let mut c = DiskCache::default();
         let loc = (StorageIndex(0), PieceIndex(0));
-        c.insert(loc, 0, Some(vec![0; 4]), false, params());
+        // a parked writer blocks the clear (upstream `count_jobs` on
+        // `write_state`); completing it through a flush frees the piece.
+        c.insert(
+            loc,
+            0,
+            Some(vec![0; 4]),
+            Some(parked_write()),
+            false,
+            params(),
+        );
         assert!(!c.try_clear_piece(loc));
-        c.write_job_done(loc, 0, true);
+        let (_first, _bufs, writers) = c.take_flush_run(loc).unwrap();
+        assert!(writers.iter().flatten().count() == 1);
+        c.run_flushed(loc, 0, 1);
         assert!(c.try_clear_piece(loc));
+    }
+
+    /// a writer displaced by a duplicate insert lands in `orphans`,
+    /// aborted — upstream aborts the overwritten `write_state` job.
+    #[test]
+    fn duplicate_insert_orphans_writer() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        c.insert(
+            loc,
+            0,
+            Some(vec![0; 4]),
+            Some(parked_write()),
+            false,
+            params(),
+        );
+        c.insert(
+            loc,
+            0,
+            Some(vec![1; 4]),
+            Some(parked_write()),
+            false,
+            params(),
+        );
+        let orphans = c.take_orphans();
+        assert_eq!(orphans.len(), 1);
+        assert!(orphans[0].flags & crate::disk_job::job_flags::ABORTED != 0);
     }
 
     #[test]
     fn force_flush_on_hash_returned() {
         let mut c = DiskCache::default();
         let loc = (StorageIndex(0), PieceIndex(0));
-        c.insert(loc, 0, Some(vec![0; 4]), false, params());
+        c.insert(loc, 0, Some(vec![0; 4]), None, false, params());
         c.pieces.get_mut(&loc).unwrap().flags |= piece_flags::PIECE_HASH_RETURNED;
-        c.insert(loc, 1, Some(vec![0; 4]), false, params());
+        c.insert(loc, 1, Some(vec![0; 4]), None, false, params());
         assert!(c.piece(loc).unwrap().flags & piece_flags::FORCE_FLUSH != 0);
     }
 
@@ -890,17 +1084,17 @@ mod tests {
     fn unhashed_settles_on_hash_and_clear() {
         let mut c = DiskCache::default();
         let loc = (StorageIndex(0), PieceIndex(0));
-        c.insert(loc, 0, Some(vec![0; 4]), false, params());
-        c.insert(loc, 1, Some(vec![0; 4]), false, params());
+        c.insert(loc, 0, Some(vec![0; 4]), None, false, params());
+        c.insert(loc, 1, Some(vec![0; 4]), None, false, params());
         assert_eq!(c.num_unhashed, 2);
         // duplicate inserts replace in place — no double counting
-        c.insert(loc, 1, Some(vec![9; 4]), false, params());
+        c.insert(loc, 1, Some(vec![9; 4]), None, false, params());
         assert_eq!(c.num_unhashed, 2);
         c.hash_returned(loc);
         assert_eq!(c.num_unhashed, 0);
         // a piece evicted un-hashed settles too
         let loc2 = (StorageIndex(0), PieceIndex(1));
-        c.insert(loc2, 0, Some(vec![0; 4]), false, params());
+        c.insert(loc2, 0, Some(vec![0; 4]), None, false, params());
         assert_eq!(c.num_unhashed, 1);
         c.free_piece(loc2);
         assert_eq!(c.num_unhashed, 0);

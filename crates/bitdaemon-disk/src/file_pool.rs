@@ -80,7 +80,12 @@ pub struct OpenFileState {
 struct PoolEntry {
     handle: Arc<FileHandle>,
     mode: OpenMode,
+    /// LRU ordering key (monotonic tick — cheaper than `Instant`
+    /// comparisons and immune to clock issues).
     last_use: u64,
+    /// `last_use` as reported by `get_status` — upstream stores
+    /// `aux::time_now()` on the entry itself.
+    last_use_time: Instant,
 }
 
 /// One pending opener's wait object.
@@ -231,6 +236,7 @@ impl FilePool {
                 if let Some(e) = files.get_mut(&file_key) {
                     lru.remove(&(e.last_use, file_key));
                     e.last_use = new_tick;
+                    e.last_use_time = Instant::now();
                     lru.insert((new_tick, file_key), ());
                     *hits += 1;
                     return Ok(e.handle.clone());
@@ -304,6 +310,7 @@ impl FilePool {
                                         handle: handle.clone(),
                                         mode,
                                         last_use: tick,
+                                        last_use_time: Instant::now(),
                                     },
                                 );
                                 lru.insert((tick, file_key), ());
@@ -312,6 +319,7 @@ impl FilePool {
                         } else if let Some(e) = files.get_mut(&file_key) {
                             let old_tick = e.last_use;
                             e.last_use = tick;
+                            e.last_use_time = Instant::now();
                             lru.remove(&(old_tick, file_key));
                             lru.insert((tick, file_key), ());
                         }
@@ -323,6 +331,7 @@ impl FilePool {
                                 handle: handle.clone(),
                                 mode,
                                 last_use: tick,
+                                last_use_time: Instant::now(),
                             },
                         );
                         lru.insert((tick, file_key), ());
@@ -363,7 +372,14 @@ impl FilePool {
         match FileHandle::open(file_path, u64::try_from(size).unwrap_or(0), mode) {
             Ok(fh) => Ok(Arc::new(fh)),
             Err(e) => {
-                if !(mode.contains(OpenMode::WRITE) && e.source.kind() == io::ErrorKind::NotFound) {
+                // upstream retries on `no_such_file_or_directory`; on
+                // Windows shared drives a missing directory surfaces as
+                // ERROR_IO_DEVICE (1117) instead — same retry there.
+                // (raw_os_error 1117 never collides with a POSIX errno,
+                // so the check is safe off-Windows.)
+                let missing_dir = e.source.kind() == io::ErrorKind::NotFound
+                    || e.source.raw_os_error() == Some(1117);
+                if !(mode.contains(OpenMode::WRITE) && missing_dir) {
                     return Err(StorageError::new(e.source, file_index, e.operation));
                 }
                 if let Some(parent) = file_path.parent() {
@@ -461,7 +477,7 @@ impl FilePool {
             .map(|(k, e)| OpenFileState {
                 file_index: k.1,
                 open_mode: to_file_open_mode(e.mode, false),
-                last_use: Instant::now(), // tick→Instant mapping is lossy; report now
+                last_use: e.last_use_time,
             })
             .collect()
     }

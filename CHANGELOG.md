@@ -29,6 +29,90 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- **`part_file` on-disk format is now upstream-compatible**: header
+  and slot table are big-endian (was little-endian — written part
+  files were unreadable by libtorrent and vice versa), free slots are
+  reused FIFO (was LIFO), write-opens create missing directories and
+  retry (was a permanent failure), files open with the hidden
+  attribute like upstream, and `move_partfile` skips empty files,
+  tolerates ENOENT, and falls back to `copy_file` on cross-device
+  moves.
+- **Write jobs complete at flush, not at cache insert** — the core
+  upstream invariant (`cached_block_entry::write_state = disk_job*`):
+  the job is parked on its cache block, carried by the `FlushJob`,
+  and its handler fires when the block is durable — with the flush's
+  error propagated on failure. A failed `writev` retires the visited
+  span as flushed (upstream `flushed.set_bit` on error) rather than
+  retrying silently; evicted/superseded/teardown writers complete
+  aborted exactly once via the completed queue with correct fence
+  accounting.
+- **Hash jobs no longer spin on a bounded wait** behind in-flight
+  writes — they repost through the `piece_gate` and park until the
+  flush lands (was a ~400 ms sleep loop that could hash a zero hole
+  on a busy disk).
+- `check_fastresume` returns the pure upstream `status_t` bitmask —
+  `initialize()` errors surface as `fatal_disk_error` instead of
+  being swallowed, `no_recheck_incomplete_resume` is honored, and the
+  session decodes `need_full_check`/`fatal_disk_error` correctly.
+- `move_storage` rolls back already-moved files on failure, honors
+  `fail_if_exist`/`dont_replace`/`always_reset_files`, updates
+  `save_path` on both `PreadStorage` and `MmapStorage`, and keeps
+  `part_file_dir`/`stat_cache`/`file_pool` consistent after moves,
+  deletes and `release_files`.
+- `delete_files` continues past per-file errors (upstream
+  best-effort), `has_any_file` only counts non-pad files with
+  `size > 0` and recognizes dangling symlinks, `set_file_priority`
+  applies partial mutations and exports part-file data when a file
+  leaves `dont_download`.
+- `file_pool` retries opens on `ERROR_IO_DEVICE` (Windows shared
+  drives report it instead of ENOENT) and reports real `last_use`
+  timestamps; `file_progress::init` is idempotent like upstream;
+  `stat_cache::get_filesize` reports `ENOENT` for symlink-flagged
+  files.
+- `apply_settings` now resizes the disk thread pools — `aio_threads`
+  and `hashing_threads` were read at construction but a runtime change
+  was a silent no-op (upstream `update_disk_threads` semantics).
+- `DiskIoThreadPool` aligned on `disk_io_thread_pool.cpp`: the idle
+  reaper formula was `min_idle − 1` (and `min_idle` was never sampled,
+  staying at `i64::MAX` — wiring the reaper would have emptied the
+  pool); now verbatim `min(max(min_idle, threads − max), threads − 1)`
+  with the upstream `exchange(num_idle)` re-seed. The wait loop uses
+  the upstream 1 s `wait_for` cadence emitting one idle/active pair
+  per round, `job_queued` counts *idle* threads as coverage (busy
+  threads can't take new jobs) and clamps `threads_to_exit` on arrival,
+  `stop_threads` assigns instead of accumulating, and `try_thread_exit`
+  removes the dead handle — `num_threads` no longer counts exited
+  workers (latent under-provisioning on any shrink).
+- `reap_idle_threads` is now driven: the session tick calls it every
+  60 s across all pools (upstream's per-pool `deadline_timer`).
+- `async_write` now returns the back-pressure status even when the job
+  is parked behind a fence — upstream `account_pending_write` runs
+  before `is_blocked`, so a parked write still reports `exceeded`
+  (the peer was free to keep requesting past the high watermark).
+- Disk job flags are now plumbed through `pread_disk_io` (previously
+  parsed and dropped): `volatile_read` reaches `advise_dont_need` on
+  `read`/`partial_read`/`hash`/`hash2` read paths, `sequential_access`
+  maps to `open_mode::SEQUENTIAL_ACCESS` (`FILE_FLAG_SEQUENTIAL_SCAN`/
+  `fadvise(SEQUENTIAL)`) via `file_mode_for_job` parity, and `v1_hash`
+  gates the SHA-1 pass — a v2-only hash job reads `piece_size2` and
+  skips SHA-1 entirely like upstream `do_job(hash)`. `async_hash`
+  wipes the caller's v2 span on entry (upstream's stale-bytes
+  contract) and `hash_job` fills from `take_precomputed_v2` and only
+  hashes blocks still marked unknown.
+- `async_delete_files` aborts queued volatile hash jobs on the hash
+  pool (upstream `abort_hash_jobs`) so a delete during a recheck
+  doesn't grind the whole hash queue; `clear_piece` drains
+  `piece_gate.blocked` for the piece (upstream `clear_piece_jobs`) so
+  parked hash jobs complete aborted instead of hashing cleared data.
+- Session-side job flags now match `torrent.cpp`: `add_piece` writes
+  get `flush_piece | volatile_read` under `disk_io_write_mode ==
+  disable_os_cache`; `verify_piece` hashes get `flush_piece` /
+  `volatile_read` per write mode plus `v1_hash`;
+  `start_checking`-style rehashes get `sequential_access |
+  volatile_read | v1_hash`. `hash_job_v2_span` now sizes for every
+  v2-capable torrent (upstream `has_v2()`, hybrid included), and
+  `torrent::disable_v1_hashes` is stored and round-trips through
+  `torrent::flags()` like upstream's `m_disable_v1_hashes`.
 - `peer_info` queue fields now match upstream: `download_queue_length`
   counts sent *and* unsent requests, `requests_in_buffer` counts
   requests still sitting in the send buffer (drained via

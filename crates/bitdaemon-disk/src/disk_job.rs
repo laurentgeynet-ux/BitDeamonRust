@@ -56,8 +56,13 @@ pub mod job_flags {
     pub const FENCE: u8 = 1;
     /// `disk_job::in_progress`.
     pub const IN_PROGRESS: u8 = 2;
-    /// `disk_job::aborted` (upstream `6_bit` = bits 2|4 — both set).
-    pub const ABORTED: u8 = 0b0001_1000;
+    /// `disk_job::aborted` (upstream `6_bit` = `1 << 6`).
+    pub const ABORTED: u8 = 0x40;
+    /// Internal: the write job is parked on a cache block (upstream
+    /// `write_state == disk_job*`) — its back-pressure slot is owned
+    /// by the cache entry, so `job_done` must not decrement
+    /// `write_blocks` again when the writer completes.
+    pub const CACHED: u8 = 0x20;
 }
 
 /// `status_t` upstream.
@@ -77,6 +82,9 @@ pub struct ReadJob {
     pub offset: i32,
     /// `volatile_read` — hint not to cache (upstream flag).
     pub volatile: bool,
+    /// `sequential_access` — more sequential reads follow
+    /// (upstream `file_mode_for_job` → `open_mode::sequential_access`).
+    pub sequential: bool,
 }
 pub struct PartialReadJob {
     /// handler — `(buffer, error)`.
@@ -91,6 +99,11 @@ pub struct PartialReadJob {
     pub piece: PieceIndex,
     /// `offset`.
     pub offset: i32,
+    /// carried over from the `Read` job — upstream keeps `j->flags`
+    /// when the job is converted, so `volatile_read` still applies.
+    pub volatile: bool,
+    /// `sequential_access`, same carry-over.
+    pub sequential: bool,
 }
 
 /// `job::write`.
@@ -116,10 +129,19 @@ pub struct HashJob {
     pub handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, Vec<Sha256Hash>, StorageError) + Send>,
     /// `piece`.
     pub piece: PieceIndex,
-    /// `block_hashes` — out: per-16KiB-block SHA-256 (v2).
+    /// `block_hashes` — out: per-16KiB-block SHA-256 (v2). Zero entries
+    /// mean "unknown" — they're filled from precomputed storage or
+    /// hashed (upstream's caller clears the span before submit).
     pub block_hashes: Vec<Sha256Hash>,
-    /// `piece_hash` — out.
+    /// `piece_hash` — out. Only set when `v1_hash` is set (upstream
+    /// skips the SHA-1 pass entirely for v2-only hashes).
     pub piece_hash: Sha1Hash,
+    /// `v1_hash` flag — compute the v1 piece SHA-1.
+    pub v1_hash: bool,
+    /// `volatile_read` — `advise_dont_need` on the read path.
+    pub volatile: bool,
+    /// `sequential_access` — `fadvise(SEQUENTIAL)`/SCAN on open.
+    pub sequential: bool,
 }
 
 /// `job::hash2` — SHA-256 over one block.
@@ -132,6 +154,10 @@ pub struct Hash2Job {
     pub offset: i32,
     /// `piece_hash2` — out.
     pub piece_hash2: Sha256Hash,
+    /// `volatile_read` — `advise_dont_need` on the read path.
+    pub volatile: bool,
+    /// `sequential_access` — `fadvise(SEQUENTIAL)`/SCAN on open.
+    pub sequential: bool,
 }
 
 /// `job::move_storage`.
@@ -224,6 +250,11 @@ pub struct FlushJob {
     pub spans: Vec<(PieceIndex, i32, usize)>,
     /// contiguous block buffers (≤ 16 KiB each, last may be short).
     pub bufs: Vec<Vec<u8>>,
+    /// Write jobs parked on the flushed blocks (upstream
+    /// `cached_block_entry::write_state = disk_job*`, moved out by
+    /// `take_write_job`): they complete *here*, with this job's
+    /// result — a write isn't done until its data is durable.
+    pub writers: Vec<Box<DiskJob>>,
 }
 
 /// The `std::variant<...>` job payload.
@@ -262,6 +293,20 @@ pub enum JobKind {
 }
 
 /// `aux::disk_job` — flags + result + payload.
+///
+/// Manual `Debug`: `action` holds `FnOnce` handlers (not `Debug`) —
+/// report the job type name instead.
+impl std::fmt::Debug for DiskJob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskJob")
+            .field("storage", &self.storage)
+            .field("flags", &self.flags)
+            .field("ret", &self.ret)
+            .field("type", &self.get_type())
+            .finish()
+    }
+}
+
 pub struct DiskJob {
     /// `storage` — the torrent this job belongs to (upstream
     /// `j->storage` pointer, bound at submit time).

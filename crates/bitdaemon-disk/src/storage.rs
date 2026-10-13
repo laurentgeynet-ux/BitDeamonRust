@@ -102,7 +102,12 @@ pub struct StorageParams<'a> {
 pub struct PreadStorage {
     files: FileStorage,
     renamed: RenamedFiles,
-    save_path: PathBuf,
+    /// `m_save_path` — upstream `move_storage` assigns the new path
+    /// back into the storage (`std::tie(ret, m_save_path) = ...`), so
+    /// every subsequent resolve/`open_file` targets the *new*
+    /// location. Interior mutability because the upstream entry point
+    /// runs under the fence (shared access).
+    save_path: Mutex<PathBuf>,
     part_file_dir: PathBuf,
     part_file_name: PathBuf,
     pool: Arc<FilePool>,
@@ -137,8 +142,8 @@ impl PreadStorage {
     /// `pread_storage(params, pool)`.
     #[must_use]
     pub fn new(params: StorageParams<'_>, pool: Arc<FilePool>) -> Self {
-        assert!(params.v1 || params.v2, "storage must be v1 or v2");
-        assert!(params.files.num_files() > 0);
+        debug_assert!(params.v1 || params.v2, "storage must be v1 or v2");
+        debug_assert!(params.files.num_files() > 0);
         let mut name = b".0000000000000000000000000000000000000000.parts".to_vec();
         for (i, b) in params.info_hash.iter().enumerate() {
             name[1 + i * 2] = b"0123456789abcdef"[usize::from(b >> 4)];
@@ -147,7 +152,7 @@ impl PreadStorage {
         Self {
             files: params.files.clone(),
             renamed: params.renamed.clone(),
-            save_path: crate::fs::complete(&params.path),
+            save_path: Mutex::new(crate::fs::complete(&params.path)),
             part_file_dir: params.part_file_dir,
             part_file_name: bytes_to_path(&name),
             pool,
@@ -223,9 +228,35 @@ impl PreadStorage {
         self.use_partfile[index.get()] = b;
     }
 
+    /// current save path (`m_save_path` — mutable via `move_storage`).
+    fn save_path(&self) -> PathBuf {
+        self.save_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// `combine_path(m_save_path, m_part_file_dir)` when a custom
+    /// part-file dir is configured, else `m_save_path` — upstream's
+    /// part-file base (upstream joins it *under* the save path; a
+    /// bare `part_file_dir` would escape the torrent dir).
+    fn part_file_dir_path(&self) -> PathBuf {
+        let save = self.save_path();
+        if self.part_file_dir.as_os_str().is_empty() {
+            save
+        } else {
+            save.join(&self.part_file_dir)
+        }
+    }
+
+    /// full path of the `.parts` file (dir + name).
+    fn part_file_path(&self) -> PathBuf {
+        self.part_file_dir_path().join(&self.part_file_name)
+    }
+
     fn resolve_path(&self, index: FileIndex) -> PathBuf {
         let rel = self.renamed.file_path(&self.files, index, &[]);
-        self.save_path.join(bytes_to_path(&rel))
+        self.save_path().join(bytes_to_path(&rel))
     }
 
     /// `open_file` — pooled open honoring the rename overlay.
@@ -286,16 +317,14 @@ impl PreadStorage {
         )
     }
 
+    /// `need_partfile` — lazily construct the part file at
+    /// `combine_path(save_path, part_file_dir)` (or `save_path` when
+    /// no custom dir is set).
     fn need_partfile(&self) {
         let mut g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_none() {
-            let dir = if self.part_file_dir.as_os_str().is_empty() {
-                self.save_path.clone()
-            } else {
-                self.part_file_dir.clone()
-            };
             *g = Some(PartFile::new(
-                dir,
+                self.part_file_dir_path(),
                 self.part_file_name.clone(),
                 self.files.num_pieces(),
                 self.files.piece_length(),
@@ -502,30 +531,35 @@ impl PreadStorage {
         &self.file_priority
     }
 
-    /// `has_any_file` — true if any non-pad file exists on disk.
+    /// `has_any_file` — upstream: any file (pad/zero-size included —
+    /// the `sz > 0` check inside does the filtering) with a positive
+    /// size on disk, **or** a part file present.
     pub fn has_any_file(&self) -> StorageResult<bool> {
-        let fs = &self.files;
-        for i in fs.file_range() {
-            if fs.pad_file_at(i) || fs.file_size(i) == 0 {
-                continue;
-            }
-            let rel = self.renamed.file_path(fs, i, &[]);
-            let p = self.save_path.join(bytes_to_path(&rel));
-            match fs::stat_file(&p, fs::FileStatusFlags::DONT_FOLLOW_LINKS) {
-                // a dangling symlink still counts as existing (upstream)
-                Ok(_) => return Ok(true),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(StorageError::new(e, i, Operation::FileStat)),
-            }
+        if crate::storage_utils::has_any_file(
+            &self.files,
+            &self.renamed,
+            &self.save_path(),
+            &self.stat_cache,
+        )? {
+            return Ok(true);
         }
-        Ok(false)
+        // also check the part file (upstream stats it with
+        // `error_file_partfile` — a part file full of priority-0 data
+        // still means "we have data on disk")
+        match fs::stat_file(&self.part_file_path(), fs::FileStatusFlags::NONE) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(StorageError::new(e, FileIndex(-1), Operation::FileStat)),
+        }
     }
 
-    /// `release_files` — close all pooled handles for this torrent and
-    /// flush part-file metadata.
+    /// `release_files` — flush part-file metadata, close all pooled
+    /// handles, and drop the stat cache (upstream clears it so the
+    /// next access re-stats a possibly-externally-changed disk).
     pub fn release_files(&self) -> StorageResult<()> {
-        self.pool.release_storage(self.storage_index());
         self.tick();
+        self.pool.release_storage(self.storage_index());
+        self.stat_cache.clear();
         Ok(())
     }
 
@@ -537,15 +571,19 @@ impl PreadStorage {
         }
     }
 
-    /// `rename_file(index, new_filename)` — rename on disk when the
-    /// file exists, else record the rename for later creation.
+    /// `rename_file(index, new_filename)` — release the pooled handle
+    /// first (upstream: a pooled handle would pin the old name on
+    /// Windows), then rename on disk when the file exists, else record
+    /// the rename for later creation.
     pub fn rename_file(&mut self, index: FileIndex, new_filename: &[u8]) -> StorageResult<()> {
+        self.pool.release_one(self.storage_index(), index);
+        let save_path = self.save_path();
         crate::storage_utils::rename_file(
             &self.files,
             &mut self.renamed,
             index,
             new_filename,
-            &self.save_path,
+            &save_path,
         )
     }
 
@@ -585,71 +623,122 @@ impl PreadStorage {
         crate::storage_utils::initialize_storage(
             &self.files,
             &self.renamed,
-            &self.save_path,
+            &self.save_path(),
             stat_cache_ptr,
             &self.file_priority,
             |i| self.open_file(i, OpenMode::WRITE).map(|_| ()),
-            |_target, _link| Ok(()), // symlinks: not created on Windows by default
-            |_i, _size| {},          // oversized flag collected above
+            // upstream reports oversized *non*-priority-0 files
+            // through this callback too (priority-0 ones were flagged
+            // in the pass above)
+            |_i, _size| ret |= disk_status::OVERSIZED_FILE,
         )?;
+        // upstream releases files it opened during initialize (they
+        // were opened in write mode and would pin sparse/alloc state)
+        self.pool.release_storage(self.storage_index());
         Ok(ret)
     }
 
-    /// `move_storage(new_save_path, flags)` — move all files; returns
-    /// `(status, new_path)`.
+    /// `move_storage(new_save_path, flags)` — release every pooled
+    /// handle first (Windows refuses renames of open files), move all
+    /// files + the part file, then commit `m_save_path` and drop the
+    /// stat cache. Returns upstream's `(status, new_path, error)`
+    /// triple — on failure the path is the *unchanged* old one.
     pub fn move_storage(
         &self,
         new_save_path: PathBuf,
         flags: MoveFlags,
-    ) -> StorageResult<(u8, PathBuf)> {
-        let save_path = self.save_path.clone();
+    ) -> (u8, PathBuf, Option<StorageError>) {
+        self.pool.release_storage(self.storage_index());
+        let save_path = self.save_path();
+        let part_dir = self.part_file_dir.clone();
         let mut pf = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
-        crate::storage_utils::move_storage(
+        let (status, path, error) = crate::storage_utils::move_storage(
             &self.files,
             &self.renamed,
             save_path,
             new_save_path,
             |path| {
+                let dir = if part_dir.as_os_str().is_empty() {
+                    path.to_path_buf()
+                } else {
+                    // upstream `combine_path(p, m_part_file_dir)` +
+                    // the `create_directories` it does first
+                    let d = path.join(&part_dir);
+                    fs::create_directories(&d)?;
+                    d
+                };
                 if let Some(p) = pf.as_mut() {
-                    p.move_partfile(path.to_path_buf())
+                    p.move_partfile(dir)
                 } else {
                     Ok(())
                 }
             },
             flags,
-        )
+        );
+        if status & disk_status::FATAL_DISK_ERROR == 0 && status & disk_status::FILE_EXIST == 0 {
+            *self.save_path.lock().unwrap_or_else(|e| e.into_inner()) = path.clone();
+        }
+        self.stat_cache.clear();
+        (status, path, error)
     }
 
-    /// `delete_files(options)` — delete torrent files / partfile.
+    /// `delete_files(options)` — release the pool and destroy the
+    /// part-file object *first* (upstream order: a live handle would
+    /// pin the file we're about to delete; destroying it flushes the
+    /// metadata), then delete the torrent files + part file.
     pub fn delete_files(&self, options: u8) -> StorageResult<()> {
-        let part_file = self.save_path.join(&self.part_file_name);
+        self.pool.release_storage(self.storage_index());
+        // `delete(m_part_file)` upstream — Drop flushes metadata
+        self.part_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let part_file = self.part_file_path();
         crate::storage_utils::delete_files(
             &self.files,
             &self.renamed,
-            &self.save_path,
+            &self.save_path(),
             &part_file,
             options,
         )
     }
 
     /// `set_file_priority` — move data in/out of the part file as
-    /// priorities cross the `dont_download` boundary.
+    /// priorities cross the `dont_download` boundary. Upstream applies
+    /// each file's new priority *in place* (`m_file_priority[i]`), so
+    /// on error the files processed so far keep their new priority and
+    /// the failing one keeps its old — mirrored here (no
+    /// all-or-nothing copy).
     pub fn set_file_priority(&mut self, prio: &[DownloadPriority]) -> StorageResult<()> {
-        let mut new_prio = self.file_priority.clone();
-        for idx in 0..self.files.num_files() as usize {
-            let i = FileIndex(idx as i32);
-            if idx >= prio.len() || idx >= new_prio.len() {
+        // extend our file priorities in case it's truncated; the
+        // default assumed priority is 4 (the default)
+        if prio.len() > self.file_priority.len() {
+            self.file_priority
+                .resize(prio.len(), DownloadPriority::DEFAULT);
+        }
+        for (idx, &new) in prio.iter().enumerate() {
+            let Some(i32_idx) = i32::try_from(idx).ok() else {
+                break;
+            };
+            let i = FileIndex(i32_idx);
+            // pad files always have priority 0
+            if i >= self.files.end_file() || self.files.pad_file_at(i) {
                 continue;
             }
-            let old_prio = new_prio[idx];
-            let new = prio[idx];
-            new_prio[idx] = new;
+            let old_prio = self.file_priority[idx];
 
             if old_prio == DownloadPriority::DONT_DOWNLOAD && new != DownloadPriority::DONT_DOWNLOAD
             {
-                // move data out of the part file
-                let handle = self.open_file(i, OpenMode::WRITE)?;
-                if self.use_partfile(i) {
+                // `m_part_file && use_partfile(i)` — move data out of
+                // the part file. `open_file` doesn't take the
+                // part-file mutex but is kept out of the guard anyway.
+                let has_part = self
+                    .part_file
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some();
+                if has_part && self.use_partfile(i) {
+                    let handle = self.open_file(i, OpenMode::WRITE)?;
                     let file_offset = self.files.file_offset(i);
                     let size = self.files.file_size(i);
                     let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
@@ -665,31 +754,30 @@ impl PreadStorage {
                                 }
                             }
                         })
-                        .map_err(|e| {
-                            new_prio[idx] = old_prio;
-                            StorageError::new(e, i, Operation::PartfileWrite)
-                        })?;
+                        .map_err(|e| StorageError::new(e, i, Operation::PartfileWrite))?;
                         if let Some(e) = write_err {
-                            new_prio[idx] = old_prio;
                             return Err(StorageError::new(e, i, Operation::PartfileWrite));
                         }
                     }
-                    drop(g);
                 }
             } else if old_prio != DownloadPriority::DONT_DOWNLOAD
                 && new == DownloadPriority::DONT_DOWNLOAD
             {
-                // moving into the part file is not implemented upstream
-                // either — just stop using the part file if the file
-                // exists on disk
+                // move stuff into the part file — not implemented
+                // upstream either; just stop using the part file when
+                // the file exists on disk
                 let p = self.resolve_path(i);
                 let exists = p
                     .try_exists()
                     .map_err(|e| StorageError::new(e, i, Operation::FileStat))?;
                 self.set_use_partfile(i, !exists);
             }
+            self.file_priority[idx] = new;
+
+            if self.file_priority[idx] == DownloadPriority::DONT_DOWNLOAD && self.use_partfile(i) {
+                self.need_partfile();
+            }
         }
-        self.file_priority = new_prio;
         let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pf) = g.as_ref() {
             pf.flush_metadata()
@@ -699,13 +787,15 @@ impl PreadStorage {
     }
 
     /// `verify_resume_data` — check the fastresume record against
-    /// on-disk state (delegated to `storage_utils`).
+    /// on-disk state. Returns `(verify_success, error)` — upstream's
+    /// `bool` + `storage_error&` pair; `false` is a *verdict* (the
+    /// caller turns it into `need_full_check`), not a hard failure.
     pub fn verify_resume_data(
         &self,
         have_pieces: &bitdaemon_common::bitfield::Bitfield,
         seed_mode: bool,
         links: &[std::path::PathBuf],
-    ) -> StorageResult<bool> {
+    ) -> (bool, Option<StorageError>) {
         crate::storage_utils::verify_resume_data(
             &self.files,
             &self.renamed,
@@ -714,7 +804,7 @@ impl PreadStorage {
             links,
             &self.file_priority,
             &self.stat_cache,
-            &self.save_path,
+            &self.save_path(),
         )
     }
 }
@@ -764,21 +854,24 @@ pub trait DiskStorage: Send + Sync {
     ) -> StorageResult<i64>;
     /// `release_files`.
     fn release_files(&self) -> StorageResult<()>;
-    /// `move_storage` — `(status, new_path)`.
-    fn move_storage(&self, path: PathBuf, flags: MoveFlags) -> StorageResult<(u8, PathBuf)>;
+    /// `move_storage` — upstream returns `(status_t, new_path)` plus a
+    /// `storage_error&`; on `fatal_disk_error`/`file_exist` the path
+    /// is the *unchanged* old one. Modeled as `(status, path, error)`.
+    fn move_storage(&self, path: PathBuf, flags: MoveFlags) -> (u8, PathBuf, Option<StorageError>);
     /// `delete_files`.
     fn delete_files(&self, options: u8) -> StorageResult<()>;
     /// `rename_file`.
     fn rename_file(&mut self, index: FileIndex, new_name: &[u8]) -> StorageResult<()>;
     /// `set_file_priority`.
     fn set_file_priority(&mut self, prio: &[DownloadPriority]) -> StorageResult<()>;
-    /// `verify_resume_data`.
+    /// `verify_resume_data` — `(verify_success, error)`; `false` is a
+    /// verdict (`need_full_check`), not a hard failure.
     fn verify_resume_data(
         &self,
         have_pieces: &bitdaemon_common::bitfield::Bitfield,
         seed_mode: bool,
         links: &[PathBuf],
-    ) -> StorageResult<bool>;
+    ) -> (bool, Option<StorageError>);
     /// `has_any_file` — true if any non-pad file exists on disk;
     /// drives `need_full_check` when there is no resume data.
     /// Default `false` keeps injected storages source-compatible.
@@ -862,7 +955,7 @@ impl DiskStorage for PreadStorage {
     fn release_files(&self) -> StorageResult<()> {
         PreadStorage::release_files(self)
     }
-    fn move_storage(&self, path: PathBuf, flags: MoveFlags) -> StorageResult<(u8, PathBuf)> {
+    fn move_storage(&self, path: PathBuf, flags: MoveFlags) -> (u8, PathBuf, Option<StorageError>) {
         PreadStorage::move_storage(self, path, flags)
     }
     fn delete_files(&self, options: u8) -> StorageResult<()> {
@@ -879,7 +972,7 @@ impl DiskStorage for PreadStorage {
         have_pieces: &bitdaemon_common::bitfield::Bitfield,
         seed_mode: bool,
         links: &[PathBuf],
-    ) -> StorageResult<bool> {
+    ) -> (bool, Option<StorageError>) {
         PreadStorage::verify_resume_data(self, have_pieces, seed_mode, links)
     }
     fn has_any_file(&self) -> StorageResult<bool> {

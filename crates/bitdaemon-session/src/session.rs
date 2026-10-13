@@ -337,6 +337,10 @@ pub struct Session {
     pub next_queue_seq: i64,
     /// last LSD broadcast.
     last_lsd: Option<Instant>,
+    /// last disk-pool idle reaping — upstream gives every
+    /// `disk_io_thread_pool` a 60 s `deadline_timer`
+    /// (`reap_idle_threads`); the session tick drives ours.
+    last_disk_reap: Option<Instant>,
     /// torrents that already fired their prioritized first LSD
     /// announce (upstream `torrent::start_announcing` emits one
     /// immediately, the 5-min timer only re-sends).
@@ -455,16 +459,17 @@ pub enum DiskCompleted {
         /// job result.
         err: StorageError,
     },
-    /// `async_check_files` — fastresume validation verdict
-    /// (`ret`: bit 0 = accepted, bits 8..16 = `disk_status` flags
-    /// from the storage's deferred `initialize()`).
+    /// `async_check_files` — fastresume validation verdict; `ret` is
+    /// upstream's pure `status_t` (`disk_status` bits:
+    /// `need_full_check`, `fatal_disk_error`, `oversized_file`,
+    /// plus the `initialize()` flags).
     CheckFiles {
         /// torrent.
         ih: Sha1Hash,
-        /// resume accepted (`verify_resume_data` verdict — bit 0).
+        /// resume accepted — neither `need_full_check` nor
+        /// `fatal_disk_error` set on the returned `status_t`.
         accepted: bool,
-        /// `disk_status` bits (job `ret >> 8`) — `oversized_file`
-        /// among them.
+        /// the job's `status_t` (`disk_status` bits) verbatim.
         status: i32,
         /// job result.
         err: StorageError,
@@ -577,6 +582,7 @@ impl Default for Session {
             lsd_announced: std::collections::BTreeSet::new(),
             next_queue_seq: 0,
             last_lsd: None,
+            last_disk_reap: None,
             session_time: 0,
             ip_filter: bitdaemon_net::ip_filter::IpFilter::new(),
             settings: crate::settings::SessionSettings::default(),
@@ -753,11 +759,14 @@ impl Session {
                             let tx = self.disk_tx.clone();
                             let storage = t.storage;
                             let v2 = t.hash_job_v2_span(req.piece);
+                            // `verify_piece` flags: write_mode-derived
+                            // flush/volatile + `v1_hash`.
+                            let hflags = t.hash_job_flags(false, self.settings.disk_io_write_mode);
                             disk.async_hash(
                                 storage,
                                 req.piece,
                                 v2,
-                                0,
+                                hflags,
                                 Box::new(move |piece, hash, block_hashes, err| {
                                     let _ = tx.send(DiskCompleted::Hash {
                                         ih,
@@ -997,7 +1006,17 @@ impl Session {
                         Box::new(move |err| {
                             let _ = tx.send(DiskCompleted::Write { ih, peer, req, err });
                         }),
-                        0,
+                        // upstream `torrent::add_piece`: writes get
+                        // `flush_piece | volatile_read` only under
+                        // `disk_io_write_mode == disable_os_cache`.
+                        if self.settings.disk_io_write_mode
+                            == crate::settings::DiskIoMode::DisableOsCache
+                        {
+                            bitdaemon_disk::disk_interface::flags::FLUSH_PIECE
+                                | bitdaemon_disk::disk_interface::flags::VOLATILE_READ
+                        } else {
+                            0
+                        },
                     );
                     if let Some(t) = self.torrents.get_mut(&ih)
                         && let Some(p) = t.peers.get_mut(&peer)
@@ -1047,12 +1066,16 @@ impl Session {
                     };
                     let storage = t.storage;
                     let v2 = t.hash_job_v2_span(*piece);
+                    // `start_checking` flags: sequential + volatile +
+                    // `v1_hash` — a full recheck shouldn't pollute the
+                    // OS page cache (upstream `advise_dont_need`).
+                    let hflags = t.hash_job_flags(true, self.settings.disk_io_write_mode);
                     let (piece, tx) = (*piece, self.disk_tx.clone());
                     disk.async_hash(
                         storage,
                         piece,
                         v2,
-                        0,
+                        hflags,
                         Box::new(move |piece, hash, block_hashes, err| {
                             let _ = tx.send(DiskCompleted::Hash {
                                 ih,
@@ -1075,6 +1098,7 @@ impl Session {
         io.set_write_no_cache(self.settings.disk_io_write_mode.bypasses_os_cache());
         io.set_read_no_cache(self.settings.disk_io_read_mode.bypasses_os_cache());
         io.set_cache_expiry(self.settings.cache_expiry.as_secs());
+        io.set_no_recheck_incomplete_resume(self.settings.no_recheck_incomplete_resume);
         io.set_open_mode_extra(open_mode_extra(&self.settings));
         self.disk = Some(io);
     }
@@ -1124,10 +1148,17 @@ impl Session {
             resume_data,
             links,
             Box::new(move |ret, err| {
+                // `ret` is upstream's `status_t` (`disk_status`) —
+                // the resume is accepted when neither
+                // `need_full_check` nor `fatal_disk_error` is set.
+                let rejected = ret
+                    & (i32::from(bitdaemon_disk::storage::disk_status::NEED_FULL_CHECK)
+                        | i32::from(bitdaemon_disk::storage::disk_status::FATAL_DISK_ERROR))
+                    != 0;
                 let _ = tx.send(DiskCompleted::CheckFiles {
                     ih,
-                    accepted: ret & 0xff != 0,
-                    status: ret >> 8,
+                    accepted: !rejected,
+                    status: ret,
                     err,
                 });
             }),
@@ -2402,7 +2433,12 @@ impl Session {
             d.set_write_no_cache(s.disk_io_write_mode.bypasses_os_cache());
             d.set_read_no_cache(s.disk_io_read_mode.bypasses_os_cache());
             d.set_cache_expiry(s.cache_expiry.as_secs());
+            d.set_no_recheck_incomplete_resume(s.no_recheck_incomplete_resume);
             d.set_open_mode_extra(open_mode_extra(&s));
+            // `session_impl::update_disk_threads` — `aio_threads` and
+            // `hashing_threads` resize their pools live upstream.
+            d.set_max_threads(s.aio_threads);
+            d.set_hash_threads(s.hashing_threads);
         }
         self.alerts.set_queue_limit(s.alert_queue_size);
         // `update_alert_mask` — upstream hot-applies the persisted
@@ -2544,6 +2580,20 @@ impl Session {
             self.manage_queue(dl, sd);
         }
         self.drain_disk_completed(out);
+        // `disk_io_thread_pool::m_idle_timer` — reap threads idle for
+        // the whole 60 s interval (verbatim cadence). Upstream's timer
+        // starts with the first pool thread and cancels on empty; a
+        // tick-driven call is a no-op on an empty pool.
+        if let Some(d) = &self.disk {
+            let now = Instant::now();
+            if self
+                .last_disk_reap
+                .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(60))
+            {
+                self.last_disk_reap = Some(now);
+                d.reap_idle_threads();
+            }
+        }
         // `session_impl` ip notifier — interface changes re-open
         // listen sockets upstream; here the driver owns sockets so
         // we surface the event.

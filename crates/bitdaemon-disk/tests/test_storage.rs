@@ -152,19 +152,25 @@ fn verify_resume_seed_requires_sizes() {
     let mut have = bitdaemon_common::bitfield::Bitfield::new();
     have.resize_with(2, false);
     // not a seed → missing files are tolerated when no piece is marked
-    assert!(st.verify_resume_data(&have, false, &[]).unwrap());
+    // (upstream `verify_resume_data` → `(true, no error)`)
+    let (ok, err) = st.verify_resume_data(&have, false, &[]);
+    assert!(ok && err.is_none());
 
-    // seed with wrong/missing files → mismatching_file_size error
+    // seed with wrong/missing files → `(false, mismatching_file_size)`
+    // — upstream's verdict+error pair, not a hard Err
     have.set_all();
-    let r = st.verify_resume_data(&have, false, &[]);
-    assert!(r.is_err());
+    let (ok, err) = st.verify_resume_data(&have, false, &[]);
+    assert!(!ok);
+    assert!(err.is_some());
 
     // write real data (both pieces → complete files) → verify passes
     st.write(&[9u8; 1024], PieceIndex(0), 0, OpenMode::WRITE)
         .unwrap();
     st.write(&[9u8; 976], PieceIndex(1), 0, OpenMode::WRITE)
         .unwrap();
-    assert!(st.verify_resume_data(&have, false, &[]).unwrap());
+    let (ok, err) = st.verify_resume_data(&have, false, &[]);
+    assert!(ok);
+    assert!(err.is_none());
     stdfs::remove_dir_all(&d).unwrap();
 }
 
@@ -294,12 +300,11 @@ fn move_storage_replaces_path() {
     st.write(&[2u8; 1024], PieceIndex(0), 0, OpenMode::WRITE)
         .unwrap();
 
-    let (status, new_path) = st
-        .move_storage(
-            d2.clone(),
-            bitdaemon_disk::storage::MoveFlags::AlwaysReplaceFiles,
-        )
-        .unwrap();
+    let (status, new_path, err) = st.move_storage(
+        d2.clone(),
+        bitdaemon_disk::storage::MoveFlags::AlwaysReplaceFiles,
+    );
+    assert!(err.is_none());
     assert_eq!(status & !disk_status::NEED_FULL_CHECK, 0);
     assert!(new_path.join("t/b.bin").exists());
     stdfs::remove_dir_all(&d).unwrap();

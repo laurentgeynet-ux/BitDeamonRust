@@ -40,6 +40,8 @@ pub enum Operation {
     FileTruncate,
     /// `operation_t::mkdir`.
     Mkdir,
+    /// `operation_t::symlink` — create/readlink of a symlink.
+    Symlink,
     /// `operation_t::check_resume`.
     CheckResume,
     /// `operation_t::alloc_cache_piece`.
@@ -77,6 +79,7 @@ impl Operation {
             Self::FileFsync => "file_fsync",
             Self::FileTruncate => "file_truncate",
             Self::Mkdir => "mkdir",
+            Self::Symlink => "symlink",
             Self::CheckResume => "check_resume",
             Self::AllocCachePiece => "alloc_cache_piece",
             Self::PartfileWrite => "partfile_write",
@@ -119,6 +122,20 @@ impl StorageError {
             io,
             file,
             operation,
+        }
+    }
+}
+
+/// Manual `Clone` — `io::Error` isn't `Clone`; reconstruct it with
+/// the same kind and rendered message (raw OS code text becomes the
+/// kind's generic text — upstream `error_code` copies preserve
+/// code+category, we preserve kind+message).
+impl Clone for StorageError {
+    fn clone(&self) -> Self {
+        Self {
+            io: io::Error::new(self.io.kind(), self.io.to_string()),
+            file: self.file,
+            operation: self.operation,
         }
     }
 }

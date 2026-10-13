@@ -15,8 +15,13 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::disk_job::DiskJob;
+
+/// `m_job_cond.wait_for(l, 1s)` — the idle loop's poll cadence; each
+/// wake re-runs the exit check and re-samples `min_idle`.
+const IDLE_POLL: Duration = Duration::from_secs(1);
 
 /// `jobqueue_t` — upstream intrusive tailqueue; a deque of owned jobs.
 pub type JobQueue = VecDeque<Box<DiskJob>>;
@@ -114,7 +119,9 @@ impl DiskIoThreadPool {
         let threads = self.threads.lock().unwrap_or_else(|e| e.into_inner());
         let cur = i64::try_from(threads.len()).unwrap_or(0);
         if cur > i {
-            g.threads_to_exit += cur - i;
+            // upstream `stop_threads` assigns — pending exits are
+            // re-set, not accumulated.
+            g.threads_to_exit = cur - i;
             self.job_cond.notify_all();
             return;
         }
@@ -143,27 +150,42 @@ impl DiskIoThreadPool {
             .push(handle);
     }
 
-    /// `job_queued(queue_size)` — spawn workers while jobs outnumber
-    /// threads (upstream policy: `queue_size > num_threads`, capped).
+    /// `job_queued(queue_size)` — spawn workers until idle+new cover
+    /// the queue (`for i = num_idle; i < queue_size && threads < max`),
+    /// capped at `max_threads`. Upstream counts *idle* threads as
+    /// coverage — busy ones can't take the new jobs — and shrinks any
+    /// pending exit request so arriving jobs keep their workers.
     pub fn job_queued(self: &Arc<Self>, queue_size: usize) {
-        if queue_size == 0 || self.inner.lock().unwrap_or_else(|e| e.into_inner()).abort {
+        let qs = i64::try_from(queue_size).unwrap_or(i64::MAX);
+        // cheap check first — enough idle workers already.
+        if self.num_idle.load(Ordering::Relaxed) >= qs {
             return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.abort {
+            return;
+        }
+        let num_idle = self.num_idle.load(Ordering::Relaxed);
+        // reduce the number of threads requested to stop — the new
+        // jobs are going to need them.
+        let keep = std::cmp::max(0, num_idle - qs);
+        if g.threads_to_exit > keep {
+            g.threads_to_exit = keep;
         }
         let max = self.max_threads.load(Ordering::Relaxed);
-        if max <= 0 {
-            return;
-        }
         let mut threads = self.threads.lock().unwrap_or_else(|e| e.into_inner());
-        let num_threads = i64::try_from(threads.len()).unwrap_or(0);
-        let want = std::cmp::min(i64::try_from(queue_size).unwrap_or(0), max);
-        for _ in num_threads..want {
+        let mut covered = num_idle;
+        while covered < qs && i64::try_from(threads.len()).unwrap_or(i64::MAX) < max {
             let pool = Arc::clone(self);
             let worker = Arc::clone(&self.worker);
             match thread::Builder::new()
                 .name("bitdaemon-disk".to_string())
                 .spawn(move || worker(pool))
             {
-                Ok(h) => threads.push(h),
+                Ok(h) => {
+                    threads.push(h);
+                    covered += 1;
+                }
                 Err(_) => break,
             }
         }
@@ -236,33 +258,41 @@ impl DiskIoThreadPool {
         self.job_cond.notify_all();
     }
 
-    /// `wait_for_job(l)` — worker-side wait. Caller pops the job itself
-    /// on `NewJob`.
+    /// `wait_for_job(l)` — worker-side wait, verbatim. The exit check
+    /// only runs while (or before) going idle: a thread asked to exit
+    /// with a non-empty queue drains it first unless other threads
+    /// remain (`queued empty || num_threads > 1`). Each 1 s wait round
+    /// emits one `thread_idle`/`thread_active` pair so
+    /// `reap_idle_threads` samples the interval's real idle minimum.
     pub fn wait_for_job(&self) -> WaitResult {
-        if self.should_exit() {
-            return WaitResult::ExitThread;
-        }
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if !g.queued.is_empty() {
-            return WaitResult::NewJob;
-        }
-        self.num_idle.fetch_add(1, Ordering::Relaxed);
-        loop {
-            // upstream: untimed wait — a spurious wake just re-checks
-            g = self.job_cond.wait(g).unwrap_or_else(|e| e.into_inner());
+        if g.queued.is_empty() {
             if self.interrupt.swap(false, Ordering::Relaxed) {
-                self.num_idle.fetch_sub(1, Ordering::Relaxed);
                 return WaitResult::Interrupt;
             }
-            if g.threads_to_exit > 0 || g.abort {
-                self.num_idle.fetch_sub(1, Ordering::Relaxed);
-                return WaitResult::ExitThread;
-            }
-            if !g.queued.is_empty() {
-                self.num_idle.fetch_sub(1, Ordering::Relaxed);
-                return WaitResult::NewJob;
+            loop {
+                if g.threads_to_exit > 0
+                    && (g.queued.is_empty() || self.num_threads() > 1)
+                    && self.try_thread_exit(&mut g)
+                {
+                    return WaitResult::ExitThread;
+                }
+                self.thread_idle();
+                let (gg, _) = self
+                    .job_cond
+                    .wait_timeout(g, IDLE_POLL)
+                    .unwrap_or_else(|e| e.into_inner());
+                g = gg;
+                self.thread_active();
+                if self.interrupt.swap(false, Ordering::Relaxed) {
+                    return WaitResult::Interrupt;
+                }
+                if !g.queued.is_empty() {
+                    break;
+                }
             }
         }
+        WaitResult::NewJob
     }
 
     /// `should_exit()` — weak check.
@@ -275,18 +305,25 @@ impl DiskIoThreadPool {
             > 0
     }
 
-    /// `try_thread_exit()` — last call before a worker returns; true ⇒
-    /// the thread must exit.
-    pub fn try_thread_exit(&self) -> bool {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if g.abort {
-            return true;
-        }
+    /// `try_thread_exit(id)` — consume one exit token. The exiting
+    /// thread removes its own handle from `threads` (upstream detaches
+    /// it) so `num_threads`/`job_queued`/`set_max_threads` never count
+    /// dead workers; under `abort` handles stay for `abort()` to join.
+    /// `g` must be the already-held pool lock — `threads` is taken
+    /// under it everywhere, no new ordering.
+    fn try_thread_exit(&self, g: &mut PoolInner) -> bool {
         if g.threads_to_exit > 0 {
             g.threads_to_exit -= 1;
+            if !g.abort {
+                let id = thread::current().id();
+                let mut threads = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(pos) = threads.iter().position(|t| t.thread().id() == id) {
+                    threads.remove(pos);
+                }
+            }
             return true;
         }
-        false
+        g.abort
     }
 
     /// `thread_idle` / `thread_active` — idle bookkeeping (reaper input).
@@ -308,18 +345,40 @@ impl DiskIoThreadPool {
         }
     }
 
-    /// `reap_idle_threads` — upstream's 60 s timer callback: stop
-    /// threads that were idle for the whole interval.
+    /// `reap_idle_threads` — upstream's 60 s timer callback, verbatim:
+    /// stop `min(max(min_idle, threads − max), threads − 1)` — the
+    /// larger of the interval's idle minimum or the over-cap excess,
+    /// always leaving one thread for interrupts. `min_idle` exchanges
+    /// with the *current* idle count (not MAX): the next interval's
+    /// baseline is now, so a first idle-less interval simply seeds it.
     pub fn reap_idle_threads(&self) {
-        let idle = self.min_idle.load(Ordering::Relaxed);
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        // keep at least one thread to react to interrupts
-        let to_stop = std::cmp::max(0, idle - 1);
-        if to_stop > 0 {
-            g.threads_to_exit += to_stop;
-            self.job_cond.notify_all();
+        if g.abort {
+            return;
         }
-        self.min_idle.store(i64::MAX, Ordering::Relaxed);
+        let nthreads = i64::try_from(self.threads.lock().unwrap_or_else(|e| e.into_inner()).len())
+            .unwrap_or(i64::MAX);
+        if nthreads == 0 {
+            return;
+        }
+        let min_idle = self
+            .min_idle
+            .swap(self.num_idle.load(Ordering::Relaxed), Ordering::Relaxed);
+        if min_idle <= 0 {
+            return;
+        }
+        let to_stop = std::cmp::min(
+            std::cmp::max(
+                min_idle,
+                nthreads - self.max_threads.load(Ordering::Relaxed),
+            ),
+            nthreads - 1,
+        );
+        if to_stop <= 0 {
+            return;
+        }
+        g.threads_to_exit = to_stop;
+        self.job_cond.notify_all();
     }
 
     /// `abort(wait)` — stop everything, optionally join.
@@ -371,6 +430,18 @@ impl DiskIoThreadPool {
         }
     }
 
+    /// `visit_jobs` mutating — `abort_hash_jobs` marks queued volatile
+    /// hash jobs `aborted` (they complete with the aborted error when
+    /// a worker dequeues them, like upstream's in-place flag set).
+    pub fn mark_aborted(&self, mut pred: impl FnMut(&DiskJob) -> bool) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for j in &mut g.queued {
+            if j.flags & crate::disk_job::job_flags::ABORTED == 0 && pred(j) {
+                j.flags |= crate::disk_job::job_flags::ABORTED;
+            }
+        }
+    }
+
     /// Drain all queued jobs (abort path).
     pub fn drain_jobs(&self) -> JobQueue {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -378,11 +449,5 @@ impl DiskIoThreadPool {
         g.queued_hashes = 0;
         g.queued_other = 0;
         std::mem::take(&mut g.queued)
-    }
-
-    /// `m_min_idle_threads` reset happens in `reap_idle_threads`;
-    /// initialize to MAX so the first reaping sees real mins.
-    pub fn init_min_idle(&self) {
-        self.min_idle.store(i64::MAX, Ordering::Relaxed);
     }
 }

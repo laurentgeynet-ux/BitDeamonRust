@@ -38,7 +38,9 @@ use crate::file_view_pool::{FileView, FileViewPool};
 pub struct MmapStorage {
     files: FileStorage,
     renamed: RenamedFiles,
-    save_path: PathBuf,
+    /// `m_save_path` — `move_storage` commits the new path back into
+    /// the storage (upstream `std::tie(ret, m_save_path) = ...`).
+    save_path: Mutex<PathBuf>,
     part_file_dir: PathBuf,
     part_file_name: PathBuf,
     pool: Arc<FileViewPool>,
@@ -67,8 +69,8 @@ impl MmapStorage {
     /// `mmap_storage(params, pool)`.
     #[must_use]
     pub fn new(params: StorageParams<'_>, pool: Arc<FileViewPool>) -> Self {
-        assert!(params.v1 || params.v2, "storage must be v1 or v2");
-        assert!(params.files.num_files() > 0);
+        debug_assert!(params.v1 || params.v2, "storage must be v1 or v2");
+        debug_assert!(params.files.num_files() > 0);
         let mut name = b".0000000000000000000000000000000000000000.parts".to_vec();
         for (i, b) in params.info_hash.iter().enumerate() {
             name[1 + i * 2] = b"0123456789abcdef"[usize::from(b >> 4)];
@@ -77,7 +79,7 @@ impl MmapStorage {
         Self {
             files: params.files.clone(),
             renamed: params.renamed.clone(),
-            save_path: bitdaemon_disk::fs::complete(&params.path),
+            save_path: Mutex::new(bitdaemon_disk::fs::complete(&params.path)),
             part_file_dir: params.part_file_dir,
             part_file_name: bytes_to_path(&name),
             pool,
@@ -153,7 +155,7 @@ impl MmapStorage {
 
     fn resolve_path(&self, index: FileIndex) -> PathBuf {
         let rel = self.renamed.file_path(&self.files, index, &[]);
-        self.save_path.join(bytes_to_path(&rel))
+        self.save_path().join(bytes_to_path(&rel))
     }
 
     /// `mmap_storage::open_file` (mmap_storage.cpp:879-927) — same
@@ -206,16 +208,35 @@ impl MmapStorage {
         )
     }
 
+    /// current save path (`m_save_path`).
+    fn save_path(&self) -> PathBuf {
+        self.save_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// `combine_path(save_path, part_file_dir)` or `save_path` — the
+    /// part file lives *under* the save path when a dir is set.
+    fn part_file_dir_path(&self) -> PathBuf {
+        let save = self.save_path();
+        if self.part_file_dir.as_os_str().is_empty() {
+            save
+        } else {
+            save.join(&self.part_file_dir)
+        }
+    }
+
+    /// full path of the `.parts` file.
+    fn part_file_path(&self) -> PathBuf {
+        self.part_file_dir_path().join(&self.part_file_name)
+    }
+
     fn need_partfile(&self) {
         let mut g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_none() {
-            let dir = if self.part_file_dir.as_os_str().is_empty() {
-                self.save_path.clone()
-            } else {
-                self.part_file_dir.clone()
-            };
             *g = Some(PartFile::new(
-                dir,
+                self.part_file_dir_path(),
                 self.part_file_name.clone(),
                 self.files.num_pieces(),
                 self.files.piece_length(),
@@ -375,11 +396,12 @@ impl MmapStorage {
         &self.file_priority
     }
 
-    /// `release_files` — drop every cached view and flush the part
-    /// file (upstream `release_files` unmaps everything).
+    /// `release_files` — drop every cached view, flush the part file
+    /// and clear the stat cache (upstream order and coverage).
     pub fn release_files(&self) -> StorageResult<()> {
-        self.pool.clear();
         self.tick();
+        self.pool.clear();
+        self.stat_cache.clear();
         Ok(())
     }
 
@@ -391,14 +413,17 @@ impl MmapStorage {
         }
     }
 
-    /// `rename_file`.
+    /// `rename_file` — unmap first (a live view pins the name on
+    /// Windows), then rename on disk or record it.
     pub fn rename_file(&mut self, index: FileIndex, new_filename: &[u8]) -> StorageResult<()> {
+        self.pool.clear();
+        let save_path = self.save_path();
         storage_utils::rename_file(
             &self.files,
             &mut self.renamed,
             index,
             new_filename,
-            &self.save_path,
+            &save_path,
         )
     }
 
@@ -437,74 +462,105 @@ impl MmapStorage {
         storage_utils::initialize_storage(
             &self.files,
             &self.renamed,
-            &self.save_path,
+            &self.save_path(),
             stat_cache_ptr,
             &self.file_priority,
             |i| self.open_file(i, OpenMode::WRITE).map(|_| ()),
-            |_target, _link| Ok(()),
-            |_i, _size| {},
+            |_i, _size| ret |= disk_status::OVERSIZED_FILE,
         )?;
         Ok(ret)
     }
 
-    /// `move_storage`.
+    /// `move_storage` — unmap first (Windows won't rename mapped
+    /// files), then move files + part file and commit `m_save_path`
+    /// only on success. Returns the upstream `(status, path, error)`
+    /// triple.
     pub fn move_storage(
         &self,
         new_save_path: PathBuf,
         flags: MoveFlags,
-    ) -> StorageResult<(u8, PathBuf)> {
+    ) -> (u8, PathBuf, Option<StorageError>) {
         self.pool.clear(); // unmap before moving files (Windows locks)
-        let save_path = self.save_path.clone();
+        let save_path = self.save_path();
+        let part_dir = self.part_file_dir.clone();
         let mut pf = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
-        storage_utils::move_storage(
+        let (status, path, error) = storage_utils::move_storage(
             &self.files,
             &self.renamed,
             save_path,
             new_save_path,
             |path| {
+                let dir = if part_dir.as_os_str().is_empty() {
+                    path.to_path_buf()
+                } else {
+                    let d = path.join(&part_dir);
+                    bitdaemon_disk::fs::create_directories(&d)?;
+                    d
+                };
                 if let Some(p) = pf.as_mut() {
-                    p.move_partfile(path.to_path_buf())
+                    p.move_partfile(dir)
                 } else {
                     Ok(())
                 }
             },
             flags,
-        )
+        );
+        if status & disk_status::FATAL_DISK_ERROR == 0 && status & disk_status::FILE_EXIST == 0 {
+            *self.save_path.lock().unwrap_or_else(|e| e.into_inner()) = path.clone();
+        }
+        self.stat_cache.clear();
+        (status, path, error)
     }
 
     /// `delete_files` — unmap first (Windows won't delete mapped
-    /// files), then delegate.
+    /// files) and destroy the part file (flushes its metadata), then
+    /// delegate.
     pub fn delete_files(&self, options: u8) -> StorageResult<()> {
         if options & remove_flags::DELETE_FILES != 0 {
             self.pool.clear();
         }
-        let part_file = self.save_path.join(&self.part_file_name);
+        self.part_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let part_file = self.part_file_path();
         storage_utils::delete_files(
             &self.files,
             &self.renamed,
-            &self.save_path,
+            &self.save_path(),
             &part_file,
             options,
         )
     }
 
     /// `set_file_priority` — export out of the part file through the
-    /// view on `dont_download`→wanted transitions.
+    /// view on `dont_download`→wanted transitions. Priorities are
+    /// applied in place like upstream (`m_file_priority[i]`), so a
+    /// failure leaves the earlier files' new priorities committed.
     pub fn set_file_priority(&mut self, prio: &[DownloadPriority]) -> StorageResult<()> {
-        let mut new_prio = self.file_priority.clone();
-        for idx in 0..self.files.num_files() as usize {
-            let i = FileIndex(idx as i32);
-            if idx >= prio.len() || idx >= new_prio.len() {
+        if prio.len() > self.file_priority.len() {
+            self.file_priority
+                .resize(prio.len(), DownloadPriority::DEFAULT);
+        }
+        for (idx, &new) in prio.iter().enumerate() {
+            let Some(i32_idx) = i32::try_from(idx).ok() else {
+                break;
+            };
+            let i = FileIndex(i32_idx);
+            if i >= self.files.end_file() || self.files.pad_file_at(i) {
                 continue;
             }
-            let old_prio = new_prio[idx];
-            let new = prio[idx];
-            new_prio[idx] = new;
+            let old_prio = self.file_priority[idx];
 
             if old_prio == DownloadPriority::DONT_DOWNLOAD && new != DownloadPriority::DONT_DOWNLOAD
             {
-                let view = self.open_file(i, OpenMode::WRITE)?;
-                if self.use_partfile(i) {
+                let has_part = self
+                    .part_file
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_some();
+                if has_part && self.use_partfile(i) {
+                    let view = self.open_file(i, OpenMode::WRITE)?;
                     let file_offset = self.files.file_offset(i);
                     let size = self.files.file_size(i);
                     let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
@@ -518,16 +574,11 @@ impl MmapStorage {
                                 write_err = Some(e);
                             }
                         })
-                        .map_err(|e| {
-                            new_prio[idx] = old_prio;
-                            StorageError::new(e, i, Operation::PartfileWrite)
-                        })?;
+                        .map_err(|e| StorageError::new(e, i, Operation::PartfileWrite))?;
                         if let Some(e) = write_err {
-                            new_prio[idx] = old_prio;
                             return Err(StorageError::new(e, i, Operation::PartfileWrite));
                         }
                     }
-                    drop(g);
                 }
             } else if old_prio != DownloadPriority::DONT_DOWNLOAD
                 && new == DownloadPriority::DONT_DOWNLOAD
@@ -538,8 +589,12 @@ impl MmapStorage {
                     .map_err(|e| StorageError::new(e, i, Operation::FileStat))?;
                 self.set_use_partfile(i, !exists);
             }
+            self.file_priority[idx] = new;
+
+            if self.file_priority[idx] == DownloadPriority::DONT_DOWNLOAD && self.use_partfile(i) {
+                self.need_partfile();
+            }
         }
-        self.file_priority = new_prio;
         let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pf) = g.as_ref() {
             pf.flush_metadata()
@@ -548,13 +603,13 @@ impl MmapStorage {
         Ok(())
     }
 
-    /// `verify_resume_data`.
+    /// `verify_resume_data` — `(verdict, error)` like upstream.
     pub fn verify_resume_data(
         &self,
         have_pieces: &bitdaemon_common::bitfield::Bitfield,
         seed_mode: bool,
         links: &[PathBuf],
-    ) -> StorageResult<bool> {
+    ) -> (bool, Option<StorageError>) {
         storage_utils::verify_resume_data(
             &self.files,
             &self.renamed,
@@ -563,8 +618,30 @@ impl MmapStorage {
             links,
             &self.file_priority,
             &self.stat_cache,
-            &self.save_path,
+            &self.save_path(),
         )
+    }
+
+    /// `has_any_file` — any positive-size file on disk, or a part
+    /// file present (upstream `mmap_storage::has_any_file` is the
+    /// same as `pread_storage`'s).
+    pub fn has_any_file(&self) -> StorageResult<bool> {
+        if storage_utils::has_any_file(
+            &self.files,
+            &self.renamed,
+            &self.save_path(),
+            &self.stat_cache,
+        )? {
+            return Ok(true);
+        }
+        match bitdaemon_disk::fs::stat_file(
+            &self.part_file_path(),
+            bitdaemon_disk::fs::FileStatusFlags::NONE,
+        ) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(StorageError::new(e, FileIndex(-1), Operation::FileStat)),
+        }
     }
 }
 
@@ -611,7 +688,7 @@ impl DiskStorage for MmapStorage {
     fn release_files(&self) -> StorageResult<()> {
         MmapStorage::release_files(self)
     }
-    fn move_storage(&self, path: PathBuf, flags: MoveFlags) -> StorageResult<(u8, PathBuf)> {
+    fn move_storage(&self, path: PathBuf, flags: MoveFlags) -> (u8, PathBuf, Option<StorageError>) {
         MmapStorage::move_storage(self, path, flags)
     }
     fn delete_files(&self, options: u8) -> StorageResult<()> {
@@ -628,8 +705,12 @@ impl DiskStorage for MmapStorage {
         have_pieces: &bitdaemon_common::bitfield::Bitfield,
         seed_mode: bool,
         links: &[PathBuf],
-    ) -> StorageResult<bool> {
+    ) -> (bool, Option<StorageError>) {
         MmapStorage::verify_resume_data(self, have_pieces, seed_mode, links)
+    }
+
+    fn has_any_file(&self) -> StorageResult<bool> {
+        MmapStorage::has_any_file(self)
     }
     fn set_open_mode_extra(&self, mode: OpenMode) {
         self.open_mode_extra

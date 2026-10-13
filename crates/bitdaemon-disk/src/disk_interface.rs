@@ -195,12 +195,30 @@ pub trait DiskIo: Send + Sync {
     /// in the write cache before the periodic flush (upstream 60).
     fn set_cache_expiry(&self, _secs: u64) {}
 
+    /// `settings_pack::no_recheck_incomplete_resume` — when set,
+    /// `async_check_files` never reports `need_full_check` (upstream
+    /// reads the setting inside `do_job(check_fastresume)`).
+    fn set_no_recheck_incomplete_resume(&self, _v: bool) {}
+
     /// `settings_pack::enable_set_file_valid_data`/`no_atime_storage` —
     /// extra `OpenMode` bits pushed into every storage's file opens.
     /// Upstream reads them live from `settings_interface` inside
     /// `pread_storage::open_file`; backends snapshot them per storage.
     /// Default no-op for storages without tunable open flags.
     fn set_open_mode_extra(&self, _mode: crate::open_mode::OpenMode) {}
+
+    /// `session_impl::update_disk_threads` — resize the generic job
+    /// pool (`aio_threads` → `m_generic_threads.set_max_threads`).
+    fn set_max_threads(&self, _n: i64) {}
+
+    /// `session_impl::update_disk_threads` — resize the dedicated hash
+    /// pool (`hashing_threads` → `m_hash_threads.set_max_threads`).
+    fn set_hash_threads(&self, _n: i64) {}
+
+    /// `disk_io_thread_pool::reap_idle_threads` — upstream runs it on
+    /// a 60 s `deadline_timer` per pool; the session drives it from
+    /// `tick` at the same cadence.
+    fn reap_idle_threads(&self) {}
 
     /// periodic flush of expired cache regions — called once per
     /// session tick (upstream's disk-thread flush timer).

@@ -281,8 +281,10 @@ pool.
 - [x] **`SetFileValidData`** (ADR-0022): `enable_set_file_valid_data`
       setting → `allow_set_file_valid_data` → `SetFileValidData` on
       truncate + non-sparse, with best-effort `SE_MANAGE_VOLUME_NAME`.
-      CLI enables it by default (qBittorrent parity — the CLI forces
-      `StorageMode::Allocate`).
+      CLI enables it by default (qBittorrent parity — opt-out via
+      `--no-set-file-valid-data`; default storage mode is `sparse`,
+      which already avoids NTFS zero-fill on out-of-order writes —
+      `allocate` + SFVD covers the pre-allocation path).
 - [x] **`hashing_threads` pool** (ADR-0022): dedicated
       `DiskIoThreadPool` for `hash`/`hash2` jobs (upstream
       `m_hash_threads`, default 1); `aio_threads` default raised to

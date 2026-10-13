@@ -109,6 +109,7 @@ fn read_job(piece: i32, got: Arc<Mutex<Vec<u8>>>, done: Arc<AtomicUsize>) -> Box
             piece: PieceIndex(piece),
             offset: 0,
             volatile: false,
+            sequential: false,
         }),
     })
 }
@@ -161,9 +162,9 @@ fn read_burst_all_complete() {
 }
 
 /// real-swarm catch: `check_fastresume` with **no resume data** must
-/// return `need_full_check` (ret bit0 = 0) when files exist on disk,
-/// and `accepted` only when the directory is empty — upstream
-/// `pread_disk_io::do_job(check_fastresume)`:
+/// return `need_full_check` (`ret & status_t::need_full_check`) when
+/// files exist on disk, and `0` only when the directory is empty —
+/// upstream `pread_disk_io::do_job(check_fastresume)`:
 /// `!contains_resume_data → has_any_file ? need_full_check : ok`.
 /// Previously the empty `have` bitfield made `verify_resume_data`
 /// answer "ok", so existing data was never re-hashed.
@@ -201,8 +202,11 @@ fn check_fastresume_no_resume_needs_full_check_when_files_exist() {
         }),
     );
     wait(&io, &done);
-    assert_eq!(
-        ret.load(Ordering::Relaxed) & 0xff,
+    // `ret` is a pure `status_t` bitmask: `need_full_check` (bit 1)
+    // must be set — files exist but no resume data describes them.
+    assert_ne!(
+        ret.load(Ordering::Relaxed)
+            & bitdaemon_disk::storage::disk_status::NEED_FULL_CHECK as usize,
         0,
         "must need_full_check"
     );
@@ -223,7 +227,8 @@ fn check_fastresume_no_resume_needs_full_check_when_files_exist() {
         }),
     );
     wait(&io, &done2);
-    assert_eq!(ret2.load(Ordering::Relaxed) & 0xff, 1, "must accept");
+    // empty directory + no resume data → `status_t` clean (accepted)
+    assert_eq!(ret2.load(Ordering::Relaxed), 0, "must accept");
 }
 
 #[test]
@@ -311,6 +316,9 @@ fn hash_job_computes_piece_sha1() {
                 piece: PieceIndex(0),
                 block_hashes: Vec::new(),
                 piece_hash: Sha1Hash::default(),
+                v1_hash: true,
+                volatile: false,
+                sequential: false,
             }),
         }),
     );
@@ -331,7 +339,7 @@ fn hash_parked_behind_inflight_write_is_released() {
 
     use bitdaemon_disk::open_mode::OpenMode;
     use bitdaemon_disk::storage::{DiskStorage, MoveFlags};
-    use bitdaemon_disk::storage_error::StorageResult;
+    use bitdaemon_disk::storage_error::{StorageError, StorageResult};
 
     // `write` blocks on a barrier so the piece_gate holds the hash job
     // deterministically until the test releases the worker.
@@ -384,7 +392,7 @@ fn hash_parked_behind_inflight_write_is_released() {
         fn release_files(&self) -> StorageResult<()> {
             self.inner.release_files()
         }
-        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> StorageResult<(u8, PathBuf)> {
+        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> (u8, PathBuf, Option<StorageError>) {
             unimplemented!()
         }
         fn delete_files(&self, _o: u8) -> StorageResult<()> {
@@ -401,7 +409,7 @@ fn hash_parked_behind_inflight_write_is_released() {
             _h: &bitdaemon_common::bitfield::Bitfield,
             _s: bool,
             _l: &[PathBuf],
-        ) -> StorageResult<bool> {
+        ) -> (bool, Option<StorageError>) {
             unimplemented!()
         }
     }
@@ -440,6 +448,9 @@ fn hash_parked_behind_inflight_write_is_released() {
                 piece: PieceIndex(0),
                 block_hashes: Vec::new(),
                 piece_hash: Sha1Hash::default(),
+                v1_hash: true,
+                volatile: false,
+                sequential: false,
             }),
         }),
     );
@@ -507,12 +518,14 @@ fn disabled_backend_completes_noop() {
 }
 
 /// real-swarm catch (Ubuntu 6.5 GiB swarm): a flush whose `write`
-/// fails must NOT mark its blocks `flushed` — `run_flushed` used to
-/// retire them unconditionally, leaving verified pieces with
-/// never-written zero holes on disk. The buffers must return to the
-/// cache and retry instead.
+/// fails completes every parked writer with the error — upstream
+/// `flush_cache_blocks` sets `j2->error` and still marks the visited
+/// blocks `flushed` (the buffer is dropped, not retried; the peer
+/// layer re-requests the piece). The write handler must observe the
+/// failure exactly once, and a later `flush_all` must not resurrect
+/// the dropped block.
 #[test]
-fn flush_error_restores_buffers() {
+fn flush_error_propagates_to_writer() {
     use bitdaemon_common::types::PeerRequest;
     use bitdaemon_disk::disk_interface::DiskIo;
     use bitdaemon_disk::open_mode::OpenMode;
@@ -575,7 +588,7 @@ fn flush_error_restores_buffers() {
         fn release_files(&self) -> StorageResult<()> {
             self.inner.release_files()
         }
-        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> StorageResult<(u8, PathBuf)> {
+        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> (u8, PathBuf, Option<StorageError>) {
             unimplemented!()
         }
         fn delete_files(&self, _o: u8) -> StorageResult<()> {
@@ -592,7 +605,7 @@ fn flush_error_restores_buffers() {
             _h: &bitdaemon_common::bitfield::Bitfield,
             _s: bool,
             _l: &[PathBuf],
-        ) -> StorageResult<bool> {
+        ) -> (bool, Option<StorageError>) {
             unimplemented!()
         }
     }
@@ -611,7 +624,8 @@ fn flush_error_restores_buffers() {
     let mut buf = io.buffer_pool().allocate_buffer("t");
     buf.data_mut().unwrap()[..1024].fill(0x5A);
     let hit = Arc::new(AtomicUsize::new(0));
-    let h = Arc::clone(&hit);
+    let saw_err = Arc::new(AtomicBool::new(false));
+    let (h, se) = (Arc::clone(&hit), Arc::clone(&saw_err));
     io.async_write(
         StorageIndex(0),
         PeerRequest {
@@ -621,38 +635,45 @@ fn flush_error_restores_buffers() {
         },
         buf,
         None,
-        Box::new(move |_| {
+        Box::new(move |e| {
+            // upstream: the write handler receives the *flush* error —
+            // a cached write is not durable until the block lands.
+            se.store(e.is_err(), Ordering::Relaxed);
             h.fetch_add(1, Ordering::Relaxed);
         }),
         0,
     );
 
-    // the first flush attempt must fail; the block goes back dirty
+    // the first flush attempt must fail; the writer completes with
+    // the propagated error exactly once.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while DiskIo::flush_error_count(&*io) == 0 && std::time::Instant::now() < deadline {
+    while hit.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
         io.completed().call_job_handlers();
         std::thread::sleep(Duration::from_millis(5));
     }
+    assert_eq!(hit.load(Ordering::Relaxed), 1);
+    assert!(
+        saw_err.load(Ordering::Relaxed),
+        "writer must see the flush error"
+    );
     assert_eq!(DiskIo::flush_error_count(&*io), 1);
 
-    // retry — buffers restored, so the second attempt lands the data
+    // upstream marks the visited span flushed even on error — no
+    // restore, no silent retry: `flush_all` must not resurrect it.
     io.flush_all();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
+    while std::time::Instant::now() < deadline {
         io.completed().call_job_handlers();
-        let a = std::fs::read(d.join("t/a.bin")).unwrap_or_default();
-        let b = std::fs::read(d.join("t/b.bin")).unwrap_or_default();
-        // piece 0 spans a.bin[0..1000] + b.bin[0..24]
-        if a.len() == 1000
-            && a.iter().all(|&x| x == 0x5A)
-            && b.len() >= 24
-            && b[..24].iter().all(|&x| x == 0x5A)
-        {
+        std::thread::sleep(Duration::from_millis(20));
+        if io.completed().pending() == 0 {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "data never flushed");
-        std::thread::sleep(Duration::from_millis(5));
     }
+    let a = std::fs::read(d.join("t/a.bin")).unwrap_or_default();
+    assert!(
+        !a.iter().all(|&x| x == 0x5A) || a.len() < 1000,
+        "failed block must not be re-flushed"
+    );
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();
 }
@@ -741,19 +762,27 @@ fn spanning_read_fully_cached_needs_no_disk() {
     let (io, _drained) = make_io(0);
     io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs_big(), &d)));
 
-    let done = Arc::new(AtomicUsize::new(0));
-    // two dirty blocks of a four-block piece → stays in the cache
-    aw(&io, 0, 0x4000, 0xAA, Arc::clone(&done));
-    aw(&io, 0x4000, 0x4000, 0xBB, Arc::clone(&done));
+    // two dirty blocks of a four-block piece → stays in the cache;
+    // the writers stay parked on their blocks — upstream completes a
+    // write when the flush makes it durable, not at insert.
+    let wdone = Arc::new(AtomicUsize::new(0));
+    aw(&io, 0, 0x4000, 0xAA, Arc::clone(&wdone));
+    aw(&io, 0x4000, 0x4000, 0xBB, Arc::clone(&wdone));
 
+    let done = Arc::new(AtomicUsize::new(0));
     let got = Arc::new(Mutex::new(Vec::new()));
     ar(&io, 0x2000, 0x4000, Arc::clone(&got), Arc::clone(&done));
 
-    wait_done(&io, &done, 3);
+    wait_done(&io, &done, 1);
     let got = got.lock().unwrap();
     assert!(got.len() >= 0x4000);
     assert!(got[..0x2000].iter().all(|&b| b == 0xAA));
     assert!(got[0x2000..0x4000].iter().all(|&b| b == 0xBB));
+    drop(got);
+    // nothing flushed yet → the writers are still pending.
+    assert_eq!(wdone.load(Ordering::Relaxed), 0);
+    io.flush_all();
+    wait_done(&io, &wdone, 2);
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();
 }
@@ -770,19 +799,24 @@ fn spanning_read_one_side_cached_runs_partial_read() {
     let (io, _drained) = make_io(0);
     io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs_big(), &d)));
 
-    let done = Arc::new(AtomicUsize::new(0));
-    // only block 0 is dirty in the cache; block 1 exists on disk only
-    aw(&io, 0, 0x4000, 0xAA, Arc::clone(&done));
+    // only block 0 is dirty in the cache; block 1 exists on disk
+    // only — the write stays parked until a flush lands it.
+    let wdone = Arc::new(AtomicUsize::new(0));
+    aw(&io, 0, 0x4000, 0xAA, Arc::clone(&wdone));
 
+    let done = Arc::new(AtomicUsize::new(0));
     let got = Arc::new(Mutex::new(Vec::new()));
     ar(&io, 0x2000, 0x4000, Arc::clone(&got), Arc::clone(&done));
 
-    wait_done(&io, &done, 2);
+    wait_done(&io, &done, 1);
     let got = got.lock().unwrap();
     assert!(got.len() >= 0x4000);
     // first half from the cached block, second half read off disk
     assert!(got[..0x2000].iter().all(|&b| b == 0xAA));
     assert!(got[0x2000..0x4000].iter().all(|&b| b == 0xCC));
+    drop(got);
+    io.flush_all();
+    wait_done(&io, &wdone, 1);
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();
 }
@@ -821,16 +855,21 @@ fn aligned_read_served_from_cache() {
     let (io, _drained) = make_io(0);
     io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs_big(), &d)));
 
-    let done = Arc::new(AtomicUsize::new(0));
-    aw(&io, 0x4000, 0x4000, 0xDD, Arc::clone(&done));
+    let wdone = Arc::new(AtomicUsize::new(0));
+    aw(&io, 0x4000, 0x4000, 0xDD, Arc::clone(&wdone));
 
+    let done = Arc::new(AtomicUsize::new(0));
     let got = Arc::new(Mutex::new(Vec::new()));
     ar(&io, 0x4000, 0x4000, Arc::clone(&got), Arc::clone(&done));
 
-    wait_done(&io, &done, 2);
+    wait_done(&io, &done, 1);
     let got = got.lock().unwrap();
     assert!(got.len() >= 0x4000);
     assert!(got[..0x4000].iter().all(|&b| b == 0xDD));
+    drop(got);
+    // the writer completes once `flush_all` makes the block durable.
+    io.flush_all();
+    wait_done(&io, &wdone, 1);
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();
 }
@@ -883,7 +922,7 @@ fn write_parked_behind_fence_inserts_on_repost() {
     use bitdaemon_disk::disk_interface::DiskIo;
     use bitdaemon_disk::open_mode::OpenMode;
     use bitdaemon_disk::storage::{DiskStorage, MoveFlags};
-    use bitdaemon_disk::storage_error::StorageResult;
+    use bitdaemon_disk::storage_error::{StorageError, StorageResult};
 
     // `release_files` is a fence job — hold it mid-flight so the
     // fence stays raised while the write arrives.
@@ -938,7 +977,7 @@ fn write_parked_behind_fence_inserts_on_repost() {
             self.release.wait();
             self.inner.release_files()
         }
-        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> StorageResult<(u8, PathBuf)> {
+        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> (u8, PathBuf, Option<StorageError>) {
             unimplemented!()
         }
         fn delete_files(&self, _o: u8) -> StorageResult<()> {
@@ -955,7 +994,7 @@ fn write_parked_behind_fence_inserts_on_repost() {
             _h: &bitdaemon_common::bitfield::Bitfield,
             _s: bool,
             _l: &[PathBuf],
-        ) -> StorageResult<bool> {
+        ) -> (bool, Option<StorageError>) {
             unimplemented!()
         }
     }
@@ -987,12 +1026,12 @@ fn write_parked_behind_fence_inserts_on_repost() {
     entered.wait();
 
     // fence up → the write parks, returns false like upstream.
-    let done = Arc::new(AtomicUsize::new(0));
+    let wdone = Arc::new(AtomicUsize::new(0));
     let mut buf = io.buffer_pool().allocate_buffer("w");
     for b in buf.data_mut().unwrap() {
         *b = 0xE5;
     }
-    let d2 = Arc::clone(&done);
+    let d2 = Arc::clone(&wdone);
     let pressure = io.async_write(
         StorageIndex(0),
         PeerRequest {
@@ -1009,25 +1048,30 @@ fn write_parked_behind_fence_inserts_on_repost() {
     );
     assert!(!pressure, "parked write must report no back-pressure");
     assert_eq!(
-        done.load(Ordering::Relaxed),
+        wdone.load(Ordering::Relaxed),
         0,
         "parked write must not complete"
     );
 
     // let the fence job finish — the repost inserts the block into
-    // the cache and completes the write through the queue.
+    // the cache; the writer stays parked on it (not yet durable).
     release.wait();
-    wait_done(&io, &done, 1);
     wait_done(&io, &rf_done, 1);
 
     // the block landed in the cache at repost — the read is served
     // without touching disk (the data files do not exist).
+    let done = Arc::new(AtomicUsize::new(0));
     let got = Arc::new(Mutex::new(Vec::new()));
     ar(&io, 0x8000, 0x4000, Arc::clone(&got), Arc::clone(&done));
-    wait_done(&io, &done, 2);
+    wait_done(&io, &done, 1);
     let got = got.lock().unwrap();
     assert!(got.len() >= 0x4000);
     assert!(got[..0x4000].iter().all(|&b| b == 0xE5));
+    drop(got);
+    // upstream: the write handler fires only when the flush lands
+    // the block on disk.
+    io.flush_all();
+    wait_done(&io, &wdone, 1);
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();
 }
@@ -1040,7 +1084,7 @@ fn stacked_fence_flushes_reposted_write_before_running() {
     use bitdaemon_disk::disk_interface::DiskIo;
     use bitdaemon_disk::open_mode::OpenMode;
     use bitdaemon_disk::storage::{DiskStorage, MoveFlags};
-    use bitdaemon_disk::storage_error::StorageResult;
+    use bitdaemon_disk::storage_error::{StorageError, StorageResult};
 
     // `release_files` is a fence job. Its first invocation holds the
     // fence at a barrier while a write and a *stacked* fence queue
@@ -1112,7 +1156,7 @@ fn stacked_fence_flushes_reposted_write_before_running() {
             }
             self.inner.release_files()
         }
-        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> StorageResult<(u8, PathBuf)> {
+        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> (u8, PathBuf, Option<StorageError>) {
             unimplemented!()
         }
         fn delete_files(&self, _o: u8) -> StorageResult<()> {
@@ -1129,7 +1173,7 @@ fn stacked_fence_flushes_reposted_write_before_running() {
             _h: &bitdaemon_common::bitfield::Bitfield,
             _s: bool,
             _l: &[PathBuf],
-        ) -> StorageResult<bool> {
+        ) -> (bool, Option<StorageError>) {
             unimplemented!()
         }
     }

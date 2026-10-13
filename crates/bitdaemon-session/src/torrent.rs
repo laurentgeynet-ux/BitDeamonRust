@@ -306,6 +306,10 @@ pub struct Torrent {
     /// while set, `is_seed()` is true and verification is lazy
     /// (`m_verified`/`m_verifying` track slow background checks).
     pub seed_mode: bool,
+    /// `m_disable_v1_hashes` — hybrid torrent: skip the SHA-1 piece
+    /// hash and treat the storage as v2-only. Locked at construction
+    /// (upstream ctor) so the storage layout can't drift mid-life.
+    pub disable_v1_hashes: bool,
     /// `m_verified` — pieces confirmed while in seed_mode
     /// (lazy re-check bookkeeping; cleared on leave).
     pub seed_verified: Bitfield,
@@ -607,6 +611,7 @@ impl Torrent {
             upload_mode: false,
             share_mode: false,
             seed_mode: false,
+            disable_v1_hashes: false,
             seed_verified: Bitfield::default(),
             seed_verifying: Bitfield::default(),
             num_verified: 0,
@@ -777,6 +782,13 @@ impl Torrent {
             t.seed_verified = Bitfield::with_size(t.num_pieces.max(0) as usize);
             t.seed_verifying = Bitfield::with_size(t.num_pieces.max(0) as usize);
         }
+        // upstream `torrent::torrent` locks `m_disable_v1_hashes` at
+        // construction (`atp.flags & disable_v1_hashes && v2`) so a
+        // later settings change can't desync the storage layout.
+        t.disable_v1_hashes = atp
+            .flags
+            .contains(bitdaemon_common::flags::TorrentFlags::DISABLE_V1_HASHES)
+            && t.ti.as_ref().is_some_and(|ti| ti.v2());
         t.save_path = String::from_utf8_lossy(&atp.save_path).into_owned();
         t.storage_mode = atp.storage_mode;
         t.part_file_dir = String::from_utf8_lossy(&atp.part_file_dir).into_owned();
@@ -3436,12 +3448,48 @@ impl Torrent {
             .is_some_and(|t| t.v2() && t.info_hash_v1().is_none())
     }
 
+    /// `info_hashes().has_v1() && !m_disable_v1_hashes` — whether a
+    /// hash job should also produce the SHA-1 piece hash (upstream
+    /// `torrent::verify_piece`/`start_checking` flag condition).
+    #[must_use]
+    pub fn wants_v1_hash(&self) -> bool {
+        !self.disable_v1_hashes
+            && self
+                .ti
+                .as_ref()
+                .is_some_and(|ti| ti.info_hash_v1().is_some())
+    }
+
+    /// The `disk_job_flags` for `async_hash`, mirroring upstream:
+    /// `verify_piece` — `flush_piece` under write_through, `flush_piece
+    /// | volatile_read` under disable_os_cache (+ `v1_hash` when v1 is
+    /// wanted); `start_checking` — `sequential_access | volatile_read`
+    /// (+ `v1_hash`). `checking` selects which upstream path applies.
+    #[must_use]
+    pub fn hash_job_flags(&self, checking: bool, write_mode: crate::settings::DiskIoMode) -> u8 {
+        use bitdaemon_disk::disk_interface::flags as f;
+        let mut flags = if checking {
+            f::SEQUENTIAL_ACCESS | f::VOLATILE_READ
+        } else {
+            match write_mode {
+                crate::settings::DiskIoMode::WriteThrough => f::FLUSH_PIECE,
+                crate::settings::DiskIoMode::DisableOsCache => f::FLUSH_PIECE | f::VOLATILE_READ,
+                _ => 0,
+            }
+        };
+        if self.wants_v1_hash() {
+            flags |= f::V1_HASH;
+        }
+        flags
+    }
+
     /// The `block_hashes` span to pass to `async_hash`: sized to
-    /// `blocks_in_piece2` for v2-only torrents, empty otherwise
-    /// (upstream `hash_job` only fills v2 hashes when requested).
+    /// `blocks_in_piece2` for every v2-capable torrent — hybrid
+    /// included (upstream `verify_piece` resizes on `has_v2()`), so
+    /// `on_blocks_hashed` feeds the v2 tree on every verified piece.
     #[must_use]
     pub fn hash_job_v2_span(&self, piece: PieceIndex) -> Vec<bitdaemon_common::Sha256Hash> {
-        if !self.is_v2_only() {
+        if !self.ti.as_ref().is_some_and(|ti| ti.v2()) {
             return Vec::new();
         }
         self.files
@@ -3507,6 +3555,9 @@ impl Torrent {
         }
         if self.seed_mode {
             f |= F::SEED_MODE;
+        }
+        if self.disable_v1_hashes {
+            f |= F::DISABLE_V1_HASHES;
         }
         f
     }

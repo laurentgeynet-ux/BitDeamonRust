@@ -27,7 +27,12 @@ impl FileProgress {
 
     /// `init(picker, fs)` — upstream iterates pieces asking the picker;
     /// we take the same `have_pieces` bitfield the picker wraps.
+    /// Idempotent like upstream (`if (!m_file_progress.empty()) return`)
+    /// — a second init must not wipe progress already accrued.
     pub fn init(&mut self, have_pieces: &Bitfield, fs: &FileStorage) {
+        if !self.file_progress.is_empty() {
+            return;
+        }
         let num_files = usize::try_from(fs.num_files()).unwrap_or(0);
         self.file_progress.clear();
         self.file_progress.resize(num_files, 0);

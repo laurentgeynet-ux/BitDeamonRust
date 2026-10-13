@@ -70,6 +70,15 @@ impl StatCache {
         fs: &FileStorage,
         save_path: &Path,
     ) -> io::Result<i64> {
+        // upstream: always pretend symlinks don't exist — they get
+        // special create/validate logic, and statting the target
+        // blindly risks a cycle of references.
+        if fs
+            .file_flags(i)
+            .contains(bitdaemon_core::file_storage::FileFlags::SYMLINK)
+        {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
         let path = fs.file_path(i, &[]);
         let path = bytes_to_path(&path);
         let full = save_path.join(&path);
