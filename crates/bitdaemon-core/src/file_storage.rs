@@ -1223,10 +1223,14 @@ pub fn file_piece_range_exclusive(fs: &FileStorage, file: FileIndex) -> IndexRan
     let end = if file == FileIndex(fs.num_files() - 1) {
         fs.end_piece()
     } else {
-        PieceIndex(
+        // a file that starts mid-piece and doesn't reach that piece's
+        // end owns no piece exclusively; clamp rather than let end fall
+        // below begin, which would describe a backwards range
+        let computed = PieceIndex(
             ((i64::from(range.piece.0) * piece_size + i64::from(range.start) + file_size + 1)
                 / piece_size) as i32,
-        )
+        );
+        if computed < begin { begin } else { computed }
     };
     index_range(begin, end)
 }

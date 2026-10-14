@@ -41,8 +41,14 @@ pub struct IndexRange<I> {
 }
 
 /// `index_range{b, e}` construction.
+///
+/// Upstream asserts `begin <= end` in the `index_range` ctor — an end
+/// before begin would iterate `cur != end` until index wraparound
+/// rather than describe an empty range. `const` was dropped for the
+/// `debug_assert` (trait calls aren't const); no caller needs it.
 #[must_use]
-pub const fn index_range<I>(begin: I, end: I) -> IndexRange<I> {
+pub fn index_range<I: PartialOrd>(begin: I, end: I) -> IndexRange<I> {
+    debug_assert!(begin <= end, "index_range: begin must not exceed end");
     IndexRange { begin, end }
 }
 

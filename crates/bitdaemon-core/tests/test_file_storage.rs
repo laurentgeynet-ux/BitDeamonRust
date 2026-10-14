@@ -241,6 +241,49 @@ fn test_piece_range() {
     assert_eq!((r.begin, r.end), (PieceIndex(3), PieceIndex(7)));
 }
 
+/// upstream `piece_range_short_file_owns_no_piece` (e7381c7bc): a file
+/// starting mid-piece that never reaches that piece's end shares it with
+/// both neighbors — its *exclusive* range must be empty `{2,2}`, not the
+/// inverted `{2,1}` the unclamped formula produced.
+#[test]
+fn test_piece_range_short_file_owns_no_piece() {
+    let piece_size: i64 = 16;
+    let mut fs = FileStorage::new();
+    fs.set_piece_length(piece_size as i32);
+    // "middle" starts mid-piece (piece 1, local offset 4) and ends at
+    // local offset 7 — it shares piece 1 with both neighbors and owns
+    // no piece exclusively
+    add_file(&mut fs, &combine_path(b"temp_storage", b"0"), 20);
+    add_file(&mut fs, &combine_path(b"temp_storage", b"middle"), 3);
+    add_file(&mut fs, &combine_path(b"temp_storage", b"2"), 17);
+    fs.set_num_pieces(calc_num_pieces(&fs));
+    //        +----------------+--+-------------------------+
+    // pieces | 0              | 1                | 2       |
+    //        +----------------+--+-------------------------+
+    // files  |      0         |m |            2            |
+    //        +----------------+--+-------------------------+
+    assert_eq!(fs.num_pieces(), 3);
+
+    // "0" fully owns piece 0; piece 1 is split between "0", "middle", "2"
+    let r = file_piece_range_inclusive(&fs, FileIndex(0));
+    assert_eq!((r.begin, r.end), (PieceIndex(0), PieceIndex(2)));
+    let r = file_piece_range_exclusive(&fs, FileIndex(0));
+    assert_eq!((r.begin, r.end), (PieceIndex(0), PieceIndex(1)));
+
+    // "middle" only touches piece 1 (inclusive well-formed); exclusive
+    // must be the empty `{2,2}` — not inverted
+    let r = file_piece_range_inclusive(&fs, FileIndex(1));
+    assert_eq!((r.begin, r.end), (PieceIndex(1), PieceIndex(2)));
+    let r = file_piece_range_exclusive(&fs, FileIndex(1));
+    assert_eq!((r.begin, r.end), (PieceIndex(2), PieceIndex(2)));
+
+    // "2" is the last file: owns piece 2 exclusively (piece 1 shared)
+    let r = file_piece_range_inclusive(&fs, FileIndex(2));
+    assert_eq!((r.begin, r.end), (PieceIndex(1), PieceIndex(3)));
+    let r = file_piece_range_exclusive(&fs, FileIndex(2));
+    assert_eq!((r.begin, r.end), (PieceIndex(2), PieceIndex(3)));
+}
+
 #[test]
 fn test_piece_size_last_piece() {
     let mut fs = FileStorage::new();
