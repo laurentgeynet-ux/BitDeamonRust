@@ -7,6 +7,40 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Wire-compat fix (upload path)**: `PeerMessage::DontHave` now
+  carries the peer's negotiated `lt_donthave` extension id and
+  encodes as BEP-10 `msg_extended` (10-byte frame). It was
+  previously emitted as standard id `0x0f` + 4-byte piece index,
+  which libtorrent parses as `have_none` and rejects with a
+  disconnect (payload must be 1 byte). Outbound `DontHave` is
+  gated on the negotiated `lt_donthave` id (predictive-piece and
+  disk-read-error paths); outbound `RejectRequest` is gated on
+  BEP-6 `supports_fast`. Inbound `have_none` with a payload is a
+  decode error (disconnect), matching upstream
+  `invalid_have_none`; inbound `lt_donthave` drops malformed
+  frames silently and disconnects on out-of-bitfield indexes.
+- **Request/reject counter parity**: `piece_requests`,
+  `invalid_piece_requests`, `max_piece_requests`,
+  `choked_piece_requests`, `cancelled_piece_requests` and
+  `piece_rejects` are now incremented at the upstream sites
+  (`piece_rejects` counts the reject decision even when BEP-6
+  suppresses the wire message); `num_peers_up_requests` gauge
+  decrements when predictive-piece drains empty a queue;
+  `request_latency` blends the disk-read RTT at 5%
+  (`blend_stats_counter`) using the issue-time stamp carried
+  through `async_read`; per-message `num_incoming_*` /
+  `num_outgoing_*` counters wired at `dispatch` and the outbound
+  `send_to_peer` funnel, including the upstream FAST-range
+  `num_incoming_suggest + packet_type` arithmetic quirk.
+- `m_last_sent_payload` stamped per drained request (rejects
+  included) and `fill_send_buffer` aborts on `is_aborted`, per
+  upstream.
+- Queue-full request rejections no longer raise
+  `invalid_request_alert` (upstream logs only; the alert is for
+  malformed/out-of-range requests).
+
 ### Added
 
 - Session `on_tick` leg parity: `try_connect_more_peers` verbatim

@@ -172,9 +172,18 @@ pub enum PeerMessage {
     HaveAll,
     /// `msg_have_none`.
     HaveNone,
-    /// `msg_dont_have` — upstream reuses the `have_none` wire id
-    /// (`0x0f`) with a 4-byte piece-index payload; `write_dont_have`.
-    DontHave(PieceIndex),
+    /// `lt_donthave` — `write_dont_have`. NOT a standard message:
+    /// upstream sends a BEP-10 `msg_extended` frame carrying the
+    /// piece index under the *remote's* negotiated `lt_donthave`
+    /// extension id. Callers must only build this when the peer
+    /// advertised the extension (`ext_id != 0`) — upstream
+    /// suppresses the send otherwise.
+    DontHave {
+        /// Piece index.
+        piece: PieceIndex,
+        /// Remote's `lt_donthave` BEP-10 extension id.
+        ext_id: u8,
+    },
     /// `msg_reject_request`.
     RejectRequest(PeerRequest),
     /// `msg_allowed_fast`.
@@ -343,6 +352,38 @@ fn write_hash_req(out: &mut Vec<u8>, id: MessageId, r: &HashRequestWire) {
     write_u32(r.proof_layers as u32, out);
 }
 
+impl PeerMessage {
+    /// The wire message id this variant serializes as — `0x14`
+    /// (`msg_extended`) for `DontHave` (an `lt_donthave` BEP-10
+    /// frame) and `Extended`. `Keepalive` has no id on the wire;
+    /// it returns `u8::MAX` so callers can skip it.
+    #[must_use]
+    pub fn wire_id(&self) -> u8 {
+        match self {
+            Self::Choke => MessageId::Choke as u8,
+            Self::Unchoke => MessageId::Unchoke as u8,
+            Self::Interested => MessageId::Interested as u8,
+            Self::NotInterested => MessageId::NotInterested as u8,
+            Self::Have(_) => MessageId::Have as u8,
+            Self::Bitfield(_) => MessageId::Bitfield as u8,
+            Self::Request(_) => MessageId::Request as u8,
+            Self::Piece { .. } => MessageId::Piece as u8,
+            Self::Cancel(_) => MessageId::Cancel as u8,
+            Self::DhtPort(_) => MessageId::DhtPort as u8,
+            Self::SuggestPiece(_) => MessageId::SuggestPiece as u8,
+            Self::HaveAll => MessageId::HaveAll as u8,
+            Self::HaveNone => MessageId::HaveNone as u8,
+            Self::DontHave { .. } | Self::Extended { .. } => MessageId::Extended as u8,
+            Self::RejectRequest(_) => MessageId::RejectRequest as u8,
+            Self::AllowedFast(_) => MessageId::AllowedFast as u8,
+            Self::HashRequest(_) => MessageId::HashRequest as u8,
+            Self::Hashes { .. } => MessageId::Hashes as u8,
+            Self::HashReject(_) => MessageId::HashReject as u8,
+            Self::Keepalive => u8::MAX,
+        }
+    }
+}
+
 /// `encode(msg)` — serialize one message (incl. length prefix).
 #[must_use]
 pub fn encode(msg: &PeerMessage) -> Bytes {
@@ -400,11 +441,13 @@ pub fn encode(msg: &PeerMessage) -> Bytes {
             write_u32(1, &mut out);
             write_u8(MessageId::HaveNone as u8, &mut out);
         }
-        // `write_dont_have` — `have_none` id + piece payload.
-        PeerMessage::DontHave(p) => {
-            write_u32(5, &mut out);
-            write_u8(MessageId::HaveNone as u8, &mut out);
-            write_u32(p.0 as u32, &mut out);
+        // `write_dont_have` — BEP-10 extended frame under the
+        // negotiated `lt_donthave` id, not a standard message.
+        PeerMessage::DontHave { piece, ext_id } => {
+            write_u32(6, &mut out);
+            write_u8(MessageId::Extended as u8, &mut out);
+            write_u8(*ext_id, &mut out);
+            write_u32(piece.0 as u32, &mut out);
         }
         PeerMessage::RejectRequest(r) => {
             write_request(&mut out, MessageId::RejectRequest, r);
@@ -450,10 +493,8 @@ pub fn wire_len(msg: &PeerMessage) -> usize {
         | PeerMessage::NotInterested
         | PeerMessage::HaveAll
         | PeerMessage::HaveNone => 5,
-        PeerMessage::Have(_)
-        | PeerMessage::SuggestPiece(_)
-        | PeerMessage::DontHave(_)
-        | PeerMessage::AllowedFast(_) => 9,
+        PeerMessage::Have(_) | PeerMessage::SuggestPiece(_) | PeerMessage::AllowedFast(_) => 9,
+        PeerMessage::DontHave { .. } => 10,
         PeerMessage::Bitfield(b) => 5 + b.len(),
         PeerMessage::Request(_) | PeerMessage::Cancel(_) | PeerMessage::RejectRequest(_) => 17,
         PeerMessage::Piece { data, .. } => 13 + data.len(),
@@ -572,14 +613,11 @@ pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
             PeerMessage::HaveAll
         }
         Some(MessageId::HaveNone) => {
-            // upstream `incoming_packet`: the same id carries
-            // `have_none` (len 1) and `dont_have` (len 5 = id +
-            // piece index).
-            match buf.len() {
-                1 => PeerMessage::HaveNone,
-                5 => PeerMessage::DontHave(PieceIndex(read_u32(&mut cur)? as i32)),
-                _ => return Err(WireError::BadLength { id, len: buf.len() }),
-            }
+            // upstream `on_have_none` requires `packet_size == 1`
+            // exactly — anything else is `invalid_have_none` and
+            // disconnects the peer.
+            expect_len(buf.len(), 1, id)?;
+            PeerMessage::HaveNone
         }
         Some(MessageId::RejectRequest) => {
             expect_len(buf.len(), 13, id)?;

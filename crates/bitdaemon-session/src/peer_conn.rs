@@ -1062,12 +1062,15 @@ impl PeerConn {
                 eff.push(PeerEffect::RefcountBulk(old, false));
                 eff.push(PeerEffect::PeerSeed(false));
             }
-            M::DontHave(i) => {
-                // upstream `incoming_dont_have` — beyond the
-                // torrent's piece range is just logged (magnets
-                // have `end_piece()==0` → every index returns),
-                // beyond the peer's own bitfield is a protocol
-                // violation.
+            M::DontHave { piece: i, .. } => {
+                // `incoming_dont_have` — on the wire this only ever
+                // arrives as an `lt_donthave` extended message (the
+                // `Extended` arm below routes it here-equivalent
+                // logic inline; this arm stays for the semantic
+                // variant). Beyond the torrent's piece range is just
+                // logged upstream (magnets have `end_piece()==0` →
+                // every index returns), beyond the peer's own
+                // bitfield is a protocol violation.
                 if i.0 < 0 || i.0 >= num_pieces.max(0) {
                     return;
                 }
@@ -1117,11 +1120,14 @@ impl PeerConn {
                 }
             }
             M::Request(r) => {
-                // `incoming_request` — an omitted bitfield reads as
-                // `have_none` before the first request; upstream runs
-                // the real `incoming_have_none` (`m_has_metadata` on;
-                // the refcount drop can't trigger: `m_bitfield_
-                // received` was false ⇒ `m_have_piece` is empty).
+                // `incoming_request` — `piece_requests` counts every
+                // request wire message, valid or not.
+                counters.inc(crate::counters::Counter::PieceRequests);
+                // an omitted bitfield reads as `have_none` before the
+                // first request; upstream runs the real
+                // `incoming_have_none` (`m_has_metadata` on; the
+                // refcount drop can't trigger: `m_bitfield_received`
+                // was false ⇒ `m_have_piece` is empty).
                 if !self.bitfield_received {
                     self.on_have_none();
                     self.has_metadata = true;
@@ -1130,6 +1136,7 @@ impl PeerConn {
                 // the layout exists; upstream rejects without the
                 // interested/invalid machinery.
                 if num_pieces <= 0 {
+                    counters.inc(crate::counters::Counter::InvalidPieceRequests);
                     eff.push(PeerEffect::RejectRequest(r));
                     return;
                 }
@@ -1143,12 +1150,11 @@ impl PeerConn {
                 };
                 // `max_allowed_in_request_queue` — reject floods before
                 // they grow the upload queue (`max_piece_requests`).
+                // Upstream only *logs* this reject — no
+                // `invalid_request_alert`.
                 if self.upload_queue.len() as i64 > i64::from(max_in_queue) {
+                    counters.inc(crate::counters::Counter::MaxPieceRequests);
                     eff.push(PeerEffect::RejectRequest(r));
-                    eff.push(PeerEffect::InvalidRequest(format!(
-                        "incoming request queue full {}",
-                        self.upload_queue.len()
-                    )));
                     return;
                 }
                 // a request implies interest — upstream logs an
@@ -1165,6 +1171,7 @@ impl PeerConn {
                     // `invalid_request_alert` for out-of-range
                     // piece/start/length — it does not disconnect
                     // (only >300 invalid requests while choked do).
+                    counters.inc(crate::counters::Counter::InvalidPieceRequests);
                     eff.push(PeerEffect::RejectRequest(r));
                     eff.push(PeerEffect::InvalidRequest(format!(
                         "out of range: piece {} start {} length {}",
@@ -1204,6 +1211,9 @@ impl PeerConn {
                             return;
                         }
                     } else {
+                        // `choked && fast_idx == -1` — upstream
+                        // rejects + counts (`choked_piece_requests`).
+                        counters.inc(crate::counters::Counter::ChokedPieceRequests);
                         eff.push(PeerEffect::RejectRequest(r));
                         if self.now_ms - self.last_choke_ms > 2000 {
                             eff.push(PeerEffect::Disconnect(
@@ -1230,6 +1240,9 @@ impl PeerConn {
                     .iter()
                     .position(|u| u.piece == r.piece && u.start == r.start && u.length == r.length)
                 {
+                    // `incoming_cancel` — a hit counts
+                    // (`cancelled_piece_requests`), a miss is ignored.
+                    counters.inc(crate::counters::Counter::CancelledPieceRequests);
                     self.upload_queue.remove(pos);
                     eff.push(PeerEffect::CancelRequest(r));
                     // upstream `incoming_cancel` — the peer learns the
@@ -1390,6 +1403,10 @@ impl PeerConn {
             M::DhtPort(p) => eff.push(PeerEffect::DhtPort(p)),
             M::Extended { id, ref data } => {
                 if id == 0 {
+                    // `on_extended` — ext handshake gets its own
+                    // counter on top of the dispatch-level
+                    // `num_incoming_extended`.
+                    counters.inc(crate::counters::Counter::NumIncomingExtHandshake);
                     // BEP-10 handshake — learn the remote's ext ids
                     if let Some(hs) = bitdaemon_net::bep10::ExtendedHandshake::parse(data) {
                         let ids = hs.remote_ids();
@@ -1459,10 +1476,15 @@ impl PeerConn {
                         eff.push(PeerEffect::ExtHandshake);
                     }
                 } else if id == self.local_ut_metadata {
+                    // `ut_metadata` plugin bumps its own subtype
+                    // counter on top of `num_incoming_extended`.
+                    counters.inc(crate::counters::Counter::NumIncomingMetadata);
                     eff.push(PeerEffect::MetadataPacket(data.to_vec()));
                 } else if id == self.local_ut_pex {
+                    counters.inc(crate::counters::Counter::NumIncomingPex);
                     eff.push(PeerEffect::PexPacket(data.to_vec()));
                 } else if id == self.local_i2p_pex {
+                    counters.inc(crate::counters::Counter::NumIncomingPex);
                     eff.push(PeerEffect::I2pPexPacket(data.to_vec()));
                 } else if id == self.local_upload_only {
                     // `upload_only` — 1-byte flag (upstream checks

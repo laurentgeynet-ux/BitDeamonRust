@@ -725,16 +725,28 @@ impl Engine {
         }
     }
 
+    /// Single funnel for peer-bound messages — the engine-side end
+    /// of `send_message`. `count_outgoing` keeps the session's
+    /// `num_outgoing_*` counters in sync with what actually enters
+    /// a writer pump.
+    fn send_to_peer(
+        &mut self,
+        ih: Sha1Hash,
+        peer: u64,
+        msg: bitdaemon_net::peer_wire::PeerMessage,
+    ) {
+        slock(&self.session).count_outgoing(&ih, peer, &msg);
+        if let Some(tx) = self.writers.get(&(ih, peer)) {
+            if tx.send(msg).is_err() {
+                self.writers.remove(&(ih, peer));
+            }
+        }
+    }
+
     fn send_msgs_to_peers(&mut self, out: Vec<SessionOut>) {
         for e in out {
             match e {
-                SessionOut::ToPeer { ih, peer, msg } => {
-                    if let Some(tx) = self.writers.get(&(ih, peer)) {
-                        if tx.send(msg).is_err() {
-                            self.writers.remove(&(ih, peer));
-                        }
-                    }
-                }
+                SessionOut::ToPeer { ih, peer, msg } => self.send_to_peer(ih, peer, msg),
                 SessionOut::Torrent(
                     bitdaemon_session::torrent::TorrentEffect::DisconnectPeer { peer, .. },
                 ) => self.disconnect_writer(peer),
@@ -758,13 +770,7 @@ impl Engine {
     async fn dispatch(&mut self, out: Vec<SessionOut>) {
         for e in out {
             match e {
-                SessionOut::ToPeer { ih, peer, msg } => {
-                    if let Some(tx) = self.writers.get(&(ih, peer)) {
-                        if tx.send(msg).is_err() {
-                            self.writers.remove(&(ih, peer));
-                        }
-                    }
-                }
+                SessionOut::ToPeer { ih, peer, msg } => self.send_to_peer(ih, peer, msg),
                 SessionOut::UdpPacket(buf, to) => {
                     // upstream sends BT-SEARCH *from* its dedicated
                     // 6771 socket — route multicast-group traffic

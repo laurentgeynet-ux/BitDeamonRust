@@ -1017,6 +1017,21 @@ impl Counters {
             c.store(n, Ordering::Relaxed);
         }
     }
+    /// `inc_stats_counter` by raw index — same use as [`Self::set_idx`].
+    pub fn inc_idx(&self, idx: usize) {
+        if let Some(c) = self.v.get(idx) {
+            c.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    /// `blend_stats_counter(c, value, ratio)` — move the gauge toward
+    /// `value` by `ratio` percent: `v = (v·(100−r) + x·r)/100`.
+    pub fn blend(&self, c: Counter, value: i64, ratio: i64) {
+        let cur = self.v[c as usize].load(Ordering::Relaxed);
+        self.v[c as usize].store(
+            (cur * (100 - ratio) + value * ratio) / 100,
+            Ordering::Relaxed,
+        );
+    }
     /// `counters[c]`.
     #[must_use]
     pub fn value(&self, c: Counter) -> i64 {

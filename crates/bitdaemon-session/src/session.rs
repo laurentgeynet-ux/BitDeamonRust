@@ -731,6 +731,9 @@ pub enum DiskCompleted {
         buf: DiskBufferHolder,
         /// job result.
         err: StorageError,
+        /// when the job was issued — `on_disk_read_complete`
+        /// blends `now - issue_time` into `request_latency`.
+        issue_time: std::time::Instant,
     },
     /// `async_write` — block persisted; schedule piece hash.
     Write {
@@ -1501,6 +1504,7 @@ impl Session {
                     req,
                     buf,
                     err,
+                    issue_time,
                 } => {
                     // `on_disk_read_complete` — the in-flight read is
                     // over regardless of outcome (`m_reading_bytes`).
@@ -1517,8 +1521,33 @@ impl Session {
                         // a `file_error_alert`, and its consecutive
                         // failure count bumped; >100 disconnects.
                         // Success resets the count (below).
-                        self.push_to_peer(&ih, peer, PeerMessage::DontHave(req.piece), out);
-                        self.push_to_peer(&ih, peer, PeerMessage::RejectRequest(req), out);
+                        // `write_dont_have` — BEP-10 `lt_donthave`
+                        // frame under the peer's negotiated id;
+                        // suppressed entirely when unadvertised.
+                        // `write_reject_request` — BEP-6 only: a
+                        // non-FAST peer must not see msg 0x10.
+                        let (dh, fast) = self
+                            .torrents
+                            .get(&ih)
+                            .and_then(|t| t.peers.get(&peer))
+                            .map_or((0, false), |c| (c.ext_dont_have, c.supports_fast));
+                        if dh != 0 {
+                            self.push_to_peer(
+                                &ih,
+                                peer,
+                                PeerMessage::DontHave {
+                                    piece: req.piece,
+                                    ext_id: dh,
+                                },
+                                out,
+                            );
+                        }
+                        if fast {
+                            self.push_to_peer(&ih, peer, PeerMessage::RejectRequest(req), out);
+                        }
+                        // `write_reject_request` counts the reject
+                        // even when the peer can't receive it.
+                        self.counters.inc(crate::counters::Counter::PieceRejects);
                         let path = self
                             .torrents
                             .get(&ih)
@@ -1550,6 +1579,14 @@ impl Session {
                         if let Some(c) = t.peers.get_mut(&peer) {
                             c.disk_read_failures = 0;
                         }
+                        // `request_latency` — EWMA(5%) of the disk
+                        // round-trip, upstream blends `disk_rtt` in
+                        // µs on every successful read.
+                        self.counters.blend(
+                            crate::counters::Counter::RequestLatency,
+                            issue_time.elapsed().as_micros().min(i64::MAX as u128) as i64,
+                            5,
+                        );
                         // `suggest_read_cache` — a block we just
                         // served is likely still in the read cache
                         // → a good suggestion candidate.
@@ -2117,6 +2154,10 @@ impl Session {
                     };
                     let storage = t.storage;
                     let (peer, req, tx) = (*peer, *req, self.disk_tx.clone());
+                    // `on_disk_read_complete` blends the disk RTT
+                    // into `request_latency` — the issue time rides
+                    // with the job like upstream's `issue_time`.
+                    let issue_time = std::time::Instant::now();
                     // upstream `peer_connection::on_piece_request`
                     // (peer_connection.cpp:5403): `volatile_read`
                     // under `disk_io_read_mode == disable_os_cache`.
@@ -2130,6 +2171,7 @@ impl Session {
                                 req,
                                 buf,
                                 err,
+                                issue_time,
                             });
                         }),
                         if self.settings.disk_io_read_mode
@@ -7286,6 +7328,55 @@ impl Session {
             }
             self.route(ih, eff, out);
         }
+    }
+
+    /// `send_message`'s per-type accounting — `num_outgoing_*` for
+    /// every message handed to the transport layer. Upstream bumps
+    /// these at the `write_*` builders; our single funnel is the
+    /// `SessionOut::ToPeer` drain in the engine, which calls this
+    /// before each `tx.send`. Extended sub-messages (`ut_pex`,
+    /// `ut_metadata`) get their own counter on top of
+    /// `num_outgoing_extended`, like the plugins upstream.
+    pub fn count_outgoing(&mut self, ih: &Sha1Hash, peer: u64, msg: &PeerMessage) {
+        use crate::counters::Counter as C;
+        use bitdaemon_net::peer_wire::PeerMessage as M;
+        let idx = match msg {
+            M::Keepalive => return, // no counter upstream
+            M::Extended { id, .. } => {
+                if *id == 0 {
+                    C::NumOutgoingExtHandshake as usize
+                } else {
+                    // plugins count their own subtype too — resolve
+                    // against this conn's negotiated remote ids.
+                    if let Some(c) = self.torrents.get(ih).and_then(|t| t.peers.get(&peer)) {
+                        if c.ext_ut_pex == *id || c.ext_i2p_pex == *id {
+                            self.counters.inc(C::NumOutgoingPex);
+                        } else if c.ext_ut_metadata == *id {
+                            self.counters.inc(C::NumOutgoingMetadata);
+                        }
+                    }
+                    C::NumOutgoingExtended as usize
+                }
+            }
+            // `write_dont_have` bumps `num_outgoing_extended`.
+            M::DontHave { .. } => C::NumOutgoingExtended as usize,
+            M::HashRequest(_) => C::NumOutgoingHashRequest as usize,
+            M::Hashes { .. } => C::NumOutgoingHashes as usize,
+            M::HashReject(_) => C::NumOutgoingHashReject as usize,
+            m => {
+                let id = m.wire_id();
+                if id <= 9 {
+                    C::NumOutgoingChoke as usize + id as usize
+                } else if (13..=17).contains(&id) {
+                    // contiguous `num_outgoing_suggest..allowed_fast`
+                    // — the outgoing map is *not* quirked upstream.
+                    C::NumOutgoingSuggest as usize + (id as usize - 13)
+                } else {
+                    C::NumOutgoingExtended as usize
+                }
+            }
+        };
+        self.counters.inc_idx(idx);
     }
 
     /// Queue `msg` to `peer` — charges its wire size to the peer's

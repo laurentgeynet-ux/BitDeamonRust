@@ -3337,6 +3337,13 @@ impl Torrent {
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
+        // upstream `fill_send_buffer` bails when the torrent is
+        // being torn down (`t->is_aborted()`); a deleted-storage
+        // torrent drains its queue with rejects — removal here drops
+        // the peers table entirely, which is the same effect.
+        if self.aborted {
+            return;
+        }
         let Some(c) = self.peers.get_mut(&peer_id) else {
             return;
         };
@@ -3401,12 +3408,21 @@ impl Torrent {
                     peer: peer_id,
                     req: r,
                 });
-            } else if c.supports_fast {
-                out.push(TorrentEffect::SendTo {
-                    peer: peer_id,
-                    msg: PeerMessage::RejectRequest(r),
-                });
+            } else {
+                // `write_reject_request` — `piece_rejects` counts the
+                // decision; the wire message is BEP-6 only.
+                counters.add(crate::counters::Counter::PieceRejects, 1);
+                if c.supports_fast {
+                    out.push(TorrentEffect::SendTo {
+                        peer: peer_id,
+                        msg: PeerMessage::RejectRequest(r),
+                    });
+                }
             }
+            // upstream stamps `m_last_sent_payload` per *processed*
+            // request — a rejected request still means we produced
+            // bytes for this peer.
+            c.last_sent_payload_ms = c.now_ms;
         }
         // upstream `fill_send_buffer` tail — a served read in share
         // mode re-runs the swarm rebalance (`recalc_share_mode`).
@@ -3555,6 +3571,8 @@ impl Torrent {
                             .get(&peer_id)
                             .is_some_and(|c| c.superseed_pieces.contains(&Some(req.piece)));
                         if !leaked {
+                            counters.inc(crate::counters::Counter::InvalidPieceRequests);
+                            counters.add(crate::counters::Counter::PieceRejects, 1);
                             if let Some(c) = self.peers.get_mut(&peer_id) {
                                 c.num_invalid_requests += 1;
                                 // rejected requests never enter
@@ -3617,6 +3635,7 @@ impl Torrent {
                         // watermark.
                         self.fill_send_buffer(peer_id, s, counters, out);
                     } else {
+                        counters.add(crate::counters::Counter::PieceRejects, 1);
                         if let Some(c) = self.peers.get_mut(&peer_id) {
                             c.upload_queue.retain(|u| {
                                 !(u.piece == req.piece
@@ -3722,7 +3741,10 @@ impl Torrent {
                     }));
                 }
                 PeerEffect::RejectRequest(req) => {
-                    // `write_reject_request` — BEP-6 fast ext only.
+                    // `write_reject_request` — `piece_rejects` counts
+                    // the decision unconditionally; the wire message
+                    // itself is BEP-6 fast-ext only.
+                    counters.add(crate::counters::Counter::PieceRejects, 1);
                     if self.peers.get(&peer_id).is_some_and(|c| c.supports_fast) {
                         out.push(TorrentEffect::SendTo {
                             peer: peer_id,
@@ -4058,6 +4080,25 @@ impl Torrent {
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
+        // upstream packet accounting (`bt_peer_connection` dispatch):
+        // wire ids 0..=9 → `num_incoming_choke + id`; 13..=17 →
+        // `num_incoming_suggest + id` — an upstream quirk that lands
+        // the FAST messages on `num_outgoing_have..num_outgoing_
+        // cancel` (offsets kept verbatim); everything else —
+        // extended, hash, unknown-but-decoded — lands on
+        // `num_incoming_extended`. Keepalives carry no id and are
+        // never counted.
+        if !matches!(msg, PeerMessage::Keepalive) {
+            let id = msg.wire_id();
+            let idx = if id <= 9 {
+                crate::counters::Counter::NumIncomingChoke as usize + id as usize
+            } else if (13..=17).contains(&id) {
+                crate::counters::Counter::NumIncomingSuggest as usize + id as usize
+            } else {
+                crate::counters::Counter::NumIncomingExtended as usize
+            };
+            counters.inc_idx(idx);
+        }
         // `stat.received_bytes(payload, protocol)` — only `on_piece`
         // counts payload upstream; every other message is protocol.
         // `stat_down_total` itself is bumped at the piece dispatch.
@@ -5321,8 +5362,8 @@ impl Torrent {
         } else {
             // `piece_failed` — a predictive piece was announced
             // before verification; retract it: reject the queued
-            // requests for it and advertise `dont_have` (both
-            // BEP-6 gated upstream).
+            // requests for it (BEP-6 gated) and advertise
+            // `dont_have` (BEP-10 `lt_donthave` gated).
             if self.is_predictive_piece(piece) {
                 self.predictive.clear_bit(piece.0 as usize);
                 for (id, c) in self.peers.iter_mut() {
@@ -5330,6 +5371,10 @@ impl Torrent {
                     while i < c.upload_queue.len() {
                         if c.upload_queue[i].piece == piece {
                             let r = c.upload_queue.remove(i);
+                            // `write_reject_request` counts the
+                            // decision even when BEP-6 suppresses
+                            // the wire message.
+                            counters.add(crate::counters::Counter::PieceRejects, 1);
                             if c.supports_fast {
                                 out.push(TorrentEffect::SendTo {
                                     peer: *id,
@@ -5340,10 +5385,21 @@ impl Torrent {
                             i += 1;
                         }
                     }
-                    if c.supports_fast {
+                    // `reject_piece` — the `num_peers_up_requests`
+                    // gauge drops when the drain empties the queue.
+                    if c.upload_queue.is_empty() {
+                        counters.add(crate::counters::Counter::NumPeersUpRequests, -1);
+                    }
+                    // `write_dont_have` — BEP-10 `lt_donthave`, NOT
+                    // BEP-6: suppressed unless the peer advertised a
+                    // `lt_donthave` extension id.
+                    if c.ext_dont_have != 0 {
                         out.push(TorrentEffect::SendTo {
                             peer: *id,
-                            msg: PeerMessage::DontHave(piece),
+                            msg: PeerMessage::DontHave {
+                                piece,
+                                ext_id: c.ext_dont_have,
+                            },
                         });
                     }
                 }

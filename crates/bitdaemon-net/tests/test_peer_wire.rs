@@ -254,3 +254,49 @@ fn socket_io_endpoint_list() {
     let peers = read_endpoint_list(&node.dict_find(b"peers"));
     assert_eq!(peers, vec![a, b]);
 }
+
+/// `write_dont_have` — upstream emits a BEP-10 `msg_extended` frame
+/// under the negotiated `lt_donthave` id, never a bare `0x0f`.
+#[test]
+fn dont_have_encodes_as_extended() {
+    let msg = PeerMessage::DontHave {
+        piece: PieceIndex(5),
+        ext_id: 7,
+    };
+    let m = encode(&msg);
+    // upstream: `char msg[] = {0,0,0,6,msg_extended,dont_have_id,0,0,0,0}`
+    // + `write_int32(index)` — len 6, id 20, ext id, u32 piece.
+    assert_eq!(m.as_ref(), &[0, 0, 0, 6, 20, 7, 0, 0, 0, 5]);
+    assert_eq!(bitdaemon_net::peer_wire::wire_len(&msg), m.len());
+}
+
+/// `on_have_none` upstream requires `packet_size == 1` — a `0x0f`
+/// frame carrying a payload is `invalid_have_none` (disconnect).
+#[test]
+fn have_none_rejects_payload() {
+    let mut codec = PeerWireCodec::default();
+    // the OLD encoding — `0x0f` + 4-byte piece — must not decode.
+    let mut buf = BytesMut::from(&[0, 0, 0, 5, 0x0f, 0, 0, 0, 9][..]);
+    assert!(codec.decode(&mut buf).is_err());
+    // len-1 still parses as HaveNone.
+    let mut buf = BytesMut::from(&[0, 0, 0, 1, 0x0f][..]);
+    assert_eq!(
+        codec.decode(&mut buf).expect("decode").expect("frame"),
+        PeerMessage::HaveNone
+    );
+}
+
+/// an `lt_donthave` frame decodes as plain `Extended` — the session
+/// layer dispatches on the negotiated id.
+#[test]
+fn lt_donthave_decodes_as_extended() {
+    let mut codec = PeerWireCodec::default();
+    let mut buf = BytesMut::from(&[0, 0, 0, 6, 20, 7, 0, 0, 0, 5][..]);
+    assert_eq!(
+        codec.decode(&mut buf).expect("decode").expect("frame"),
+        PeerMessage::Extended {
+            id: 7,
+            data: bytes::Bytes::from_static(&[0, 0, 0, 5])
+        }
+    );
+}

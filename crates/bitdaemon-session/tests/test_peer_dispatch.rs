@@ -544,3 +544,114 @@ fn piece_before_bitfield_runs_have_none() {
     assert_eq!(c.num_pieces, 0);
     assert!(eff.iter().any(|e| matches!(e, PeerEffect::DiskWrite(..))));
 }
+
+/// `incoming_request`/`incoming_cancel` session counters —
+/// `piece_requests` counts every request wire message;
+/// `invalid_piece_requests`/`max_piece_requests` count the reject
+/// reasons; `cancelled_piece_requests` only when the request was
+/// actually queued.
+#[test]
+fn request_counters() {
+    use bitdaemon_session::counters::{Counter, Counters};
+    let counters = Counters::default();
+    let mut c = conn();
+    // a fresh conn is choked — unchoke so requests actually queue.
+    c.choked = false;
+    let mut eff = Vec::new();
+    let good = PeerRequest {
+        piece: PieceIndex(0),
+        start: 0,
+        length: 0x4000,
+    };
+    // accepted request → queue + ReadRequest.
+    c.dispatch(
+        &PeerMessage::Request(good),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &counters,
+        &mut eff,
+    );
+    assert_eq!(counters.value(Counter::PieceRequests), 1);
+    assert_eq!(c.upload_queue.len(), 1);
+    assert!(matches!(eff.last(), Some(PeerEffect::ReadRequest(_))));
+
+    // out-of-range piece → invalid.
+    eff.clear();
+    c.dispatch(
+        &PeerMessage::Request(PeerRequest {
+            piece: PieceIndex(99),
+            start: 0,
+            length: 0x4000,
+        }),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &counters,
+        &mut eff,
+    );
+    assert_eq!(counters.value(Counter::PieceRequests), 2);
+    assert_eq!(counters.value(Counter::InvalidPieceRequests), 1);
+    assert!(matches!(eff.first(), Some(PeerEffect::RejectRequest(_))));
+
+    // queue-full reject → max_piece_requests, no invalid bump.
+    eff.clear();
+    c.dispatch(
+        &PeerMessage::Request(PeerRequest {
+            piece: PieceIndex(1),
+            start: 0,
+            length: 0x4000,
+        }),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        0, // max_in_queue = 0 → any queued request overflows
+        &counters,
+        &mut eff,
+    );
+    assert_eq!(counters.value(Counter::MaxPieceRequests), 1);
+    assert_eq!(counters.value(Counter::InvalidPieceRequests), 1);
+    assert!(matches!(eff.first(), Some(PeerEffect::RejectRequest(_))));
+
+    // cancel the queued request → cancelled_piece_requests.
+    eff.clear();
+    c.dispatch(
+        &PeerMessage::Cancel(good),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &counters,
+        &mut eff,
+    );
+    assert_eq!(counters.value(Counter::CancelledPieceRequests), 1);
+    assert!(c.upload_queue.is_empty());
+    // a cancel that misses doesn't count.
+    c.dispatch(
+        &PeerMessage::Cancel(good),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &counters,
+        &mut eff,
+    );
+    assert_eq!(counters.value(Counter::CancelledPieceRequests), 1);
+}
