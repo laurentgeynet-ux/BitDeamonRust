@@ -6331,9 +6331,12 @@ impl Session {
                 let is_seed = t.is_seed();
                 t.trackers.trigger(Some(i), at, ignore_min);
                 let due = t.trackers.trackers.get(i).is_some_and(|e| {
-                    e.endpoints
-                        .iter()
-                        .any(|ep| ep.can_announce(now, is_seed, e.fail_limit))
+                    // `announce_with_tracker` skips undispatchable
+                    // schemes even when forced (`e0716cf24`).
+                    crate::tracker_list::tracker_protocol_supported(&e.url)
+                        && e.endpoints
+                            .iter()
+                            .any(|ep| ep.can_announce(now, is_seed, e.fail_limit))
                 });
                 if !due {
                     return;
@@ -7629,9 +7632,8 @@ impl Session {
         };
         if let Some(e) = t.trackers.trackers.get_mut(i) {
             // `tracker_supported` — upstream skips protocols the
-            // tracker manager can't service (http/https/udp/ws/wss).
-            let proto = e.url.split(':').next().unwrap_or("");
-            if !matches!(proto, "http" | "https" | "udp" | "ws" | "wss") {
+            // tracker manager can't service (`e0716cf24`).
+            if !crate::tracker_list::tracker_protocol_supported(&e.url) {
                 return;
             }
             // `scrape_tracker` is client-initiated — the request

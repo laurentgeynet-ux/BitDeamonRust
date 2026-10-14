@@ -17,6 +17,21 @@ pub const RETRY_MIN: Duration = Duration::from_secs(5);
 /// `tracker_retry_delay_max`.
 pub const RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 
+/// `is_tracker_protocol_supported` — can this build dispatch the URL
+/// scheme of a tracker announce? Upstream gates it on build flags
+/// (`http` always, `https` under TORRENT_USE_SSL, `udp`, `ws`/`wss`
+/// under TORRENT_USE_RTC); this port always has ssl+ws. Shared by the
+/// announce selection (`due`), the timer (`next_announce_time`),
+/// `force_announce` and `scrape` so they can never disagree about
+/// which trackers are dispatchable — a tracker that is always skipped
+/// must also stay pristine (`fails == 0`, no `last_error`) and must
+/// not pull the announce timer back to "now" (upstream `e0716cf24`).
+#[must_use]
+pub fn tracker_protocol_supported(url: &str) -> bool {
+    let proto = url.split(':').next().unwrap_or("");
+    matches!(proto, "http" | "https" | "udp" | "ws" | "wss")
+}
+
 /// `tracker_source::source_torrent` — came from the .torrent file.
 pub const SOURCE_TORRENT: u8 = 1;
 /// `tracker_source::source_client` — added via `add_tracker`.
@@ -331,9 +346,18 @@ impl TrackerList {
 
     /// `next_announce` — the first tracker (lowest tier) that is
     /// due gets announced; upstream iterates and picks the min.
+    ///
+    /// Upstream `update_tracker_timer` skips trackers
+    /// `announce_with_tracker` will skip too — an always-skipped
+    /// tracker's `next_announce` must not drive the timer to "now",
+    /// or every fire selects nothing and the pump spins (`e0716cf24`).
     #[must_use]
     pub fn next_announce_time(&self) -> Option<Instant> {
-        self.trackers.iter().filter_map(|t| t.next_announce()).min()
+        self.trackers
+            .iter()
+            .filter(|t| tracker_protocol_supported(&t.url))
+            .filter_map(|t| t.next_announce())
+            .min()
     }
 
     /// `find_tracker`.
@@ -368,6 +392,12 @@ impl TrackerList {
         for (i, ae) in self.trackers.iter().enumerate() {
             if done {
                 break;
+            }
+            // upstream `announce_with_tracker`: schemes we cannot
+            // dispatch are skipped, never attempted — they stay
+            // pristine (`fails == 0`, no error) (`e0716cf24`).
+            if !tracker_protocol_supported(&ae.url) {
+                continue;
             }
             for ep in ae.endpoints.iter().filter(|e| e.enabled) {
                 let a = &ep.v1;

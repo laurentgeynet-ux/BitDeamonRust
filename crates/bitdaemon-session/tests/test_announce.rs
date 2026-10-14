@@ -111,6 +111,62 @@ fn announce_cycle() {
     assert_eq!(params.event, 0);
 }
 
+/// upstream `unsupported_tracker_protocol_skipped` (e0716cf24):
+/// trackers whose scheme we cannot dispatch are never attempted —
+/// they stay pristine (`fails == 0`, no error message) while a
+/// supported tracker announces. Forcing one by index still dispatches
+/// nothing.
+#[test]
+fn unsupported_tracker_protocol_skipped() {
+    use bitdaemon_session::session::ReannounceFlags;
+    use bitdaemon_session::tracker_list::SOURCE_CLIENT;
+
+    let ih = Sha1Hash::from_bytes(&[9; 20]).unwrap();
+    let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
+    for i in 0..3 {
+        t.add_tracker(
+            format!("foo://tracker-{i}.example.com/announce"),
+            0,
+            SOURCE_CLIENT,
+        );
+    }
+    t.add_tracker("http://tracker.com:8080/announce".into(), 1, SOURCE_CLIENT);
+    let mut s = Session::new();
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+
+    // only the http tracker is dispatched — the foo:// entries are
+    // never attempted
+    assert_eq!(out.len(), 1);
+    let SessionOut::TrackerAnnounce { url, .. } = &out[0] else {
+        panic!("announce effect")
+    };
+    assert_eq!(url, "http://tracker.com:8080/announce");
+
+    let t = s.torrents.get(&ih).unwrap();
+    for e in &t.trackers.trackers {
+        if e.url == "http://tracker.com:8080/announce" {
+            continue;
+        }
+        for ep in &e.endpoints {
+            assert_eq!(ep.v1.fails, 0, "{} must stay pristine", e.url);
+            assert!(ep.message.is_empty(), "{} must have no error", e.url);
+        }
+    }
+
+    // forcing a foo:// tracker by index still dispatches nothing
+    // (upstream `announce_with_tracker` skip applies to forced picks)
+    let foo_idx = t
+        .trackers
+        .find("foo://tracker-0.example.com/announce")
+        .unwrap();
+    let mut out = Vec::new();
+    s.force_announce(&ih, Some(foo_idx), 0, ReannounceFlags::default(), &mut out);
+    assert!(out.is_empty(), "forced foo:// announce must not dispatch");
+}
+
 #[test]
 fn announce_failure_backs_off() {
     let ih = Sha1Hash::from_bytes(&[6; 20]).unwrap();
