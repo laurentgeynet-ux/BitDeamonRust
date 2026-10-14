@@ -173,16 +173,17 @@ pub trait DiskIo: Send + Sync {
     /// on backends without a buffer limit.
     fn set_max_queued_bytes(&self, _bytes: i64) {}
 
-    /// `settings_pack::disk_io_write_mode` — `disable_os_cache`
-    /// variant: when true, data files open with write-through
-    /// semantics (`FILE_FLAG_WRITE_THROUGH` on Windows / `O_DIRECT`
-    /// hint on POSIX), so dirty pages can't accumulate and stall the
-    /// host's cache manager.
+    /// `settings_pack::disk_io_write_mode ∈ {disable_os_cache,
+    /// write_through}` — every file open gets `open_mode::no_cache`
+    /// (`pread_storage.cpp:780` / `mmap_storage.cpp:956`), so dirty
+    /// pages can't accumulate and stall the host's cache manager.
     fn set_write_no_cache(&self, _v: bool) {}
 
-    /// `settings_pack::disk_io_read_mode` — `disable_os_cache`:
-    /// read/hash jobs open files with `no_cache` (ADR-0015).
-    fn set_read_no_cache(&self, _v: bool) {}
+    /// `settings_pack::disk_io_write_mode == write_through` —
+    /// `sync_file` after each landed write (upstream
+    /// `pread_storage::write` reads the setting inline). No-op on
+    /// backends without per-write durability hooks.
+    fn set_write_through(&self, _v: bool) {}
 
     /// perf probe (temporary) — cumulative `(flush µs, flush jobs,
     /// completion-path µs, st.write µs, flushed bytes, WriteFile µs)`

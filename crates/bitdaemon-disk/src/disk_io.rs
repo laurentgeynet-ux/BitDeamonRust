@@ -144,8 +144,9 @@ pub struct PreadDiskIo {
     back_pressure: crate::back_pressure::BackPressure,
     /// `settings_pack::disk_io_write_mode` — `disable_os_cache` on writes.
     write_no_cache: AtomicBool,
-    /// `disk_io_read_mode=disable_os_cache` (ADR-0015).
-    read_no_cache: AtomicBool,
+    /// `disk_io_write_mode == write_through` — `sync_file` after each
+    /// write (upstream `pread_storage::write`, pread_storage.cpp:522).
+    write_through: AtomicBool,
     /// `settings_pack::cache_expiry` — seconds a cached block may sit
     /// dirty before the periodic flush (upstream default 60).
     cache_expiry: std::sync::atomic::AtomicU64,
@@ -280,7 +281,7 @@ impl PreadDiskIo {
             write_us: std::sync::atomic::AtomicU64::new(0),
             flush_bytes: std::sync::atomic::AtomicU64::new(0),
             write_no_cache: AtomicBool::new(false),
-            read_no_cache: AtomicBool::new(false),
+            write_through: AtomicBool::new(false),
             cache_expiry: std::sync::atomic::AtomicU64::new(60),
             hash_pool,
             flush_pool,
@@ -643,14 +644,12 @@ impl PreadDiskIo {
                     }
                 }
             }
-            JobKind::Hash2(h) => {
+            JobKind::Hash2(_) => {
+                // upstream `do_job(hash2)` — `m_cache.hash2` is a pure
+                // lookup + fallback; it does NOT mark the piece
+                // `piece_hash_returned`/`force_flush` (that flag means
+                // the *whole* piece hash was delivered).
                 self.num_blocks_hashed.fetch_add(1, Ordering::Relaxed);
-                if let Some(e) = self.storage(j.storage) {
-                    e.cache
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .hash_returned((j.storage, h.piece));
-                }
             }
             _ => {}
         }
@@ -874,7 +873,15 @@ impl PreadDiskIo {
         mut j: Box<DiskJob>,
     ) -> crate::disk_cache::PieceLocation {
         let JobKind::Write(w) = &mut j.action else {
-            return (j.storage, PieceIndex(-1));
+            // upstream `TORRENT_ASSERT(j->action == write)` — only
+            // write jobs reach `insert_write`. Abort explicitly: a
+            // silent drop would skip completion and leak the
+            // `write_blocks` back-pressure slot.
+            debug_assert!(matches!(j.action, JobKind::Write(_)));
+            let storage = j.storage;
+            crate::disk_completed::abort(&mut j);
+            self.completed.push(j);
+            return (storage, PieceIndex(-1));
         };
         let (piece_size, piece_size2) = {
             let st = entry.storage.read().unwrap_or_else(|e| e.into_inner());
@@ -1349,7 +1356,15 @@ impl PreadDiskIo {
                             f.prio = st.file_priorities().to_vec();
                             StorageError::default()
                         }
-                        Err(e) => e,
+                        Err(e) => {
+                            // upstream `restore_prio` writes
+                            // `prio = m_file_priority` back — the
+                            // handler sees the storage's actual
+                            // priorities, not the request that
+                            // failed partway
+                            f.prio = st.file_priorities().to_vec();
+                            e
+                        }
                     }
                 }
                 JobKind::CheckFastresume(c) => {
@@ -1432,20 +1447,8 @@ impl PreadDiskIo {
         let st: &dyn DiskStorage = &**st_guard;
         let cache = &e.cache;
         j.error = match &mut j.action {
-            JobKind::Read(r) => read_job(
-                st,
-                r,
-                j.storage,
-                cache,
-                self.read_no_cache.load(Ordering::Relaxed),
-            ),
-            JobKind::PartialRead(r) => partial_read_job(
-                st,
-                r,
-                j.storage,
-                cache,
-                self.read_no_cache.load(Ordering::Relaxed),
-            ),
+            JobKind::Read(r) => read_job(st, r, j.storage, cache),
+            JobKind::PartialRead(r) => partial_read_job(st, r, j.storage, cache),
             // upstream `do_job(write)` is `TORRENT_ASSERT_FAIL` — a
             // write never reaches the pool: `gate_or_enqueue` folds
             // it into the cache at the post-fence consult point.
@@ -1467,11 +1470,10 @@ impl PreadDiskIo {
                 for b in &f.bufs {
                     flat.extend_from_slice(b);
                 }
-                let mode = if self.write_no_cache.load(Ordering::Relaxed) {
-                    OpenMode::WRITE | OpenMode::NO_CACHE
-                } else {
-                    OpenMode::WRITE
-                };
+                // `no_cache` opens come from `PreadStorage::open_file`
+                // (keyed on `disk_io_write_mode`, all opens) — the job
+                // mode stays `write` like upstream `do_job(flush)`.
+                let mode = OpenMode::WRITE;
                 // upstream `j->flags` on the write job reach
                 // `st->write`: `volatile_read` → `dont_need`,
                 // `flush_piece` → `page_out` on the range (mmap
@@ -1519,23 +1521,39 @@ impl PreadDiskIo {
                         // `piece_hasher` role (ADR-0016): SHA-256 per
                         // flushed block, stored on the cache entry —
                         // `hash2` jobs reuse them without a re-read.
+                        // Each block hashes only
+                        // `min(buf, piece_size2 - block_offset)` bytes
+                        // (upstream `v2_hash_queue_entry::hash_len`):
+                        // a block reaching past the file boundary must
+                        // not hash the pad bytes it also carries.
+                        // Blocks entirely past `piece_size2` get no
+                        // stored hash, like upstream never queueing
+                        // them — and they always trail (a pad file
+                        // ends on a piece boundary), so a prefix per
+                        // span covers it.
                         if e.v2 {
-                            let hashes: Vec<Sha256Hash> = f
-                                .bufs
-                                .iter()
-                                .map(|b| {
-                                    let mut s = Sha256::new();
-                                    s.update(b);
-                                    Sha256Hash::from_bytes(&s.finalize()).unwrap_or_default()
-                                })
-                                .collect();
                             let mut cache = e.cache.lock().unwrap_or_else(|p| p.into_inner());
                             let mut at = 0usize;
                             for &(piece, first, n) in &f.spans {
+                                let piece_size2 = i64::from(st.files().piece_size2(piece));
+                                let mut hashes: Vec<Sha256Hash> = Vec::with_capacity(n);
+                                for (i, b) in f.bufs[at..at + n].iter().enumerate() {
+                                    let block_off = (i64::from(first) + i as i64)
+                                        * crate::disk_cache::DEFAULT_BLOCK_SIZE;
+                                    let v2_len = (b.len() as i64).min(piece_size2 - block_off);
+                                    if v2_len <= 0 {
+                                        break;
+                                    }
+                                    let mut s = Sha256::new();
+                                    s.update(&b[..usize::try_from(v2_len).unwrap_or(0)]);
+                                    hashes.push(
+                                        Sha256Hash::from_bytes(&s.finalize()).unwrap_or_default(),
+                                    );
+                                }
                                 cache.set_block_hashes(
                                     (j.storage, piece),
                                     usize::try_from(first).unwrap_or(0),
-                                    &hashes[at..at + n],
+                                    &hashes,
                                 );
                                 at += n;
                             }
@@ -1545,20 +1563,8 @@ impl PreadDiskIo {
                     Err(e) => e,
                 }
             }
-            JobKind::Hash(h) => hash_job(
-                st,
-                h,
-                j.storage,
-                cache,
-                self.read_no_cache.load(Ordering::Relaxed),
-            ),
-            JobKind::Hash2(h) => hash2_job(
-                st,
-                h,
-                j.storage,
-                cache,
-                self.read_no_cache.load(Ordering::Relaxed),
-            ),
+            JobKind::Hash(h) => hash_job(st, h, j.storage, cache),
+            JobKind::Hash2(h) => hash2_job(st, h, j.storage, cache),
             JobKind::MoveStorage(m) => {
                 // upstream `do_job(move_storage)`: ret = status_t, the
                 // job's `path` out-param gets the *resulting* save
@@ -1637,9 +1643,16 @@ impl PreadDiskIo {
                 }
                 StorageError::default()
             }
-            JobKind::StopTorrent(_) | JobKind::RenameFile(_) | JobKind::FilePriority(_) => {
-                StorageError::default()
+            JobKind::StopTorrent(_) => {
+                // upstream `do_job(stop_torrent)`: the fence already
+                // drained the write cache (`flush_storage`); the
+                // opportunistic-hasher wait folds away (our hashing
+                // only runs inside fenced jobs); then the storage's
+                // pooled handles, stat cache and part-file metadata
+                // are released so the stopped torrent holds nothing.
+                st.release_files().err().unwrap_or_default()
             }
+            JobKind::RenameFile(_) | JobKind::FilePriority(_) => StorageError::default(),
         };
         false
     }
@@ -1694,14 +1707,12 @@ fn piece_in_flight(e: &StorageEntry, storage: StorageIndex, piece: PieceIndex) -
         .is_some_and(|p| p.blocks.iter().any(|b| b.has_write_job && !b.flushed))
 }
 
-/// `disk_io_read_mode=disable_os_cache` → `open_mode::no_cache` on
-/// read opens (ADR-0015); same flag upstream ORs in. `sequential`
-/// mirrors `file_mode_for_job`'s `sequential_access` mapping.
-fn read_mode(no_cache: bool, sequential: bool) -> OpenMode {
+/// `file_mode_for_job` — read opens are `read_only` plus
+/// `sequential_access` when the job asks for it (pread_disk_io.cpp:45).
+/// `disk_io_read_mode` never produces open flags upstream — it sets
+/// the `volatile_read` job flag (`advise_dont_need` after the read).
+fn read_mode(sequential: bool) -> OpenMode {
     let mut m = OpenMode::READ_ONLY;
-    if no_cache {
-        m |= OpenMode::NO_CACHE;
-    }
     if sequential {
         m |= OpenMode::SEQUENTIAL_ACCESS;
     }
@@ -1713,7 +1724,6 @@ fn read_job(
     r: &mut ReadJob,
     storage: StorageIndex,
     cache: &Mutex<crate::disk_cache::DiskCache>,
-    no_cache: bool,
 ) -> StorageError {
     let Some(buf) = r.buf.data_mut() else {
         return StorageError::new(
@@ -1727,7 +1737,7 @@ fn read_job(
         &mut buf[..want],
         r.piece,
         i64::from(r.offset),
-        read_mode(no_cache, r.sequential),
+        read_mode(r.sequential),
         r.volatile,
         r.flush,
     ) {
@@ -1873,7 +1883,6 @@ fn partial_read_job(
     r: &mut PartialReadJob,
     storage: StorageIndex,
     cache: &Mutex<crate::disk_cache::DiskCache>,
-    no_cache: bool,
 ) -> StorageError {
     // upstream `do_job(partial_read)`: read only the missing side —
     // into `buf` at `buffer_offset` — the cached side was prefilled
@@ -1894,7 +1903,7 @@ fn partial_read_job(
         &mut buf[off..off + want],
         r.piece,
         i64::from(r.offset),
-        read_mode(no_cache, r.sequential),
+        read_mode(r.sequential),
         r.volatile,
         r.flush,
     ) {
@@ -1922,7 +1931,6 @@ fn hash_job(
     h: &mut HashJob,
     storage: StorageIndex,
     cache: &Mutex<crate::disk_cache::DiskCache>,
-    no_cache: bool,
 ) -> StorageError {
     // SHA-1 over the whole piece when `v1_hash` is set (upstream
     // `do_job(hash)`: v2-only hashing skips the SHA-1 pass entirely);
@@ -2002,7 +2010,7 @@ fn hash_job(
                     &mut buf[off..end],
                     h.piece,
                     i64::try_from(off).unwrap_or(0),
-                    read_mode(no_cache, h.sequential),
+                    read_mode(h.sequential),
                     h.volatile,
                     h.flush,
                 )
@@ -2014,36 +2022,40 @@ fn hash_job(
     let mut in_block = 0usize;
     let blocks_wanted = v2;
     let mut block_idx = 0usize;
-    let mut feed = |data: &[u8]| {
-        if h.v1_hash {
-            sha1.update(data);
-        }
-        if blocks_wanted {
-            let mut d = data;
-            while !d.is_empty() {
-                let take = (DEFAULT_BLOCK_SIZE - in_block).min(d.len());
-                // only hash blocks still missing their SHA-256 —
-                // precomputed slots skip the hasher like upstream's
-                // `v2_done` check (`block.update` is the cost).
-                if needed.get(block_idx).copied().unwrap_or(false) {
-                    block.update(&d[..take]);
+    // upstream `do_job(hash)` bounds each v2 block to
+    // `min(BS, piece_size2 - offset)` — bytes past `piece_size2`
+    // (pad region, next file's head) belong to a *different* v2
+    // piece layer and must never enter this block's SHA-256.
+    let piece_len2 = usize::try_from(i64::from(st.files().piece_size2(h.piece)))
+        .unwrap_or(0)
+        .min(piece_len);
+    if h.v1_hash {
+        sha1.update(&buf);
+    }
+    if blocks_wanted {
+        let mut d = &buf[..piece_len2];
+        while !d.is_empty() {
+            let take = (DEFAULT_BLOCK_SIZE - in_block).min(d.len());
+            // only hash blocks still missing their SHA-256 —
+            // precomputed slots skip the hasher like upstream's
+            // `v2_done` check (`block.update` is the cost).
+            if needed.get(block_idx).copied().unwrap_or(false) {
+                block.update(&d[..take]);
+            }
+            in_block += take;
+            d = &d[take..];
+            if in_block == DEFAULT_BLOCK_SIZE {
+                if needed.get(block_idx).copied().unwrap_or(false)
+                    && block_idx < h.block_hashes.len()
+                {
+                    h.block_hashes[block_idx] =
+                        Sha256Hash::from_bytes(&block.finalize_reset()).unwrap_or_default();
                 }
-                in_block += take;
-                d = &d[take..];
-                if in_block == DEFAULT_BLOCK_SIZE {
-                    if needed.get(block_idx).copied().unwrap_or(false)
-                        && block_idx < h.block_hashes.len()
-                    {
-                        h.block_hashes[block_idx] =
-                            Sha256Hash::from_bytes(&block.finalize_reset()).unwrap_or_default();
-                    }
-                    block_idx += 1;
-                    in_block = 0;
-                }
+                block_idx += 1;
+                in_block = 0;
             }
         }
-    };
-    feed(&buf);
+    }
     if in_block > 0
         && needed.get(block_idx).copied().unwrap_or(false)
         && block_idx < h.block_hashes.len()
@@ -2077,11 +2089,19 @@ fn hash2_job(
     h: &mut Hash2Job,
     storage: StorageIndex,
     cache: &Mutex<crate::disk_cache::DiskCache>,
-    no_cache: bool,
 ) -> StorageError {
     let mut sha = Sha256::new();
     let blk =
         usize::try_from(i64::from(h.offset) / crate::disk_cache::DEFAULT_BLOCK_SIZE).unwrap_or(0);
+    // upstream `do_job(hash2)`: `len = min(BS, piece_size2 - offset)`
+    // — the last v2 block stops at the file boundary; hashing a full
+    // block would pull pad bytes (or the next file's head) into the
+    // SHA-256. The write-cache path gets the same bound
+    // (`disk_cache::hash2` uses `min(BS, piece_size2 - blk * BS)`).
+    let piece_size2 = i64::from(st.files().piece_size2(h.piece));
+    let len = crate::disk_cache::DEFAULT_BLOCK_SIZE
+        .min(piece_size2 - i64::from(h.offset))
+        .max(0);
     {
         let g = cache.lock().unwrap_or_else(|e| e.into_inner());
         let loc = (storage, h.piece);
@@ -2092,7 +2112,8 @@ fn hash2_job(
         }
         // block still parked in the write cache → hash it from RAM.
         if let Some(c) = g.get(loc, blk) {
-            sha.update(c);
+            let take = usize::try_from(len).unwrap_or(0).min(c.len());
+            sha.update(&c[..take]);
             h.piece_hash2 = Sha256Hash::from_bytes(&sha.finalize()).unwrap_or_default();
             return StorageError::default();
         }
@@ -2105,10 +2126,10 @@ fn hash2_job(
     }
     let r = st.hash_with_hints(
         &mut |d| sha.update(d),
-        i64::try_from(DEFAULT_BLOCK_SIZE).unwrap_or(0),
+        len,
         h.piece,
         i64::from(h.offset),
-        read_mode(no_cache, h.sequential),
+        read_mode(h.sequential),
         h.volatile,
         h.flush,
     );
@@ -2227,6 +2248,14 @@ impl PreadDiskIo {
         self.fan_out_storages(|st| st.set_no_cow(v));
     }
 
+    /// `settings_pack::disk_io_write_mode == write_through` —
+    /// `sync_file` after each write lands (upstream keys this off
+    /// the setting inside `pread_storage::write`).
+    pub fn set_write_through(&self, v: bool) {
+        self.write_through.store(v, Ordering::Relaxed);
+        self.fan_out_storages(|st| st.set_write_through(v));
+    }
+
     /// `settings_pack::close_file_interval` — seconds between
     /// `close_oldest` kicks in the maintenance pass.
     pub fn set_close_file_interval(&self, secs: i64) {
@@ -2243,6 +2272,8 @@ impl PreadDiskIo {
             i32::try_from(self.disk_write_mode.load(Ordering::Relaxed)).unwrap_or(1),
         );
         storage.set_no_cow(self.disk_disable_cow.load(Ordering::Relaxed));
+        storage.set_write_through(self.write_through.load(Ordering::Relaxed));
+        storage.set_write_no_cache(self.write_no_cache.load(Ordering::Relaxed));
     }
 
     /// currently applied extra open flags.
@@ -2461,6 +2492,17 @@ impl DiskIo for PreadDiskIo {
     }
 
     fn async_stop_torrent(&self, storage: StorageIndex, handler: Box<dyn FnOnce() + Send>) {
+        // upstream `abort_hash_jobs` — a stopped torrent doesn't need
+        // its queued volatile (checking) hash jobs to grind on; mark
+        // them aborted so they complete fast when dequeued.
+        self.hash_pool.mark_aborted(|j| {
+            j.storage == storage
+                && match &j.action {
+                    JobKind::Hash(h) => h.volatile,
+                    JobKind::Hash2(h) => h.volatile,
+                    _ => false,
+                }
+        });
         self.add_fence_job(
             storage,
             self.mk_job(JobKind::StopTorrent(crate::disk_job::StopTorrentJob {
@@ -2570,12 +2612,13 @@ impl DiskIo for PreadDiskIo {
         PreadDiskIo::set_max_queued_bytes(self, bytes);
     }
 
-    fn set_read_no_cache(&self, v: bool) {
-        self.read_no_cache.store(v, Ordering::Relaxed);
-    }
-
     fn set_write_no_cache(&self, v: bool) {
         self.write_no_cache.store(v, Ordering::Relaxed);
+        self.fan_out_storages(|st| st.set_write_no_cache(v));
+    }
+
+    fn set_write_through(&self, v: bool) {
+        PreadDiskIo::set_write_through(self, v);
     }
 
     fn set_cache_expiry(&self, secs: u64) {

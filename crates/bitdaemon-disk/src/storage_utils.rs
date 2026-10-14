@@ -350,7 +350,8 @@ pub fn move_storage(
         match move_partfile(&new_save_path) {
             Ok(()) => {}
             Err(e) => {
-                failure = Some(StorageError::new(e, FileIndex(-1), Operation::PartfileMove));
+                // upstream `ec.file(error_file_partfile)` (-6)
+                failure = Some(StorageError::new(e, FileIndex(-6), Operation::PartfileMove));
                 // rollback sweeps every file
                 file_index = FileIndex(fs.num_files());
             }
@@ -427,8 +428,12 @@ fn delete_one_file(p: &Path) -> Option<io::Error> {
 /// `aux::delete_files` — delete torrent files + optionally the part
 /// file; then remove now-empty parent directories (deepest first).
 /// Upstream keeps going past individual file errors — a partially
-/// deleted torrent still frees as much as it can; the *first* error
-/// (per phase) is reported.
+/// deleted torrent still frees as much as it can. The error channel
+/// mirrors upstream exactly: `ec.ec` is overwritten by *each* file's
+/// delete result, so the **last** file's outcome wins (a later
+/// success clears an earlier failure); the **first** failing
+/// directory wins, and only when the file phase ended clean; a
+/// part-file failure always overrides whatever was pending.
 pub fn delete_files(
     fs: &FileStorage,
     renamed: &RenamedFiles,
@@ -436,7 +441,7 @@ pub fn delete_files(
     part_file: &Path,
     options: u8,
 ) -> StorageResult<()> {
-    let mut first_err: Option<StorageError> = None;
+    let mut ec: Option<StorageError> = None;
     if options & remove_flags::DELETE_FILES != 0 {
         let mut directories: BTreeSet<PathBuf> = BTreeSet::new();
         for i in fs.file_range() {
@@ -458,11 +463,9 @@ pub fn delete_files(
                     bp = d.parent().map(Path::to_path_buf);
                 }
             }
-            if let Some(e) = delete_one_file(&p)
-                && first_err.is_none()
-            {
-                first_err = Some(StorageError::new(e, i, Operation::FileRemove));
-            }
+            // upstream `delete_one_file(p, ec.ec)` reassigns the error
+            // per file — a subsequent success clears earlier failures
+            ec = delete_one_file(&p).map(|e| StorageError::new(e, i, Operation::FileRemove));
         }
         // deepest first — depth order beats upstream's
         // lexicographic-reverse approximation for empty-dir removal
@@ -470,21 +473,21 @@ pub fn delete_files(
         dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
         for d in dirs {
             if let Some(e) = delete_one_file(&d)
-                && first_err.is_none()
+                && ec.is_none()
             {
-                first_err = Some(StorageError::new(e, FileIndex(-1), Operation::FileRemove));
+                ec = Some(StorageError::new(e, FileIndex(-1), Operation::FileRemove));
             }
         }
     }
 
-    // when we're deleting "files", we also delete the part file
+    // when we're deleting "files", we also delete the part file —
+    // upstream overwrites `ec` unconditionally on a part-file failure
     if options & (remove_flags::DELETE_PARTFILE | remove_flags::DELETE_FILES) != 0
         && let Some(e) = delete_one_file(part_file)
-        && first_err.is_none()
     {
-        first_err = Some(StorageError::new(e, FileIndex(-1), Operation::FileRemove));
+        ec = Some(StorageError::new(e, FileIndex(-1), Operation::FileRemove));
     }
-    match first_err {
+    match ec {
         Some(e) => Err(e),
         None => Ok(()),
     }

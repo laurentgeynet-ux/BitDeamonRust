@@ -86,6 +86,9 @@ pub struct MmapStorage {
     /// `open_mode::no_cow` on truncate-opens (mmap_storage.cpp:948 —
     /// upstream applies it in the mmap backend only).
     no_cow: AtomicBool,
+    /// `disk_io_write_mode ∈ {disable_os_cache, write_through}` —
+    /// `open_mode::no_cache` on every open (mmap_storage.cpp:955-961).
+    no_cache_open: AtomicBool,
 }
 
 impl MmapStorage {
@@ -125,6 +128,7 @@ impl MmapStorage {
             // `settings_pack::mmap_file_size_cutoff` default
             mmap_file_size_cutoff: AtomicI64::new(40),
             no_cow: AtomicBool::new(false),
+            no_cache_open: AtomicBool::new(false),
         }
     }
 
@@ -198,7 +202,13 @@ impl MmapStorage {
     fn open_file(&self, index: FileIndex, mode: OpenMode) -> Result<FileView, StorageError> {
         let mut mode = mode | self.extra_mode();
         if mode.contains(OpenMode::WRITE) && !mode.contains(OpenMode::TRUNCATE) {
-            let created = self.file_created.lock().unwrap_or_else(|e| e.into_inner());
+            let mut created = self.file_created.lock().unwrap_or_else(|e| e.into_inner());
+            // upstream resizes defensively first (mmap_storage.cpp —
+            // same open_file pattern as pread_storage.cpp:719-721)
+            let n = usize::try_from(self.files.num_files()).unwrap_or(0);
+            if created.len() != n {
+                created.resize(n, false);
+            }
             if index.get() < created.len() && !created[index.get()] {
                 mode |= OpenMode::TRUNCATE;
             }
@@ -227,6 +237,12 @@ impl MmapStorage {
             <= self.mmap_file_size_cutoff.load(Ordering::Relaxed)
         {
             mode |= OpenMode::NO_MMAP;
+        }
+        // `write_mode ∈ {disable_os_cache, write_through}` → no_cache
+        // on every open — the cache already holds the data
+        // (mmap_storage.cpp:955-961).
+        if self.no_cache_open.load(Ordering::Relaxed) {
+            mode |= OpenMode::NO_CACHE;
         }
         let view = self.pool.open_file_at(
             (self.storage_index(), index),
@@ -540,6 +556,13 @@ impl MmapStorage {
             // `always_mmap_write` (default)
             _ => self.use_mmap_writes.store(true, Ordering::Relaxed),
         }
+        // `m_file_created.resize(num_files, false)` — extends with
+        // false but keeps the bits already set this session
+        // (mmap_storage.cpp:342-345).
+        self.file_created
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resize(usize::try_from(self.files.num_files()).unwrap_or(0), false);
         let mut ret = 0u8;
         for i in 0..self.files.num_files() {
             let i = FileIndex(i);
@@ -552,7 +575,14 @@ impl MmapStorage {
                 continue;
             }
             let p = self.resolve_path(i);
-            match self.stat_cache.get_filesize_path(i, &p) {
+            // upstream `stat_cache::get_filesize` pretends symlink-
+            // flagged files don't exist (stat_cache.cpp:60-68).
+            let res = if self.files.file_flags(i).contains(FileFlags::SYMLINK) {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            } else {
+                self.stat_cache.get_filesize_path(i, &p)
+            };
+            match res {
                 Ok(size) if size > 0 => {
                     self.set_use_partfile(i, false);
                     if size > fs_file_size {
@@ -725,8 +755,9 @@ impl MmapStorage {
         }
         let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pf) = g.as_ref() {
+            // upstream `ec.file(error_file_partfile)` = -6
             pf.flush_metadata()
-                .map_err(|e| StorageError::new(e, FileIndex(-1), Operation::PartfileWrite))?;
+                .map_err(|e| StorageError::new(e, FileIndex(-6), Operation::PartfileWrite))?;
         }
         Ok(())
     }
@@ -768,7 +799,8 @@ impl MmapStorage {
         ) {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(StorageError::new(e, FileIndex(-1), Operation::FileStat)),
+            // upstream `ec.file(error_file_partfile)` = -6
+            Err(e) => Err(StorageError::new(e, FileIndex(-6), Operation::FileStat)),
         }
     }
 }
@@ -923,6 +955,9 @@ impl DiskStorage for MmapStorage {
     }
     fn set_no_cow(&self, v: bool) {
         self.no_cow.store(v, Ordering::Relaxed);
+    }
+    fn set_write_no_cache(&self, v: bool) {
+        self.no_cache_open.store(v, Ordering::Relaxed);
     }
     fn store_precomputed_v2(
         &self,

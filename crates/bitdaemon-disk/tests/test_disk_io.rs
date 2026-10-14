@@ -1057,6 +1057,41 @@ fn write_parked_behind_fence_inserts_on_repost() {
         "parked write must not complete"
     );
 
+    // upstream `9ce2f49cf`: a write parked behind a fence still counts
+    // toward back-pressure (`account_pending_write` runs before
+    // `is_blocked`). With max_size = 1 block the level is already 2
+    // after this second parked write → `exceeded` is returned.
+    io.set_max_queued_bytes(0x4000);
+    let wdone2 = Arc::new(AtomicUsize::new(0));
+    let mut buf2 = io.buffer_pool().allocate_buffer("w2");
+    for b in buf2.data_mut().unwrap() {
+        *b = 0x5A;
+    }
+    let d3 = Arc::clone(&wdone2);
+    let pressure2 = io.async_write(
+        StorageIndex(0),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start: 0x4000,
+            length: 0x4000,
+        },
+        buf2,
+        None,
+        Box::new(move |_| {
+            d3.fetch_add(1, Ordering::Relaxed);
+        }),
+        0,
+    );
+    assert!(
+        pressure2,
+        "parked write over the limit must report back-pressure"
+    );
+    assert_eq!(
+        wdone2.load(Ordering::Relaxed),
+        0,
+        "parked write must not complete"
+    );
+
     // let the fence job finish — the repost inserts the block into
     // the cache; the writer stays parked on it (not yet durable).
     release.wait();
@@ -1068,14 +1103,23 @@ fn write_parked_behind_fence_inserts_on_repost() {
     let got = Arc::new(Mutex::new(Vec::new()));
     ar(&io, 0x8000, 0x4000, Arc::clone(&got), Arc::clone(&done));
     wait_done(&io, &done, 1);
+    let done2 = Arc::new(AtomicUsize::new(0));
+    let got2 = Arc::new(Mutex::new(Vec::new()));
+    ar(&io, 0x4000, 0x4000, Arc::clone(&got2), Arc::clone(&done2));
+    wait_done(&io, &done2, 1);
     let got = got.lock().unwrap();
     assert!(got.len() >= 0x4000);
     assert!(got[..0x4000].iter().all(|&b| b == 0xE5));
     drop(got);
+    let got2 = got2.lock().unwrap();
+    assert!(got2.len() >= 0x4000);
+    assert!(got2[..0x4000].iter().all(|&b| b == 0x5A));
+    drop(got2);
     // upstream: the write handler fires only when the flush lands
     // the block on disk.
     io.flush_all();
     wait_done(&io, &wdone, 1);
+    wait_done(&io, &wdone2, 1);
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();
 }
@@ -1256,6 +1300,509 @@ fn stacked_fence_flushes_reposted_write_before_running() {
     assert!(
         buf.iter().all(|&b| b == 0xE5),
         "fence flush must land the reposted write before the fence runs"
+    );
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// v2 block-boundary hashing on hybrid torrents (piece_size2 cut)
+// ---------------------------------------------------------------------------
+
+/// hybrid `FileStorage`: a single 0x5000 B v2 file under piece_length
+/// 32 KiB — `add_file` auto-appends the 0x3000 B pad to the piece
+/// boundary. `piece_size(0)` = 0x8000, `piece_size2(0)` = 0x5000,
+/// `blocks_in_piece2(0)` = 2.
+fn make_hybrid_fs() -> FileStorage {
+    let mut fs = FileStorage::new();
+    fs.set_name(b"t");
+    fs.set_piece_length(0x8000);
+    fs.add_file(
+        None,
+        b"t/a.bin",
+        0x5000,
+        FileFlags::NONE,
+        0,
+        b"",
+        Some(bitdaemon_common::Sha256Hash::from([1; 32])),
+    )
+    .unwrap();
+    fs.set_num_pieces(1);
+    fs
+}
+
+/// Regression for the `piece_size2` bounds (upstream `do_job(hash)` /
+/// `do_job(hash2)` and `disk_cache::hash2`/`v2_hash_queue_entry`):
+/// block 1 of the hybrid piece covers `[0x4000..0x5000)` — hashing the
+/// full 16 KiB would fold the pad region (or whatever bytes the writer
+/// left there) into the SHA-256 and corrupt the v2 merkle layer.
+/// Exercises all three paths: write-cache `get`, flush-stored
+/// `block_hash`, and the disk read in `hash_job`/`hash2_job`.
+#[test]
+fn hash_v2_blocks_stop_at_file_boundary() {
+    use bitdaemon_common::Sha256Hash;
+    use bitdaemon_disk::disk_interface::{DiskIo, flags};
+
+    let d = dir("hashv2_bnd");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    let data: Vec<u8> = (0..0x5000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(d.join("t/a.bin"), &data).unwrap();
+
+    let fs = make_hybrid_fs();
+    let prio = vec![DownloadPriority::DEFAULT; fs.num_files() as usize];
+    let (io, _drained) = make_io(1);
+    let idx = io.new_torrent(&StorageParams {
+        files: &fs,
+        renamed: &RenamedFiles::default(),
+        path: d.to_path_buf(),
+        part_file_dir: PathBuf::new(),
+        mode: StorageMode::Sparse,
+        priorities: &prio,
+        info_hash: [7u8; 20],
+        v1: true,
+        v2: true,
+    });
+
+    use sha2::{Digest as _, Sha256};
+    let expect_b0 = Sha256::digest(&data[..0x4000]);
+    let expect_b1 = Sha256::digest(&data[0x4000..]); // only 0x1000 bytes
+
+    let hash2_block = |io: &Arc<PreadDiskIo>, off: i32| {
+        let done = Arc::new(AtomicUsize::new(0));
+        let got = Arc::new(Mutex::new(Sha256Hash::default()));
+        let (d2, g2) = (Arc::clone(&done), Arc::clone(&got));
+        io.async_hash2(
+            idx,
+            PieceIndex(0),
+            off,
+            0,
+            Box::new(move |_, h, e| {
+                assert!(!e.is_err(), "hash2 must succeed: {e:?}");
+                *g2.lock().unwrap() = h;
+                d2.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
+        wait_done(io, &done, 1);
+        let g = got.lock().unwrap();
+        *g
+    };
+
+    // 1) write-cache path — block 1 sits dirty in the store buffer;
+    //    a wrong bound would hash the 0xA5 marker tail too.
+    let wdone = Arc::new(AtomicUsize::new(0));
+    let mut buf = io.buffer_pool().allocate_buffer("w");
+    {
+        let b = buf.data_mut().unwrap();
+        b[..0x1000].copy_from_slice(&data[0x4000..]);
+        for x in &mut b[0x1000..0x4000] {
+            *x = 0xA5;
+        }
+    }
+    {
+        use bitdaemon_common::types::PeerRequest;
+        let wd = Arc::clone(&wdone);
+        io.async_write(
+            idx,
+            PeerRequest {
+                piece: PieceIndex(0),
+                start: 0x4000,
+                length: 0x4000,
+            },
+            buf,
+            None,
+            Box::new(move |_| {
+                wd.fetch_add(1, Ordering::Relaxed);
+            }),
+            0,
+        );
+    }
+    let h = hash2_block(&io, 0x4000);
+    assert_eq!(
+        &h.as_bytes()[..],
+        &expect_b1[..],
+        "cached v2 block must stop at piece_size2"
+    );
+
+    // 2) flush-stored path — `flush_all` lands the block and stores the
+    //    per-block SHA-256 (bounded, like upstream's `hash_len`).
+    io.flush_all();
+    wait_done(&io, &wdone, 1);
+    let h = hash2_block(&io, 0x4000);
+    assert_eq!(
+        &h.as_bytes()[..],
+        &expect_b1[..],
+        "flush-stored v2 block hash must stop at piece_size2"
+    );
+
+    // 3) full-piece hash — SHA-1 over the v1 span (pad = zeroes) and
+    //    per-block SHA-256 clipped to piece_size2.
+    let done = Arc::new(AtomicUsize::new(0));
+    let got_sha1 = Arc::new(Mutex::new(Sha1Hash::default()));
+    let got_blocks = Arc::new(Mutex::new(Vec::<Sha256Hash>::new()));
+    let (d2, s2, b2) = (
+        Arc::clone(&done),
+        Arc::clone(&got_sha1),
+        Arc::clone(&got_blocks),
+    );
+    io.async_hash(
+        idx,
+        PieceIndex(0),
+        vec![Sha256Hash::default(); 2],
+        flags::V1_HASH,
+        Box::new(move |_, h, blocks, e| {
+            assert!(!e.is_err(), "hash must succeed: {e:?}");
+            *s2.lock().unwrap() = h;
+            *b2.lock().unwrap() = blocks;
+            d2.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    wait_done(&io, &done, 1);
+    let mut piece_bytes = data.clone();
+    piece_bytes.extend_from_slice(&[0u8; 0x3000]);
+    use sha1::Sha1;
+    let expect_sha1 = Sha1::digest(&piece_bytes);
+    assert_eq!(&got_sha1.lock().unwrap().as_bytes()[..], &expect_sha1[..]);
+    let b = got_blocks.lock().unwrap();
+    assert_eq!(b.len(), 2);
+    assert_eq!(&b[0].as_bytes()[..], &expect_b0[..]);
+    assert_eq!(&b[1].as_bytes()[..], &expect_b1[..]);
+
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// Port of upstream `test_disk_io_flush_after_hash_with_pad`
+/// (`e4e0474cc`): the piece's last block is all pad — never written,
+/// so the piece is never cache-complete and `async_hash` runs on the
+/// hashing pool reading the pad as zeros. Once the piece hash
+/// returns, the dirty block must still be flushed (its write handler
+/// fires) — without `flush_piece` and with no other disk job around
+/// to kick a generic thread.
+#[test]
+fn flush_after_hash_with_pad() {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::{DiskIo, flags};
+
+    let d = dir("hash_pad_flush");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+
+    // piece = 2 blocks; file-0 is 0x4000-100 bytes, a pad file covers
+    // the rest of the piece → block 1 [0x4000..0x8000) is all pad.
+    let mut fs = FileStorage::new();
+    fs.set_name(b"t");
+    fs.set_piece_length(0x8000);
+    fs.add_file(
+        None,
+        b"t/a.bin",
+        0x4000 - 100,
+        FileFlags::NONE,
+        0,
+        b"",
+        None,
+    )
+    .unwrap();
+    fs.add_file(
+        None,
+        b"t/.pad/16484",
+        0x8000 - (0x4000 - 100),
+        FileFlags::PAD_FILE,
+        0,
+        b"",
+        None,
+    )
+    .unwrap();
+    fs.add_file(None, b"t/b.bin", 0x8000, FileFlags::NONE, 0, b"", None)
+        .unwrap();
+    fs.set_num_pieces(2);
+
+    let prio = vec![DownloadPriority::DEFAULT; fs.num_files() as usize];
+    let (io, _drained) = make_io(1);
+    io.set_hash_threads(1);
+    let idx = io.new_torrent(&StorageParams {
+        files: &fs,
+        renamed: &RenamedFiles::default(),
+        path: d.to_path_buf(),
+        part_file_dir: PathBuf::new(),
+        mode: StorageMode::Sparse,
+        priorities: &prio,
+        info_hash: [7u8; 20],
+        v1: true,
+        v2: false,
+    });
+
+    // upstream `generate_piece` + zeroed pad tail: pattern inside
+    // file-0's range, zeros from file_size on.
+    let mut piece = vec![0u8; 0x8000];
+    for (i, b) in piece[..0x4000 - 100].iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+
+    let wdone = Arc::new(AtomicUsize::new(0));
+    let mut buf = io.buffer_pool().allocate_buffer("w");
+    buf.data_mut().unwrap().copy_from_slice(&piece[..0x4000]);
+    let wd = Arc::clone(&wdone);
+    io.async_write(
+        idx,
+        PeerRequest {
+            piece: PieceIndex(0),
+            start: 0,
+            length: 0x4000,
+        },
+        buf,
+        None,
+        Box::new(move |e| {
+            assert!(!e.is_err(), "write must succeed: {e:?}");
+            wd.fetch_add(1, Ordering::Relaxed);
+        }),
+        0,
+    );
+
+    let hashed = Arc::new(AtomicUsize::new(0));
+    let got = Arc::new(Mutex::new(Sha1Hash::default()));
+    let (h2, g2) = (Arc::clone(&hashed), Arc::clone(&got));
+    io.async_hash(
+        idx,
+        PieceIndex(0),
+        Vec::new(),
+        flags::V1_HASH,
+        Box::new(move |_, h, _, e| {
+            assert!(!e.is_err(), "hash must succeed: {e:?}");
+            *g2.lock().unwrap() = h;
+            h2.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+
+    // no flush_piece flag, no flush_all — the hash completion alone
+    // must schedule the piece flush (upstream wakes a generic thread).
+    wait_done(&io, &hashed, 1);
+    wait_done(&io, &wdone, 1);
+
+    use sha1::{Digest as _, Sha1};
+    let expect = Sha1::digest(&piece);
+    assert_eq!(&got.lock().unwrap().as_bytes()[..], &expect[..]);
+
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// upstream `stop_torrent` → `release_files`: every pooled handle of
+/// the stopped storage is closed (file_pool `get_status` empties).
+#[test]
+fn stop_torrent_releases_pooled_files() {
+    use bitdaemon_disk::disk_interface::DiskIo;
+
+    let d = dir("stop_rel");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    std::fs::write(d.join("t/a.bin"), vec![7u8; 1000]).unwrap();
+    std::fs::write(d.join("t/b.bin"), vec![8u8; 1000]).unwrap();
+
+    let (io, _drained) = make_io(1);
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs(), &d)));
+
+    // a read pulls the file into the pool (lazy open)
+    let done = Arc::new(AtomicUsize::new(0));
+    let got = Arc::new(Mutex::new(Vec::new()));
+    ar(&io, 0, 16, Arc::clone(&got), Arc::clone(&done));
+    wait_done(&io, &done, 1);
+    assert!(
+        !io.get_status(StorageIndex(0)).is_empty(),
+        "read must leave a pooled handle"
+    );
+
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let s2 = Arc::clone(&stopped);
+    io.async_stop_torrent(
+        StorageIndex(0),
+        Box::new(move || {
+            s2.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    wait_done(&io, &stopped, 1);
+    assert!(
+        io.get_status(StorageIndex(0)).is_empty(),
+        "stop_torrent must release the storage's pooled handles"
+    );
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// upstream `stop_torrent` → `abort_hash_jobs`: a *volatile* hash job
+/// still queued in the hash pool when the torrent stops must complete
+/// aborted — never touching the storage — while an in-flight
+/// non-volatile hash runs to completion.
+#[test]
+fn stop_torrent_aborts_queued_volatile_hash() {
+    use std::sync::Barrier;
+
+    use bitdaemon_disk::disk_interface::{DiskIo, flags};
+    use bitdaemon_disk::open_mode::OpenMode;
+    use bitdaemon_disk::storage::{DiskStorage, MoveFlags};
+    use bitdaemon_disk::storage_error::{StorageError, StorageResult};
+
+    // `read` parks the hash worker on a barrier so a second hash job
+    // stays queued while `stop_torrent` scans the hash pool.
+    struct GatedRead {
+        inner: PreadStorage,
+        entered: Arc<AtomicUsize>,
+        gate: Arc<Barrier>,
+    }
+    impl DiskStorage for GatedRead {
+        fn set_storage_index(&self, idx: StorageIndex) {
+            self.inner.set_storage_index(idx);
+        }
+        fn files(&self) -> &FileStorage {
+            self.inner.files()
+        }
+        fn file_priorities(&self) -> &[DownloadPriority] {
+            self.inner.file_priorities()
+        }
+        fn read(
+            &self,
+            buf: &mut [u8],
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+            volatile: bool,
+        ) -> StorageResult<i64> {
+            // only the FIRST read parks — if the abort regressed, the
+            // second job runs to completion instead of deadlocking
+            // the test (the `entered == 1` assert still catches it).
+            if self.entered.fetch_add(1, Ordering::Relaxed) == 0 {
+                self.gate.wait();
+            }
+            self.inner.read(buf, piece, offset, mode, volatile)
+        }
+        fn write(
+            &self,
+            buf: &[u8],
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+        ) -> StorageResult<i64> {
+            self.inner.write(buf, piece, offset, mode)
+        }
+        fn hash_with(
+            &self,
+            feed: &mut dyn FnMut(&[u8]),
+            len: i64,
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+            volatile: bool,
+        ) -> StorageResult<i64> {
+            self.inner
+                .hash_with(feed, len, piece, offset, mode, volatile)
+        }
+        fn release_files(&self) -> StorageResult<()> {
+            self.inner.release_files()
+        }
+        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> (u8, PathBuf, Option<StorageError>) {
+            unimplemented!()
+        }
+        fn delete_files(&self, _o: u8) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn rename_file(&mut self, _i: FileIndex, _n: &[u8]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn set_file_priority(&mut self, _p: &[DownloadPriority]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn verify_resume_data(
+            &self,
+            _h: &bitdaemon_common::bitfield::Bitfield,
+            _s: bool,
+            _l: &[PathBuf],
+        ) -> (bool, Option<StorageError>) {
+            unimplemented!()
+        }
+    }
+
+    let d = dir("stop_abort");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    std::fs::write(d.join("t/a.bin"), vec![3u8; 1000]).unwrap();
+    std::fs::write(d.join("t/b.bin"), vec![4u8; 1000]).unwrap();
+
+    let (io, _drained) = make_io(1);
+    // give the hash pool a worker of its own — hash jobs only route
+    // there when `max_threads > 0` (upstream `pool_for`; the generic
+    // `set_max_threads` does NOT size `hashing_threads`)
+    io.set_hash_threads(1);
+    let entered = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(Barrier::new(2));
+    io.insert_storage(
+        StorageIndex(0),
+        Box::new(GatedRead {
+            inner: storage(&make_fs(), &d),
+            entered: Arc::clone(&entered),
+            gate: Arc::clone(&gate),
+        }),
+    );
+
+    // job A — non-volatile, occupies the single hash worker inside
+    // the gated read.
+    let a_done = Arc::new(AtomicUsize::new(0));
+    let ad = Arc::clone(&a_done);
+    io.async_hash(
+        StorageIndex(0),
+        PieceIndex(0),
+        Vec::new(),
+        flags::V1_HASH,
+        Box::new(move |_, _h, _b, e| {
+            assert!(!e.is_err(), "in-flight hash must complete: {e:?}");
+            ad.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    // wait until A is inside the storage read — B then stays queued
+    // behind the single busy hash worker.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while entered.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(entered.load(Ordering::Relaxed), 1);
+
+    // job B — volatile (a checking hash) — sits in the hash pool queue.
+    let b_done = Arc::new(AtomicUsize::new(0));
+    let b_err = Arc::new(AtomicUsize::new(0));
+    let (bd, be) = (Arc::clone(&b_done), Arc::clone(&b_err));
+    io.async_hash(
+        StorageIndex(0),
+        PieceIndex(1),
+        Vec::new(),
+        flags::V1_HASH | flags::VOLATILE_READ,
+        Box::new(move |_, _h, _b, e| {
+            if e.is_err() {
+                be.fetch_add(1, Ordering::Relaxed);
+            }
+            bd.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let sd = Arc::clone(&stopped);
+    io.async_stop_torrent(
+        StorageIndex(0),
+        Box::new(move || {
+            sd.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+
+    // release A → it completes → the stop fence drains → B dequeues
+    // aborted.
+    gate.wait();
+    wait_done(&io, &a_done, 1);
+    wait_done(&io, &b_done, 1);
+    wait_done(&io, &stopped, 1);
+
+    assert_eq!(
+        b_err.load(Ordering::Relaxed),
+        1,
+        "queued volatile hash must complete aborted"
+    );
+    assert_eq!(
+        entered.load(Ordering::Relaxed),
+        1,
+        "aborted hash must never reach the storage"
     );
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();

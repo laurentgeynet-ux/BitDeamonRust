@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use bitdaemon_common::bitfield_flag;
 
@@ -172,20 +172,18 @@ pub fn hard_link(src: &Path, dst: &Path) -> io::Result<()> {
     fs::hard_link(src, dst)
 }
 
-/// `aux::copy_file` — upstream tries `CopyFile`, then hard-link
-/// heuristics on POSIX. The observable contract: `dst` is a byte-for-
-/// byte copy of `src` after return; on failure `dst` may not exist.
-/// We try hard-link first (cheap, same-fs case) then fall back to a
-/// real copy — matching upstream's preference order.
-/// (Upstream's *manual* fallback path sizes its copy buffer from
-/// `PhysicalBytesPerSectorForPerformance`; that sizing exists so a
-/// userspace copy loop doesn't read-modify-write sectors — `fs::copy`
-/// delegates to `CopyFile`/copy-offload, which is already
-/// sector-aware in-kernel, so the manual path has nothing to port.)
+/// `aux::copy_file` — a real copy, never a link: upstream's loop
+/// (`copy_file.cpp`) copies the file contents and preserves sparse
+/// regions via `SEEK_DATA`/`SEEK_HOLE` or
+/// `FSCTL_QUERY_ALLOCATED_RANGES`. A hard link would share the inode
+/// — the move/rollback callers expect an *independent* destination
+/// (upstream's move_storage only deletes the source *after* the copy
+/// completes, and `dont_replace` bookkeeping assumes distinct
+/// entries). `fs::copy` delegates to `copy_file_range`/`CopyFile`,
+/// which do the sector-aware copy in-kernel — upstream's manual
+/// buffer sizing (`PhysicalBytesPerSectorForPerformance`) exists only
+/// for the userspace loop and has nothing to port.
 pub fn copy_file(src: &Path, dst: &Path) -> io::Result<()> {
-    if hard_link(src, dst).is_ok() {
-        return Ok(());
-    }
     fs::copy(src, dst).map(|_| ())
 }
 
@@ -398,21 +396,38 @@ fn drive_kind_impl(_path: &Path) -> DriveKind {
     DriveKind::Spinning
 }
 
-/// `aux::canonicalize_path` — resolve `.`/`..`/links to an absolute
-/// normalized path. Falls back to the input when the path doesn't
-/// exist yet (upstream tolerates this for files being created).
+/// `aux::canonicalize_path` (path.cpp:770 — `TORRENT_USE_UNC_PATHS`)
+/// — a *lexical* cleanup: `.` elements are dropped, `..` pops the
+/// previous element. No filesystem access and no symlink resolution —
+/// upstream never stats the path.
 pub fn canonicalize_path(f: &Path) -> PathBuf {
-    fs::canonicalize(f).unwrap_or_else(|_| complete(f))
+    let mut out = PathBuf::new();
+    for c in f.components() {
+        match c {
+            Component::CurDir => {}
+            // upstream erases the `..` even at the head of the path —
+            // `pop()` on an empty/rooted path is a no-op, same effect.
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
-/// `aux::complete` — make relative paths absolute against the cwd.
+/// `aux::complete` — make relative paths absolute against the cwd;
+/// a leading `./` element is stripped first (path.cpp:933-934).
 #[must_use]
 pub fn complete(f: &Path) -> PathBuf {
     if f.is_absolute() {
-        f.to_path_buf()
-    } else {
-        current_working_directory().join(f)
+        return f.to_path_buf();
     }
+    let f: PathBuf = match f.components().next() {
+        Some(Component::CurDir) => f.components().skip(1).collect(),
+        _ => f.to_path_buf(),
+    };
+    current_working_directory().join(f)
 }
 
 /// `aux::current_working_directory`.

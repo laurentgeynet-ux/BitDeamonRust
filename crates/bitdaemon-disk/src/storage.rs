@@ -136,6 +136,13 @@ pub struct PreadStorage {
     /// settings inside `open_file`; we can't reach them, so the
     /// `DiskIo` pushes them via `set_open_mode_extra`).
     open_mode_extra: std::sync::atomic::AtomicU32,
+    /// `disk_io_write_mode == write_through` — `sync_file` after each
+    /// landed write (upstream reads the setting inside `write`).
+    write_through: std::sync::atomic::AtomicBool,
+    /// `disk_io_write_mode ∈ {disable_os_cache, write_through}` —
+    /// `open_mode::no_cache` on EVERY open, reads included (upstream
+    /// `pread_storage::open_file`, pread_storage.cpp:780-785).
+    no_cache_open: std::sync::atomic::AtomicBool,
 }
 
 impl PreadStorage {
@@ -168,6 +175,8 @@ impl PreadStorage {
             need_tick: std::sync::atomic::AtomicBool::new(false),
             precomputed: crate::precomputed_block_hashes::PrecomputedBlockHashes::new(),
             open_mode_extra: std::sync::atomic::AtomicU32::new(0),
+            write_through: std::sync::atomic::AtomicBool::new(false),
+            no_cache_open: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -275,7 +284,12 @@ impl PreadStorage {
     ) -> Result<Arc<crate::file::FileHandle>, StorageError> {
         let mut mode = mode | self.extra_mode();
         if mode.contains(OpenMode::WRITE) && !mode.contains(OpenMode::TRUNCATE) {
-            let created = self.file_created.lock().unwrap_or_else(|e| e.into_inner());
+            let mut created = self.file_created.lock().unwrap_or_else(|e| e.into_inner());
+            // upstream resizes defensively first (pread_storage.cpp:720)
+            let n = usize::try_from(self.files.num_files()).unwrap_or(0);
+            if created.len() != n {
+                created.resize(n, false);
+            }
             if index.get() < created.len() && !created[index.get()] {
                 mode |= OpenMode::TRUNCATE;
             }
@@ -292,6 +306,15 @@ impl PreadStorage {
                 && self.file_priority[index.get()] == DownloadPriority::DONT_DOWNLOAD)
         {
             mode |= OpenMode::SPARSE;
+        }
+        // `write_mode ∈ {disable_os_cache, write_through}` → no_cache
+        // on every open — the cache already holds the data, so it
+        // shouldn't be left in the OS cache too (pread_storage.cpp:780).
+        if self
+            .no_cache_open
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            mode |= OpenMode::NO_CACHE;
         }
         let handle = self.pool.open_file_at(
             (self.storage_index(), index),
@@ -375,7 +398,10 @@ impl PreadStorage {
                     return Ok(usize::try_from(n).unwrap_or(0));
                 }
                 let handle = self.open_file(file_index, mode)?;
-                let n = crate::file::pread_best_effort(
+                // `pread_all` — a file physically shorter than its
+                // declared range is `file_too_short` upstream, not a
+                // silent slide into the next file's bytes
+                let n = crate::file::pread_all(
                     handle.file(),
                     buf,
                     u64::try_from(file_offset).unwrap_or(0),
@@ -454,6 +480,19 @@ impl PreadStorage {
                     .map_err(|e| StorageError::new(e, file_index, Operation::FileWrite))?;
                 // upstream: writes invalidate the cached stat entry
                 self.stat_cache.set_dirty(file_index);
+                // `write_mode == write_through` → `sync_file` after
+                // each write (upstream pread_storage.cpp:522-523);
+                // sync errors are swallowed upstream (no ec out-param)
+                if self
+                    .write_through
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let _ = crate::file::sync_file(
+                        handle.file(),
+                        u64::try_from(file_offset).unwrap_or(0),
+                        buf.len() as u64,
+                    );
+                }
                 Ok(n)
             },
         )
@@ -506,7 +545,9 @@ impl PreadStorage {
                 }
                 let handle = self.open_file(file_index, mode)?;
                 scratch.resize(buf.len(), 0);
-                let n = crate::file::pread_best_effort(
+                // `pread_all` like upstream — a short file is
+                // `file_too_short`, never a partial feed
+                let n = crate::file::pread_all(
                     handle.file(),
                     &mut scratch,
                     u64::try_from(file_offset).unwrap_or(0),
@@ -549,7 +590,8 @@ impl PreadStorage {
         match fs::stat_file(&self.part_file_path(), fs::FileStatusFlags::NONE) {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(StorageError::new(e, FileIndex(-1), Operation::FileStat)),
+            // upstream `ec.file(torrent_status::error_file_partfile)` = -6
+            Err(e) => Err(StorageError::new(e, FileIndex(-6), Operation::FileStat)),
         }
     }
 
@@ -594,6 +636,20 @@ impl PreadStorage {
     pub fn initialize(&mut self) -> StorageResult<u8> {
         self.stat_cache
             .reserve(usize::try_from(self.files.num_files()).unwrap_or(0));
+        // upstream (pread_storage.cpp:233-244): don't do full file
+        // allocations on network drives — Windows-only in the pread
+        // backend (`#ifdef TORRENT_WINDOWS` + `GetDriveTypeW`; the
+        // mmap backend uses the cross-platform `get_drive_info`).
+        #[cfg(windows)]
+        if crate::fs::drive_kind(&self.save_path()) == crate::fs::DriveKind::Remote {
+            self.allocate_files = false;
+        }
+        // `m_file_created.resize(num_files, false)` — extends with
+        // false but keeps the bits already set this session.
+        self.file_created
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resize(usize::try_from(self.files.num_files()).unwrap_or(0), false);
         let mut ret = 0u8;
         for i in 0..self.files.num_files() {
             let i = FileIndex(i);
@@ -606,7 +662,16 @@ impl PreadStorage {
                 continue;
             }
             let p = self.resolve_path(i);
-            match self.stat_cache.get_filesize_path(i, &p) {
+            // upstream `stat_cache::get_filesize` pretends symlink-
+            // flagged files don't exist — they get special
+            // create/validate logic instead of a blind stat of the
+            // target (stat_cache.cpp:60-68).
+            let res = if self.files.file_flags(i).contains(FileFlags::SYMLINK) {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            } else {
+                self.stat_cache.get_filesize_path(i, &p)
+            };
+            match res {
                 Ok(size) if size > 0 => {
                     self.set_use_partfile(i, false);
                     if size > fs_file_size {
@@ -790,8 +855,9 @@ impl PreadStorage {
         }
         let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pf) = g.as_ref() {
+            // upstream `ec.file(error_file_partfile)` = -6
             pf.flush_metadata()
-                .map_err(|e| StorageError::new(e, FileIndex(-1), Operation::PartfileWrite))?;
+                .map_err(|e| StorageError::new(e, FileIndex(-6), Operation::PartfileWrite))?;
         }
         Ok(())
     }
@@ -965,6 +1031,14 @@ pub trait DiskStorage: Send + Sync {
     /// `settings_pack::disk_disable_copy_on_write` — `no_cow` on
     /// truncate-opens (upstream applies it in the mmap backend only).
     fn set_no_cow(&self, _v: bool) {}
+    /// `settings_pack::disk_io_write_mode == write_through` —
+    /// `sync_file` after each landed write (upstream reads the
+    /// setting inline inside `pread_storage::write`).
+    fn set_write_through(&self, _v: bool) {}
+    /// `settings_pack::disk_io_write_mode ∈ {disable_os_cache,
+    /// write_through}` — `open_mode::no_cache` on every open
+    /// (`pread_storage::open_file` / `mmap_storage::open_file`).
+    fn set_write_no_cache(&self, _v: bool) {}
     /// `read` + `disk_job_flags_t` — upstream's mmap backend also
     /// honors `flush_piece` (`page_out` the read range); fd storages
     /// have no page machinery so the default folds to `read`.
@@ -1103,6 +1177,14 @@ impl DiskStorage for PreadStorage {
     fn set_open_mode_extra(&self, mode: OpenMode) {
         self.open_mode_extra
             .store(mode.bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    fn set_write_through(&self, v: bool) {
+        self.write_through
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn set_write_no_cache(&self, v: bool) {
+        self.no_cache_open
+            .store(v, std::sync::atomic::Ordering::Relaxed);
     }
     fn set_need_tick(&self) -> bool {
         PreadStorage::set_need_tick(self)

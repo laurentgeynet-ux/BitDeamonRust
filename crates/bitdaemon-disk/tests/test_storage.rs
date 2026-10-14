@@ -6,11 +6,13 @@ use std::fs as stdfs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bitdaemon_common::types::{DownloadPriority, PieceIndex, StorageIndex};
+use bitdaemon_common::types::{DownloadPriority, FileIndex, PieceIndex, StorageIndex};
 use bitdaemon_core::file_storage::{FileFlags, FileStorage, RenamedFiles};
 use bitdaemon_disk::file_pool::FilePool;
 use bitdaemon_disk::open_mode::OpenMode;
-use bitdaemon_disk::storage::{PreadStorage, StorageParams, disk_status};
+use bitdaemon_disk::storage::{MoveFlags, PreadStorage, StorageParams, disk_status, remove_flags};
+use bitdaemon_disk::storage_error::Operation;
+use bitdaemon_disk::storage_utils::move_storage;
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("bitdaemon_st_{}_{}", std::process::id(), name));
@@ -338,5 +340,210 @@ fn move_storage_replaces_path() {
     assert_eq!(status & !disk_status::NEED_FULL_CHECK, 0);
     assert!(new_path.join("t/b.bin").exists());
     stdfs::remove_dir_all(&d).unwrap();
+    stdfs::remove_dir_all(&d2).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// upstream `test_storage.cpp` move-storage rollback regression trio
+// (delta fiche #01 — storage_utils.cpp:162-211)
+// ---------------------------------------------------------------------------
+
+/// `payload/{first,second}` — upstream's fixture shape (no torrent
+/// name prefix; files sit under `payload/` directly).
+fn move_fs() -> FileStorage {
+    let mut fs = FileStorage::new();
+    fs.set_piece_length(1024);
+    fs.add_file(None, b"payload/first", 1, FileFlags::NONE, 0, b"", None)
+        .unwrap();
+    fs.add_file(None, b"payload/second", 1, FileFlags::NONE, 0, b"", None)
+        .unwrap();
+    fs.set_num_pieces(1);
+    fs
+}
+
+/// upstream `move_storage_rolls_back_after_partfile_error`: a part-file
+/// move failure after every file renamed must roll the whole move
+/// back — `fatal_disk_error`, unchanged save path, `partfile_move`
+/// operation, source files restored, destination files gone.
+#[test]
+fn move_storage_rolls_back_after_partfile_error() {
+    let src = dir("ms_rb_src");
+    // upstream leaves the destination absent — `move_storage` creates it
+    let dst = std::env::temp_dir().join(format!("bitdaemon_st_{}_ms_rb_dst", std::process::id()));
+    let _ = stdfs::remove_dir_all(&dst);
+
+    let fs = move_fs();
+    stdfs::create_dir_all(src.join("payload")).unwrap();
+    stdfs::write(src.join("payload/first"), b"x").unwrap();
+    stdfs::write(src.join("payload/second"), b"x").unwrap();
+
+    let attempted = std::cell::Cell::new(false);
+    let (status, save_path, err) = move_storage(
+        &fs,
+        &RenamedFiles::default(),
+        src.clone(),
+        dst.clone(),
+        |_| {
+            attempted.set(true);
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        },
+        MoveFlags::AlwaysReplaceFiles,
+    );
+
+    assert!(attempted.get(), "part-file move must be attempted");
+    assert_ne!(status & disk_status::FATAL_DISK_ERROR, 0);
+    assert_eq!(save_path, src, "save path stays the old one on failure");
+    let e = err.expect("part-file failure must surface");
+    assert_eq!(e.operation, Operation::PartfileMove);
+    // upstream `ec.file(error_file_partfile)` = -6
+    assert_eq!(e.file, FileIndex(-6));
+    for name in ["first", "second"] {
+        assert!(src.join("payload").join(name).exists());
+        assert!(!dst.join("payload").join(name).exists());
+    }
+    stdfs::remove_dir_all(&src).unwrap();
+    stdfs::remove_dir_all(&dst).unwrap();
+}
+
+/// upstream `move_storage_rollback_preserves_skipped_files`: under
+/// `dont_replace`, a file that exists at the destination is skipped —
+/// its source stays put and a later failure must not roll it back
+/// (nor touch the pre-existing destination copy).
+#[test]
+fn move_storage_rollback_preserves_skipped_files() {
+    let src = dir("ms_skip_src");
+    let dst = dir("ms_skip_dst");
+    let fs = move_fs();
+    stdfs::create_dir_all(src.join("payload")).unwrap();
+    stdfs::create_dir_all(dst.join("payload")).unwrap();
+    stdfs::write(src.join("payload/first"), b"s").unwrap();
+    stdfs::write(src.join("payload/second"), b"m").unwrap();
+    stdfs::write(dst.join("payload/first"), b"d").unwrap();
+
+    let (status, save_path, err) = move_storage(
+        &fs,
+        &RenamedFiles::default(),
+        src.clone(),
+        dst.clone(),
+        |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        MoveFlags::DontReplace,
+    );
+
+    assert_ne!(status & disk_status::FATAL_DISK_ERROR, 0);
+    assert_eq!(save_path, src);
+    assert!(err.is_some());
+    assert_eq!(stdfs::read(src.join("payload/first")).unwrap(), b"s");
+    assert_eq!(stdfs::read(dst.join("payload/first")).unwrap(), b"d");
+    assert_eq!(stdfs::read(src.join("payload/second")).unwrap(), b"m");
+    assert!(!dst.join("payload/second").exists());
+    stdfs::remove_dir_all(&src).unwrap();
+    stdfs::remove_dir_all(&dst).unwrap();
+}
+
+/// upstream `move_storage_rollback_preserves_missing_source_files`: a
+/// declared-but-missing source file is `ENOENT`-skipped; a pre-existing
+/// unrelated destination file with the same name must survive the
+/// rollback untouched (rollback only sweeps files actually renamed).
+#[test]
+fn move_storage_rollback_preserves_missing_source_files() {
+    let src = dir("ms_miss_src");
+    let dst = dir("ms_miss_dst");
+    let fs = move_fs();
+    stdfs::create_dir_all(src.join("payload")).unwrap();
+    stdfs::create_dir_all(dst.join("payload")).unwrap();
+    // `first` declared but absent at source; unrelated `first` at dest
+    stdfs::write(src.join("payload/second"), b"m").unwrap();
+    stdfs::write(dst.join("payload/first"), b"d").unwrap();
+
+    let (status, save_path, err) = move_storage(
+        &fs,
+        &RenamedFiles::default(),
+        src.clone(),
+        dst.clone(),
+        |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        MoveFlags::AlwaysReplaceFiles,
+    );
+
+    assert_ne!(status & disk_status::FATAL_DISK_ERROR, 0);
+    assert_eq!(save_path, src);
+    assert!(err.is_some());
+    assert!(!src.join("payload/first").exists());
+    assert_eq!(stdfs::read(dst.join("payload/first")).unwrap(), b"d");
+    assert_eq!(stdfs::read(src.join("payload/second")).unwrap(), b"m");
+    assert!(!dst.join("payload/second").exists());
+    stdfs::remove_dir_all(&src).unwrap();
+    stdfs::remove_dir_all(&dst).unwrap();
+}
+
+/// upstream `delete_files` error channel (storage_utils.cpp:319-355):
+/// `ec.ec` is overwritten by *each* file's delete result — the **last**
+/// file wins, so a mid-list failure followed by a success clears; only
+/// then does the **first** directory-cleanup failure surface
+/// (`FileIndex(-1)`). A failing *last* file keeps its index.
+#[test]
+fn delete_files_error_ordering() {
+    let make3 = || {
+        let mut fs = FileStorage::new();
+        fs.set_name(b"t");
+        fs.set_piece_length(1024);
+        for n in ["a.bin", "b.bin", "c.bin"] {
+            fs.add_file(
+                None,
+                format!("t/{n}").as_bytes(),
+                100,
+                FileFlags::NONE,
+                0,
+                b"",
+                None,
+            )
+            .unwrap();
+        }
+        fs.set_num_pieces(1);
+        fs
+    };
+
+    // mid-list failure cleared by a later success → dir error wins
+    let d = dir("del_mid");
+    let fs = make3();
+    let prio = vec![DownloadPriority::DEFAULT; 3];
+    let st = storage(&fs, &d, &prio);
+    st.set_storage_index(StorageIndex(0));
+    stdfs::create_dir_all(d.join("t")).unwrap();
+    stdfs::write(d.join("t/a.bin"), b"a").unwrap();
+    // b.bin is a non-empty *directory* — remove fails on every OS
+    stdfs::create_dir_all(d.join("t/b.bin")).unwrap();
+    stdfs::write(d.join("t/b.bin/x"), b"x").unwrap();
+    stdfs::write(d.join("t/c.bin"), b"c").unwrap();
+
+    let e = st
+        .delete_files(remove_flags::DELETE_FILES)
+        .expect_err("dir cleanup must report the failure");
+    // file phase ended clean (c succeeded after b failed) → the first
+    // dir-remove failure is the reported one, not b's FileIndex(1)
+    assert_eq!(e.file, FileIndex(-1));
+    assert_eq!(e.operation, Operation::FileRemove);
+    assert!(!d.join("t/a.bin").exists());
+    assert!(!d.join("t/c.bin").exists());
+    assert!(d.join("t/b.bin").is_dir(), "failed file must remain");
+    stdfs::remove_dir_all(&d).unwrap();
+
+    // last file fails → its error is reported; dir failures masked
+    let d2 = dir("del_last");
+    let st2 = storage(&fs, &d2, &prio);
+    st2.set_storage_index(StorageIndex(0));
+    stdfs::create_dir_all(d2.join("t")).unwrap();
+    stdfs::write(d2.join("t/a.bin"), b"a").unwrap();
+    stdfs::write(d2.join("t/b.bin"), b"b").unwrap();
+    stdfs::create_dir_all(d2.join("t/c.bin")).unwrap();
+    stdfs::write(d2.join("t/c.bin/x"), b"x").unwrap();
+
+    let e = st2
+        .delete_files(remove_flags::DELETE_FILES)
+        .expect_err("last file failure must surface");
+    assert_eq!(e.file, FileIndex(2));
+    assert_eq!(e.operation, Operation::FileRemove);
+    assert!(!d2.join("t/a.bin").exists());
+    assert!(!d2.join("t/b.bin").exists());
+    assert!(d2.join("t/c.bin").is_dir());
     stdfs::remove_dir_all(&d2).unwrap();
 }

@@ -318,14 +318,13 @@ impl PartFile {
                 let buf = buf.get_or_insert_with(|| {
                     vec![0u8; usize::try_from(self.piece_size).unwrap_or(0)]
                 });
-                let n = crate::file::pread_best_effort(
+                // `pread_all` — a short slot read is an error upstream
+                // (part_file.cpp:366), not a partial export.
+                pread_all(
                     file.file(),
                     &mut buf[..usize::try_from(block_to_copy).unwrap_or(0)],
                     u64::try_from(self.slot_offset(slot) + piece_offset).unwrap_or(0),
                 )?;
-                if i64::try_from(n).unwrap_or(0) < block_to_copy {
-                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "eof"));
-                }
                 f(
                     file_offset,
                     &buf[..usize::try_from(block_to_copy).unwrap_or(0)],

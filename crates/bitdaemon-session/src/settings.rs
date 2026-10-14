@@ -54,13 +54,14 @@ pub enum DiskIoMode {
 }
 
 impl DiskIoMode {
-    /// Whether this mode bypasses the OS cache. Anything but
-    /// `EnableOsCache` maps to our `no_cache`/`write_through` open
-    /// flag (upstream maps `disable_os_cache*`/`write_through` to
-    /// uncached or synchronous I/O).
+    /// `disk_io_write_mode` → `open_mode::no_cache` predicate:
+    /// upstream opens files uncached when the *write* mode is
+    /// `disable_os_cache` or `write_through` (pread_storage.cpp:781,
+    /// mmap_storage.cpp:957). `DisableOsCacheForAlignedFiles` is
+    /// deprecated upstream and maps to neither.
     #[must_use]
     pub fn bypasses_os_cache(self) -> bool {
-        self != DiskIoMode::EnableOsCache
+        matches!(self, DiskIoMode::DisableOsCache | DiskIoMode::WriteThrough)
     }
 }
 

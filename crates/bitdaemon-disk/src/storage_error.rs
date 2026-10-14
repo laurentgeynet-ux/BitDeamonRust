@@ -104,19 +104,25 @@ pub struct StorageError {
     pub file: FileIndex,
     /// `operation()`.
     pub operation: Operation,
+    // upstream tests `ec.value() != 0` — the error_code alone carries
+    // the verdict; `file`/`operation` are metadata. Abort-stamped
+    // errors use `unknown`/`-1` yet ARE errors, so the sentinel must
+    // be "an error was recorded", which `io::Error` alone can't
+    // express (no empty state).
+    has_error: bool,
 }
 
 impl StorageError {
     /// `!storage_error` — success sentinel (`default()` = no error).
     #[must_use]
     pub fn is_ok(&self) -> bool {
-        self.file == FileIndex(-1) && self.operation == Operation::Unknown
+        !self.has_error
     }
 
     /// `error_code` present — the op failed.
     #[must_use]
     pub fn is_err(&self) -> bool {
-        !self.is_ok()
+        self.has_error
     }
 
     /// Construct from an `io::Error`.
@@ -125,6 +131,7 @@ impl StorageError {
             io,
             file,
             operation,
+            has_error: true,
         }
     }
 }
@@ -139,6 +146,7 @@ impl Clone for StorageError {
             io: io::Error::new(self.io.kind(), self.io.to_string()),
             file: self.file,
             operation: self.operation,
+            has_error: self.has_error,
         }
     }
 }
@@ -168,6 +176,7 @@ impl Default for StorageError {
             io: io::Error::from(io::ErrorKind::Other),
             file: FileIndex(-1),
             operation: Operation::Unknown,
+            has_error: false,
         }
     }
 }

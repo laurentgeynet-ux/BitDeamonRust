@@ -112,7 +112,9 @@ impl FileView {
                 buf[..n].copy_from_slice(&m[off..off + n]);
                 Ok(n)
             }
-            None => bitdaemon_disk::file::pread_best_effort(&g.file, buf, offset),
+            // fd fallback — upstream `pread_all` (mmap_storage.cpp:550):
+            // a short read is `file_too_short`, not a partial result.
+            None => bitdaemon_disk::file::pread_all(&g.file, buf, offset),
         }
     }
 

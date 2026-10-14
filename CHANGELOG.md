@@ -529,6 +529,78 @@ Regression tests: `part_file_export_lands_in_file` (both backends),
 `external_view_survives_delete`, `status_and_close_oldest`,
 `move_storage_reopens_at_new_path`.
 
+### Fixed — `bitdaemon-disk` upstream-fidelity audit (full crate sweep)
+
+`bitdaemon-disk` (`disk_io`/`disk_cache`/`storage`/`storage_utils`/
+`part_file`/`fs`/`file`/`file_pool`/`stat_cache`/`hash_picker`/…)
+was re-audited line-by-line against upstream `pread_disk_io.cpp`,
+`pread_storage.cpp`, `disk_cache.cpp`/`aux_/disk_cache.hpp`,
+`storage_utils.cpp`, `part_file.cpp`, `file.cpp`, `file_pool_impl.cpp`,
+`copy_file.cpp`, `path.cpp`, `truncate.cpp`, `error_code.hpp` @
+`v2.1.2-45-gc019e80ef` (delta `c019e80ef → d143290bb` covered), and
+every discrepancy was repaired:
+
+- **v2 block hashing bounded to `piece_size2`** in all three sites:
+  `hash_job`, `hash2_job` (both the disk-read *and* the cached-block
+  paths) and the flush-time stored block hashes. The port hashed the
+  full 16 KiB buffer; upstream hashes only
+  `min(block_size, piece_size2 - offset)` bytes
+  (`v2_hash_queue_entry::hash_len`, `disk_cache::hash2`,
+  `pread_storage::hash2`) — a hybrid piece whose last v2 block
+  straddles a pad/file boundary produced wrong SHA-256 block hashes.
+- **Strict positioned reads**: `storage::read`/`hash_with`, part-file
+  slot export and the mmap fd fallback now use `pread_all`, surfacing
+  `file_too_short` on short reads like upstream instead of silently
+  accepting them.
+- **`StorageError` truth**: `is_ok()`/`is_err()` now follow the
+  recorded error code (upstream `operator bool() = ec.value() != 0`),
+  not `file`/`operation` sentinels — aborted jobs (`Interrupted`,
+  `FileIndex(-1)`, `Unknown`) no longer report success.
+- **`stop_torrent`**: `async_stop_torrent` now releases the torrent's
+  pooled files and stamps queued volatile `hash`/`hash2` jobs aborted
+  at submit time, so a stopped torrent's parked hash work completes
+  with `operation_aborted` instead of running or leaking.
+- **`file_priority` job** writes the *stored* priorities back to the
+  disk result on failure too — upstream `set_file_priority` restores
+  and reports the pre-failure state.
+- **`delete_files` error ordering**: per-file errors are last-wins,
+  directory cleanup errors first-wins, and a part-file removal error
+  always wins — matching upstream `storage_utils.cpp` overwrite rules.
+- **`fs::copy_file`** now always performs a real sparse-aware copy;
+  the hard-link preference was dropped (upstream `copy_file` never
+  links — `DontReplace` moves must not leave source and destination
+  sharing an inode).
+- **`disk_io_write_mode` semantics**: `write_through` is plumbed
+  session → `DiskIo` → storage and runs `sync_file` after each landed
+  write (pread backend); `disable_os_cache`/`write_through` set
+  `open_mode::no_cache` on *every* open, reads included (upstream
+  `pread_storage::open_file`/`mmap_storage` mode check);
+  `disk_io_read_mode = disable_os_cache` no longer sets an open flag —
+  it routes `volatile_read` on peer and `read_piece` reads, landing as
+  `advise_dont_need` after the read.
+- **`initialize`**: `m_file_created.resize(num_files, false)` is
+  extend-only like upstream (no longer resets prior state), remote
+  drives gate `allocate_files` (`DRIVE_REMOTE`, Windows leg of
+  `pread_storage::initialize`), `open_file` defensively resizes the
+  bitset before indexing, and symlink-flagged files report their
+  declared size via the stat-cache pretend instead of a real stat.
+- **Path helpers**: `canonicalize_path` is a pure lexical cleanup (no
+  symlink resolution / no FS access — upstream UNC-build semantics)
+  and `complete()` strips a leading `./` like upstream `path.cpp`.
+- **Part-file error index**: `move_partfile`, the `set_file_priority`
+  metadata flush and `has_any_file` report `file_index` `-6`
+  (upstream `error_file_partfile` sites).
+- **`hash2` completion** no longer marks the piece `hash_returned`/
+  `FORCE_FLUSH` — upstream `disk_cache::hash2` is a pure lookup.
+
+Regression tests: `hash_v2_blocks_stop_at_file_boundary`,
+`stop_torrent_releases_pooled_files`,
+`stop_torrent_aborts_queued_volatile_hash`,
+`delete_files_error_ordering`,
+`move_storage_rolls_back_after_partfile_error`,
+`move_storage_rollback_preserves_skipped_files`,
+`move_storage_rollback_preserves_missing_source_files`.
+
 ### Fixed — `bitdaemon-dht` upstream-fidelity audit (full crate sweep)
 
 Every module of `bitdaemon-dht` was re-audited line-by-line against

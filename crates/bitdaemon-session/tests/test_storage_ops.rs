@@ -54,10 +54,12 @@ fn move_storage_done_updates_path_and_alerts() {
 fn rename_and_delete_failures_alert() {
     let ih = Sha1Hash::from_bytes(&[2; 20]).unwrap();
     let mut s = mk(ih);
-    let boom = || StorageError {
-        io: std::io::Error::from_raw_os_error(5),
-        file: FileIndex(0),
-        operation: bitdaemon_disk::storage_error::Operation::FileRename,
+    let boom = || {
+        StorageError::new(
+            std::io::Error::from_raw_os_error(5),
+            FileIndex(0),
+            bitdaemon_disk::storage_error::Operation::FileRename,
+        )
     };
     s.disk_completions()
         .send(DiskCompleted::RenameFile {

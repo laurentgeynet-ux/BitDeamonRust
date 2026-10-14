@@ -2029,6 +2029,9 @@ impl Session {
                     };
                     let storage = t.storage;
                     let (peer, req, tx) = (*peer, *req, self.disk_tx.clone());
+                    // upstream `peer_connection::on_piece_request`
+                    // (peer_connection.cpp:5403): `volatile_read`
+                    // under `disk_io_read_mode == disable_os_cache`.
                     disk.async_read(
                         storage,
                         req,
@@ -2041,7 +2044,13 @@ impl Session {
                                 err,
                             });
                         }),
-                        0,
+                        if self.settings.disk_io_read_mode
+                            == crate::settings::DiskIoMode::DisableOsCache
+                        {
+                            bitdaemon_disk::disk_interface::flags::VOLATILE_READ
+                        } else {
+                            0
+                        },
                     );
                 }
                 TorrentEffect::DiskWrite { peer, req, data } => {
@@ -2133,6 +2142,8 @@ impl Session {
                     };
                     let piece = *piece;
                     let tx = self.disk_tx.clone();
+                    // upstream `torrent::read_piece` (torrent.cpp:861):
+                    // `volatile_read` under `disable_os_cache`.
                     disk.async_read(
                         storage,
                         req,
@@ -2144,7 +2155,13 @@ impl Session {
                                 err,
                             });
                         }),
-                        0,
+                        if self.settings.disk_io_read_mode
+                            == crate::settings::DiskIoMode::DisableOsCache
+                        {
+                            bitdaemon_disk::disk_interface::flags::VOLATILE_READ
+                        } else {
+                            0
+                        },
                     );
                 }
                 TorrentEffect::SeedModeVerify { peer, piece } => {
@@ -2216,7 +2233,9 @@ impl Session {
     pub fn set_disk(&mut self, io: Arc<dyn DiskIo>) {
         io.set_max_queued_bytes(self.settings.max_queued_disk_bytes);
         io.set_write_no_cache(self.settings.disk_io_write_mode.bypasses_os_cache());
-        io.set_read_no_cache(self.settings.disk_io_read_mode.bypasses_os_cache());
+        io.set_write_through(
+            self.settings.disk_io_write_mode == crate::settings::DiskIoMode::WriteThrough,
+        );
         io.set_cache_expiry(self.settings.cache_expiry.as_secs());
         io.set_no_recheck_incomplete_resume(self.settings.no_recheck_incomplete_resume);
         io.set_open_mode_extra(open_mode_extra(&self.settings));
@@ -4720,7 +4739,7 @@ impl Session {
         if let Some(d) = &self.disk {
             d.set_max_queued_bytes(s.max_queued_disk_bytes);
             d.set_write_no_cache(s.disk_io_write_mode.bypasses_os_cache());
-            d.set_read_no_cache(s.disk_io_read_mode.bypasses_os_cache());
+            d.set_write_through(s.disk_io_write_mode == crate::settings::DiskIoMode::WriteThrough);
             d.set_cache_expiry(s.cache_expiry.as_secs());
             d.set_no_recheck_incomplete_resume(s.no_recheck_incomplete_resume);
             d.set_open_mode_extra(open_mode_extra(&s));
