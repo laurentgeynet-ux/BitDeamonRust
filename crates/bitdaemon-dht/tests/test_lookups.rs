@@ -146,8 +146,9 @@ fn sample_infohashes_reply() {
 #[test]
 fn bootstrap_uses_live_id_and_bs_flag() {
     // upstream refresh.cpp: bootstrap get_peers targets the node's
-    // *current* id at invoke time and marks router (flag_initial)
-    // entries with a.bs = 1.
+    // *current* id at invoke time — passed through
+    // `make_id_secret` (first 12 bytes kept, last 8 obfuscated) —
+    // and marks router (flag_initial) entries with a.bs = 1.
     let stored = id(0xaa);
     let live = id(0xbb);
     let l = Lookup::new(LookupKind::Bootstrap, stored, false, &hooks(), vec![]);
@@ -158,10 +159,9 @@ fn bootstrap_uses_live_id_and_bs_flag() {
     let d = e.dict().unwrap();
     assert_eq!(d[b"q".as_slice()].string().unwrap(), b"get_peers");
     let a = d[b"a".as_slice()].dict().unwrap();
-    assert_eq!(
-        a[b"info_hash".as_slice()].string().unwrap(),
-        live.as_bytes()
-    );
+    let wire = a[b"info_hash".as_slice()].string().unwrap();
+    assert_eq!(&wire[..12], &live.as_bytes()[..12], "prefix kept");
+    assert_ne!(&wire[12..], &live.as_bytes()[12..], "make_id_secret tail");
     assert_eq!(a[b"bs".as_slice()].integer().unwrap(), 1);
     // non-initial entries get no bs
     let entry2 =

@@ -30,3 +30,10 @@ pub mod rpc;
 pub mod traversal;
 
 pub use node_id::NodeId;
+
+/// `v` key stamped on every outgoing datagram — upstream writes
+/// `{'L','T', major, minor<<4|tiny}` in `dht_tracker::send_packet`.
+/// This is a distinct implementation, so it advertises `BD` +
+/// the workspace version (0.1.0 → `\x00\x10`), matching the
+/// upstream encoding scheme.
+pub const CLIENT_VERSION: [u8; 4] = [b'B', b'D', 0, 0x10];

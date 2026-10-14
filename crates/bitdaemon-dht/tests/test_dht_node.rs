@@ -29,14 +29,14 @@ fn pump(a: &mut DhtNode, b: &mut DhtNode, pa: SocketAddr, pb: SocketAddr) {
         while let Some((pkt, to)) = a.poll() {
             moved = true;
             let _ = to;
-            if let Some((rsp, _)) = b.incoming(&pkt, pa) {
-                let _ = a.incoming(&rsp, pb);
+            if let Some((rsp, _)) = b.incoming(&pkt, pa, None, true) {
+                let _ = a.incoming(&rsp, pb, None, true);
             }
         }
         while let Some((pkt, _)) = b.poll() {
             moved = true;
-            if let Some((rsp, _)) = a.incoming(&pkt, pb) {
-                let _ = b.incoming(&rsp, pa);
+            if let Some((rsp, _)) = a.incoming(&pkt, pb, None, true) {
+                let _ = b.incoming(&rsp, pa, None, true);
             }
         }
         if !moved {
@@ -66,6 +66,7 @@ fn ping_reply() {
         &bdecode_checked(&bitdaemon_bencode::bencode(&e)).unwrap(),
         pb,
         b"aa".to_vec(),
+        None,
     );
     let rsp = bdecode_checked(&pkt).unwrap();
     assert_eq!(rsp.dict_find_string_value(b"y", b""), b"r");
@@ -118,7 +119,7 @@ fn announce_requires_token() {
         d.insert("a".into(), av);
     }
     let buf = bitdaemon_bencode::bencode(&e);
-    let (pkt, _) = a.handle_query(&bdecode_checked(&buf).unwrap(), pb, b"aa".to_vec());
+    let (pkt, _) = a.handle_query(&bdecode_checked(&buf).unwrap(), pb, b"aa".to_vec(), None);
     let rsp = bdecode_checked(&pkt).unwrap();
     assert_eq!(rsp.dict_find_string_value(b"y", b""), b"e");
 
@@ -135,11 +136,13 @@ fn announce_requires_token() {
             am.insert("info_hash".into(), Entry::String(ih.as_bytes().to_vec()));
             am.insert("token".into(), Entry::String(tok.to_vec()));
             am.insert("port".into(), Entry::Int(51413));
+            // upstream requires `a.id` (20 B) on every query
+            am.insert("id".into(), Entry::String(a.id.as_bytes().to_vec()));
         }
         d.insert("a".into(), av);
     }
     let buf = bitdaemon_bencode::bencode(&e);
-    let (pkt, _) = a.handle_query(&bdecode_checked(&buf).unwrap(), pb, b"bb".to_vec());
+    let (pkt, _) = a.handle_query(&bdecode_checked(&buf).unwrap(), pb, b"bb".to_vec(), None);
     let rsp = bdecode_checked(&pkt).unwrap();
     assert_eq!(rsp.dict_find_string_value(b"y", b""), b"r");
     let _ = pa;
@@ -161,7 +164,11 @@ fn announce_write_phase() {
 
     // b stored a as a peer on ih
     let r = b.storage.get_peers(&ih, false, false, &pa.ip());
-    assert_eq!(r.peers.len(), 6, "expected one compact v4 peer");
+    assert_eq!(
+        r.peers.unwrap_or_default().len(),
+        6,
+        "expected one compact v4 peer"
+    );
     let _ = pb;
 }
 
@@ -183,7 +190,7 @@ fn incoming_upstream_get_peers_gets_reply() {
     pkt.extend_from_slice(&[0x33u8; 20]);
     pkt.extend_from_slice(b"6:noseedi1ee1:q9:get_peers1:t2:{61:v4:LT\x02\x121:y1:qe");
     let from: std::net::SocketAddr = "127.0.0.1:6940".parse().unwrap();
-    let reply = n.incoming(&pkt, from);
+    let reply = n.incoming(&pkt, from, None, true);
     assert!(reply.is_some(), "no reply to get_peers");
     let (buf, to) = reply.unwrap();
     assert_eq!(to, from);

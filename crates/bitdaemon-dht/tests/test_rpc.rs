@@ -75,9 +75,10 @@ fn incoming_dispatch_and_errors() {
         .invoke(query(), ep, 9, our_id(), false, false, |_, _| true)
         .unwrap();
     match rpc.incoming(ep, &tid.to_be_bytes(), false, Some(nid), false) {
-        Incoming::Reply { tag, id } => {
+        Incoming::Reply { tag, id, rtt } => {
             assert_eq!(tag, 9);
             assert_eq!(id, nid);
+            assert!(rtt >= 0);
         }
         other => panic!("{other:?}"),
     }

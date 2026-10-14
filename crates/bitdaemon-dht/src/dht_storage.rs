@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use bitdaemon_common::bloom_filter::BloomFilter;
 use bitdaemon_common::hash::Sha1Hash;
 use bitdaemon_common::random::random;
-use bitdaemon_net::ip_helpers::hash_address;
+use bitdaemon_net::ip_helpers::{hash_address, same_v6_prefix};
 use bitdaemon_net::socket_io::write_endpoint;
 
 use crate::dht_settings::DhtSettings;
@@ -23,6 +23,9 @@ use crate::node_id::{NodeId, min_distance_exp};
 
 /// `announce_interval` — peers expire after 1.5 × 30 min.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// `max_peers_per_prefix` — entries one IPv6 /56 can claim per
+/// info-hash.
+const MAX_PEERS_PER_PREFIX: usize = 16;
 /// `sample_infohashes_interval_max`.
 pub const SAMPLE_INFOHASHES_INTERVAL_MAX: i32 = 21600;
 /// `infohashes_sample_count_max`.
@@ -102,8 +105,10 @@ pub struct DhtStorageCounters {
 pub struct GetPeersReply {
     /// `n` — torrent name.
     pub name: Option<String>,
-    /// `values` — compact endpoints (6 or 18 bytes each).
-    pub peers: Vec<u8>,
+    /// `values` — compact endpoints (6 or 18 bytes each). `Some`
+    /// when the info-hash is known and this isn't a scrape reply —
+    /// upstream emits the key even when the list comes out empty.
+    pub peers: Option<Vec<u8>>,
     /// `BFpe`/`BFsd` for scrape queries.
     pub bfpe: Option<Vec<u8>>,
     /// seed bloom.
@@ -277,7 +282,7 @@ impl DhtStorage {
                 write_endpoint(e.addr, &mut out);
                 to_pick -= 1;
             }
-            reply.peers = out;
+            reply.peers = Some(out);
         }
 
         // full peer set → only in-set requesters get a write token
@@ -309,7 +314,13 @@ impl DhtStorage {
             }
         };
         if !name.is_empty() && v.name.is_empty() {
-            v.name = name.chars().take(100).collect();
+            // upstream `name.substr(0, 100)` — a *byte* limit; snap
+            // to a char boundary so the Rust `String` stays valid.
+            let end = (0..=name.len().min(100))
+                .rev()
+                .find(|&i| name.is_char_boundary(i))
+                .unwrap_or(0);
+            v.name = name[..end].to_string();
         }
         let peersv = if endp.is_ipv4() {
             &mut v.peers4
@@ -327,6 +338,37 @@ impl DhtStorage {
         {
             Ok(i) => peersv[i] = peer,
             Err(i) => {
+                // one host can receive on every address of its /56 —
+                // bound how many entries per info-hash a prefix claims
+                if let IpAddr::V6(a6) = endp.ip() {
+                    let prefix = a6.octets();
+                    let same_pfx = |e: &PeerEntry| match e.addr {
+                        SocketAddr::V6(p) => same_v6_prefix(&prefix, &p.ip().octets()),
+                        SocketAddr::V4(_) => false,
+                    };
+                    let mut first = i;
+                    while first > 0 && same_pfx(&peersv[first - 1]) {
+                        first -= 1;
+                    }
+                    let mut last = i;
+                    while last < peersv.len() && same_pfx(&peersv[last]) {
+                        last += 1;
+                    }
+                    if last - first >= MAX_PEERS_PER_PREFIX {
+                        // replace rather than drop — a peer in a
+                        // contested prefix still gets in
+                        let oldest = (first..last)
+                            .min_by_key(|&k| peersv[k].added)
+                            .unwrap_or(first);
+                        peersv[oldest] = peer;
+                        // the new entry belongs within the run —
+                        // sorting it restores order
+                        peersv[first..last].sort_by(|a, b| {
+                            (a.addr.ip(), a.addr.port()).cmp(&(b.addr.ip(), b.addr.port()))
+                        });
+                        return;
+                    }
+                }
                 if peersv.len() >= self.settings.max_peers as usize {
                     return;
                 }

@@ -764,9 +764,11 @@ impl RoutingTable {
         }
     }
 
-    /// `next_refresh` — `(bucket, id, endpoint)` of the
+    /// `next_refresh` — `(id, endpoint)` of the
     /// least-recently-queried node, or `None`. Marks it queried.
-    pub fn next_refresh(&mut self) -> Option<(usize, NodeId, std::net::SocketAddr)> {
+    /// The caller derives the refresh bucket as
+    /// `159 - distance_exp(own_id, id)` (upstream `node::tick`).
+    pub fn next_refresh(&mut self) -> Option<(NodeId, std::net::SocketAddr)> {
         let mut candidate: Option<(usize, usize, bool, Instant)> = None;
         let mut found = false;
 
@@ -815,7 +817,7 @@ impl RoutingTable {
             &mut self.buckets[bi].live_nodes[i]
         };
         n.last_queried = Some(Instant::now());
-        n.id.map(|id| (bi, id, n.endpoint))
+        n.id.map(|id| (id, n.endpoint))
     }
 
     /// `node_failed`.
@@ -868,8 +870,30 @@ impl RoutingTable {
         include_failed: bool,
         count: usize,
     ) -> Vec<NodeEntry> {
-        let count = if count == 0 { self.bucket_size } else { count };
         let bi = self.find_bucket(target);
+        self.find_node_at(bi, target, include_failed, count)
+    }
+
+    /// `find_node` without bucket materialization — for read-only
+    /// access (e.g. `write_nodes_entries` on a sibling-family node).
+    #[must_use]
+    pub fn find_node_ref(&self, target: &NodeId) -> Vec<NodeEntry> {
+        if self.buckets.is_empty() {
+            return Vec::new();
+        }
+        let bi = (159 - distance_exp(&self.id, target) as usize).min(self.buckets.len() - 1);
+        self.find_node_at(bi, target, false, 0)
+    }
+
+    /// shared `find_node` scan once the target bucket is known.
+    fn find_node_at(
+        &self,
+        bi: usize,
+        target: &NodeId,
+        include_failed: bool,
+        count: usize,
+    ) -> Vec<NodeEntry> {
+        let count = if count == 0 { self.bucket_size } else { count };
         let mut l: Vec<NodeEntry> = Vec::with_capacity(count);
 
         let collect = |b: &RoutingTableNode, l: &mut Vec<NodeEntry>| {
@@ -910,10 +934,17 @@ impl RoutingTable {
         l
     }
 
-    /// `is_full`.
+    /// `is_full` — live nodes at `bucket_limit` *and* a full
+    /// replacement list; out-of-range buckets count as not full
+    /// (upstream's `send_single_refresh` relies on that for
+    /// `num_active_buckets()`).
     #[must_use]
     pub fn is_full(&self, bucket: usize) -> bool {
+        if self.buckets.is_empty() || bucket >= self.buckets.len() {
+            return false;
+        }
         self.buckets[bucket].live_nodes.len() >= self.bucket_limit(bucket)
+            && self.buckets[bucket].replacements.len() >= self.bucket_size
     }
 }
 

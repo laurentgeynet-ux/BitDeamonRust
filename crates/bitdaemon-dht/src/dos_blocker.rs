@@ -64,6 +64,17 @@ impl DosBlocker {
         }
     }
 
+    /// `set_rate_limit` — `dht_block_ratelimit` (msgs / 10 s window
+    /// is `limit * 10` upstream).
+    pub fn set_rate_limit(&mut self, limit: u32) {
+        self.message_rate_limit = limit;
+    }
+
+    /// `set_block_timer` — `dht_block_timeout` in seconds.
+    pub fn set_block_timeout(&mut self, secs: i32) {
+        self.block_timeout = Duration::from_secs(secs.max(0) as u64);
+    }
+
     /// `incoming(addr, now)` — `false` when the source is banned.
     pub fn incoming(&mut self, addr: IpAddr, now: Instant) -> bool {
         // find exact match, or the least-loaded slot for a new entry

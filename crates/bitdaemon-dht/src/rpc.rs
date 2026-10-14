@@ -56,8 +56,10 @@ pub struct RpcManager {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
     /// matched a pending request — `r.id` is the responder's
-    /// verified node id (caller may `node_seen` it).
-    Reply { tag: u64, id: NodeId },
+    /// verified node id (caller may `node_seen` it). `rtt` is the
+    /// measured round-trip time in milliseconds (upstream feeds it
+    /// to `routing_table::node_seen`).
+    Reply { tag: u64, id: NodeId, rtt: i32 },
     /// the peer answered with a `y:"e"` error, or the reply was
     /// malformed — treat as a timeout (`observer::timeout()`).
     Error { tag: u64 },
@@ -109,6 +111,9 @@ impl RpcManager {
         if read_only {
             e.insert("ro".into(), Entry::Int(1));
         }
+        // upstream stamps `v` in `dht_tracker::send_packet` — every
+        // outgoing datagram, queries included.
+        e.insert("v".into(), Entry::String(crate::CLIENT_VERSION.to_vec()));
         if !send(q, ep) {
             return None;
         }
@@ -159,10 +164,32 @@ impl RpcManager {
                 Incoming::Reply {
                     tag: pending.tag,
                     id,
+                    rtt: i32::try_from(Instant::now().duration_since(pending.sent).as_millis())
+                        .unwrap_or(i32::MAX),
                 }
             }
             _ => Incoming::Error { tag: pending.tag },
         }
+    }
+
+    /// `unreachable` — an ICMP/transport-level failure for `ep`:
+    /// the oldest transaction toward it is failed as a timeout
+    /// (upstream `rpc_manager::unreachable` → `o->timeout()`).
+    /// Returns the freed request's tag.
+    pub fn unreachable(&mut self, ep: SocketAddr) -> Option<u64> {
+        for list in self.transactions.values_mut() {
+            let Some(pos) = list.iter().position(|p| p.ep == ep) else {
+                continue;
+            };
+            let pending = list.remove(pos);
+            if list.is_empty() {
+                // borrow ends at the statement; tidy the key below
+            }
+            let tag = pending.tag;
+            self.transactions.retain(|_, l| !l.is_empty());
+            return Some(tag);
+        }
+        None
     }
 
     /// `tick()` — fire short/final timeouts; returns how long the

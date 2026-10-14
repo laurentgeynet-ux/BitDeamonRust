@@ -116,6 +116,13 @@ impl Lookup {
         self.noseed = noseed;
     }
 
+    /// read back `m_noseeds` (carried to the phase-2 `get_peers`
+    /// spawned by `obfuscated_get_peers::done`).
+    #[must_use]
+    pub fn noseed(&self) -> bool {
+        self.noseed
+    }
+
     /// `m_write_tokens` — accumulated put tokens with the
     /// responder endpoint (`node_entry`).
     #[must_use]
@@ -149,14 +156,17 @@ impl Lookup {
         let mut sent_hash = None;
         match self.kind {
             LookupKind::Bootstrap => {
-                // upstream: always the *current* node id (it may
-                // change mid-bootstrap), and flag_initial targets
-                // get `a.bs = 1` so the router knows we're
+                // upstream: `make_id_secret(nid())` — always the
+                // *current* node id, obfuscated (it may change
+                // mid-bootstrap); flag_initial targets get
+                // `a.bs = 1` so the router knows we're
                 // bootstrapping, not collateral traffic.
+                let mut wire_target = current_id;
+                crate::node_id::make_id_secret(&mut wire_target);
                 em.insert("q".into(), Entry::String(b"get_peers".to_vec()));
                 am.insert(
                     "info_hash".into(),
-                    Entry::String(target.as_bytes().to_vec()),
+                    Entry::String(wire_target.as_bytes().to_vec()),
                 );
                 sent_hash = Some(target);
                 if entry.flags & crate::traversal::obs_flags::INITIAL != 0 {
@@ -232,15 +242,31 @@ impl Lookup {
         match self.kind {
             LookupKind::GetPeers | LookupKind::ObfuscatedGetPeers => {
                 let values = r.dict_find_list(b"values");
-                if !!values.is_valid() {
-                    for i in 0..values.list_size() {
-                        let p = values.list_at(i);
-                        if p.string_length() == 6 {
-                            if let Ok(ep) = read_compact(p.string_value(), false) {
+                if values.is_valid() {
+                    let single = values.list_at(0);
+                    if values.list_size() == 1
+                        && single.node_type() == bitdaemon_bencode::NodeType::String
+                        && ep.is_ipv4()
+                    {
+                        // Mainline DHT sends a single string of
+                        // concatenated 6-byte compact endpoints.
+                        for c in single.string_value().chunks_exact(6) {
+                            if let Ok(ep) = read_compact(c, false) {
                                 out.peers.push(ep);
                             }
-                        } else if p.string_length() == 18 {
-                            if let Ok(ep) = read_compact(p.string_value(), true) {
+                        }
+                    } else {
+                        // uTorrent/libtorrent format — one string
+                        // per peer (6 or 18 bytes).
+                        for i in 0..values.list_size() {
+                            let p = values.list_at(i);
+                            if p.string_length() == 6 {
+                                if let Ok(ep) = read_compact(p.string_value(), false) {
+                                    out.peers.push(ep);
+                                }
+                            } else if p.string_length() == 18
+                                && let Ok(ep) = read_compact(p.string_value(), true)
+                            {
                                 out.peers.push(ep);
                             }
                         }
@@ -294,7 +320,7 @@ impl Lookup {
             if !n.is_valid() {
                 continue;
             }
-            let v6 = key == b"nodes2";
+            let v6 = key == b"nodes6";
             let stride = if v6 { 38 } else { 26 };
             for chunk in n.string_value().chunks_exact(stride) {
                 let Some(nid) = NodeId::from_bytes(&chunk[..20]) else {

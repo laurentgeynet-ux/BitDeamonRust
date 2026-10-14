@@ -30,16 +30,16 @@ fn announce_and_get() {
     let r: IpAddr = "9.9.9.9".parse().unwrap();
     let g = s.get_peers(&h, false, false, &r);
     assert_eq!(g.name.as_deref(), Some("torrent-name"));
-    assert_eq!(g.peers.len(), 12); // 2 × 6-byte compact v4
+    assert_eq!(g.peers.as_deref().map_or(0, |v| v.len()), 12); // 2 × 6-byte compact v4
     assert!(!g.no_token);
 
     // noseed filters the seed out
     let g = s.get_peers(&h, true, false, &r);
-    assert_eq!(g.peers.len(), 6);
+    assert_eq!(g.peers.as_deref().map_or(0, |v| v.len()), 6);
 
     // unknown hash
     let g = s.get_peers(&ih(9), false, false, &r);
-    assert!(g.peers.is_empty());
+    assert!(g.peers.is_none_or(|p| p.is_empty()));
     assert!(!g.no_token); // table isn't full
 }
 
@@ -53,7 +53,7 @@ fn scrape_bloom() {
     let g = s.get_peers(&h, false, true, &r);
     assert_eq!(g.bfpe.as_ref().map(|v| v.len()), Some(256));
     assert_eq!(g.bfsd.as_ref().map(|v| v.len()), Some(256));
-    assert!(g.peers.is_empty());
+    assert!(g.peers.is_none_or(|p| p.is_empty()));
 }
 
 #[test]

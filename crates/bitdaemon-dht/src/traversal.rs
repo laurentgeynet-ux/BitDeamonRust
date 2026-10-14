@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 
-use crate::node_id::{NodeId, compare_ref};
+use crate::node_id::{NodeId, compare_ref, generate_random_id};
 
 /// `observer::flag_*`.
 pub mod obs_flags {
@@ -162,15 +162,25 @@ impl Traversal {
     pub fn results(&self) -> &[ObserverEntry] {
         &self.results
     }
-    /// `observer::reply` — upstream stamps the responder's id onto
-    /// the observer (`o->m_id = id`), which is how `NO_ID` router
-    /// entries become addressable for the announce phase.
-    pub fn set_id(&mut self, idx: usize, id: NodeId) {
-        if let Some(o) = self.results.get_mut(idx) {
-            if o.id.is_none() {
-                o.id = Some(id);
-            }
+    /// `observer::set_id` — upstream overwrites the observer's id
+    /// and `resort_result`s it into the sorted region (this is how
+    /// `NO_ID` router entries become real nodes for the announce
+    /// phase). Since indices shift, the new position is returned;
+    /// callers must use it for the follow-up `finished`/`failed`.
+    pub fn set_id(&mut self, idx: usize, id: NodeId) -> usize {
+        if idx >= self.results.len() {
+            return idx;
         }
+        let mut o = self.results.remove(idx);
+        if idx < self.sorted_results {
+            self.sorted_results -= 1;
+        }
+        o.id = Some(id);
+        let pos = self.results[..self.sorted_results]
+            .partition_point(|e| compare_ref(&e.id(), &id, &self.target));
+        self.results.insert(pos, o);
+        self.sorted_results += 1;
+        pos
     }
     /// `target()`.
     #[must_use]
@@ -211,7 +221,12 @@ impl Traversal {
             } else {
                 0
             });
-        if flags & obs_flags::NO_ID != 0 {
+        // upstream treats `id.is_all_zeros()` as `flag_no_id` even
+        // when the caller didn't set it: a random stand-in id is
+        // assigned and the entry lands unsorted at the tail.
+        if flags & obs_flags::NO_ID != 0 || id.is_all_zeros() {
+            o.id = Some(generate_random_id());
+            o.flags |= obs_flags::NO_ID;
             self.results.push(o);
         } else {
             // sorted insertion among the first sorted_results
@@ -421,7 +436,11 @@ impl Traversal {
         self.add_requests(hooks, invoke)
     }
 
-    /// `done()` — mark all outstanding queries done, clear results.
+    /// `done()` — mark all outstanding queries done. Upstream
+    /// clears `m_results` here, but the subclass `done()`
+    /// (`find_data` write-token collection, `obfuscated_get_peers`
+    /// phase-2 seeding) reads them *first* — we keep them until
+    /// the node drops the traversal, which preserves that order.
     fn finish(&mut self) {
         if self.done {
             return;
@@ -443,8 +462,5 @@ impl Traversal {
             }
         }
         self.completed = true;
-        self.results.clear();
-        self.sorted_results = 0;
-        self.invoke_count = 0;
     }
 }
