@@ -27,6 +27,7 @@ fn bitfield_then_have() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -43,6 +44,7 @@ fn bitfield_then_have() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -81,6 +83,7 @@ fn choke_aborts_unsent_requests() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -114,6 +117,7 @@ fn piece_marks_download_and_requests_more() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -142,6 +146,7 @@ fn invalid_request_rejected_and_alerted() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -179,6 +184,7 @@ fn valid_request_queues_for_upload() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -195,6 +201,7 @@ fn valid_request_queues_for_upload() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -223,6 +230,7 @@ fn choked_request_rejected_then_disconnects() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -241,6 +249,7 @@ fn choked_request_rejected_then_disconnects() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -271,6 +280,7 @@ fn choked_accept_fast_request_served_with_budget() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -290,6 +300,7 @@ fn choked_accept_fast_request_served_with_budget() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -320,6 +331,7 @@ fn request_queue_cap_rejects() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         1,
         &bitdaemon_session::counters::Counters::default(),
@@ -345,6 +357,7 @@ fn request_before_metadata_rejected() {
         0x4000,
         0x40000,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -353,4 +366,181 @@ fn request_before_metadata_rejected() {
     assert_eq!(eff.len(), 1);
     assert!(matches!(eff[0], PeerEffect::RejectRequest(_)));
     assert!(!c.peer_interested);
+}
+
+#[test]
+fn oversized_piece_disconnects() {
+    // `bt_peer_connection::on_piece` — a payload larger than
+    // `t->block_size()` is `packet_too_large`: disconnect before any
+    // `incoming_piece` state moves (no slow-start bump, no queue
+    // bookkeeping, no bitfield inference).
+    let mut c = conn();
+    let b = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    c.pipeline
+        .download_queue
+        .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b));
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Piece {
+            piece: PieceIndex(3),
+            offset: 0,
+            data: bytes::Bytes::from(vec![0u8; 0x4001]),
+        },
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert_eq!(eff.len(), 1, "expected only the disconnect: {eff:?}");
+    assert!(matches!(
+        eff[0],
+        PeerEffect::Disconnect("packet_too_large", true)
+    ));
+    assert_eq!(c.pipeline.download_queue.len(), 1);
+    assert_eq!(c.pipeline.desired_queue_size, 4, "no slow-start bump");
+    assert!(!c.bitfield_received);
+}
+
+#[test]
+fn piece_matching_only_request_queue_is_unwanted() {
+    // `incoming_piece` looks up `m_download_queue` only — a block
+    // that matches a still-unsent `request_queue` entry is dropped
+    // as `piece_unknown`; the request stays queued and goes out on
+    // the wire later.
+    let mut c = conn();
+    let b = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    assert!(c.add_request(b, false, false));
+    assert_eq!(c.pipeline.request_queue.len(), 1);
+    assert!(c.pipeline.download_queue.is_empty());
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Piece {
+            piece: PieceIndex(3),
+            offset: 0,
+            data: bytes::Bytes::from_static(&[1u8; 16]),
+        },
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert_eq!(eff.len(), 1, "expected only UnwantedBlock: {eff:?}");
+    assert!(matches!(eff[0], PeerEffect::UnwantedBlock(b2, 16) if b2 == b));
+    // the unsent request survives — it will hit the wire later
+    assert_eq!(c.pipeline.request_queue.len(), 1);
+}
+
+#[test]
+fn seed_drops_piece_as_seed_waste() {
+    // `incoming_piece` is_seed leg — payload received while we hold
+    // every piece is `piece_seed` waste; one stale download-queue
+    // front entry drops per message and nothing reaches disk, the
+    // picker or the alert stream.
+    let mut c = conn();
+    let b = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    c.pipeline
+        .download_queue
+        .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b));
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Piece {
+            piece: PieceIndex(3),
+            offset: 0,
+            data: bytes::Bytes::from_static(&[1u8; 16]),
+        },
+        10,
+        0x4000,
+        0x40000,
+        None,
+        true,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert_eq!(eff.len(), 1, "expected only SeedWaste: {eff:?}");
+    assert!(matches!(eff[0], PeerEffect::SeedWaste(16)));
+    assert!(c.pipeline.download_queue.is_empty());
+}
+
+#[test]
+fn empty_piece_still_bumps_slow_start() {
+    // upstream order: the slow-start bump + `update_desired_queue_
+    // size` run *before* the zero-length piece is treated as a
+    // reject — a BitComet-style reject still grows the queue target.
+    let mut c = conn();
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Piece {
+            piece: PieceIndex(0),
+            offset: 0,
+            data: bytes::Bytes::new(),
+        },
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert_eq!(c.pipeline.desired_queue_size, 5, "4 + 1 slow-start");
+    assert!(matches!(eff[0], PeerEffect::PeerError(_)));
+}
+
+#[test]
+fn piece_before_bitfield_runs_have_none() {
+    // `incoming_piece` calls `incoming_have_none()` when the peer
+    // omitted the bitfield — `m_has_metadata` is set through it
+    // (a peer delivering torrent data provably holds metadata).
+    let mut c = conn();
+    let b = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    c.pipeline
+        .download_queue
+        .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b));
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Piece {
+            piece: PieceIndex(3),
+            offset: 0,
+            data: bytes::Bytes::from_static(&[1u8; 16]),
+        },
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(c.bitfield_received);
+    assert!(c.has_metadata);
+    assert_eq!(c.num_pieces, 0);
+    assert!(eff.iter().any(|e| matches!(e, PeerEffect::DiskWrite(..))));
 }

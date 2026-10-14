@@ -47,7 +47,10 @@ pub enum TorrentEffect {
     DiskWrite {
         peer: u64,
         req: PeerRequest,
-        data: Vec<u8>,
+        /// `Bytes` — the wire buffer rides through refcount clones
+        /// (piece dispatch / web-seed slicing); the only copy is the
+        /// disk-pool buffer at `async_write`.
+        data: bytes::Bytes,
     },
     /// verify a piece's hash (`verify_piece` — resume restore and
     /// post-write verification).
@@ -3676,6 +3679,16 @@ impl Torrent {
                         block: b.block_index as u32,
                     }));
                 }
+                PeerEffect::SeedWaste(len) => {
+                    // `incoming_piece` is_seed leg — payload received
+                    // while seeding counts as `piece_seed` waste; no
+                    // `unwanted_block_alert` upstream.
+                    self.add_redundant_bytes(
+                        i64::from(len),
+                        crate::peer_conn::WasteReason::Seed,
+                        counters,
+                    );
+                }
                 PeerEffect::BlockFinished(b) => {
                     out.push(TorrentEffect::Alert(crate::alerts::Alert::BlockFinished {
                         ih: self.info_hash,
@@ -4105,6 +4118,10 @@ impl Torrent {
             }
         }
         let block_size = self.block_size();
+        // `t->is_seed()` — the torrent-level seed state; computed
+        // before the per-conn borrow (the `Piece` arm needs it for
+        // upstream's `is_seed` leg).
+        let is_seed = self.is_seed();
         let mut seen_complete = false;
         if let Some(c) = self.peers.get_mut(&peer_id) {
             // `m_last_receive` — conn-clock of last inbound data;
@@ -4137,6 +4154,7 @@ impl Torrent {
                 block_size,
                 self.piece_length,
                 self.files.as_deref(),
+                is_seed,
                 s.max_piece_count,
                 s.max_allowed_in_request_queue,
                 counters,
@@ -4961,6 +4979,9 @@ impl Torrent {
         data: Vec<u8>,
         out: &mut Vec<TorrentEffect>,
     ) {
+        // one `Vec → Bytes` conversion, then refcounted slices per
+        // covered block (`request_large_blocks` replies span many).
+        let data = bytes::Bytes::from(data);
         let block_size = i64::from(self.block_size());
         let blocks = self.web_seed_blocks(&req);
         let mut data_off = 0usize;
@@ -4984,7 +5005,7 @@ impl Torrent {
                     start: (i64::from(b.block_index) * block_size) as i32,
                     length: bs as i32,
                 },
-                data: data[data_off..data_off + bs].to_vec(),
+                data: data.slice(data_off..data_off + bs),
             });
             data_off += bs;
             if data_off >= data.len() {
@@ -5015,11 +5036,14 @@ impl Torrent {
     /// `on_disk_write_complete` — the block landed on disk;
     /// upstream `picker().mark_as_finished(block, nullptr)`.
     pub fn mark_block_finished(&mut self, piece: PieceIndex, start: i32) {
+        // `p.start / t->block_size()` upstream — `block_size()` is
+        // `min(piece_length, 0x4000)`, not a fixed 16 KiB.
+        let block_index = start / self.block_size().max(1);
         if let Some(p) = self.picker.as_mut() {
             p.mark_as_finished(
                 bitdaemon_common::types::PieceBlock {
                     piece_index: piece,
-                    block_index: start / 16384,
+                    block_index,
                 },
                 None,
             );
@@ -5361,7 +5385,13 @@ impl Torrent {
             if let Some(p) = self.picker.as_mut() {
                 p.restore_piece(piece, &[]);
             }
-            out.push(TorrentEffect::PieceFailed(piece));
+            // `on_piece_hashed` (checking) doesn't route a failed
+            // check through `on_piece_failed` — no `piece_failed`
+            // alert for recheck misses, the piece just stays
+            // not-have.
+            if !self.checking {
+                out.push(TorrentEffect::PieceFailed(piece));
+            }
             for (id, block) in inflight {
                 if let (Some(p), Some(c)) = (self.picker.as_mut(), self.peers.get(&id)) {
                     // `picker_options()` — parole/snubbed peers pick
@@ -7555,25 +7585,29 @@ impl Torrent {
                         .sum::<i64>()
                 })
                 .sum::<i64>() as i32,
-            down_bandwidth_queue: self
-                .peers
-                .values()
-                .map(|c| {
-                    c.pipeline
-                        .request_queue
-                        .iter()
-                        .map(|b| {
-                            // 16 KiB blocks; tail of last piece is
-                            // shorter (`files.piece_size` exact).
-                            let start = i64::from(b.block.block_index) * 0x4000;
-                            let psize = self.files.as_ref().map_or(self.piece_length, |f| {
-                                i64::from(f.piece_size(b.block.piece_index))
-                            });
-                            (psize - start).clamp(0, 0x4000)
-                        })
-                        .sum::<i64>()
-                })
-                .sum::<i64>() as i32,
+            down_bandwidth_queue: {
+                // block indices are in `block_size()` units —
+                // `min(piece_length, 0x4000)`, not a fixed 16 KiB;
+                // tail of last piece is shorter (`files.piece_size`
+                // exact).
+                let bs = i64::from(self.block_size());
+                self.peers
+                    .values()
+                    .map(|c| {
+                        c.pipeline
+                            .request_queue
+                            .iter()
+                            .map(|b| {
+                                let start = i64::from(b.block.block_index) * bs;
+                                let psize = self.files.as_ref().map_or(self.piece_length, |f| {
+                                    i64::from(f.piece_size(b.block.piece_index))
+                                });
+                                (psize - start).clamp(0, bs)
+                            })
+                            .sum::<i64>()
+                    })
+                    .sum::<i64>() as i32
+            },
             seed_rank: self.seed_rank(s),
             queue_position: queue_pos,
             distributed_full_copies: d_full,

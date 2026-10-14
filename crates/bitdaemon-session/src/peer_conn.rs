@@ -297,6 +297,12 @@ pub struct PeerConn {
     /// this conn is counted in `num_peers_down_disk` while its own
     /// write queue keeps the read gate closed.
     pub disk_blocked: bool,
+    /// The `disk_observer` upstream passes as `self()` to every
+    /// `async_write`: when the global write queue drains below the
+    /// low watermark the observer releases this conn's `bw_disk`
+    /// gate — the second release path alongside the own-write
+    /// completion (which can lag by a full `cache_expiry` interval).
+    pub disk_observer: Option<std::sync::Arc<dyn bitdaemon_disk::back_pressure::DiskObserver>>,
     /// `m_channel_state[upload_channel] & peer_info::bw_disk` —
     /// counted in `num_peers_up_disk` while the send buffer is
     /// drained with disk reads still in flight.
@@ -497,6 +503,7 @@ impl PeerConn {
             reading_bytes: 0,
             outstanding_writing_bytes: 0,
             disk_blocked: false,
+            disk_observer: None,
             up_disk_blocked: false,
             failed: false,
             num_invalid_requests: 0,
@@ -892,7 +899,10 @@ impl PeerConn {
     }
 
     /// `peer_connection::incoming_piece` — was this block actually
-    /// requested (present in request or download queue)? `block_size`
+    /// requested? Upstream looks up `m_download_queue` only: a block
+    /// that matches a still-unsent `request_queue` entry is *not*
+    /// wanted (the peer can't know it — the payload is dropped and
+    /// the queued request goes out on the wire later). `block_size`
     /// is `t->block_size()` — `min(piece_length, 0x4000)`, so a
     /// hardcoded 16 KiB divisor mis-indexes small-piece torrents.
     #[must_use]
@@ -905,13 +915,14 @@ impl PeerConn {
             .download_queue
             .iter()
             .any(|b| b.block == block)
-            || self.pipeline.request_queue.iter().any(|b| b.block == block)
     }
 
     /// `dispatch` — route a decoded wire message. Returns the
     /// side-effects the torrent layer must run (picker updates,
     /// disk writes, uploads). `block_size` is the torrent's
-    /// `t->block_size()` for mapping byte offsets to block indices.
+    /// `t->block_size()` for mapping byte offsets to block indices;
+    /// `is_seed` is the *torrent's* `t->is_seed()` (we hold every
+    /// piece — incoming payload is `piece_seed` waste).
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &mut self,
@@ -920,6 +931,7 @@ impl PeerConn {
         block_size: i32,
         piece_length: i64,
         files: Option<&bitdaemon_core::FileStorage>,
+        is_seed: bool,
         max_piece_count: i32,
         max_in_queue: i32,
         counters: &crate::counters::Counters,
@@ -971,9 +983,13 @@ impl PeerConn {
             }
             M::Have(i) => {
                 // upstream: a `have` before any bitfield implies an
-                // omitted (empty) bitfield — `incoming_have_none`.
+                // omitted (empty) bitfield — the real
+                // `incoming_have_none` runs (`m_has_metadata` on; the
+                // refcount drop can't trigger: `m_bitfield_received`
+                // was false ⇒ `m_have_piece` is empty).
                 if !self.bitfield_received {
-                    self.bitfield_received = true;
+                    self.on_have_none();
+                    self.has_metadata = true;
                 }
                 // `suggest_read_cache`: the peer took a piece we
                 // suggested — refill it (checked before the bit
@@ -1102,9 +1118,13 @@ impl PeerConn {
             }
             M::Request(r) => {
                 // `incoming_request` — an omitted bitfield reads as
-                // `have_none` before the first request.
+                // `have_none` before the first request; upstream runs
+                // the real `incoming_have_none` (`m_has_metadata` on;
+                // the refcount drop can't trigger: `m_bitfield_
+                // received` was false ⇒ `m_have_piece` is empty).
                 if !self.bitfield_received {
-                    self.bitfield_received = true;
+                    self.on_have_none();
+                    self.has_metadata = true;
                 }
                 // `!valid_metadata` — requests can't be honored before
                 // the layout exists; upstream rejects without the
@@ -1225,18 +1245,37 @@ impl PeerConn {
                 offset,
                 ref data,
             } => {
-                // `incoming_piece` — an omitted bitfield reads as
-                // `have_none`; a piece-level message also proves the
-                // peer holds metadata (`m_has_metadata`).
-                if !self.bitfield_received {
-                    self.bitfield_received = true;
-                }
-                self.has_metadata = true;
                 let r = bitdaemon_common::PeerRequest {
                     piece,
                     start: offset,
                     length: data.len() as i32,
                 };
+                // `bt_peer_connection::on_piece` — a payload larger
+                // than the torrent's block size is a protocol
+                // violation (`errors::packet_too_large`); upstream
+                // disconnects on the first fragment, before any
+                // `incoming_piece` state moves.
+                if i64::from(r.length) > i64::from(block_size) {
+                    eff.push(PeerEffect::Disconnect("packet_too_large", true));
+                    return;
+                }
+                // `incoming_piece` — an omitted bitfield reads as
+                // `have_none`; upstream runs the real
+                // `incoming_have_none` here (`m_has_metadata` on; the
+                // refcount drop can't trigger: `m_bitfield_received`
+                // was false ⇒ `m_have_piece` is empty).
+                if !self.bitfield_received {
+                    self.on_have_none();
+                    self.has_metadata = true;
+                }
+                // upstream `incoming_piece` runs the slow-start bump
+                // + `update_desired_queue_size` before the
+                // empty-piece/seed/requested checks.
+                self.pipeline.on_piece_received(
+                    self.now_ms,
+                    i64::from(self.rate_down_speed),
+                    block_size,
+                );
                 // BitComet quirk upstream: a zero-length `piece`
                 // message is used as a reject-request — process it as
                 // one (and report `peer_sent_empty_piece`).
@@ -1258,14 +1297,21 @@ impl PeerConn {
                     }
                     return;
                 }
-                // upstream `incoming_piece` runs the slow-start bump
-                // + `update_desired_queue_size` before checking
-                // whether the block was even requested.
-                self.pipeline.on_piece_received(
-                    self.now_ms,
-                    i64::from(self.rate_down_speed),
-                    block_size,
-                );
+                // `incoming_piece` is_seed leg — a `piece` received
+                // while we are seeding is dropped outright: one stale
+                // `m_download_queue` front entry self-heals per
+                // message, the payload counts as `piece_seed` waste,
+                // and nothing reaches unsnub, the picker, or disk.
+                if is_seed {
+                    if !self.pipeline.download_queue.is_empty() {
+                        self.pipeline.download_queue.remove(0);
+                        if self.pipeline.download_queue.is_empty() {
+                            counters.add(crate::counters::Counter::NumPeersDownRequests, -1);
+                        }
+                    }
+                    eff.push(PeerEffect::SeedWaste(r.length));
+                    return;
+                }
                 let block = PieceBlock {
                     piece_index: r.piece,
                     block_index: r.start / block_size,
@@ -1285,7 +1331,6 @@ impl PeerConn {
                     .pipeline
                     .download_queue
                     .iter()
-                    .chain(self.pipeline.request_queue.iter())
                     .find(|b| b.block == block)
                     .map_or(WasteReason::Unknown, |e| {
                         if e.timed_out {
@@ -1311,7 +1356,7 @@ impl PeerConn {
                 // the pre-mark picker state. `block_finished_alert`
                 // posts on write completion (session side), never at
                 // receipt.
-                eff.push(PeerEffect::DiskWrite(r, data.to_vec(), waste));
+                eff.push(PeerEffect::DiskWrite(r, data.clone(), waste));
                 eff.push(PeerEffect::MarkDownloaded(block));
                 // `check_graceful_pause` runs before the
                 // re-pick upstream (`is_disconnecting` then skips it).
@@ -1827,8 +1872,9 @@ pub enum PeerEffect {
     /// write a received block to disk — the `WasteReason` carries the
     /// queue-entry flags (`timed_out`/`not_wanted`/`busy`) upstream
     /// reads off the `m_download_queue` iterator to bucket the block
-    /// when it turns out already-downloaded.
-    DiskWrite(bitdaemon_common::PeerRequest, Vec<u8>, WasteReason),
+    /// when it turns out already-downloaded. The payload rides as
+    /// `Bytes` — a refcount clone, not a `to_vec` copy.
+    DiskWrite(bitdaemon_common::PeerRequest, bytes::Bytes, WasteReason),
     /// serve a peer's request (upload path).
     ReadRequest(bitdaemon_common::PeerRequest),
     /// peer cancelled a request.
@@ -1876,6 +1922,9 @@ pub enum PeerEffect {
     /// `unwanted_block_alert` — a `piece` message arrived for a
     /// block that is not in either request queue.
     UnwantedBlock(PieceBlock, i32),
+    /// `incoming_piece` seed leg — a `piece` message received while
+    /// we hold every piece: `piece_seed` waste, no alert, no write.
+    SeedWaste(i32),
     /// `block_finished_alert` — a `piece` message completed a
     /// requested block.
     BlockFinished(PieceBlock),

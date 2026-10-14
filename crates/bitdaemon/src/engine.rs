@@ -2880,13 +2880,26 @@ impl Engine {
         let _ = max_dials_per_tick;
         let disk_notify = self.disk_notify.clone();
         tokio::pin!(stop);
+        // upstream's tick is an absolute `deadline_timer`: it fires on
+        // schedule no matter how busy the io_context is. A `sleep()`
+        // created inside `select!` is re-armed on every iteration, so
+        // any branch that stays continuously ready (inbound pieces at
+        // full rate, sent_rx, disk_notify) starves the tick forever —
+        // observed as multi-tens-of-seconds freezes mid-download.
+        // Pinning one `Sleep` outside the loop preserves the deadline
+        // across rounds; it is re-armed each time it fires.
+        let tick_timer = tokio::time::sleep(slock(&self.session).settings.tick_interval);
+        tokio::pin!(tick_timer);
         loop {
-            // `m_tick_interval` — upstream reschedules its tick timer
-            // from `settings_pack::tick_interval` each round (default
-            // 500 ms); read it live so `apply_settings` retunes.
-            let tick = slock(&self.session).settings.tick_interval;
             tokio::select! {
-                _ = tokio::time::sleep(tick) => {}
+                _ = &mut tick_timer => {
+                    // `m_tick_interval` — upstream reschedules its tick
+                    // timer from `settings_pack::tick_interval` each
+                    // round (default 500 ms); read it live so
+                    // `apply_settings` retunes.
+                    let t = slock(&self.session).settings.tick_interval;
+                    tick_timer.as_mut().reset(tokio::time::Instant::now() + t);
+                }
                 m = self.inbound_rx.recv() => {
                     // upstream's io_context services peer messages as they
                     // arrive — batching them until the 1 Hz tick would let

@@ -137,8 +137,70 @@ Until `1.0.0`, breaking changes may occur in any release.
   (per-conn quota since the `BandwidthManager` wiring) in
   `check_request_timeouts`.
 
+### Changed
+
+- Incoming block payloads no longer take two full copies on the way
+  to disk: `PeerEffect::DiskWrite`/`TorrentEffect::DiskWrite` now
+  carry the wire `Bytes` buffer (refcount clone at dispatch,
+  refcounted `slice` per covered block on the `request_large_blocks`
+  web-seed path), and `session` moves it into the
+  `DiskBufferHolder` — the single remaining copy is the one into the
+  write cache block, which owns its data.
+
 ### Fixed
 
+- **Engine tick starvation under sustained load** (the "runs fine,
+  collapses for ~1 min, resumes" report): `Engine::run` created a
+  fresh `tokio::time::sleep(tick_interval)` inside the `select!` on
+  every loop iteration, so each inbound piece, disk completion or
+  sent notification hit `continue` and restarted the deadline —
+  under continuous traffic the timer never won and `tick()`
+  (quotas, `connect_rx`/`gone_rx`/`announce_rx`/`udp_rx` drains,
+  request timeouts, snubbing, dial pump, choker, tracker/DHT/LSD
+  work) starved. The swarm then froze, burst into mass inactivity
+  disconnects once a quiet gap let the timer through, and resumed.
+  A single pinned `Sleep` now lives outside the loop and is reset
+  only after firing — the upstream `deadline_timer` semantic.
+- **Disk back-pressure gated peers could sleep ~`cache_expiry`**:
+  `Session` passed `None` as the `DiskObserver` to `async_write`,
+  so a peer write-gated by `max_queued_disk_bytes` was only
+  released when its own blocks flushed (bounded by cache expiry)
+  instead of when the global queue drained under the low watermark.
+  A per-peer `PeerDiskObserver` now reports through the
+  `DiskCompleted::PeerDrain` channel — upstream `peer_connection`'s
+  `disk_observer`/`on_disk()` leg — and `check_buffer_level` at
+  flush drains unblocks gated peers as soon as the queue falls
+  under the low watermark.
+- **Recheck no longer kills the torrent on a physically-short file**:
+  `on_piece_hashed`'s skip-file leg — `UnexpectedEof`/`NotFound`
+  (upstream `eof`, `file_too_short`, `no_such_file_or_directory`,
+  `partfile_missing_piece`, Windows `ERROR_HANDLE_EOF`) reported by a
+  checking hash now just leaves the piece not-have and lets the check
+  continue, instead of `set_error` + `pause`. On Windows sparse files
+  the never-written tail legitimately reads past the physical end, so
+  every `force_recheck`/rejected-resume on a partial download paused
+  the torrent permanently (0 peers, stalled). Non-eof errors during
+  checking take upstream's fatal leg (`auto_managed(false)` + pause +
+  `set_error`), and failed-check pieces no longer emit
+  `piece_failed`/`hash_failed` alerts — upstream only posts those from
+  the download path (`on_piece_failed`), never from `on_piece_hashed`.
+- **`incoming_piece` fidelity sweep** (libtorrent `RC_2_1` @
+  `e7381c7bc`): a `piece` message whose payload exceeds the torrent's
+  `block_size()` now disconnects the peer (`packet_too_large`, like
+  `bt_peer_connection::on_piece` at `recv_pos == 1`) instead of
+  feeding up-to-4 MiB into a single cache block. The omitted-bitfield
+  leg now runs the real `incoming_have_none` (`m_have_piece` clear +
+  `m_num_pieces = 0` + `m_has_metadata`), and the slow-start bump +
+  `update_desired_queue_size` moved ahead of the empty-piece/seed
+  legs to match upstream's order. A `piece` received while *we* are
+  seeding now takes upstream's `is_seed` leg — `piece_seed` waste,
+  one stale `download_queue` front entry dropped per message, no
+  `unwanted_block` alert — and `was_requested` consults
+  `download_queue` only, so a block matching a still-unsent request
+  is unwanted exactly like upstream. `mark_block_finished` and
+  `torrent_status.down_bandwidth_queue` divide by `block_size()`
+  instead of a hardcoded 16 KiB (correct for `piece_length < 16 KiB`
+  torrents).
 - **Downloaded blocks never reached disk**: `PeerEffect::DiskWrite`
   was emitted *after* `MarkDownloaded` in the same batch, so the
   redundant-block `is_downloaded` consult in `apply_peer_effects`

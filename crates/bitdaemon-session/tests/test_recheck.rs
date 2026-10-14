@@ -53,6 +53,106 @@ fn force_recheck_queues_hash_per_piece() {
 }
 
 #[test]
+fn recheck_eof_skips_file_without_error() {
+    use bitdaemon_common::types::FileIndex;
+    use bitdaemon_disk::storage_error::{Operation, StorageError};
+    use bitdaemon_session::session::DiskCompleted;
+
+    let ih = Sha1Hash::from_bytes(&[8; 20]).unwrap();
+    let mut t = Torrent::new(ih, 3, 128 * 1024, Bitfield::with_size(3), StorageIndex(0));
+    t.piece_hashes = Some(vec![Sha1Hash::from_bytes(&[0; 20]).unwrap(); 3]);
+    t.init_picker(false);
+    let mut s = session();
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.force_recheck(&ih, &mut out);
+    let pgen = s.torrents[&ih].picker_generation;
+    assert!(s.torrents[&ih].checking);
+
+    // the file is physically shorter than its declared span (e.g. a
+    // sparse tail that was never written) — upstream `on_piece_hashed`
+    // treats `eof`/`file_too_short`/`ENOENT`/`partfile_missing_piece`
+    // as skip-file: the piece stays not-have, checking continues, no
+    // error state, no pause.
+    let eof = StorageError::new(
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof"),
+        FileIndex(0),
+        Operation::FileRead,
+    );
+    s.disk_completions()
+        .send(DiskCompleted::Hash {
+            ih,
+            piece: PieceIndex(1),
+            hash: Sha1Hash::default(),
+            block_hashes: Vec::new(),
+            picker_gen: pgen,
+            err: eof,
+        })
+        .unwrap();
+    s.drain_disk_completed(&mut Vec::new());
+    let t = s.torrents.get(&ih).unwrap();
+    assert!(
+        t.last_error.is_empty(),
+        "eof during check must not set_error"
+    );
+    assert!(!t.is_paused(), "eof during check must not pause");
+    assert!(t.checking);
+    assert_eq!(t.checking_pieces, 2);
+    assert!(!t.have.get_bit(1));
+
+    // the other pieces still complete the pass normally
+    s.on_piece_verified(&ih, PieceIndex(0), true, &mut Vec::new());
+    s.on_piece_verified(&ih, PieceIndex(2), true, &mut Vec::new());
+    let t = s.torrents.get(&ih).unwrap();
+    assert!(!t.checking);
+    assert!(t.have.get_bit(0) && t.have.get_bit(2));
+}
+
+#[test]
+fn recheck_fatal_error_pauses_and_drops_automanage() {
+    use bitdaemon_common::types::FileIndex;
+    use bitdaemon_disk::storage_error::{Operation, StorageError};
+    use bitdaemon_session::session::DiskCompleted;
+
+    let ih = Sha1Hash::from_bytes(&[8; 20]).unwrap();
+    let mut t = Torrent::new(ih, 2, 128 * 1024, Bitfield::with_size(2), StorageIndex(0));
+    t.piece_hashes = Some(vec![Sha1Hash::from_bytes(&[0; 20]).unwrap(); 2]);
+    t.init_picker(false);
+    t.auto_managed = true;
+    let mut s = session();
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.force_recheck(&ih, &mut out);
+    let pgen = s.torrents[&ih].picker_generation;
+
+    // a non-eof-class disk error mid-check is the fatal leg:
+    // upstream `on_piece_hashed` → `auto_managed(false)` + `pause()`
+    // + `set_error` + `trigger_auto_manage`.
+    let perm = StorageError::new(
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        FileIndex(0),
+        Operation::FileRead,
+    );
+    s.disk_completions()
+        .send(DiskCompleted::Hash {
+            ih,
+            piece: PieceIndex(0),
+            hash: Sha1Hash::default(),
+            block_hashes: Vec::new(),
+            picker_gen: pgen,
+            err: perm,
+        })
+        .unwrap();
+    s.drain_disk_completed(&mut Vec::new());
+    let t = s.torrents.get(&ih).unwrap();
+    assert!(!t.last_error.is_empty());
+    assert!(t.is_paused());
+    assert!(!t.auto_managed);
+}
+
+#[test]
 fn piece_priorities_and_sequential() {
     let ih = Sha1Hash::from_bytes(&[9; 20]).unwrap();
     let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));

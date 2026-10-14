@@ -172,6 +172,77 @@ fn hash_mismatch_fails_piece() {
 }
 
 #[test]
+fn peer_drain_releases_disk_gate() {
+    // upstream `peer_connection::on_disk` — when the write queue
+    // drains below the low watermark, the conn's `bw_disk` gate
+    // releases even with writes still outstanding (the own-write
+    // completion path is the *second* release, not the only one).
+    use bitdaemon_disk::back_pressure::PeerWriteGates;
+    use bitdaemon_session::counters::Counter;
+    use bitdaemon_session::session::DiskCompleted;
+
+    let mut s = Session::new();
+    let gates = std::sync::Arc::new(PeerWriteGates::new());
+    s.set_write_gates(gates.clone());
+    let mut t = mk_torrent(2);
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+
+    let mut c = PeerConn::new(2, PeerPipeline::new(1000, 30, 250), 0);
+    c.disk_blocked = true;
+    c.outstanding_writing_bytes = 0x4000;
+    s.torrents.get_mut(&ih).unwrap().peers.insert(7, c);
+    s.counters.inc(Counter::NumPeersDownDisk);
+    gates.set_blocked((ih, 7));
+    let gate = gates.gate((ih, 7));
+    assert!(gate.load(std::sync::atomic::Ordering::Relaxed));
+
+    s.disk_completions()
+        .send(DiskCompleted::PeerDrain { ih, peer: 7 })
+        .unwrap();
+    s.drain_disk_completed(&mut Vec::new());
+
+    let p = &s.torrents[&ih].peers[&7];
+    assert!(!p.disk_blocked, "PeerDrain must clear bw_disk");
+    assert!(
+        !gate.load(std::sync::atomic::Ordering::Relaxed),
+        "PeerDrain must release the read gate"
+    );
+    assert_eq!(s.counters.value(Counter::NumPeersDownDisk), 0);
+    // outstanding bytes stay — the in-flight writes still drain via
+    // their own completions (upstream leaves them alone too).
+    assert_eq!(p.outstanding_writing_bytes, 0x4000);
+}
+
+#[test]
+fn peer_drain_on_unblocked_peer_is_noop() {
+    use bitdaemon_session::counters::Counter;
+    use bitdaemon_session::session::DiskCompleted;
+
+    let mut s = Session::new();
+    let mut t = mk_torrent(2);
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+    s.torrents
+        .get_mut(&ih)
+        .unwrap()
+        .peers
+        .insert(7, PeerConn::new(2, PeerPipeline::new(1000, 30, 250), 0));
+
+    s.disk_completions()
+        .send(DiskCompleted::PeerDrain { ih, peer: 7 })
+        .unwrap();
+    // stale/gone peer — also a no-op
+    s.disk_completions()
+        .send(DiskCompleted::PeerDrain { ih, peer: 99 })
+        .unwrap();
+    s.drain_disk_completed(&mut Vec::new());
+
+    assert!(!s.torrents[&ih].peers[&7].disk_blocked);
+    assert_eq!(s.counters.value(Counter::NumPeersDownDisk), 0);
+}
+
+#[test]
 fn lsd_emit_and_receive() {
     use bitdaemon_net::lsd::{LSD_ADDR4, LSD_PORT, render_lsd_packet};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};

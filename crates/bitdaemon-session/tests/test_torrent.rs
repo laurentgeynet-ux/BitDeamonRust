@@ -52,6 +52,7 @@ fn peer_bitfield_refcounts_picker() {
         0x4000,
         0x4000 * 8,
         None,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),

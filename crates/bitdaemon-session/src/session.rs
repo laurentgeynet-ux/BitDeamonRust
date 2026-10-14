@@ -745,6 +745,16 @@ pub enum DiskCompleted {
         /// job result.
         err: StorageError,
     },
+    /// `disk_observer::on_disk` — the global write queue drained
+    /// below the low watermark; a `bw_disk`-gated conn releases its
+    /// read gate here even with writes still outstanding (upstream
+    /// clears `bw_disk` unconditionally and re-runs `setup_receive`).
+    PeerDrain {
+        /// torrent.
+        ih: Sha1Hash,
+        /// gated conn.
+        peer: u64,
+    },
     /// `async_check_files` — fastresume validation verdict; `ret` is
     /// upstream's pure `status_t` (`disk_status` bits:
     /// `need_full_check`, `fatal_disk_error`, `oversized_file`,
@@ -847,6 +857,33 @@ pub enum DiskCompleted {
         /// job result.
         err: StorageError,
     },
+}
+
+/// `disk_observer` — upstream hands `async_write` the `peer_connection`
+/// itself (`self()`); the back-pressure layer holds it weakly and posts
+/// `on_disk()` onto the io_context once the write queue drains below
+/// the low watermark. Ours reports through the same channel as disk-job
+/// completions so the `bw_disk`/`num_peers_down_disk` bookkeeping stays
+/// on the session task.
+struct PeerDiskObserver {
+    /// completion channel (same sender the disk-job handlers clone).
+    tx: std::sync::mpsc::Sender<DiskCompleted>,
+    /// torrent.
+    ih: Sha1Hash,
+    /// gated conn.
+    peer: u64,
+}
+
+impl bitdaemon_disk::back_pressure::DiskObserver for PeerDiskObserver {
+    /// `peer_connection::on_disk` — runs on a disk worker thread
+    /// (the default poster); the actual state flip happens when the
+    /// session drains `PeerDrain`.
+    fn on_disk(&self) {
+        let _ = self.tx.send(DiskCompleted::PeerDrain {
+            ih: self.ih,
+            peer: self.peer,
+        });
+    }
 }
 
 impl Default for Session {
@@ -1715,6 +1752,25 @@ impl Session {
                         }
                     }
                 }
+                DiskCompleted::PeerDrain { ih, peer } => {
+                    // `peer_connection::on_disk` — the write queue
+                    // drained below the low watermark; clear the
+                    // `bw_disk` gate even while writes are still
+                    // outstanding and let the pump resume reading
+                    // (upstream re-runs `setup_receive` here). A
+                    // not-blocked or gone conn is a no-op.
+                    if let Some(t) = self.torrents.get_mut(&ih)
+                        && let Some(p) = t.peers.get_mut(&peer)
+                        && p.disk_blocked
+                    {
+                        p.disk_blocked = false;
+                        self.counters
+                            .add(crate::counters::Counter::NumPeersDownDisk, -1);
+                        if let Some(gates) = &self.write_gates {
+                            gates.clear_blocked((ih, peer));
+                        }
+                    }
+                }
                 DiskCompleted::MoveStorage { ih, path, err } => {
                     // `storage_moved{,_failed}_alert`
                     if err.is_ok() {
@@ -1923,11 +1979,43 @@ impl Session {
                         (v1, v2)
                     };
                     if err.is_err() {
-                        // `piece_finished`'s `disk_error` leg —
-                        // `handle_disk_error("piece_verified", e)`
-                        // (class none → set_error + pause), then the
-                        // verify path still runs below.
-                        self.on_disk_error(ih, &err, DiskJobClass::None, None, out);
+                        // `on_piece_hashed` (the *checking* pass)
+                        // treats absent/short files as skip-file, not
+                        // a torrent error: upstream `eof`,
+                        // `file_too_short`, `no_such_file_or_directory`,
+                        // `partfile_missing_piece` and Windows'
+                        // `ERROR_HANDLE_EOF` all fold into
+                        // `NotFound`/`UnexpectedEof` here. A sparse
+                        // file's never-written tail reads past the
+                        // physical end — the pieces just stay
+                        // not-have and the check continues (upstream
+                        // also jumps `m_checking_piece` past the
+                        // file; ours were all dispatched up front so
+                        // they simply fail the same way). The fatal
+                        // leg instead drops auto-management, sets the
+                        // error and pauses (`auto_managed(false)` +
+                        // `trigger_auto_manage` + `set_error`).
+                        let checking = self
+                            .torrents
+                            .get(&ih)
+                            .is_some_and(|t| t.checking && !t.checking_resume);
+                        let eof_class = matches!(
+                            err.io.kind(),
+                            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::NotFound
+                        );
+                        if !(checking && eof_class) {
+                            // `piece_finished`'s `disk_error` leg —
+                            // `handle_disk_error("piece_verified", e)`
+                            // (class none → set_error + pause), then
+                            // the verify path still runs below.
+                            self.on_disk_error(ih, &err, DiskJobClass::None, None, out);
+                            if checking {
+                                if let Some(t) = self.torrents.get_mut(&ih) {
+                                    t.auto_managed = false;
+                                }
+                                self.auto_manage_scaler = 0;
+                            }
+                        }
                     }
                     // `(v1 && !v2) || (!v1 && v2)` →
                     // `handle_inconsistent_hashes`; v1||v2 true →
@@ -2060,7 +2148,26 @@ impl Session {
                     let storage = t.storage;
                     let (peer, req) = (*peer, *req);
                     let tx = self.disk_tx.clone();
-                    let holder = DiskBufferHolder::from_owned(data.clone());
+                    // `async_write`'s `o` — upstream passes the conn
+                    // itself (`self()`); the observer lives on the
+                    // `PeerConn` so the back-pressure layer's `Weak`
+                    // stays valid for the conn's lifetime, and its
+                    // `on_disk` reports through `disk_tx` like a job
+                    // completion.
+                    let observer = self.torrents.get_mut(&ih).and_then(|t| {
+                        t.peers.get_mut(&peer).map(|p| {
+                            std::sync::Arc::clone(p.disk_observer.get_or_insert_with(|| {
+                                std::sync::Arc::new(PeerDiskObserver {
+                                    tx: tx.clone(),
+                                    ih,
+                                    peer,
+                                })
+                            }))
+                        })
+                    });
+                    // `data` is `Bytes` (refcounted up to here) —
+                    // this is the one copy, into the disk buffer.
+                    let holder = DiskBufferHolder::from_owned(data.to_vec());
                     // `incoming_piece`'s `exceeded` — the disk queue
                     // was already over its limit when this block was
                     // handed off; unlike the global cache watermark,
@@ -2070,7 +2177,7 @@ impl Session {
                         storage,
                         req,
                         holder,
-                        None,
+                        observer,
                         Box::new(move |err| {
                             let _ = tx.send(DiskCompleted::Write { ih, peer, req, err });
                         }),
@@ -3953,7 +4060,7 @@ impl Session {
                     start: off,
                     length: chunk.len() as i32,
                 },
-                data: chunk.to_vec(),
+                data: bytes::Bytes::copy_from_slice(chunk),
             });
             off += chunk.len() as i32;
         }

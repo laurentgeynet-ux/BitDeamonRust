@@ -20,6 +20,12 @@ pub trait DiskObserver: Send + Sync {
     fn on_disk(&self);
 }
 
+impl std::fmt::Debug for dyn DiskObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("disk_observer")
+    }
+}
+
 /// Poster for observer callbacks — upstream `post(ios, …)`. Takes the
 /// locked observers; invoked without the back-pressure mutex held.
 pub type Poster = Arc<dyn Fn(Vec<Weak<dyn DiskObserver>>) + Send + Sync>;
