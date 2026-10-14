@@ -922,6 +922,7 @@ impl Engine {
         let datagram = self.datagram.clone();
         let demux = self.udp_tracker_demux.clone();
         let resolver = self.resolver.clone();
+        let session = Arc::clone(&self.session);
         self.tasks_forget();
         let handle = tokio::spawn(async move {
             let mut params = params;
@@ -979,19 +980,39 @@ impl Engine {
                                     .collect();
                                 let payload =
                                     bitdaemon_net::ws_tracker::build_announce(&params, &[]);
+                                let min_interval = slock(&session)
+                                    .settings
+                                    .min_websocket_announce_interval
+                                    .as_secs()
+                                    .min(i32::MAX as u64)
+                                    as i32;
                                 bitdaemon_net::ws_tracker::announce_ws(
                                     &mut s, &host, &c.path, &key, &payload,
                                 )
                                 .await
-                                .map(|r| bitdaemon_net::http_tracker::TrackerResponse {
-                                    interval: r.interval as i32,
-                                    min_interval: r.min_interval as i32,
-                                    complete: r.complete,
-                                    incomplete: r.incomplete,
-                                    downloaded: r.downloaded,
-                                    ..Default::default()
-                                })
                                 .map_err(|e| e.to_string())
+                                .and_then(|r| {
+                                    // upstream `on_read`: a `failure
+                                    // reason` reports the announce as
+                                    // failed — `tracker_request_error`
+                                    // (`0ee23cc89`). Frames without
+                                    // info_hash are filtered inside
+                                    // `announce_ws` (`73f4832de`).
+                                    if let Some(reason) = r.failure_reason {
+                                        return Err(reason);
+                                    }
+                                    Ok(bitdaemon_net::http_tracker::TrackerResponse {
+                                        // upstream clamps the reply's
+                                        // interval to
+                                        // `min_websocket_announce_interval`
+                                        interval: (r.interval as i32).max(min_interval),
+                                        min_interval: r.min_interval as i32,
+                                        complete: r.complete,
+                                        incomplete: r.incomplete,
+                                        downloaded: r.downloaded,
+                                        ..Default::default()
+                                    })
+                                })
                             }
                             Err(e) => Err(format!("connect: {e}")),
                         },

@@ -48,8 +48,10 @@ pub struct RtcAnswer {
 /// `websocket_tracker_response` — a parsed tracker frame.
 #[derive(Debug, Clone, Default)]
 pub struct WsTrackerResponse {
-    /// `info_hash` (20 bytes, latin-1 decoded).
-    pub info_hash: [u8; 20],
+    /// `info_hash` (20 bytes, latin-1 decoded) — `optional` upstream
+    /// (`73f4832de`): absent on uncorrelated `failure reason` frames,
+    /// which carry no announce correlation.
+    pub info_hash: Option<[u8; 20]>,
     /// `interval` (s).
     pub interval: i64,
     /// `min interval` (s).
@@ -161,7 +163,7 @@ pub fn parse_response(data: &[u8]) -> Result<WsTrackerResponse, String> {
         return Err(format!("invalid info hash size {}", raw.len()));
     }
     let mut r = WsTrackerResponse {
-        info_hash: raw.try_into().unwrap_or([0; 20]),
+        info_hash: Some(raw.try_into().unwrap_or([0; 20])),
         failure_reason: failure,
         ..Default::default()
     };
@@ -269,6 +271,16 @@ pub async fn announce_ws(
         rand::random::<u32>(),
     )
     .await?;
-    let (_op, data) = ws_read_message(s).await?;
-    parse_response(&data).map_err(WsError::Protocol)
+    // upstream `on_read`: a `failure reason` frame without info_hash
+    // can't be correlated to our announce — it is ignored and `do_read`
+    // re-issued (`73f4832de`). Keep reading until a frame carries an
+    // info_hash (or the connection fails).
+    loop {
+        let (_op, data) = ws_read_message(s).await?;
+        match parse_response(&data) {
+            Err(e) => return Err(WsError::Protocol(e)),
+            Ok(r) if r.info_hash.is_none() => continue,
+            Ok(r) => return Ok(r),
+        }
+    }
 }
