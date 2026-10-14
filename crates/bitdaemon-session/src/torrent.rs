@@ -2342,8 +2342,11 @@ impl Torrent {
             connection_type: ConnectionType::STANDARD_BITTORRENT,
             pending_disk_bytes: 0,
             pending_disk_read_bytes: 0,
-            send_quota: 0,
-            receive_quota: 0,
+            // `p.send_quota`/`p.receive_quota` — live per-conn quota.
+            send_quota: c.bw.quota[crate::peer_conn::UPLOAD_CHANNEL]
+                .load(std::sync::atomic::Ordering::Relaxed) as i32,
+            receive_quota: c.bw.quota[crate::peer_conn::DOWNLOAD_CHANNEL]
+                .load(std::sync::atomic::Ordering::Relaxed) as i32,
             rtt: 0,
             num_pieces: c.num_pieces,
             download_rate_peak: c.download_rate_peak,
@@ -2355,8 +2358,27 @@ impl Torrent {
             },
             remote_endpoint: remote,
             local_endpoint: None,
-            read_state: BandwidthState::NETWORK,
-            write_state: BandwidthState::NETWORK,
+            // `p.read_state`/`p.write_state` — `m_channel_state`
+            // bits; `bw_disk` lives on `disk_blocked`/`up_disk_blocked`
+            // here and is folded back in.
+            read_state: BandwidthState(
+                c.bw.channel_state[crate::peer_conn::DOWNLOAD_CHANNEL]
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    | if c.disk_blocked {
+                        BandwidthState::DISK.0
+                    } else {
+                        0
+                    },
+            ),
+            write_state: BandwidthState(
+                c.bw.channel_state[crate::peer_conn::UPLOAD_CHANNEL]
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    | if c.up_disk_blocked {
+                        BandwidthState::DISK.0
+                    } else {
+                        0
+                    },
+            ),
             client: if c.client_version.is_empty() {
                 // `peer_connection::peer_info_struct` fallback —
                 // `identify_client` on the handshake peer id.
@@ -2968,6 +2990,11 @@ impl Torrent {
         if c.pipeline.endgame {
             counters.add(crate::counters::Counter::NumPeersEndGame, -1);
         }
+        // `peer_connection::~peer_connection` — a queued bandwidth
+        // request of a dead conn is dropped and its assigned quota
+        // returned on the next `update_quotas` pass.
+        c.bw.disconnecting
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if c.disk_blocked {
             // `~peer_connection` clears the `bw_disk` channel bit —
             // a conn dropped while disk-gated leaves the gauge.
@@ -3877,6 +3904,8 @@ impl Torrent {
                 c.stat_down_total += n;
                 c.stat_down_round += n;
                 self.last_payload_down = Some(Instant::now());
+                // `stat::received_payload` → session counter.
+                counters.add(crate::counters::Counter::RecvPayloadBytes, n);
             }
             // `seen_complete` — any packet from a seed that has
             // already delivered payload refreshes the timestamp
@@ -6372,10 +6401,9 @@ impl Torrent {
     /// and the last eligible in-flight block times out so another
     /// peer can pick it. Parole peers keep their pipeline.
     ///
-    /// `download_quota_ok` stands in for upstream's per-conn
-    /// `m_quota[download_channel] > 0` gate — BitDaemon meters one
-    /// global bucket rather than per-conn quota, so the session
-    /// passes whether the download channel had any budget this tick.
+    /// The `m_quota[download_channel] > 0` snub gate reads the conn's
+    /// own bandwidth quota (`c.bw`) — a throttled peer can't be
+    /// blamed for missing deadlines.
     ///
     /// The endgame branch mirrors `second_tick`'s 5 s retry: once a
     /// strict-endgame peer drains both queues it re-picks (a busy
@@ -6383,9 +6411,10 @@ impl Torrent {
     pub fn check_request_timeouts(
         &mut self,
         s: &crate::settings::SessionSettings,
-        download_quota_ok: bool,
         session_conns: i64,
         counters: &crate::counters::Counters,
+        pool: &bitdaemon_net::peer_class::PeerClassPool,
+        alert_mask: crate::alerts::AlertCategory,
         out: &mut Vec<TorrentEffect>,
     ) {
         let now_ms = self.now_ms;
@@ -6427,7 +6456,55 @@ impl Torrent {
             data_requests_blocked: self.checking,
             has_picker: self.picker.is_some(),
         };
+        // `peer_connection::second_tick` head — the per-conn IP/TCP
+        // overhead drain (`use_quota_overhead` on the conn's class
+        // set AND the torrent's) runs before the disconnecting
+        // early-out upstream.
+        let rate_limit_overhead = s.rate_limit_ip_overhead;
         for (peer_id, c) in self.peers.iter_mut() {
+            let _ = peer_id;
+            let mut warning = 0u8;
+            if rate_limit_overhead {
+                use std::sync::atomic::Ordering::Relaxed;
+                let amount_down =
+                    c.bw.ip_overhead[crate::peer_conn::DOWNLOAD_CHANNEL].swap(0, Relaxed);
+                let amount_up = c.bw.ip_overhead[crate::peer_conn::UPLOAD_CHANNEL].swap(0, Relaxed);
+                if amount_down != 0 || amount_up != 0 {
+                    warning |= crate::session::Session::quota_overhead(
+                        pool,
+                        &c.peer_classes,
+                        amount_down,
+                        amount_up,
+                    );
+                    warning |= crate::session::Session::quota_overhead(
+                        pool,
+                        &self.peer_classes,
+                        amount_down,
+                        amount_up,
+                    );
+                    // `stat::{download,upload}_ip_protocol` → the
+                    // session's overhead counters.
+                    counters.add(crate::counters::Counter::RecvIpOverheadBytes, amount_down);
+                    counters.add(crate::counters::Counter::SentIpOverheadBytes, amount_up);
+                }
+            }
+            // upstream posts `performance_alert::{download,
+            // upload}_limit_too_low` when a class throttle is lower
+            // than the overhead it must absorb.
+            if warning != 0 && (alert_mask.0 & crate::alerts::AlertCategory::PERFORMANCE.0) != 0 {
+                for channel in 0..2 {
+                    if (warning >> channel) & 1 == 0 {
+                        continue;
+                    }
+                    out.push(TorrentEffect::Alert(crate::alerts::Alert::Performance {
+                        warning: if channel == crate::peer_conn::DOWNLOAD_CHANNEL {
+                            "download_limit_too_low".into()
+                        } else {
+                            "upload_limit_too_low".into()
+                        },
+                    }));
+                }
+            }
             // `peer_connection::second_tick` early-outs a conn mid-
             // teardown — `m_disconnecting` → `disconnect()` + return
             // before any timeout/keepalive/snub eval.
@@ -6582,9 +6659,12 @@ impl Torrent {
             // `m_quota[download_channel] > 0` — upstream skips both
             // timeout checks for a conn the bandwidth manager gave
             // no download budget to this tick (a throttled peer
-            // can't be blamed for missing deadlines); ours is the
-            // global-limiter approximation.
-            if !download_quota_ok || c.pipeline.download_queue.is_empty() {
+            // can't be blamed for missing deadlines).
+            if c.bw.quota[crate::peer_conn::DOWNLOAD_CHANNEL]
+                .load(std::sync::atomic::Ordering::Relaxed)
+                <= 0
+                || c.pipeline.download_queue.is_empty()
+            {
                 continue;
             }
             let request_timed_out = c.pipeline.requested_ms != 0
@@ -8634,6 +8714,11 @@ impl Torrent {
         for id in ranked {
             if let Some(c) = self.peers.get_mut(&id) {
                 c.disconnecting = true;
+                // `peer_connection::disconnect` — `m_disconnecting`
+                // purges the conn's queued bandwidth requests on the
+                // next `update_quotas` pass.
+                c.bw.disconnecting
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
             out.push(TorrentEffect::DisconnectPeer {
                 peer: id,

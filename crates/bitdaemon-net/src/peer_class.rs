@@ -9,6 +9,7 @@
 //! rules applied when a peer connects.
 
 use crate::bandwidth::BandwidthChannel;
+use std::sync::Arc;
 
 /// `upload_channel`/`download_channel` indices into `channel[2]`.
 pub const UPLOAD: usize = 0;
@@ -34,11 +35,12 @@ pub struct PeerClassInfo {
 }
 
 /// Upstream clamp in `peer_class::set_upload_limit`/`set_download_limit`:
-/// negative → 0 (unlimited), `0 < l < 10` → 10 B/s floor.
+/// negative → 0 (unlimited), `0 < l < 10` → 10 B/s floor; `0` stays
+/// unlimited (upstream's second test is `limit < 10 && limit > 0`).
 fn clamp_limit(limit: i64) -> i64 {
     if limit < 0 {
         0
-    } else if limit < 10 {
+    } else if limit > 0 && limit < 10 {
         10
     } else {
         limit
@@ -48,8 +50,11 @@ fn clamp_limit(limit: i64) -> i64 {
 /// `peer_class` — one bandwidth/throttle class.
 #[derive(Debug)]
 pub struct PeerClass {
-    /// `channel[2]` — rate-limited channels (up/down).
-    pub channel: [BandwidthChannel; 2],
+    /// `channel[2]` — rate-limited channels (up/down). `Arc` because
+    /// queued `bw_request`s hold channel clones past the class's
+    /// lifetime in the pool (upstream keeps raw pointers; pool slots
+    /// stay alive as long as requests reference them).
+    pub channel: [Arc<BandwidthChannel>; 2],
     /// `ignore_unchoke_slots`.
     pub ignore_unchoke_slots: bool,
     /// `connection_limit_factor`.
@@ -68,7 +73,10 @@ impl PeerClass {
     /// `peer_class(label)` — `in_use = true`, `references = 1`.
     fn new(label: impl Into<String>) -> Self {
         Self {
-            channel: [BandwidthChannel::default(), BandwidthChannel::default()],
+            channel: [
+                Arc::new(BandwidthChannel::new()),
+                Arc::new(BandwidthChannel::new()),
+            ],
             ignore_unchoke_slots: false,
             connection_limit_factor: 100,
             priority: [1, 1],
@@ -362,6 +370,8 @@ mod tests {
     fn limit_clamps() {
         let mut c = PeerClass::new("x");
         c.set_upload_limit(-1); // contract: limit >= -1; <0 → 0 (unlimited)
+        assert_eq!(c.channel[UPLOAD].throttle_value(), 0);
+        c.set_upload_limit(0); // 0 stays 0 — unlimited, no floor
         assert_eq!(c.channel[UPLOAD].throttle_value(), 0);
         c.set_upload_limit(5);
         assert_eq!(c.channel[UPLOAD].throttle_value(), 10);

@@ -3,12 +3,15 @@
 //!
 //! Upstream stores raw `bandwidth_channel*` in each `bw_request` and a
 //! `shared_ptr<bandwidth_socket>` for the peer. The Rust version uses
-//! `Rc<BandwidthChannel>` (`Cell` interior mutability — the channels
-//! outlive the managers) and `Rc<dyn BandwidthSocket>`.
+//! `Arc<BandwidthChannel>` and `Arc<dyn BandwidthSocket>`: peer socket
+//! tasks run on the tokio thread pool, so channel state is atomic and
+//! the socket interface is `Send + Sync`. All quota mutation still
+//! happens under the session lock, matching upstream's single-threaded
+//! network loop — `Relaxed` ordering is sufficient.
 
-use std::cell::Cell;
 use std::collections::VecDeque;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 /// `inf` — "unlimited" quota sentinel (`INT_MAX` upstream).
 pub const INF: i64 = i32::MAX as i64;
@@ -17,13 +20,13 @@ pub const INF: i64 = i32::MAX as i64;
 #[derive(Debug, Default)]
 pub struct BandwidthChannel {
     /// `tmp` — priority sum, temporary storage during distribution.
-    pub tmp: Cell<i64>,
+    pub tmp: AtomicI64,
     /// `distribute_quota` — bytes to distribute this round.
-    pub distribute_quota: Cell<i64>,
+    pub distribute_quota: AtomicI64,
     /// `m_quota_left` — assigned-but-unused bytes (i64 upstream).
-    quota_left: Cell<i64>,
+    quota_left: AtomicI64,
     /// `m_limit` — bytes/sec (0 = infinite).
-    limit: Cell<i64>,
+    limit: AtomicI64,
 }
 
 impl BandwidthChannel {
@@ -37,86 +40,95 @@ impl BandwidthChannel {
     pub fn throttle(&self, limit: i64) {
         debug_assert!(limit >= 0);
         debug_assert!(limit < INF);
-        self.limit.set(limit);
+        self.limit.store(limit, Ordering::Relaxed);
     }
 
     /// `throttle()`.
     #[must_use]
     pub fn throttle_value(&self) -> i64 {
-        self.limit.get()
+        self.limit.load(Ordering::Relaxed)
     }
 
     /// `quota_left()`.
     #[must_use]
     pub fn quota_left(&self) -> i64 {
-        if self.limit.get() == 0 {
+        if self.limit.load(Ordering::Relaxed) == 0 {
             return INF;
         }
-        self.quota_left.get().max(0)
+        self.quota_left.load(Ordering::Relaxed).max(0)
     }
 
     /// `update_quota(dt_milliseconds)` — refill the bucket; the cap is
     /// `3 * limit` (3 seconds of burst, upstream `m_quota_left / 3 >
     /// m_limit → clamp`) and `inf`.
     pub fn update_quota(&self, dt_milliseconds: i64) {
-        debug_assert!(self.limit.get() >= 0);
-        debug_assert!(self.limit.get() < INF);
+        let limit = self.limit.load(Ordering::Relaxed);
+        debug_assert!(limit >= 0);
+        debug_assert!(limit < INF);
 
-        if self.limit.get() == 0 {
+        if limit == 0 {
             return;
         }
 
-        let to_add = (self.limit.get() * dt_milliseconds + 500) / 1000;
-        let mut q = self.quota_left.get();
+        let to_add = (limit * dt_milliseconds + 500) / 1000;
+        let mut q = self.quota_left.load(Ordering::Relaxed);
         if to_add > INF - q {
             q = INF;
         } else {
             q += to_add;
-            if q / 3 > self.limit.get() {
-                q = self.limit.get() * 3;
+            if q / 3 > limit {
+                q = limit * 3;
             }
             q = q.min(INF);
         }
-        self.quota_left.set(q);
-        self.distribute_quota.set(q.max(0));
+        self.quota_left.store(q, Ordering::Relaxed);
+        self.distribute_quota.store(q.max(0), Ordering::Relaxed);
     }
 
     /// `return_quota(amount)` — a disconnecting peer returns its
     /// unused quota.
     pub fn return_quota(&self, amount: i64) {
         debug_assert!(amount >= 0);
-        if self.limit.get() == 0 {
+        if self.limit.load(Ordering::Relaxed) == 0 {
             return;
         }
-        self.quota_left.set(self.quota_left.get() + amount);
+        self.quota_left.fetch_add(amount, Ordering::Relaxed);
     }
 
     /// `use_quota(amount)`.
     pub fn use_quota(&self, amount: i64) {
         debug_assert!(amount >= 0);
-        if self.limit.get() == 0 {
+        if self.limit.load(Ordering::Relaxed) == 0 {
             return;
         }
-        self.quota_left.set(self.quota_left.get() - amount);
+        self.quota_left.fetch_sub(amount, Ordering::Relaxed);
     }
 
     /// `need_queueing(amount)` — optimization: if more than one second
     /// of quota remains, grant immediately instead of queueing.
     #[must_use]
     pub fn need_queueing(&self, amount: i64) -> bool {
-        if self.quota_left.get() - amount < self.limit.get() {
+        let limit = self.limit.load(Ordering::Relaxed);
+        // fetched quota is debited only when the request will not
+        // queue (upstream's single-threaded check-then-subtract —
+        // callers run under the session lock, Relaxed is enough).
+        let q = self.quota_left.load(Ordering::Relaxed);
+        if q - amount < limit {
             return true;
         }
-        self.quota_left.set(self.quota_left.get() - amount);
+        self.quota_left.store(q - amount, Ordering::Relaxed);
         false
     }
 }
 
 /// `bandwidth_socket` — the interface a peer connection implements to
-/// receive assigned quota.
-pub trait BandwidthSocket {
+/// receive assigned quota. `Send + Sync`: queued requests live inside
+/// the session (behind `Mutex`) while the receiving side is a peer
+/// socket task on the tokio pool.
+pub trait BandwidthSocket: Send + Sync {
     /// Called when the request is fully (or finally) assigned;
     /// `channels` is the manager's channel id (`upload`/`download`).
+    /// Must not block — it runs under the session lock.
     fn assign_bandwidth(&self, channel: i32, amount: i64);
 
     /// `is_disconnecting()` — queued requests of dead peers are
@@ -127,7 +139,7 @@ pub trait BandwidthSocket {
 /// `bw_request` — one queued bandwidth request.
 pub struct BwRequest {
     /// `peer`.
-    pub peer: Rc<dyn BandwidthSocket>,
+    pub peer: Arc<dyn BandwidthSocket>,
     /// `priority` — 1 is normal.
     pub priority: i64,
     /// `assigned` — bytes assigned so far.
@@ -137,7 +149,7 @@ pub struct BwRequest {
     /// `ttl` — rounds this request survives (starts at 20 upstream).
     pub ttl: i32,
     /// `channel[]` — up to `MAX_BANDWIDTH_CHANNELS`.
-    pub channels: Vec<Rc<BandwidthChannel>>,
+    pub channels: Vec<Arc<BandwidthChannel>>,
 }
 
 /// `bw_request::max_bandwidth_channels`.
@@ -146,7 +158,7 @@ pub const MAX_BANDWIDTH_CHANNELS: usize = 10;
 impl BwRequest {
     /// `bw_request(peer, blk, prio)` — `ttl` starts at 20.
     #[must_use]
-    pub fn new(peer: Rc<dyn BandwidthSocket>, blk: i64, prio: i64) -> Self {
+    pub fn new(peer: Arc<dyn BandwidthSocket>, blk: i64, prio: i64) -> Self {
         debug_assert!(prio > 0);
         Self {
             peer,
@@ -174,10 +186,11 @@ impl BwRequest {
             if ch.throttle_value() == 0 {
                 continue;
             }
-            if ch.tmp.get() == 0 {
+            let tmp = ch.tmp.load(Ordering::Relaxed);
+            if tmp == 0 {
                 continue;
             }
-            quota = (ch.distribute_quota.get() * self.priority / ch.tmp.get()).min(quota);
+            quota = (ch.distribute_quota.load(Ordering::Relaxed) * self.priority / tmp).min(quota);
         }
         self.assigned += quota;
         for ch in &self.channels {
@@ -233,21 +246,25 @@ impl BandwidthManager {
             .any(|r| std::ptr::eq(r.peer.as_ref(), peer))
     }
 
-    /// `close()` — `m_abort = true`.
+    /// `close()` — `m_abort = true`; upstream drains the queue,
+    /// dispatching each request's assigned quota (LIFO) so peers see
+    /// a final grant before teardown.
     pub fn close(&mut self) {
         self.abort = true;
         self.queued_bytes = 0;
-        self.queue.clear();
+        while let Some(bwr) = self.queue.pop_back() {
+            bwr.peer.assign_bandwidth(self.channel, bwr.assigned);
+        }
     }
 
     /// `request_bandwidth(peer, blk, priority, channels)` — 0 = the
     /// request was queued; `blk` = granted immediately.
     pub fn request_bandwidth(
         &mut self,
-        peer: Rc<dyn BandwidthSocket>,
+        peer: Arc<dyn BandwidthSocket>,
         blk: i64,
         priority: i64,
-        channels: &[Rc<BandwidthChannel>],
+        channels: &[Arc<BandwidthChannel>],
     ) -> i64 {
         if self.abort {
             return 0;
@@ -266,7 +283,7 @@ impl BandwidthManager {
         let mut bwr = BwRequest::new(peer, blk, priority);
         for c in channels {
             if c.need_queueing(blk) {
-                bwr.channels.push(Rc::clone(c));
+                bwr.channels.push(Arc::clone(c));
             }
         }
 
@@ -280,7 +297,7 @@ impl BandwidthManager {
     }
 
     /// `update_quotas(dt_milliseconds)` — one round of quota
-    /// distribution (called every second upstream; `dt` capped at
+    /// distribution (called every tick upstream; `dt` capped at
     /// 3000 ms).
     pub fn update_quotas(&mut self, dt_milliseconds: i64) {
         if self.abort || self.queue.is_empty() {
@@ -306,20 +323,20 @@ impl BandwidthManager {
                 done.push(req);
             } else {
                 for ch in &self.queue[i].channels {
-                    ch.tmp.set(0);
+                    ch.tmp.store(0, Ordering::Relaxed);
                 }
                 i += 1;
             }
         }
 
         // per-channel priority sums
-        let mut channels: Vec<Rc<BandwidthChannel>> = Vec::new();
+        let mut channels: Vec<Arc<BandwidthChannel>> = Vec::new();
         for r in &self.queue {
             for ch in &r.channels {
-                if ch.tmp.get() == 0 {
-                    channels.push(Rc::clone(ch));
+                if ch.tmp.load(Ordering::Relaxed) == 0 {
+                    channels.push(Arc::clone(ch));
                 }
-                ch.tmp.set(ch.tmp.get() + r.priority);
+                ch.tmp.fetch_add(r.priority, Ordering::Relaxed);
             }
         }
 

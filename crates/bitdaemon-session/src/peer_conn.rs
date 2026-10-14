@@ -18,6 +18,93 @@ use crate::peer_pipeline::{PeerPipeline, PendingBlock};
 use crate::piece_picker::{PickerStats, PiecePicker};
 use crate::request_blocks::{PeerRequestCtx, TorrentRequestCtx};
 
+/// `peer_connection::upload_channel`/`download_channel` — bandwidth
+/// channel indices (match `peer_class::{UPLOAD,DOWNLOAD}`).
+pub const UPLOAD_CHANNEL: usize = 0;
+/// `peer_connection::download_channel`.
+pub const DOWNLOAD_CHANNEL: usize = 1;
+
+/// `peer_connection`'s `m_quota[]` + `m_channel_state[]` — shared
+/// between the session (requests, grants, status reads — all under
+/// the session lock) and the engine's per-connection socket task
+/// (actual byte consumption + waiting on grants). Upstream keeps the
+/// counters inside `peer_connection` on the network thread; the tokio
+/// split moves them into an `Arc` so the socket task can consume
+/// quota without taking the session lock per block.
+///
+/// Implements [`bitdaemon_net::bandwidth::BandwidthSocket`] — a
+/// queued request stores a clone of this `Arc` inside the session's
+/// `BandwidthManager`s and `assign_bandwidth` lands under the lock.
+#[derive(Debug)]
+pub struct PeerQuota {
+    /// `m_quota[channel]` — bytes this conn may transfer right now.
+    pub quota: [std::sync::atomic::AtomicI64; 2],
+    /// `m_channel_state[channel]` — `peer_info::bw_*` bits
+    /// (`BandwidthState` values).
+    pub channel_state: [std::sync::atomic::AtomicU8; 2],
+    /// `stat::upload_ip_overhead`/`download_ip_overhead` — the
+    /// socket task accumulates per-packet IP/TCP header bytes here;
+    /// the per-second tick drains them into the class channels via
+    /// `use_quota_overhead` like upstream's `second_tick`.
+    pub ip_overhead: [std::sync::atomic::AtomicI64; 2],
+    /// grant dispatch — `assign_bandwidth` notifies the parked task.
+    grant: [tokio::sync::Notify; 2],
+    /// `is_disconnecting` — queued requests of a dead conn are
+    /// dropped and their assigned quota returned on the next
+    /// `update_quotas` pass.
+    pub disconnecting: std::sync::atomic::AtomicBool,
+}
+
+impl PeerQuota {
+    /// `m_channel_state` starts at `bw_idle` upstream.
+    #[must_use]
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            quota: [
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+            ],
+            channel_state: [
+                std::sync::atomic::AtomicU8::new(crate::peer_info::BandwidthState::IDLE.0),
+                std::sync::atomic::AtomicU8::new(crate::peer_info::BandwidthState::IDLE.0),
+            ],
+            ip_overhead: [
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+            ],
+            grant: [tokio::sync::Notify::new(), tokio::sync::Notify::new()],
+            disconnecting: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Park until `assign_bandwidth` dispatches quota on `channel`
+    /// (a `Notify` permit survives pre-registration, so a grant
+    /// landing before the wait begins is not lost).
+    pub async fn wait_grant(&self, channel: usize) {
+        self.grant[channel].notified().await;
+    }
+}
+
+impl bitdaemon_net::bandwidth::BandwidthSocket for PeerQuota {
+    /// `peer_connection::assign_bandwidth` — quota lands, `bw_limit`
+    /// clears, the parked socket task wakes (upstream re-arms
+    /// `setup_send`/`setup_receive`; ours resumes at the gate).
+    fn assign_bandwidth(&self, channel: i32, amount: i64) {
+        let c = usize::try_from(channel).unwrap_or(0).min(1);
+        self.quota[c].fetch_add(amount, std::sync::atomic::Ordering::Relaxed);
+        self.channel_state[c].fetch_and(
+            !crate::peer_info::BandwidthState::LIMIT.0,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.grant[c].notify_one();
+    }
+
+    fn is_disconnecting(&self) -> bool {
+        self.disconnecting
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// The direction-independent flags of a peer connection.
 #[derive(Debug)]
 pub struct PeerConn {
@@ -313,6 +400,10 @@ pub struct PeerConn {
     /// `peer_connection::m_extensions` — per-connection plugins
     /// produced by `SessionPlugin::new_peer_connection`.
     pub plugins: Vec<std::sync::Arc<dyn crate::alerts::PeerPlugin>>,
+    /// `m_quota[]`/`m_channel_state[]` — bandwidth state shared with
+    /// the socket task (`BandwidthSocket` impl for the manager's
+    /// queued requests).
+    pub bw: std::sync::Arc<PeerQuota>,
 }
 
 impl PeerConn {
@@ -421,6 +512,7 @@ impl PeerConn {
             uploaded_at_last_unchoke: 0,
             now_ms,
             plugins: Vec::new(),
+            bw: PeerQuota::new(),
         }
     }
 
@@ -1566,6 +1658,40 @@ impl PeerConn {
     #[must_use]
     pub fn interested_msg() -> PeerMessage {
         PeerMessage::Interested
+    }
+
+    /// `peer_connection::wanted_transfer` — how much quota a request
+    /// should cover for `channel`. `recv_spare` is the engine's read
+    /// buffer room, upstream's `m_recv_buffer.packet_bytes_remaining()`.
+    /// `tick_ms` is `settings_pack::tick_interval` in milliseconds.
+    #[must_use]
+    pub fn wanted_transfer(&self, channel: usize, recv_spare: i64, tick_ms: i64) -> i64 {
+        let tick = tick_ms.max(1);
+        if channel == DOWNLOAD_CHANNEL {
+            let download_rate = i64::from(self.rate_down_speed) * 3 / 2;
+            (self.pipeline.outstanding_bytes + 30)
+                .max(recv_spare + 30)
+                .max(download_rate * tick / 1000)
+        } else {
+            let upload_rate = i64::from(self.rate_up_speed) * 2;
+            (self.reading_bytes as i64)
+                .max(self.send_buffer as i64)
+                .max(upload_rate * tick / 1000)
+        }
+    }
+
+    /// `stat::trancieve_ip_packet` — IP/TCP overhead estimate for one
+    /// socket op moving `bytes`: one packet header per `mtu`-sized
+    /// run *plus* the ACK going back the other way (upstream folds
+    /// both into each direction's `ip_protocol` channel).
+    #[must_use]
+    pub fn ip_overhead_bytes(bytes: i64, ipv6: bool) -> i64 {
+        let header = (if ipv6 { 40 } else { 20 }) + 20;
+        let packet_size = 1500 - header;
+        // `max(1, ceil(bytes / packet_size)) * header` — `ceil` for
+        // non-negative operands is `(a + b - 1) / b` (0 for a=0, which
+        // the floor covers).
+        ((bytes + packet_size - 1) / packet_size).max(1) * header
     }
 }
 

@@ -54,11 +54,26 @@ Until `1.0.0`, breaking changes may occur in any release.
   through its `BandwidthChannel`s (upstream `-1`-for-unlimited API
   semantics, resume round-trip included), `setup_peer_class` fires on
   the first nonzero limit, and the class is released on
-  `remove_torrent`/`abort`. Deferred until `BandwidthManager` wiring:
-  class-channel consumption (`use_quota_overhead`,
-  `rate_limit_ip_overhead` debits, `bw_network`/`bw_limit` channel
-  state — `peer_proportional` currently counts with `!disk_blocked`
-  as the `bw_network` stand-in).
+  `remove_torrent`/`abort`.
+- Upstream rate limiting wired end-to-end (`bandwidth_limit`/
+  `bandwidth_manager`/`peer_connection::request_bandwidth` consumers):
+  the session owns one `BandwidthManager` per direction and the
+  class channels are the throttle state; conns carry `PeerQuota`
+  (`m_quota`/`m_channel_state` atomics) — the engine's per-peer pump
+  caps socket reads/writes at `min(quota, staged)`, queues
+  (`bw_limit`) when channels are empty, and resumes on
+  `assign_bandwidth` grants via `Notify`, matching upstream's
+  `setup_receive`/`setup_send` gates. `wanted_transfer` (outstanding
+  bytes + 30 / recv spare + 30 / rate-scaled tick), per-request
+  `get_priority` (max over conn + torrent class sets),
+  `copy_pertinent_channels` (only throttled channels), the
+  `rate_limit_ip_overhead` drain in `check_request_timeouts`
+  (`performance_alert::{down,up}load_limit_too_low`), disconnecting
+  quota return and `manager.close()` on engine drop all follow
+  `peer_connection.cpp`/`session_impl.cpp`. Replaces the bespoke
+  per-engine `RateLimiter` buckets; the global/`download_quota_ok`
+  approximation for the snub gate is gone — the real
+  `m_quota[download_channel] > 0` check is used.
 - Disconnect severity propagation (`peer_connection::disconnect(ec, op,
   severity)` → `m_failed` → `peer_list::connection_closed` failcount):
   `PeerEffect::Disconnect`/`TorrentEffect::DisconnectPeer` now carry the
@@ -102,10 +117,40 @@ Until `1.0.0`, breaking changes may occur in any release.
 - `num_peers_down_requests` accounting (peers with a non-empty
   download queue), endgame 5 s re-pick via `m_last_request`, and the
   `m_quota[download_channel] > 0` gate on the timeout detectors
-  (approximated by the global download bucket) in
+  (per-conn quota since the `BandwidthManager` wiring) in
   `check_request_timeouts`.
 
 ### Fixed
+
+- `peer_class::set_*_limit` clamp kept `0` as *unlimited* like
+  upstream (`limit < 10 && limit > 0 → 10`); a `0` limit was
+  wrongly throttled to 10 B/s on the `set_peer_class` path.
+- Bandwidth prefetch parity (`setup_receive`/`setup_send` head calls):
+  `request_bandwidth` now runs unconditionally at the top of the
+  engine pump's read and write gates, topping a queued request up to
+  `wanted_transfer` so its grant lands before the current quota
+  drains — upstream requests on every receive/send setup, not just
+  on exhaustion. Previously the conn stalled up to one
+  `update_quotas` round (500 ms) each time quota hit zero.
+- `m_disconnecting` parity for bandwidth queues: arming
+  `PeerQuota::disconnecting` now happens where `c.disconnecting =
+  true` is decided (pause `disconnect_all`, graceful-pause idle
+  conns, `too_many_connections` teardown), not only at
+  `remove_peer`/pump exit — `update_quotas` drops a tearing-down
+  conn's queued requests on the next pass and returns their quota
+  like upstream.
+- `rate_limit_ip_overhead` accounting drained the conn's IP/TCP
+  overhead counters in *two* places (session tick head *and*
+  `check_request_timeouts`); the first drain left the
+  upstream-equivalent site (conn `second_tick`) reading zeros. The
+  duplicate was removed — the overhead debit and the
+  `download_limit_too_low`/`upload_limit_too_low` performance alerts
+  now see real numbers.
+- Engine tick split matches `session_impl::on_tick`: quota
+  distribution (`update_quotas`) rides the 500 ms `tick_interval`
+  timer while the per-conn `second_tick` work is gated on ≥1 s
+  elapsed (`m_last_second_tick`); the run loop sleeps the
+  settings-live `tick_interval` like upstream's `m_tick_timer`.
 
 - **Pause is now two-layered like upstream** — `m_paused` (user) and
   `m_session_paused` are distinct; `is_paused()` is their OR, so a

@@ -3,9 +3,8 @@
 //! semantics ported here are the deterministic parts: refill,
 //! proportional assignment, ttl expiry, disconnect quota return).
 
-use std::cell::Cell;
-use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use bitdaemon_net::bandwidth::{BandwidthChannel, BandwidthManager, BandwidthSocket};
 use bitdaemon_net::chained_buffer::{BufferHolder, ChainedBuffer};
@@ -109,15 +108,15 @@ fn chained_buffer_custom_holder() {
 
 struct TestPeer {
     /// bytes received via `assign_bandwidth`.
-    got: Cell<i64>,
-    disconnecting: Cell<bool>,
+    got: AtomicI64,
+    disconnecting: AtomicBool,
 }
 
 impl TestPeer {
-    fn new() -> Rc<Self> {
-        Rc::new(Self {
-            got: Cell::new(0),
-            disconnecting: Cell::new(false),
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            got: AtomicI64::new(0),
+            disconnecting: AtomicBool::new(false),
         })
     }
 }
@@ -125,11 +124,11 @@ impl TestPeer {
 impl BandwidthSocket for TestPeer {
     fn assign_bandwidth(&self, _channel: i32, amount: i64) {
         // upstream dispatches with 0 for disconnecting peers
-        self.got.set(self.got.get() + amount);
+        self.got.fetch_add(amount, Ordering::Relaxed);
     }
 
     fn is_disconnecting(&self) -> bool {
-        self.disconnecting.get()
+        self.disconnecting.load(Ordering::Relaxed)
     }
 }
 
@@ -178,21 +177,27 @@ fn manager_immediate_grant() {
     let mut mgr = BandwidthManager::new(1);
     // no channels -> immediate
     let peer = TestPeer::new();
-    assert_eq!(mgr.request_bandwidth(peer, 0x4000, 1, &[]), 0x4000);
+    assert_eq!(
+        mgr.request_bandwidth(peer as Arc<dyn BandwidthSocket>, 0x4000, 1, &[]),
+        0x4000
+    );
 
     // channel with plenty of quota -> immediate
-    let ch = Rc::new(BandwidthChannel::new());
+    let ch = Arc::new(BandwidthChannel::new());
     ch.throttle(1000);
     ch.update_quota(3000);
     let peer = TestPeer::new();
-    assert_eq!(mgr.request_bandwidth(peer, 100, 1, &[Rc::clone(&ch)]), 100);
+    assert_eq!(
+        mgr.request_bandwidth(peer as Arc<dyn BandwidthSocket>, 100, 1, &[Arc::clone(&ch)]),
+        100
+    );
     assert_eq!(mgr.queue_size(), 0);
 }
 
 #[test]
 fn manager_queue_and_distribute() {
     let mut mgr = BandwidthManager::new(1);
-    let ch = Rc::new(BandwidthChannel::new());
+    let ch = Arc::new(BandwidthChannel::new());
     ch.throttle(1000);
 
     let p1 = TestPeer::new();
@@ -200,19 +205,19 @@ fn manager_queue_and_distribute() {
     // channel empty: both requests queue
     assert_eq!(
         mgr.request_bandwidth(
-            Rc::clone(&p1) as Rc<dyn BandwidthSocket>,
+            Arc::clone(&p1) as Arc<dyn BandwidthSocket>,
             1000,
             1,
-            &[Rc::clone(&ch)]
+            &[Arc::clone(&ch)]
         ),
         0
     );
     assert_eq!(
         mgr.request_bandwidth(
-            Rc::clone(&p2) as Rc<dyn BandwidthSocket>,
+            Arc::clone(&p2) as Arc<dyn BandwidthSocket>,
             1000,
             1,
-            &[Rc::clone(&ch)]
+            &[Arc::clone(&ch)]
         ),
         0
     );
@@ -223,15 +228,15 @@ fn manager_queue_and_distribute() {
     // quota accumulates in `assigned` — peers are only notified on
     // completion (or ttl expiry)
     mgr.update_quotas(1000);
-    assert_eq!(p1.got.get(), 0);
-    assert_eq!(p2.got.get(), 0);
+    assert_eq!(p1.got.load(Ordering::Relaxed), 0);
+    assert_eq!(p2.got.load(Ordering::Relaxed), 0);
     assert_eq!(mgr.queue_size(), 2);
     assert_eq!(mgr.queued_bytes(), 1000);
 
     // second round completes them
     mgr.update_quotas(1000);
-    assert_eq!(p1.got.get(), 1000);
-    assert_eq!(p2.got.get(), 1000);
+    assert_eq!(p1.got.load(Ordering::Relaxed), 1000);
+    assert_eq!(p2.got.load(Ordering::Relaxed), 1000);
     assert_eq!(mgr.queue_size(), 0);
     assert_eq!(mgr.queued_bytes(), 0);
 }
@@ -239,59 +244,59 @@ fn manager_queue_and_distribute() {
 #[test]
 fn manager_priority_split() {
     let mut mgr = BandwidthManager::new(1);
-    let ch = Rc::new(BandwidthChannel::new());
+    let ch = Arc::new(BandwidthChannel::new());
     ch.throttle(1000);
 
     let hi = TestPeer::new();
     let lo = TestPeer::new();
     mgr.request_bandwidth(
-        Rc::clone(&hi) as Rc<dyn BandwidthSocket>,
+        Arc::clone(&hi) as Arc<dyn BandwidthSocket>,
         1000,
         3,
-        &[Rc::clone(&ch)],
+        &[Arc::clone(&ch)],
     );
     mgr.request_bandwidth(
-        Rc::clone(&lo) as Rc<dyn BandwidthSocket>,
+        Arc::clone(&lo) as Arc<dyn BandwidthSocket>,
         1000,
         1,
-        &[Rc::clone(&ch)],
+        &[Arc::clone(&ch)],
     );
 
     // round 1: quota = distribute*prio/tmp (tmp=4) -> hi 750, lo 250
     // (still queued — notification happens on completion)
     mgr.update_quotas(1000);
-    assert_eq!(hi.got.get(), 0);
-    assert_eq!(lo.got.get(), 0);
+    assert_eq!(hi.got.load(Ordering::Relaxed), 0);
+    assert_eq!(lo.got.load(Ordering::Relaxed), 0);
     // round 2: hi completes (750+250), lo at 500 still queued
     mgr.update_quotas(1000);
-    assert_eq!(hi.got.get(), 1000);
-    assert_eq!(lo.got.get(), 0);
+    assert_eq!(hi.got.load(Ordering::Relaxed), 1000);
+    assert_eq!(lo.got.load(Ordering::Relaxed), 0);
     assert_eq!(mgr.queue_size(), 1);
     // round 3: lo alone gets the full channel and completes
     mgr.update_quotas(1000);
-    assert_eq!(lo.got.get(), 1000);
+    assert_eq!(lo.got.load(Ordering::Relaxed), 1000);
     assert_eq!(mgr.queue_size(), 0);
 }
 
 #[test]
 fn manager_disconnect_returns_quota() {
     let mut mgr = BandwidthManager::new(1);
-    let ch = Rc::new(BandwidthChannel::new());
+    let ch = Arc::new(BandwidthChannel::new());
     ch.throttle(1000);
 
     let p = TestPeer::new();
     // 2000-byte request on a 1000 B/s channel -> partial assign
     mgr.request_bandwidth(
-        Rc::clone(&p) as Rc<dyn BandwidthSocket>,
+        Arc::clone(&p) as Arc<dyn BandwidthSocket>,
         2000,
         1,
-        &[Rc::clone(&ch)],
+        &[Arc::clone(&ch)],
     );
     mgr.update_quotas(1000); // assigns 1000, still queued
-    assert_eq!(p.got.get(), 0);
+    assert_eq!(p.got.load(Ordering::Relaxed), 0);
     assert_eq!(mgr.queue_size(), 1);
 
-    p.disconnecting.set(true);
+    p.disconnecting.store(true, Ordering::Relaxed);
     mgr.update_quotas(1000);
     // gone from queue; assigned quota was returned to the channel
     assert_eq!(mgr.queue_size(), 0);

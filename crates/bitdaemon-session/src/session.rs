@@ -417,11 +417,6 @@ pub struct Session {
     pub alerts: AlertManager,
     /// `m_stats_counters`.
     pub counters: Counters,
-    /// `m_quota[download_channel] > 0` approximation — the engine's
-    /// download limiter reports whether the channel had budget left
-    /// this tick; request/piece timeout snubbing is skipped while
-    /// the channel is starved (`peer_connection::second_tick`).
-    pub download_quota_ok: bool,
     /// `m_peer_id` — generated with the default fingerprint
     /// (`generate_peer_id`); used in announces and handshakes.
     pub peer_id: bitdaemon_common::PeerId,
@@ -497,6 +492,11 @@ pub struct Session {
     /// `m_local_class` — `ignore_unchoke_slots` + 150% connection
     /// factor; `local_*_rate_limit` settings map here.
     pub local_peer_class: bitdaemon_net::peer_class::PeerClassIndex,
+    /// `m_download_rate` — the download-channel `BandwidthManager`
+    /// (queued quota requests + per-tick distribution).
+    pub download_rate: bitdaemon_net::bandwidth::BandwidthManager,
+    /// `m_upload_rate` — the upload-channel manager.
+    pub upload_rate: bitdaemon_net::bandwidth::BandwidthManager,
     /// per-purpose proxies (`m_peer_proxy`, `m_tracker_proxy`,
     /// `m_web_seed_proxy`, `m_dht_proxy`, `m_i2p_proxy` upstream).
     pub proxies: SessionProxies,
@@ -803,7 +803,7 @@ impl Default for Session {
             write_gates: None,
             alerts: AlertManager::default(),
             counters: Counters::default(),
-            download_quota_ok: true,
+
             peer_id: bitdaemon_common::peer_id::generate_peer_id(b"-OB0001-"),
             listen_port: 6881,
             ssl_listen_port: 4433,
@@ -832,6 +832,14 @@ impl Default for Session {
             global_peer_class: 0,
             tcp_peer_class: 1,
             local_peer_class: 2,
+            // `get_bandwidth_manager(channel)` — one manager per
+            // direction, keyed by the `peer_connection` channel id.
+            download_rate: bitdaemon_net::bandwidth::BandwidthManager::new(
+                crate::peer_conn::DOWNLOAD_CHANNEL as i32,
+            ),
+            upload_rate: bitdaemon_net::bandwidth::BandwidthManager::new(
+                crate::peer_conn::UPLOAD_CHANNEL as i32,
+            ),
             proxies: SessionProxies::default(),
             pe_settings: bitdaemon_net::pe_crypto::PeSettings::default(),
             services: ServiceSwitches::default(),
@@ -2326,6 +2334,11 @@ impl Session {
                         continue;
                     }
                     c.disconnecting = true;
+                    // `peer_connection::disconnect` sets
+                    // `m_disconnecting` — `update_quotas` drops the
+                    // conn's queued bandwidth requests next pass.
+                    c.bw.disconnecting
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                         peer: *pid,
                         reason: "torrent_paused",
@@ -2352,6 +2365,8 @@ impl Session {
                         choke_ids.push(*pid);
                     } else {
                         c.disconnecting = true;
+                        c.bw.disconnecting
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                             peer: *pid,
                             reason: "torrent_paused",
@@ -4512,14 +4527,168 @@ impl Session {
         self.init_peer_class_filter(unlimited);
     }
 
+    /// `session_impl::copy_pertinent_channels` — append the
+    /// *throttled* `BandwidthChannel`s of every class in `set`
+    /// (unlimited channels don't constrain anything and are left
+    /// out upstream too).
+    fn copy_pertinent_channels(
+        &self,
+        set: &bitdaemon_net::peer_class::PeerClassSet,
+        channel: usize,
+        dst: &mut Vec<std::sync::Arc<bitdaemon_net::bandwidth::BandwidthChannel>>,
+        cap: usize,
+    ) {
+        for i in 0..set.num_classes() {
+            if dst.len() >= cap {
+                break;
+            }
+            let Some(pc) = self.peer_class_pool.at(set.class_at(i)) else {
+                continue;
+            };
+            let ch = &pc.channel[channel];
+            if ch.throttle_value() == 0 {
+                continue;
+            }
+            dst.push(std::sync::Arc::clone(ch));
+        }
+    }
+
+    /// `peer_connection::get_priority` — the request's weight is the
+    /// *max* `priority[channel]` over the conn's class set and the
+    /// torrent's class set.
+    fn request_priority(
+        &self,
+        conn_set: &bitdaemon_net::peer_class::PeerClassSet,
+        torrent_set: &bitdaemon_net::peer_class::PeerClassSet,
+        channel: usize,
+    ) -> i64 {
+        let mut prio = 1i64;
+        for set in [conn_set, torrent_set] {
+            for i in 0..set.num_classes() {
+                if let Some(pc) = self.peer_class_pool.at(set.class_at(i))
+                    && prio < i64::from(pc.priority[channel])
+                {
+                    prio = i64::from(pc.priority[channel]);
+                }
+            }
+        }
+        prio
+    }
+
+    /// `peer_connection::request_bandwidth` — asks the channel
+    /// manager for `bytes` (raised to `wanted_transfer`) of quota on
+    /// `channel`. Returns `None` when the conn is gone (the socket
+    /// task should tear down); `Some(0)` when the request is queued
+    /// (`bw_limit` set — the grant lands via
+    /// `PeerQuota::assign_bandwidth`) *or* when existing quota
+    /// already covers the wanted transfer; `Some(n)` = `n` bytes
+    /// granted into `quota` immediately.
+    pub fn request_bandwidth(
+        &mut self,
+        ih: &Sha1Hash,
+        peer: u64,
+        channel: usize,
+        mut bytes: i64,
+    ) -> Option<i64> {
+        use crate::peer_info::BandwidthState as Bw;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tick_ms = self.settings.tick_interval.as_millis() as i64;
+        let t = self.torrents.get(ih)?;
+        let c = t.peers.get(&peer)?;
+
+        // one outstanding request per channel upstream
+        if c.bw.channel_state[channel].load(Relaxed) & Bw::LIMIT.0 != 0 {
+            return Some(0);
+        }
+
+        bytes = bytes.max(c.wanted_transfer(channel, bytes, tick_ms));
+        let quota = c.bw.quota[channel].load(Relaxed);
+        if quota >= bytes {
+            return Some(0);
+        }
+        bytes -= quota;
+
+        let priority = self.request_priority(&c.peer_classes, &t.peer_classes, channel);
+        let handle = std::sync::Arc::clone(&c.bw);
+        let mut channels = Vec::new();
+        let cap = bitdaemon_net::bandwidth::MAX_BANDWIDTH_CHANNELS;
+        self.copy_pertinent_channels(&c.peer_classes, channel, &mut channels, cap);
+        self.copy_pertinent_channels(&t.peer_classes, channel, &mut channels, cap);
+
+        let mgr = if channel == crate::peer_conn::DOWNLOAD_CHANNEL {
+            &mut self.download_rate
+        } else {
+            &mut self.upload_rate
+        };
+        let ret = mgr.request_bandwidth(handle.clone(), bytes, priority, &channels);
+        if ret == 0 {
+            handle.channel_state[channel].fetch_or(Bw::LIMIT.0, Relaxed);
+        } else {
+            handle.quota[channel].fetch_add(ret, Relaxed);
+        }
+        Some(ret)
+    }
+
+    /// `session_impl::use_quota_overhead` — debit `amount_down`/
+    /// `amount_up` from every channel of every class in `set`
+    /// (IP/TCP overhead consumes quota too). Returns a bitmask of
+    /// directions whose limit is *lower than* the overhead —
+    /// upstream's `performance_alert` trigger bits. Associated fn:
+    /// the per-conn tick drains while a torrent is mut-borrowed.
+    pub(crate) fn quota_overhead(
+        pool: &bitdaemon_net::peer_class::PeerClassPool,
+        set: &bitdaemon_net::peer_class::PeerClassSet,
+        amount_down: i64,
+        amount_up: i64,
+    ) -> u8 {
+        let mut ret = 0u8;
+        for i in 0..set.num_classes() {
+            let Some(pc) = pool.at(set.class_at(i)) else {
+                continue;
+            };
+            let ch = &pc.channel[crate::peer_conn::DOWNLOAD_CHANNEL];
+            ch.use_quota(amount_down);
+            if ch.throttle_value() > 0 && ch.throttle_value() < amount_down {
+                ret |= 1 << crate::peer_conn::DOWNLOAD_CHANNEL;
+            }
+            let ch = &pc.channel[crate::peer_conn::UPLOAD_CHANNEL];
+            ch.use_quota(amount_up);
+            if ch.throttle_value() > 0 && ch.throttle_value() < amount_up {
+                ret |= 1 << crate::peer_conn::UPLOAD_CHANNEL;
+            }
+        }
+        ret
+    }
+
+    /// `session_impl::update_quotas` — one round of quota
+    /// distribution on both direction managers (`dt` = elapsed
+    /// milliseconds since the last pass).
+    pub fn update_quotas(&mut self, dt_milliseconds: i64) {
+        self.download_rate.update_quotas(dt_milliseconds);
+        self.upload_rate.update_quotas(dt_milliseconds);
+    }
+
+    /// The conn's shared bandwidth handle — the engine's socket task
+    /// consumes quota through it without the session lock.
+    #[must_use]
+    pub fn peer_quota(
+        &self,
+        ih: &Sha1Hash,
+        peer: u64,
+    ) -> Option<std::sync::Arc<crate::peer_conn::PeerQuota>> {
+        self.torrents
+            .get(ih)
+            .and_then(|t| t.peers.get(&peer))
+            .map(|c| std::sync::Arc::clone(&c.bw))
+    }
+
     /// `session_impl`'s mixed-mode block at the top of `on_tick` —
     /// `prefer_tcp` leaves the `tcp` class unthrottled;
     /// `peer_proportional` splits the global rate between TCP and
-    /// uTP conns proportional to each side's active-peer count.
-    /// Upstream ANDs each count with `peer_info::bw_network` (conn
-    /// actively on the wire — has quota, waiting on a socket op);
-    /// until the `BandwidthManager` consumes the class channels the
-    /// closest signal is "has queued work and isn't disk-blocked".
+    /// uTP conns proportional to each side's active-peer count —
+    /// upstream counts conns whose `bw_network` flag is set (quota
+    /// held, waiting on a socket op).
     fn update_mixed_mode(&mut self) {
         match self.settings.mixed_mode_algorithm {
             crate::settings::BandwidthMixedAlgo::PreferTcp => {
@@ -4541,10 +4710,18 @@ impl Session {
                             bitdaemon_net::peer_class::FilterSocketType::Utp
                                 | bitdaemon_net::peer_class::FilterSocketType::SslUtp
                         ));
-                        if c.pipeline.download_queue.len() > 1 && !c.disk_blocked {
+                        let ch_state = |d: usize| {
+                            c.bw.channel_state[d].load(std::sync::atomic::Ordering::Relaxed)
+                                & crate::peer_info::BandwidthState::NETWORK.0
+                                != 0
+                        };
+                        if c.pipeline.download_queue.len() > 1
+                            && ch_state(bitdaemon_net::peer_class::DOWNLOAD)
+                        {
                             num_peers[proto][bitdaemon_net::peer_class::DOWNLOAD] += 1;
                         }
-                        if !c.upload_queue.is_empty() && !c.up_disk_blocked {
+                        if !c.upload_queue.is_empty() && ch_state(bitdaemon_net::peer_class::UPLOAD)
+                        {
                             num_peers[proto][bitdaemon_net::peer_class::UPLOAD] += 1;
                         }
                     }
@@ -4986,9 +5163,10 @@ impl Session {
                     // blocks stuck past `request_timeout`.
                     t.check_request_timeouts(
                         &self.settings,
-                        self.download_quota_ok,
                         session_conns,
                         &self.counters,
+                        &self.peer_class_pool,
+                        self.alerts.mask(),
                         &mut eff,
                     );
                     // `peer_connection::second_tick` super-seed
@@ -6344,13 +6522,6 @@ impl Session {
         }
     }
 
-    /// `m_quota[download_channel] > 0` — the download channel was
-    /// granted budget this tick. The engine's `RateLimiter` feeds
-    /// this; it gates the snub checks in `check_request_timeouts`.
-    pub fn set_download_quota_available(&mut self, ok: bool) {
-        self.download_quota_ok = ok;
-    }
-
     /// Queue `msg` to `peer` — charges its wire size to the peer's
     /// `send_buffer` so `fill_send_buffer`'s watermark sees queued
     /// bytes (upstream `append_to_send_buffer`).
@@ -6462,6 +6633,10 @@ impl Session {
         out: &mut Vec<SessionOut>,
     ) {
         let mut eff = Vec::new();
+        // `on_send_data` — `counters::sent_bytes` tracks socket-level
+        // writes (payload + protocol, excluding IP overhead).
+        self.counters
+            .add(crate::counters::Counter::SentBytes, bytes as i64);
         if let Some(t) = self.torrents.get_mut(ih) {
             if let Some(c) = t.peers.get_mut(&peer) {
                 c.send_buffer = c.send_buffer.saturating_sub(bytes);
@@ -6500,6 +6675,9 @@ impl Session {
                             c.stat_up_round += n;
                             c.last_sent_payload_ms = t.now_ms;
                             t.last_payload_up = Some(std::time::Instant::now());
+                            // `stat::sent_payload` → session counter.
+                            self.counters
+                                .add(crate::counters::Counter::SentPayloadBytes, n);
                         }
                     }
                     self.push_to_peer(&ih, peer, msg, out);
@@ -7292,6 +7470,24 @@ impl Session {
         self.counters.set(
             crate::counters::Counter::NumPeersConnected,
             self.num_peers() as i64,
+        );
+        // `update_stats_counters` — the `limiter_*` gauges read the
+        // live bandwidth-manager queues.
+        self.counters.set(
+            crate::counters::Counter::LimiterUpQueue,
+            self.upload_rate.queue_size() as i64,
+        );
+        self.counters.set(
+            crate::counters::Counter::LimiterDownQueue,
+            self.download_rate.queue_size() as i64,
+        );
+        self.counters.set(
+            crate::counters::Counter::LimiterUpBytes,
+            self.upload_rate.queued_bytes(),
+        );
+        self.counters.set(
+            crate::counters::Counter::LimiterDownBytes,
+            self.download_rate.queued_bytes(),
         );
         crate::counters::SessionStats::snapshot(&self.counters)
     }

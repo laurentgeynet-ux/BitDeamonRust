@@ -407,8 +407,12 @@ async fn main() -> anyhow::Result<()> {
     slock(&eng.session).set_listen_port(args.port);
     slock(&eng.session).set_dht_port(udp_port);
     if args.limit > 0 {
-        slock(&eng.session).settings.download_rate_limit = args.limit;
-        eng.download_limiter.set_limit(args.limit);
+        // `download_rate_limit` lives on the global peer-class channel
+        // — go through `apply_settings` so the diff fires the
+        // channel throttle.
+        let mut s = slock(&eng.session).settings.clone();
+        s.download_rate_limit = args.limit;
+        eng.apply_settings(s);
     }
     if let Some(proxy) = &args.proxy {
         let (host, port) = proxy

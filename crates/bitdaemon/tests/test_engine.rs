@@ -403,28 +403,43 @@ async fn acceptor_pump_registers_peer() {
 }
 
 #[tokio::test]
-async fn rate_limiter_throttles() {
-    use bitdaemon::engine::RateLimiter;
-    use std::sync::Arc;
-    let rl = Arc::new(RateLimiter::new(100)); // 100 B/s
-    rl.acquire(60).await;
-    // 40 left — this must wait for a refill
-    let rl2 = rl.clone();
-    let h = tokio::spawn(async move {
-        rl2.acquire(80).await;
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    assert!(!h.is_finished());
-    rl.refill(1000); // +100 tokens
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    assert!(h.is_finished());
-}
-
-#[tokio::test]
-async fn rate_limiter_unlimited() {
-    use bitdaemon::engine::RateLimiter;
-    let rl = RateLimiter::new(0);
-    rl.acquire(1 << 30).await; // instant
+async fn bandwidth_request_queues_on_exhausted_channel() {
+    // `peer_connection::request_bandwidth` — the conn's class channels
+    // carry the limits; an empty channel queues the request until
+    // `update_quotas` distributes (`BandwidthManager` round).
+    use bitdaemon_session::peer_conn::DOWNLOAD_CHANNEL;
+    let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(None)));
+    let mut eng = Engine::new(conn, None);
+    let ih = Sha1Hash::from_bytes(&[6; 20]).unwrap();
+    let t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
+    lock(&eng.session).add_torrent(t);
+    {
+        let s = &mut *lock(&eng.session);
+        let t = s.torrents.get_mut(&ih).unwrap();
+        t.set_download_limit(100, &mut s.peer_class_pool);
+        // wire a peer in so request_bandwidth has a conn
+        let mut c = bitdaemon_session::peer_conn::PeerConn::new(
+            4,
+            bitdaemon_session::peer_pipeline::PeerPipeline::new(3, 60, 250),
+            0,
+        );
+        c.handshake_done = true;
+        t.peers.insert(1, c);
+    }
+    // the class channel starts empty → request queues (0 = queued)
+    let granted = {
+        let mut s = lock(&eng.session);
+        s.request_bandwidth(&ih, 1, DOWNLOAD_CHANNEL, 50)
+    };
+    assert_eq!(granted, Some(0));
+    // one distribution round grants the 100 B/s budget
+    {
+        let mut s = lock(&eng.session);
+        s.update_quotas(1000);
+        let q = s.peer_quota(&ih, 1).unwrap();
+        assert!(q.quota[DOWNLOAD_CHANNEL].load(std::sync::atomic::Ordering::Relaxed) > 0);
+    }
+    eng.tick(std::time::Instant::now()).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -556,46 +571,32 @@ async fn upnp_map_cycle() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn per_torrent_rate_limiters() {
-    // `torrent::set_upload_limit` → a per-ih `RateLimiter` the
-    // writer pump acquires on payload sends.
+async fn per_torrent_rate_limits() {
+    // `torrent::set_upload_limit`/`set_download_limit` land on the
+    // torrent's lazily-created peer class channels — the same knobs
+    // `TorrentHandle::set_*_limit` reach.
     let ih = Sha1Hash::from_bytes(&[6; 20]).unwrap();
     let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(None)));
     let mut eng = Engine::new(conn, None);
     let t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
     lock(&eng.session).add_torrent(t);
-    // torrent limits live on the session's peer-class pool — the
-    // same pool `TorrentHandle::set_upload_limit` reaches.
     {
         let s = &mut *lock(&eng.session);
         let t = s.torrents.get_mut(&ih).unwrap();
         t.set_upload_limit(10, &mut s.peer_class_pool);
         t.set_download_limit(20, &mut s.peer_class_pool);
+        assert_eq!(t.upload_limit(&s.peer_class_pool), 10);
+        assert_eq!(t.download_limit(&s.peer_class_pool), 20);
+        // the torrent's class channels carry the limits verbatim
+        let pc = s.peer_class_pool.at(t.peer_class).unwrap();
+        assert_eq!(
+            pc.channel[bitdaemon_net::peer_class::UPLOAD].throttle_value(),
+            10
+        );
+        assert_eq!(
+            pc.channel[bitdaemon_net::peer_class::DOWNLOAD].throttle_value(),
+            20
+        );
     }
-
-    let _ = eng.tick(std::time::Instant::now()).await;
-    let ul = eng.torrent_up_limiters.get(&ih).unwrap().clone();
-    let dl = eng.torrent_down_limiters.get(&ih).unwrap().clone();
-
-    // 10 B/s bucket starts full; drain then block until refill
-    ul.acquire(10).await;
-    let waiter = tokio::spawn({
-        let ul = ul.clone();
-        async move { ul.acquire(5).await }
-    });
-    tokio::task::yield_now().await;
-    assert!(!waiter.is_finished());
-    ul.refill(1000);
-    waiter.await.unwrap();
-
-    // download limiter exists with its own budget
-    dl.acquire(15).await;
-    dl.acquire(5).await;
-    // empty now — a further acquire must wait for refill
-    let dl2 = dl.clone();
-    let w2 = tokio::spawn(async move { dl2.acquire(1).await });
-    tokio::task::yield_now().await;
-    assert!(!w2.is_finished());
-    dl.refill(1000);
-    w2.await.unwrap();
+    eng.tick(std::time::Instant::now()).await;
 }

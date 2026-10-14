@@ -65,91 +65,10 @@ struct AnnounceDone {
 /// An inbound peer message, tagged with its stream's peer id.
 struct InboundPeerMsg {
     packet: PeerPacket,
-}
-
-/// token-bucket rate limiter shared by every peer writer task —
-/// async counterpart of upstream's `bandwidth_channel` grant loop
-/// (`throttle` sets bytes/s; `0` = unlimited, refill each tick,
-/// burst capped at one second of quota).
-pub struct RateLimiter {
-    tokens: std::sync::atomic::AtomicI64,
-    limit: std::sync::atomic::AtomicI64,
-    notify: tokio::sync::Notify,
-}
-
-impl RateLimiter {
-    /// `bandwidth_channel` — `0` means unlimited.
-    #[must_use]
-    pub fn new(bytes_per_sec: i64) -> Self {
-        Self {
-            tokens: std::sync::atomic::AtomicI64::new(bytes_per_sec),
-            limit: std::sync::atomic::AtomicI64::new(bytes_per_sec),
-            notify: tokio::sync::Notify::new(),
-        }
-    }
-
-    /// `throttle`.
-    pub fn set_limit(&self, bytes_per_sec: i64) {
-        self.limit
-            .store(bytes_per_sec, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// `m_quota[download_channel] > 0` — the channel had budget
-    /// left this tick (unlimited ⇒ always). Gates request-timeout
-    /// snubbing upstream; fed to `Session::set_download_quota_available`.
-    pub fn quota_available(&self) -> bool {
-        self.limit.load(std::sync::atomic::Ordering::Relaxed) <= 0
-            || self.tokens.load(std::sync::atomic::Ordering::Relaxed) > 0
-    }
-
-    /// `update_quota` — grant one `dt_ms` worth of tokens (cap = 1s).
-    pub fn refill(&self, dt_ms: i64) {
-        let limit = self.limit.load(std::sync::atomic::Ordering::Relaxed);
-        if limit <= 0 {
-            return;
-        }
-        let grant = limit * dt_ms / 1000;
-        let mut cur = self.tokens.load(std::sync::atomic::Ordering::Relaxed);
-        loop {
-            let next = (cur + grant).min(limit);
-            match self.tokens.compare_exchange_weak(
-                cur,
-                next,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(t) => cur = t,
-            }
-        }
-        self.notify.notify_waiters();
-    }
-
-    /// `assign_bandwidth` — wait until `n` bytes may be sent.
-    pub async fn acquire(&self, n: i64) {
-        if self.limit.load(std::sync::atomic::Ordering::Relaxed) <= 0 {
-            return;
-        }
-        loop {
-            let cur = self.tokens.load(std::sync::atomic::Ordering::Relaxed);
-            if cur >= n {
-                if self
-                    .tokens
-                    .compare_exchange_weak(
-                        cur,
-                        cur - n,
-                        std::sync::atomic::Ordering::Relaxed,
-                        std::sync::atomic::Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    return;
-                }
-                continue;
-            }
-            self.notify.notified().await;
-        }
-    }
+    /// raw socket bytes consumed by this read chunk — attributed to
+    /// the first message decoded from it (`counters::recv_bytes`
+    /// counts wire bytes, including partial/deferred frames).
+    wire_bytes: usize,
 }
 
 /// result of an async dial job (`session_impl::on_connection_attempt`).
@@ -322,19 +241,14 @@ pub struct Engine {
     /// (upstream `m_connect_speed`). `run` uses it when the caller
     /// doesn't pass an explicit per-tick budget.
     pub connection_speed: i32,
-    /// `settings_pack::upload_rate_limit` — shared upload token
-    /// bucket for every peer writer (payload bytes only, like
-    /// upstream's channel-0 data accounting).
-    pub upload_limiter: Arc<RateLimiter>,
-    /// `settings_pack::download_rate_limit` — shared download
-    /// bucket (upstream throttles incoming payload the same way).
-    pub download_limiter: Arc<RateLimiter>,
-    /// per-torrent limiters (`torrent::set_upload_limit`/
-    /// `set_download_limit` → `peer_class` channels upstream).
-    /// Created lazily in `attach_stream`, re-throttled each tick.
-    pub torrent_up_limiters: std::collections::HashMap<Sha1Hash, Arc<RateLimiter>>,
-    /// per-torrent download limiters.
-    pub torrent_down_limiters: std::collections::HashMap<Sha1Hash, Arc<RateLimiter>>,
+    /// `m_last_tick` for `update_quotas` — the quota distribution
+    /// needs the real elapsed time between ticks, not the 1 Hz
+    /// interval (this loop also fires on inbound/disk events).
+    last_quota_tick: Instant,
+    /// `m_last_second_tick` — upstream gates the heavy
+    /// `second_tick` work (session/torrent/conn) to once a second
+    /// while `update_quotas` runs every `tick_interval`.
+    last_second_tick: Instant,
     /// uTP socket manager (`utp_socket_manager`) — demuxes uTP
     /// datagrams on the shared UDP socket when enabled.
     pub utp_manager: Option<Arc<bitdaemon_net::utp_stream::UtpManager>>,
@@ -430,10 +344,8 @@ impl Engine {
             // `settings_pack::max_out_request_queue` default.
             max_out_request_queue: 500,
             connection_speed: 30,
-            upload_limiter: Arc::new(RateLimiter::new(0)),
-            download_limiter: Arc::new(RateLimiter::new(0)),
-            torrent_up_limiters: std::collections::HashMap::new(),
-            torrent_down_limiters: std::collections::HashMap::new(),
+            last_quota_tick: Instant::now(),
+            last_second_tick: Instant::now(),
             utp_manager: None,
             utp_connector: None,
             utp_enabled: false,
@@ -686,6 +598,14 @@ impl Engine {
         }
 
         while let Ok(m) = self.inbound_rx.try_recv() {
+            // `counters::recv_bytes` — raw socket bytes, attributed
+            // to the first message decoded from each read chunk.
+            if m.wire_bytes > 0 {
+                slock(&self.session).counters.add(
+                    bitdaemon_session::counters::Counter::RecvBytes,
+                    m.wire_bytes as i64,
+                );
+            }
             slock(&self.session).on_peer_message(&m.packet, &mut out);
         }
         while let Ok((ih, peer)) = self.gone_rx.try_recv() {
@@ -758,48 +678,28 @@ impl Engine {
             self.portmap_add_device(dev, port, "bitdaemon".to_string());
         }
 
-        // `update_quota` — refill the upload bucket each tick
-        self.upload_limiter
-            .set_limit(slock(&self.session).settings.upload_rate_limit);
-        self.upload_limiter.refill(1000);
-        self.download_limiter
-            .set_limit(slock(&self.session).settings.download_rate_limit);
-        self.download_limiter.refill(1000);
-        // per-torrent channels — `torrent::set_{up,down}load_limit`
+        // `session_impl::update_quotas` — distribute quota to queued
+        // bandwidth requests with the elapsed time (upstream runs it
+        // every `tick_interval` = 500 ms, independent of the 1 s
+        // `second_tick` work).
         {
-            let ses = slock(&self.session);
-            for (ih, t) in &ses.torrents {
-                let up = t.upload_limit(&ses.peer_class_pool);
-                let down = t.download_limit(&ses.peer_class_pool);
-                self.torrent_up_limiters
-                    .entry(*ih)
-                    .or_insert_with(|| Arc::new(RateLimiter::new(up)))
-                    .set_limit(up);
-                self.torrent_down_limiters
-                    .entry(*ih)
-                    .or_insert_with(|| Arc::new(RateLimiter::new(down)))
-                    .set_limit(down);
-            }
-        }
-        self.torrent_up_limiters
-            .retain(|ih, _| slock(&self.session).torrents.contains_key(ih));
-        self.torrent_down_limiters
-            .retain(|ih, _| slock(&self.session).torrents.contains_key(ih));
-        for l in self
-            .torrent_up_limiters
-            .values()
-            .chain(self.torrent_down_limiters.values())
-        {
-            l.refill(1000);
+            let dt = now
+                .saturating_duration_since(self.last_quota_tick)
+                .as_millis() as i64;
+            slock(&self.session).update_quotas(dt);
+            self.last_quota_tick = now;
         }
         // refresh the acceptor's known info-hash set
         *self.known_ihs.lock().unwrap_or_else(|e| e.into_inner()) =
             slock(&self.session).torrents.keys().copied().collect();
-        // `m_quota[download_channel] > 0` — the per-conn quota
-        // upstream's bw_manager hands out; our single bucket is the
-        // approximation — a starved channel skips snub checks.
-        slock(&self.session).set_download_quota_available(self.download_limiter.quota_available());
-        slock(&self.session).tick(&mut out);
+        // `on_tick` gate — the per-second `second_tick` aggregate only
+        // runs once ≥1 s elapsed (`m_last_second_tick`); quota
+        // distribution above still rides the fast tick.
+        if now.saturating_duration_since(self.last_second_tick) >= std::time::Duration::from_secs(1)
+        {
+            self.last_second_tick = now;
+            slock(&self.session).tick(&mut out);
+        }
         slock(&self.session).tracker_announce_due(now, 0, &mut out);
         self.dispatch(out).await;
         self.natpmp_renew().await;
@@ -2226,10 +2126,9 @@ impl Engine {
     }
 
     /// `session_impl::apply_settings_pack` — swap settings and
-    /// re-arm the engine-side limiters/timeouts immediately.
+    /// re-arm the engine-side timeouts immediately (rate limits live
+    /// on the peer-class channels, updated inside `apply_settings`).
     pub fn apply_settings(&mut self, s: bitdaemon_session::settings::SessionSettings) {
-        self.upload_limiter.set_limit(s.upload_rate_limit);
-        self.download_limiter.set_limit(s.download_rate_limit);
         self.queue_time = s.request_queue_time.as_secs() as i32;
         self.request_timeout = s.request_timeout.as_secs() as i32;
         // `m_max_out_request_queue` reads `max_out_request_queue`,
@@ -2893,12 +2792,15 @@ impl Engine {
         stop: F,
         max_dials_per_tick: usize,
     ) {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         let disk_notify = self.disk_notify.clone();
         tokio::pin!(stop);
         loop {
+            // `m_tick_interval` — upstream reschedules its tick timer
+            // from `settings_pack::tick_interval` each round (default
+            // 500 ms); read it live so `apply_settings` retunes.
+            let tick = slock(&self.session).settings.tick_interval;
             tokio::select! {
-                _ = interval.tick() => {}
+                _ = tokio::time::sleep(tick) => {}
                 m = self.inbound_rx.recv() => {
                     // upstream's io_context services peer messages as they
                     // arrive — batching them until the 1 Hz tick would let
@@ -2909,11 +2811,23 @@ impl Engine {
                     // the resulting effects, and loop back to select.
                     let mut out = Vec::new();
                     if let Some(m) = m {
+                        if m.wire_bytes > 0 {
+                            slock(&self.session).counters.add(
+                                bitdaemon_session::counters::Counter::RecvBytes,
+                                m.wire_bytes as i64,
+                            );
+                        }
                         slock(&self.session).on_peer_message(&m.packet, &mut out);
                     }
                     for _ in 0..1024 {
                         match self.inbound_rx.try_recv() {
                             Ok(m) => {
+                                if m.wire_bytes > 0 {
+                                    slock(&self.session).counters.add(
+                                        bitdaemon_session::counters::Counter::RecvBytes,
+                                        m.wire_bytes as i64,
+                                    );
+                                }
                                 slock(&self.session).on_peer_message(&m.packet, &mut out);
                             }
                             Err(_) => break,
@@ -3195,19 +3109,37 @@ impl Engine {
         let inbound_tx = self.inbound_tx.clone();
         let gone_tx = self.gone_tx.clone();
         let sent_tx = self.sent_tx.clone();
-        let ul = self.upload_limiter.clone();
-        let dl = self.download_limiter.clone();
-        let tul = self.torrent_up_limiters.get(&ih).cloned();
-        let tdl = self.torrent_down_limiters.get(&ih).cloned();
+        let session = Arc::clone(&self.session);
+        // `m_quota[]`/`m_channel_state[]` — the conn's bandwidth
+        // handle (shared with the session's `PeerConn`; a conn that
+        // died during `peer_connected` gets a detached handle — the
+        // `gone`/disconnect path tears the task down).
+        let bw = slock(&session)
+            .peer_quota(&ih, peer)
+            .unwrap_or_else(bitdaemon_session::peer_conn::PeerQuota::new);
         let write_gates = self.write_gates.clone();
+        let ipv6 = remote.is_ipv6();
         // one task owns the stream: select between inbound decode and
         // outbound encode (upstream's per-connection pump). Reads go
-        // through `read_buf` + a persistent buffer — `read_message`'s
-        // two-phase `read_exact` is NOT cancellation-safe inside a
-        // `select!`: a losing read leaves the length bytes consumed
-        // and desyncs the frame stream.
+        // through a persistent buffer — `read_message`'s two-phase
+        // `read_exact` is NOT cancellation-safe inside a `select!`:
+        // a losing read leaves the length bytes consumed and desyncs
+        // the frame stream.
         let h = tokio::spawn(async move {
+            use bitdaemon_session::peer_conn::{DOWNLOAD_CHANNEL, UPLOAD_CHANNEL};
+            use std::sync::atomic::Ordering::Relaxed;
             let mut buf = bytes::BytesMut::with_capacity(256 * 1024);
+            // capped read staging — `async_read_some(reserve(
+            // min(max_receive, quota)))` upstream: the socket only
+            // pulls what the quota allows, so the wire never runs
+            // ahead of the limiter.
+            let mut tmp = vec![0u8; 64 * 1024];
+            // `m_send_buffer` — the task-local tail of queued
+            // messages that outran the upload quota (drained first,
+            // before new `rx` traffic, like upstream's chained_buffer
+            // holding what one `async_write_some` couldn't cover).
+            let mut pending: std::collections::VecDeque<PeerMessage> =
+                std::collections::VecDeque::new();
             let mut rc4 = rc4;
             let gate = write_gates.as_ref().map(|g| g.gate((ih, peer)));
             'pump: loop {
@@ -3230,7 +3162,66 @@ impl Engine {
                             )
                             .await;
                         }
-                        tokio::io::AsyncReadExt::read_buf(&mut s, &mut buf).await
+                        // `setup_receive` — `m_quota[download_channel]
+                        // == 0` stalls the read; `request_bandwidth`
+                        // runs *unconditionally* at its head upstream,
+                        // topping up to `wanted_transfer` so a queued
+                        // request's grant lands before the current
+                        // quota drains (prefetch). A pending `bw_limit`
+                        // or sufficient quota makes it a no-op.
+                        let want = loop {
+                            // `m_recv_buffer.max_receive()` upstream —
+                            // the staged room the next read wants.
+                            let spare = (buf.capacity() - buf.len()) as i64;
+                            if slock(&session)
+                                .request_bandwidth(
+                                    &ih,
+                                    peer,
+                                    DOWNLOAD_CHANNEL,
+                                    spare.max(1),
+                                )
+                                .is_none()
+                            {
+                                // conn gone — tear down
+                                return Err(std::io::ErrorKind::BrokenPipe.into());
+                            }
+                            let q = bw.quota[DOWNLOAD_CHANNEL].load(Relaxed);
+                            if q > 0 {
+                                break usize::try_from(q)
+                                    .unwrap_or(tmp.len())
+                                    .min(tmp.len());
+                            }
+                            if bw.disconnecting.load(Relaxed) {
+                                return Err(std::io::ErrorKind::BrokenPipe.into());
+                            }
+                            // quota exhausted and a request is queued
+                            // (`bw_limit` set) → wait for the grant;
+                            // `bw_limit` unset means the manager granted
+                            // nothing yet but the request isn't queued
+                            // — loop back and re-check/re-request.
+                            if bw.channel_state[DOWNLOAD_CHANNEL]
+                                .load(Relaxed)
+                                & bitdaemon_session::peer_info::BandwidthState::LIMIT.0
+                                != 0
+                            {
+                                bw.wait_grant(DOWNLOAD_CHANNEL).await;
+                            } else {
+                                tokio::task::yield_now().await;
+                            }
+                        };
+                        // `bw_network` — a socket op in flight
+                        bw.channel_state[DOWNLOAD_CHANNEL].fetch_or(
+                            bitdaemon_session::peer_info::BandwidthState::NETWORK.0,
+                            Relaxed,
+                        );
+                        let r = tokio::io::AsyncReadExt::read(
+                            &mut s, &mut tmp[..want],
+                        ).await;
+                        bw.channel_state[DOWNLOAD_CHANNEL].fetch_and(
+                            !bitdaemon_session::peer_info::BandwidthState::NETWORK.0,
+                            Relaxed,
+                        );
+                        r
                     } => {
                         match r {
                             Ok(0) => {
@@ -3238,24 +3229,30 @@ impl Engine {
                                 break;
                             }
                             Ok(n) => {
+                                // `on_receive_data` — consume quota
+                                // by *socket* bytes, then charge the
+                                // IP/TCP overhead (`trancieve_ip_packet`
+                                // hits both directions — the packet
+                                // we got plus the ACK we send).
+                                bw.quota[DOWNLOAD_CHANNEL].fetch_sub(n as i64, Relaxed);
+                                let oh = bitdaemon_session::peer_conn::PeerConn::ip_overhead_bytes(
+                                    n as i64,
+                                    ipv6,
+                                );
+                                bw.ip_overhead[DOWNLOAD_CHANNEL].fetch_add(oh, Relaxed);
+                                bw.ip_overhead[UPLOAD_CHANNEL].fetch_add(oh, Relaxed);
+                                buf.extend_from_slice(&tmp[..n]);
                                 // RC4 stream decryption happens in
                                 // place before frame decode.
                                 if let Some(r) = &mut rc4 {
                                     let tail = buf.len() - n;
                                     r.decrypt(&mut buf[tail..]);
                                 }
+                                let mut fresh = n;
                                 loop {
                                 match bitdaemon_net::bt_peer_conn::decode_next(&mut buf) {
                                     Ok(Some(msg)) => {
-                                        // download throttle — hold the
-                                        // pump, TCP back-pressure does the
-                                        // rest (upstream rate-limits reads)
-                                        if let PeerMessage::Piece { data, .. } = &msg {
-                                            dl.acquire(data.len() as i64).await;
-                                            if let Some(l) = &tdl {
-                                                l.acquire(data.len() as i64).await;
-                                            }
-                                        }
+                                        let wb = std::mem::take(&mut fresh);
                                         if inbound_tx
                                             .send(InboundPeerMsg {
                                                 packet: PeerPacket {
@@ -3264,6 +3261,7 @@ impl Engine {
                                                     remote,
                                                     msg,
                                                 },
+                                                wire_bytes: wb,
                                             })
                                             .is_err()
                                         {
@@ -3284,70 +3282,137 @@ impl Engine {
                             }
                         }
                     }
-                    w = tokio::time::timeout(
-                        std::time::Duration::from_secs(60),
-                        rx.recv(),
-                    ) => {
-                        // upstream sends a keepalive when the conn
-                        // has been silent ~2min; 60s keeps buffers
-                        // warm under NAT without wire chatter.
-                        let w = match w {
-                            Err(_) => Some(PeerMessage::Keepalive),
-                            Ok(v) => v,
-                        };
-                        match w {
-                            Some(msg) => {
-                                // `append_to_send_buffer` — upstream
-                                // batches whatever is queued into the
-                                // chained_buffer and issues one
-                                // vectored write; drain what arrived.
-                                let mut batch = vec![msg];
-                                while batch.len() < 64 {
-                                    match rx.try_recv() {
-                                        Ok(m) => batch.push(m),
-                                        Err(_) => break,
-                                    }
-                                }
-                                // throttle bulk payload (upstream
-                                // throttles on the send path)
-                                for m in &batch {
-                                    if let PeerMessage::Piece { data, .. } = m {
-                                        ul.acquire(data.len() as i64).await;
-                                        if let Some(l) = &tul {
-                                            l.acquire(data.len() as i64).await;
-                                        }
-                                    }
-                                }
-                                let wres = if let Some(r) = &mut rc4 {
-                                    bitdaemon_net::bt_peer_conn::write_messages_rc4(
-                                        &mut s, r, &batch,
-                                    )
-                                    .await
-                                } else {
-                                    write_messages(&mut s, &batch).await
-                                };
-                                match wres {
-                                    Err(e) => {
-                                        debug!(peer = peer, remote = ?remote, err = %e, "peer write error, dropping");
-                                        break;
-                                    }
-                                    Ok(()) => {
-                                        // `on_sent` — the bytes left
-                                        // the send buffer; session
-                                        // re-runs `fill_send_buffer`.
-                                        let n: usize = batch
-                                            .iter()
-                                            .map(bitdaemon_net::peer_wire::wire_len)
-                                            .sum();
-                                        let _ = sent_tx.send((ih, peer, n));
-                                    }
-                                }
+                    // `setup_send` — the whole quota dance lives in
+                    // the select future so a parked `wait_grant` does
+                    // NOT stall the read arm (upstream's reads keep
+                    // running while the upload channel is starved).
+                    // Resolves to the quota-capped batch to write.
+                    w = async {
+                        // `append_to_send_buffer` — new work lands on
+                        // `pending`; a 60 s idle conn gets a keepalive.
+                        if pending.is_empty() {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(60),
+                                rx.recv(),
+                            ).await {
+                                Ok(Some(m)) => pending.push_back(m),
+                                Ok(None) => return None,
+                                Err(_) => pending.push_back(PeerMessage::Keepalive),
                             }
-                            None => break,
+                        }
+                        while pending.len() < 64 {
+                            match rx.try_recv() {
+                                Ok(m) => pending.push_back(m),
+                                Err(_) => break,
+                            }
+                        }
+                        let queued_bytes: i64 = pending
+                            .iter()
+                            .map(|m| bitdaemon_net::peer_wire::wire_len(m) as i64)
+                            .sum();
+                        // `setup_send` head — `request_bandwidth` runs
+                        // unconditionally upstream, topping up to
+                        // `wanted_transfer` so a queued grant is in
+                        // flight before the current quota drains
+                        // (prefetch); a pending `bw_limit` or
+                        // sufficient quota makes it a no-op.
+                        slock(&session)
+                            .request_bandwidth(&ih, peer, UPLOAD_CHANNEL, queued_bytes.max(1))?;
+                        // `can_write` — need ≥ the first message's
+                        // quota before issuing the write.
+                        loop {
+                            let q = bw.quota[UPLOAD_CHANNEL].load(Relaxed);
+                            let first = bitdaemon_net::peer_wire::wire_len(&pending[0]) as i64;
+                            if q >= first {
+                                break;
+                            }
+                            if bw.disconnecting.load(Relaxed) {
+                                return None;
+                            }
+                            if bw.channel_state[UPLOAD_CHANNEL]
+                                .load(Relaxed)
+                                & bitdaemon_session::peer_info::BandwidthState::LIMIT.0
+                                != 0
+                            {
+                                bw.wait_grant(UPLOAD_CHANNEL).await;
+                            } else {
+                                // no queued request and not enough
+                                // quota — re-request (grant may have
+                                // landed between checks)
+                                slock(&session).request_bandwidth(
+                                    &ih,
+                                    peer,
+                                    UPLOAD_CHANNEL,
+                                    queued_bytes.max(1),
+                                )?;
+                                tokio::task::yield_now().await;
+                            }
+                        }
+                        // `min(send_buffer.size(), quota)` — upstream
+                        // writes a quota-truncated byte run; ours is
+                        // message-granular (same wire stream).
+                        let q = bw.quota[UPLOAD_CHANNEL].load(Relaxed);
+                        let mut bytes = 0i64;
+                        let mut n = 0usize;
+                        for m in &pending {
+                            let wl = bitdaemon_net::peer_wire::wire_len(m) as i64;
+                            if n > 0 && bytes + wl > q {
+                                break;
+                            }
+                            bytes += wl;
+                            n += 1;
+                        }
+                        let batch: Vec<PeerMessage> =
+                            pending.drain(..n).collect();
+                        Some((batch, bytes))
+                    } => {
+                        let Some((batch, sent_bytes)) = w else {
+                            break 'pump;
+                        };
+                        // `bw_network` for the duration of the write
+                        bw.channel_state[UPLOAD_CHANNEL].fetch_or(
+                            bitdaemon_session::peer_info::BandwidthState::NETWORK.0,
+                            Relaxed,
+                        );
+                        let wres = if let Some(r) = &mut rc4 {
+                            bitdaemon_net::bt_peer_conn::write_messages_rc4(
+                                &mut s, r, &batch,
+                            )
+                            .await
+                        } else {
+                            write_messages(&mut s, &batch).await
+                        };
+                        bw.channel_state[UPLOAD_CHANNEL].fetch_and(
+                            !bitdaemon_session::peer_info::BandwidthState::NETWORK.0,
+                            Relaxed,
+                        );
+                        match wres {
+                            Err(e) => {
+                                debug!(peer = peer, remote = ?remote, err = %e, "peer write error, dropping");
+                                break;
+                            }
+                            Ok(()) => {
+                                // `on_send_data` — debit the quota by
+                                // socket bytes + account the IP/TCP
+                                // overhead (header per packet + the
+                                // ACK going back).
+                                bw.quota[UPLOAD_CHANNEL].fetch_sub(sent_bytes, Relaxed);
+                                let oh = bitdaemon_session::peer_conn::PeerConn::ip_overhead_bytes(
+                                    sent_bytes,
+                                    ipv6,
+                                );
+                                bw.ip_overhead[UPLOAD_CHANNEL].fetch_add(oh, Relaxed);
+                                bw.ip_overhead[DOWNLOAD_CHANNEL].fetch_add(oh, Relaxed);
+                                // `on_sent` — the bytes left the send
+                                // buffer; session re-runs
+                                // `fill_send_buffer`.
+                                let _ = sent_tx.send((ih, peer, sent_bytes as usize));
+                            }
                         }
                     }
                 }
             }
+            bw.disconnecting.store(true, Relaxed);
             if let Some(g) = &write_gates {
                 g.remove(&(ih, peer));
             }
@@ -3495,6 +3560,14 @@ fn crypto_select(provide: u32, pe: bitdaemon_net::pe_crypto::PeSettings) -> u32 
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        // `session_impl::abort_stage2` — closing the bandwidth
+        // managers drains queued requests (each peer gets its
+        // assigned quota dispatched) before the tasks abort.
+        if let Ok(s) = self.session.lock() {
+            let mut s = s;
+            s.download_rate.close();
+            s.upload_rate.close();
+        }
         for t in &self.tasks {
             t.abort();
         }
