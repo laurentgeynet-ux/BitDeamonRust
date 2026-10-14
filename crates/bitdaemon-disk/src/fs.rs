@@ -292,8 +292,7 @@ mod linux_drive {
         let Ok(md) = std::fs::metadata(path) else {
             return DriveKind::Spinning;
         };
-        // SAFETY: pure arithmetic on a dev_t.
-        let device_id = unsafe { format!("{}:{}\n", libc::major(md.dev()), libc::minor(md.dev())) };
+        let device_id = format!("{}:{}\n", libc::major(md.dev()), libc::minor(md.dev()));
         let Ok(entries) = std::fs::read_dir("/sys/block") else {
             return DriveKind::Spinning;
         };
@@ -308,9 +307,10 @@ mod linux_drive {
             match std::fs::read_to_string(base.join("queue/rotational")).as_deref() {
                 Ok("1\n") => return DriveKind::Spinning,
                 Ok("0\n") => {
-                    return if std::fs::read_to_string(base.join("queue/dax")).as_deref()
-                        == Ok("1\n")
-                    {
+                    return if matches!(
+                        std::fs::read_to_string(base.join("queue/dax")).as_deref(),
+                        Ok("1\n")
+                    ) {
                         DriveKind::SsdDax
                     } else {
                         DriveKind::SsdDisk

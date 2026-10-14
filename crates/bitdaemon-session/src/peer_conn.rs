@@ -1304,9 +1304,15 @@ impl PeerConn {
                     eff.push(PeerEffect::Unsnub);
                 }
                 let block = self.on_piece(&r, block_size);
-                eff.push(PeerEffect::MarkDownloaded(block));
-                eff.push(PeerEffect::BlockFinished(block));
+                // upstream `incoming_piece` order: the redundant
+                // `is_downloaded` consult and the `async_write`
+                // dispatch run *before* `mark_as_writing` — emit
+                // `DiskWrite` first so the torrent-side gate reads
+                // the pre-mark picker state. `block_finished_alert`
+                // posts on write completion (session side), never at
+                // receipt.
                 eff.push(PeerEffect::DiskWrite(r, data.to_vec(), waste));
+                eff.push(PeerEffect::MarkDownloaded(block));
                 // `check_graceful_pause` runs before the
                 // re-pick upstream (`is_disconnecting` then skips it).
                 eff.push(PeerEffect::GracefulCheck);

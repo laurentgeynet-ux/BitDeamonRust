@@ -3472,6 +3472,11 @@ impl Torrent {
         // the post-block pick when the payload was waste — set by the
         // `DiskWrite` arm, consumed by the next `MaybePick`.
         let mut waste_pick = false;
+        // `incoming_piece` returns before `mark_as_writing` when a
+        // block is redundant or we're seeding — the `DiskWrite` arm
+        // classifies it (it runs first in the batch) and records the
+        // block here so the trailing `MarkDownloaded` is dropped.
+        let mut skipped_writes: Vec<PieceBlock> = Vec::new();
         for e in effects {
             match e {
                 PeerEffect::RefcountInc(i) => {
@@ -3500,18 +3505,23 @@ impl Torrent {
                     // (the queue-entry flags pick timed_out /
                     // cancelled / end_game / unknown); neither
                     // reaches disk.
+                    let block = PieceBlock {
+                        piece_index: req.piece,
+                        block_index: req.start / self.block_size().max(1),
+                    };
                     if self.is_seed() {
                         self.add_redundant_bytes(
                             i64::from(req.length),
                             crate::peer_conn::WasteReason::Seed,
                             counters,
                         );
+                        skipped_writes.push(block);
                         continue;
                     }
-                    let block = PieceBlock {
-                        piece_index: req.piece,
-                        block_index: req.start / self.block_size().max(1),
-                    };
+                    // upstream consults `is_downloaded` *before*
+                    // `mark_as_writing` — `DiskWrite` precedes
+                    // `MarkDownloaded` in the batch for exactly that
+                    // reason.
                     if self.picker.as_ref().is_some_and(|p| p.is_downloaded(block)) {
                         self.add_redundant_bytes(i64::from(req.length), waste, counters);
                         // upstream re-picks on the freed slot
@@ -3520,6 +3530,7 @@ impl Torrent {
                         // picks` — the `MaybePick` next in the batch
                         // picks up this flag.
                         waste_pick = true;
+                        skipped_writes.push(block);
                         continue;
                     }
                     out.push(TorrentEffect::DiskWrite {
@@ -3707,6 +3718,12 @@ impl Torrent {
                     }
                 }
                 PeerEffect::MarkDownloaded(b) => {
+                    // upstream returns before `mark_as_writing` for
+                    // seed/redundant blocks — the `DiskWrite` arm
+                    // classified them already.
+                    if skipped_writes.contains(&b) {
+                        continue;
+                    }
                     if let Some(p) = self.picker.as_mut() {
                         p.mark_as_writing(b, key);
                     }

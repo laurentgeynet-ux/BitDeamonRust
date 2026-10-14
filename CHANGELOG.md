@@ -139,6 +139,27 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- **Downloaded blocks never reached disk**: `PeerEffect::DiskWrite`
+  was emitted *after* `MarkDownloaded` in the same batch, so the
+  redundant-block `is_downloaded` consult in `apply_peer_effects`
+  (added in `69f2c8e`) observed the just-marked `Writing` state and
+  dropped every payload — the swarm downloaded at full rate, progress
+  climbed, but `have` stayed at 0, no flush ran and no file was ever
+  created. The effects are now emitted in upstream `incoming_piece`
+  order (`is_downloaded` consult + `async_write` dispatch, *then*
+  `mark_as_writing`); blocks classified seed/redundant suppress their
+  trailing `MarkDownloaded` exactly like upstream's early return. The
+  receipt-time `block_finished_alert` emission is also gone — upstream
+  posts it from `on_disk_write_complete` only (the session already
+  does), so the alert no longer double-fires nor fires for blocks the
+  disk rejected.
+- Linux CI compile fix: `drive_kind`'s `queue/dax` probe compared
+  `Result<&str, &io::Error>` with `==` (`io::Error` isn't
+  `PartialEq`); the `#[cfg]`-gated arm only compiled on Linux, which
+  is why the failure never showed on Windows. Also dropped a stray
+  `unsafe` wrapper around `format!` in the same probe. CI matrices
+  gained `fail-fast: false` so a Linux failure no longer cancels the
+  Windows leg mid-run.
 - Upstream-sync fixes (libtorrent `RC_2_1` up to `v2.1.2-62-ge7381c7bc`):
   `file_piece_range_exclusive` no longer emits an inverted range when a
   mid-piece-start file owns no whole piece — `end` is clamped to `begin`
