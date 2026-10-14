@@ -14,7 +14,7 @@ use bitdaemon_core::merkle::{
     merkle_num_nodes,
 };
 use bitdaemon_core::merkle_tree::MerkleTree;
-use bitdaemon_disk::hash_picker::{HashPicker, HashRequest};
+use bitdaemon_disk::hash_picker::{HashPicker, HashPickerState, HashRequest};
 
 const BLOCK: usize = 0x4000;
 
@@ -64,7 +64,8 @@ fn pick_piece_layer() {
         MerkleTree::new(n, 1, root1()),
     ];
 
-    let mut picker = HashPicker::new(&fs, &mut trees);
+    let mut hp_state = HashPickerState::default();
+    let mut picker = HashPicker::new(&fs, &mut trees, &mut hp_state);
 
     let mut pieces = Bitfield::with_size(8 * 512);
     pieces.set_all();
@@ -98,7 +99,8 @@ fn hash_picker_empty_trees() {
     add_file(&mut fs, "test/tmp1", 4 * 512 * 16 * 1024);
 
     let mut trees: Vec<MerkleTree> = Vec::new();
-    let mut picker = HashPicker::new(&fs, &mut trees);
+    let mut hp_state = HashPickerState::default();
+    let mut picker = HashPicker::new(&fs, &mut trees, &mut hp_state);
 
     let pieces = Bitfield::with_value(4 * 512, true);
     assert_eq!(picker.pick_hashes(&pieces).count, 0);
@@ -111,7 +113,8 @@ fn hash_picker_reject_piece_hashes() {
     add_file(&mut fs, "test/tmp1", 100 * 16 * 1024);
 
     let mut trees = vec![MerkleTree::new(100 * 16, 16, root1())];
-    let mut picker = HashPicker::new(&fs, &mut trees);
+    let mut hp_state = HashPickerState::default();
+    let mut picker = HashPicker::new(&fs, &mut trees, &mut hp_state);
     picker.verify_block_hashes(PieceIndex(40));
 
     let pieces = Bitfield::with_value(100, true);
@@ -129,7 +132,8 @@ fn block_hash_request_reissued_after_timeout() {
     add_file(&mut fs, "test/tmp1", 100 * 16 * BLOCK as i64);
 
     let mut trees = vec![MerkleTree::new(100 * 16, 16, root1())];
-    let mut picker = HashPicker::new(&fs, &mut trees);
+    let mut hp_state = HashPickerState::default();
+    let mut picker = HashPicker::new(&fs, &mut trees, &mut hp_state);
     picker.verify_block_hashes(PieceIndex(40));
 
     // no piece data → only the block-hash request can be picked
@@ -170,7 +174,8 @@ fn block_hash_request_resolved_stops_reissue() {
             .is_some()
     );
 
-    let mut picker = HashPicker::new(&fs, &mut trees);
+    let mut hp_state = HashPickerState::default();
+    let mut picker = HashPicker::new(&fs, &mut trees, &mut hp_state);
     picker.verify_block_hashes(PieceIndex(40));
 
     let pieces = Bitfield::with_value(100, false);
@@ -206,7 +211,8 @@ fn block_hash_request_cleared_when_piece_and_block_layer_coincide() {
     let mut trees = vec![MerkleTree::new(513, 1, full_tree[0])];
     trees[0].load_tree(&full_tree, &verified);
 
-    let mut picker = HashPicker::new(&fs, &mut trees);
+    let mut hp_state = HashPickerState::default();
+    let mut picker = HashPicker::new(&fs, &mut trees, &mut hp_state);
     picker.verify_block_hashes(PieceIndex(512));
 
     let pieces = Bitfield::with_value(513, false);
@@ -242,7 +248,8 @@ fn block_hash_request_retried_when_piece_and_block_layer_coincide() {
     let mut trees = vec![MerkleTree::new(513, 1, full_tree[0])];
     trees[0].load_tree(&full_tree, &unverified);
 
-    let mut picker = HashPicker::new(&fs, &mut trees);
+    let mut hp_state = HashPickerState::default();
+    let mut picker = HashPicker::new(&fs, &mut trees, &mut hp_state);
     picker.verify_block_hashes(PieceIndex(512));
 
     let pieces = Bitfield::with_value(513, false);
@@ -267,7 +274,8 @@ fn add_leaf_hashes() {
     let mut trees = vec![MerkleTree::new(4 * 512, 1, full_tree[0])];
 
     {
-        let mut picker = HashPicker::new(&fs, &mut trees);
+        let mut hp_state = HashPickerState::default();
+        let mut picker = HashPicker::new(&fs, &mut trees, &mut hp_state);
 
         let pieces_start = full_tree.len() - merkle_num_leafs(4 * 512);
         let mut hashes: Vec<Sha256Hash> = (0..512).map(|i| full_tree[pieces_start + i]).collect();
@@ -343,7 +351,8 @@ fn add_piece_hashes() {
     let mut trees = vec![MerkleTree::new(4 * 1024, 4, full_tree[0])];
 
     {
-        let mut picker = HashPicker::new(&fs, &mut trees);
+        let mut hp_state = HashPickerState::default();
+        let mut picker = HashPicker::new(&fs, &mut trees, &mut hp_state);
 
         let pieces_start = merkle_num_nodes(1024) - 1024;
 
@@ -385,7 +394,8 @@ fn add_piece_hashes_marks_request_complete() {
     let full_tree = build_tree(4 * 512);
     let mut trees = vec![MerkleTree::new(4 * 512, 4, full_tree[0])];
 
-    let mut picker = HashPicker::new(&fs, &mut trees);
+    let mut hp_state = HashPickerState::default();
+    let mut picker = HashPicker::new(&fs, &mut trees, &mut hp_state);
     let pieces = Bitfield::with_value(512, true);
 
     let picked = picker.pick_hashes(&pieces);

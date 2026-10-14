@@ -138,69 +138,90 @@ struct PieceBlockRequest {
 
 /// `aux::hash_picker`. Holds references — callers keep the trees alive
 /// (upstream stores references too).
+/// The picker's persistent state — upstream `m_hash_picker` is a
+/// torrent member across calls (`piece_hash_requested` throttle
+/// state, `piece_block_requests` retry queue). Opaque to callers:
+/// construct once per torrent (`HashPickerState::default()`
+/// before trees exist), pass `&mut` into each op.
+#[derive(Default)]
+pub struct HashPickerState {
+    /// `m_piece_hash_requested` — per file, per 512-piece chunk.
+    piece_hash_requested: Vec<Vec<PieceHashRequest>>,
+    /// `m_piece_block_requests` — queued per-piece block-layer
+    /// verification requests.
+    piece_block_requests: Vec<PieceBlockRequest>,
+}
+
 pub struct HashPicker<'a> {
     files: &'a FileStorage,
     /// `m_merkle_trees`.
     trees: &'a mut Vec<MerkleTree>,
     piece_layer: i32,
     piece_tree_root_layer: i32,
-    /// `m_piece_hash_requested` — per file, per 512-piece chunk.
-    piece_hash_requested: Vec<Vec<PieceHashRequest>>,
-    piece_block_requests: Vec<PieceBlockRequest>,
+    state: &'a mut HashPickerState,
 }
 
 impl<'a> HashPicker<'a> {
-    /// `hash_picker(files, trees)`.
-    #[must_use]
-    pub fn new(files: &'a FileStorage, trees: &'a mut Vec<MerkleTree>) -> Self {
+    /// `hash_picker(files, trees)` — `state` persists on the
+    /// torrent; when its size doesn't match the tree set (fresh
+    /// metadata) the ctor sweep re-runs.
+    pub fn new(
+        files: &'a FileStorage,
+        trees: &'a mut Vec<MerkleTree>,
+        state: &'a mut HashPickerState,
+    ) -> Self {
         let piece_layer = merkle_num_layers(merkle_num_leafs(
             usize::try_from(files.piece_length()).unwrap_or(0) / DEFAULT_BLOCK_SIZE,
         )) as i32;
         let piece_tree_root_layer = piece_layer + merkle_num_layers(512) as i32;
 
-        let mut piece_hash_requested: Vec<Vec<PieceHashRequest>> = vec![Vec::new(); trees.len()];
-        for (fidx, tree) in trees.iter().enumerate() {
-            let f = FileIndex(fidx as i32);
-            if files.pad_file_at(f) {
-                continue;
-            }
-            let v = tree.verified_leafs();
-            if files.file_size(f) <= i64::from(files.piece_length()) {
-                continue;
-            }
+        if state.piece_hash_requested.len() != trees.len() {
+            let mut piece_hash_requested: Vec<Vec<PieceHashRequest>> =
+                vec![Vec::new(); trees.len()];
+            for (fidx, tree) in trees.iter().enumerate() {
+                let f = FileIndex(fidx as i32);
+                if files.pad_file_at(f) {
+                    continue;
+                }
+                let v = tree.verified_leafs();
+                if files.file_size(f) <= i64::from(files.piece_length()) {
+                    continue;
+                }
 
-            let num_chunks = ((files.file_num_pieces(f) + 511) / 512).max(0) as usize;
-            piece_hash_requested[fidx] = vec![
-                PieceHashRequest {
-                    last_request: None,
-                    num_requests: 0,
-                    have: false
-                };
-                num_chunks
-            ];
+                let num_chunks = ((files.file_num_pieces(f) + 511) / 512).max(0) as usize;
+                piece_hash_requested[fidx] = vec![
+                    PieceHashRequest {
+                        last_request: None,
+                        num_requests: 0,
+                        have: false
+                    };
+                    num_chunks
+                ];
 
-            let piece_layer_idx = merkle_num_layers(merkle_num_leafs(
-                usize::try_from(files.file_num_blocks(f)).unwrap_or(0),
-            )) as i32
-                - piece_layer;
-            let piece_layer_start = merkle_layer_start(piece_layer_idx as usize);
+                let piece_layer_idx = merkle_num_layers(merkle_num_leafs(
+                    usize::try_from(files.file_num_blocks(f)).unwrap_or(0),
+                )) as i32
+                    - piece_layer;
+                let piece_layer_start = merkle_layer_start(piece_layer_idx as usize);
 
-            for i in 0..piece_hash_requested[fidx].len() {
-                let mut j = i * 512;
-                loop {
-                    if j == (i + 1) * 512 || j >= files.file_num_pieces(f) as usize {
-                        piece_hash_requested[fidx][i].have = true;
-                        break;
+                for i in 0..piece_hash_requested[fidx].len() {
+                    let mut j = i * 512;
+                    loop {
+                        if j == (i + 1) * 512 || j >= files.file_num_pieces(f) as usize {
+                            piece_hash_requested[fidx][i].have = true;
+                            break;
+                        }
+                        if (files.piece_length() as usize == DEFAULT_BLOCK_SIZE && !v.get_bit(j))
+                            || (files.piece_length() as usize > DEFAULT_BLOCK_SIZE
+                                && !tree.has_node(piece_layer_start + j))
+                        {
+                            break;
+                        }
+                        j += 1;
                     }
-                    if (files.piece_length() as usize == DEFAULT_BLOCK_SIZE && !v.get_bit(j))
-                        || (files.piece_length() as usize > DEFAULT_BLOCK_SIZE
-                            && !tree.has_node(piece_layer_start + j))
-                    {
-                        break;
-                    }
-                    j += 1;
                 }
             }
+            state.piece_hash_requested = piece_hash_requested;
         }
 
         Self {
@@ -208,8 +229,7 @@ impl<'a> HashPicker<'a> {
             trees,
             piece_layer,
             piece_tree_root_layer,
-            piece_hash_requested,
-            piece_block_requests: Vec::new(),
+            state,
         }
     }
 
@@ -219,13 +239,13 @@ impl<'a> HashPicker<'a> {
         let now = Instant::now();
 
         // per-piece block requests first
-        if let Some(pos) = self.piece_block_requests.iter().position(|e| {
+        if let Some(pos) = self.state.piece_block_requests.iter().position(|e| {
             e.last_request
                 .is_none_or(|t| now.duration_since(t) > MIN_REQUEST_INTERVAL)
         }) {
             let blocks_per_piece = i64::from(self.files.piece_length()) / DEFAULT_BLOCK_SIZE as i64;
-            let file = self.piece_block_requests[pos].file;
-            let piece = self.piece_block_requests[pos].piece;
+            let file = self.state.piece_block_requests[pos].file;
+            let piece = self.state.piece_block_requests[pos].piece;
             let first_block = piece as i64 * blocks_per_piece;
             let nidx = NodeIndex {
                 file,
@@ -238,15 +258,17 @@ impl<'a> HashPicker<'a> {
                 count: blocks_per_piece as i32,
                 proof_layers: self.layers_to_verify(nidx),
             };
-            let req = &mut self.piece_block_requests[pos];
+            let req = &mut self.state.piece_block_requests[pos];
             req.num_requests += 1;
             req.last_request = Some(now);
             // upstream re-sorts by num_requests (stable)
-            self.piece_block_requests.sort_by_key(|r| r.num_requests);
+            self.state
+                .piece_block_requests
+                .sort_by_key(|r| r.num_requests);
             return ret;
         }
 
-        for fidx in 0..self.piece_hash_requested.len() {
+        for fidx in 0..self.state.piece_hash_requested.len() {
             let f = FileIndex(fidx as i32);
             if self.files.pad_file_at(f) || self.files.file_size(f) == 0 {
                 continue;
@@ -256,7 +278,7 @@ impl<'a> HashPicker<'a> {
             let piece_tree_root_layer = (num_layers - self.piece_tree_root_layer).max(0);
             let piece_tree_root_start = merkle_layer_start(piece_tree_root_layer as usize);
 
-            for (i, r) in self.piece_hash_requested[fidx].iter_mut().enumerate() {
+            for (i, r) in self.state.piece_hash_requested[fidx].iter_mut().enumerate() {
                 if r.have
                     || r.last_request
                         .is_some_and(|t| now.duration_since(t) < MIN_REQUEST_INTERVAL)
@@ -305,7 +327,7 @@ impl<'a> HashPicker<'a> {
         req.base == self.piece_layer
             && req.index % 512 == 0
             && req.index < num_pieces
-            && !self.piece_hash_requested[req.file.0 as usize].is_empty()
+            && !self.state.piece_hash_requested[req.file.0 as usize].is_empty()
             && (req.count == 512 || (req.count <= 512 && unpadded == num_pieces - req.index))
     }
 
@@ -371,7 +393,8 @@ impl<'a> HashPicker<'a> {
         if valid_piece_layer {
             let mut i = req.index;
             while i < req.index + req.count {
-                self.piece_hash_requested[req.file.0 as usize][(i / 512) as usize].have = true;
+                self.state.piece_hash_requested[req.file.0 as usize][(i / 512) as usize].have =
+                    true;
                 i += 512;
             }
         }
@@ -383,11 +406,12 @@ impl<'a> HashPicker<'a> {
                 num_requests: 0,
             };
             if let Some(pos) = self
+                .state
                 .piece_block_requests
                 .iter()
                 .position(|r| r.file == resolved.file && r.piece == resolved.piece)
             {
-                self.piece_block_requests.remove(pos);
+                self.state.piece_block_requests.remove(pos);
             }
         }
         ret
@@ -469,6 +493,7 @@ impl<'a> HashPicker<'a> {
                 num_requests: 0,
             };
             if let Some(r) = self
+                .state
                 .piece_block_requests
                 .iter_mut()
                 .find(|r| r.file == resolved.file && r.piece == resolved.piece)
@@ -481,7 +506,8 @@ impl<'a> HashPicker<'a> {
         if self.matches_piece_layer_request(req) {
             let mut i = req.index;
             while i < req.index + req.count {
-                let r = &mut self.piece_hash_requested[req.file.0 as usize][(i / 512) as usize];
+                let r =
+                    &mut self.state.piece_hash_requested[req.file.0 as usize][(i / 512) as usize];
                 r.last_request = None;
                 r.num_requests = (r.num_requests - 1).max(0);
                 i += 512;
@@ -495,13 +521,14 @@ impl<'a> HashPicker<'a> {
         let fidx = self.files.file_index_at_piece(index);
         let piece = index.0 - self.files.piece_index_at_file(fidx).0;
         if self
+            .state
             .piece_block_requests
             .iter()
             .any(|r| r.file == fidx && r.piece == piece)
         {
             return;
         }
-        self.piece_block_requests.insert(
+        self.state.piece_block_requests.insert(
             0,
             PieceBlockRequest {
                 file: fidx,
