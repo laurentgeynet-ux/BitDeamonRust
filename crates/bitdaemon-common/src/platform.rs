@@ -5,30 +5,46 @@
 //! Port of `platform_util.cpp` — OS process queries upstream uses
 //! for the file-pool size default and thread naming. Implemented
 //! unsafe-free via procfs on unix-likes; other platforms get the
-//! upstream "can't query" fallback (`i32::MAX` open files, no-op
-//! naming — upstream tolerates failure everywhere).
+//! upstream "can't query" fallbacks (1024 / 10 000 open files,
+//! no-op naming — upstream tolerates failure everywhere).
+//! Upstream's `TORRENT_BUILD_SIMULATOR` build-define (256) has no
+//! runtime equivalent; `bitdaemon-sim` sets its own pool sizes.
 
 /// `max_open_files` — `getrlimit(RLIMIT_NOFILE)` equivalent. On
-/// unix we read `/proc/self/limits` ("Max open files" row); a
-/// `unlimited`/`infinity` value or any query failure yields
-/// `i32::MAX` (upstream returns `inf` for `RLIM_INFINITY` and for
-/// platforms without getrlimit).
+/// unix we read `/proc/self/limits` ("Max open files" row) since
+/// `getrlimit` would need `unsafe` FFI; `unlimited` maps to
+/// upstream's `inf` constant (10 000 000) and a query failure to
+/// 1024 — the same values `platform_util.cpp` returns. On
+/// platforms without rlimit semantics (Windows) upstream returns
+/// a fixed 10 000.
 #[must_use]
 pub fn max_open_files() -> i32 {
-    if let Ok(limits) = std::fs::read_to_string("/proc/self/limits") {
-        for line in limits.lines() {
-            if let Some(rest) = line.strip_prefix("Max open files") {
-                let mut fields = rest.split_whitespace();
-                if let Some(cur) = fields.next() {
-                    if let Ok(v) = cur.parse::<i64>() {
-                        return v.clamp(0, i64::from(i32::MAX)) as i32;
+    /// upstream's `inf` sentinel (`platform_util.cpp`).
+    const INF: i32 = 10_000_000;
+    if cfg!(unix) {
+        if let Ok(limits) = std::fs::read_to_string("/proc/self/limits") {
+            for line in limits.lines() {
+                if let Some(rest) = line.strip_prefix("Max open files") {
+                    let mut fields = rest.split_whitespace();
+                    if let Some(cur) = fields.next() {
+                        if cur == "unlimited" {
+                            return INF;
+                        }
+                        if let Ok(v) = cur.parse::<i64>() {
+                            return v.clamp(0, i64::from(INF)) as i32;
+                        }
                     }
+                    break;
                 }
-                break;
             }
         }
+        // no procfs (macOS, BSD…) or unparsable — upstream's
+        // getrlimit-failure value.
+        1024
+    } else {
+        // upstream's non-rlimit fallback (Windows).
+        10_000
     }
-    i32::MAX
 }
 
 /// `set_thread_name` — best-effort naming for the current thread

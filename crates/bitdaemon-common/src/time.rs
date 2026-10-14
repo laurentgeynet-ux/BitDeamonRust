@@ -38,16 +38,17 @@ impl Milliseconds32 {
 pub type Minutes32 = Milliseconds32;
 
 /// `minutes(n)` → `Milliseconds32` (`minutes32` is `i32` *minutes* upstream,
-/// flattened here to milliseconds since Rust has one `Duration`).
+/// flattened here to milliseconds since Rust has one `Duration`; saturates
+/// past the ~24.8-day i32-ms range upstream can't express either way).
 #[must_use]
 pub const fn minutes(n: i32) -> Milliseconds32 {
-    Milliseconds32(n * 60_000)
+    Milliseconds32(n.saturating_mul(60_000))
 }
 
-/// `seconds32(n)`.
+/// `seconds32(n)` — saturates like [`minutes`].
 #[must_use]
 pub const fn seconds32(n: i32) -> Milliseconds32 {
-    Milliseconds32(n * 1_000)
+    Milliseconds32(n.saturating_mul(1_000))
 }
 
 /// `milliseconds32(n)`.

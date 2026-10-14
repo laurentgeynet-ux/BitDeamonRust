@@ -11,6 +11,7 @@
 //! | [`peer_id`]   | `peer_id.hpp`, `src/generate_peer_id.cpp`          |
 //! | [`types`]     | `units.hpp`, `peer_request.hpp`, `piece_block.hpp`, `download_priority.hpp` |
 //! | [`error`]     | `error_code.hpp` usage patterns                    |
+//! | [`lt_error`]  | `error_code.hpp`, `src/error_code.cpp` (`lt::errors` codes + messages) |
 //! | [`flags`]     | `flags.hpp`, `torrent_flags.hpp`, `pex_flags.hpp`, `kademlia/announce_flags.hpp` |
 //! | [`time`]      | `time.hpp` (clock/duration aliases)                |
 //! | [`sliding_average`] | `aux_/sliding_average.hpp`                   |
@@ -18,6 +19,10 @@
 //! | [`bloom_filter`] | `aux_/bloom_filter.hpp`, `src/bloom_filter.cpp` |
 //! | [`mod@random`]    | `random.hpp`, `src/random.cpp`                     |
 //! | [`crc32c`]    | `aux_/crc32c.hpp`, `src/crc32c.cpp`                |
+//! | [`ffs`]       | `aux_/ffs.hpp`, `src/ffs.cpp`                      |
+//! | [`identify_client`] | `identify_client.hpp`, `src/identify_client.cpp` — canonical `identify_client_impl` |
+//! | [`platform`]  | `src/platform_util.cpp` (`max_open_files`, `set_thread_name`) |
+//! | [`version`]   | `version.hpp`, `src/version.cpp`                   |
 //! | [`mod@index_range`] | `index_range.hpp`                                |
 //! | [`timestamp_history`] | `aux_/timestamp_history.hpp`, `compare_less_wrap` (`utp_stream.cpp`) |
 //!
