@@ -8,10 +8,12 @@ human or AI — contributing code. Read it fully before touching anything.
 
 ## 1. Mission and ground truth
 
-- **Reference implementation**: libtorrent `master` @ `v2.1.2-45-gc019e80ef`
+- **Reference implementation**: libtorrent `master` @ `v2.1.2-62-ge7381c7bc`
   (~170 000 LOC: ~114k `src/*.cpp`, ~55k `include/**/*.hpp`).
 - **Local C++ checkout**: `D:\Projet\libtorrent\libtorrent`
-  (read-only reference — never modify, never copy wholesale).
+  (read-only reference between syncs — the « sync libtorrent »
+  workflow fast-forwards it to each new baseline itself; never modify
+  by hand, never copy wholesale).
 - **Fidelity rule**: match *wire behavior, file formats and state-machine
   semantics* of the C++ code, not its line-by-line structure. We write
   idiomatic Rust, we do not transliterate C++.

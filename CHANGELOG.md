@@ -139,6 +139,24 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- Upstream-sync fixes (libtorrent `RC_2_1` up to `v2.1.2-62-ge7381c7bc`):
+  `file_piece_range_exclusive` no longer emits an inverted range when a
+  mid-piece-start file owns no whole piece — `end` is clamped to `begin`
+  and `index_range` asserts `begin ≤ end` (upstream `e7381c7bc`; the
+  inverted `IndexIter` looped forever and could overflow `i32`).
+  Trackers whose URL scheme is unsupported (`http|https|udp|ws|wss`
+  only) are now skipped in `due()`, `next_announce_time`, force-announce
+  and scrape paths instead of falling into the HTTP dispatch arm — they
+  stay pristine rather than being marked failed (upstream `e0716cf24`).
+  WebSocket trackers propagate a correlated `failure reason` as an
+  announce error and ignore uncorrelated failure frames (no `info_hash`)
+  while continuing the read — previously a failure frame produced a
+  successful all-zeros response; announce intervals are clamped to
+  `min_websocket_announce_interval` (upstream `0ee23cc89` + `73f4832de`).
+  DHT `peer_prefix_limit`/`peer_prefix_limit_full` regression tests
+  ported (the IPv6 /56 cap itself was already faithful — upstream
+  `6089cdeea`). `bind_to_device` device-name socket binding is an
+  explicit won't-port decision (upstream `3f5989b60`; see PORTING.md).
 - `peer_class::set_*_limit` clamp kept `0` as *unlimited* like
   upstream (`limit < 10 && limit > 0 → 10`); a `0` limit was
   wrongly throttled to 10 B/s on the `set_peer_class` path.
