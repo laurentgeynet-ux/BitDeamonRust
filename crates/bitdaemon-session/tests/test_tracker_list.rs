@@ -14,17 +14,17 @@ use bitdaemon_session::tracker_list::{AnnounceEntry, RETRY_MAX, TrackerList};
 fn quadratic_backoff_matches_upstream() {
     let mut e = AnnounceEntry::new("udp://t:80", 0);
     let now = Instant::now();
-    // upstream comment: fails=1..  delay = 5 + f²·5·250/100 → 17.5, 55, ...
-    // (ratio 250 → multiplier f²·12.5; upstream values 7,15,27 use ratio 50)
-    e.failed(50, Duration::ZERO, now); // f=1 → 5+5*0.5 = 7.5s
+    // upstream: delay = 5 + f²·5·ratio/100 with integer seconds32
+    // math — 250/100 truncates to 2 (not 2.5).
+    e.failed(50, Duration::ZERO, now); // f=1 → 5+1*5*50/100 = 7s
     let t = e.next_announce().unwrap() - now;
-    assert_eq!(t, Duration::from_millis(7500));
-    e.failed(50, Duration::ZERO, now); // f=2 → 5+4*5*0.5 = 15s
+    assert_eq!(t, Duration::from_secs(7));
+    e.failed(50, Duration::ZERO, now); // f=2 → 5+4*5*50/100 = 15s
     let t = e.next_announce().unwrap() - now;
     assert_eq!(t, Duration::from_secs(15));
-    e.failed(50, Duration::ZERO, now); // f=3 → 5+9*5*0.5 = 27.5s
+    e.failed(50, Duration::ZERO, now); // f=3 → 5+9*5*50/100 = 27s
     let t = e.next_announce().unwrap() - now;
-    assert_eq!(t, Duration::from_millis(27_500));
+    assert_eq!(t, Duration::from_secs(27));
 }
 
 #[test]
@@ -45,11 +45,12 @@ fn tier_ordering_and_failover() {
     l.add(AnnounceEntry::new("udp://a:80", 0)); // dedup
     assert_eq!(l.trackers.len(), 2);
     assert_eq!(l.trackers[0].url, "udp://a:80");
-    // exhaust tier-0's fail_limit
+    // exhaust tier-0's fail_limit — upstream's announce_state then
+    // fails over to the next tier (no announce_to_all flags).
     l.trackers[0].fail_limit = 1;
     l.trackers[0].failed(250, Duration::ZERO, Instant::now());
     let now = Instant::now() + Duration::from_secs(3600);
-    let due = l.due(now, false);
+    let due = l.due(now, false, false, false);
     assert_eq!(due, vec![1]); // only tier-2 remains
 }
 

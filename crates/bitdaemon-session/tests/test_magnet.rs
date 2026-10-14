@@ -73,6 +73,7 @@ fn wrong_metadata_rejected() {
 fn auto_managed_queue_limits_downloads() {
     use bitdaemon_session::session::Session;
     let mut ses = Session::new();
+    ses.settings.active_downloads = 2;
     for i in 0..4u8 {
         let ih = Sha1Hash::from_bytes(&[i; 20]).unwrap();
         ses.add_torrent(Torrent::new(
@@ -83,7 +84,7 @@ fn auto_managed_queue_limits_downloads() {
             StorageIndex(u32::from(i)),
         ));
     }
-    ses.manage_queue(2, -1);
+    ses.manage_queue(&mut Vec::new());
     let queued: Vec<_> = ses.torrents.values().map(|t| t.queued).collect();
     assert_eq!(queued.iter().filter(|q| **q).count(), 2);
     // upstream `auto_manage_torrents`: pausing an auto-managed
@@ -92,7 +93,7 @@ fn auto_managed_queue_limits_downloads() {
     // requires clearing `auto_managed` first.
     let first = *ses.torrents.keys().next().unwrap();
     ses.set_paused(&first, true, &mut Vec::new());
-    ses.manage_queue(2, -1);
+    ses.manage_queue(&mut Vec::new());
     let queued2 = ses.torrents.values().filter(|t| t.queued).count();
     assert_eq!(queued2, 2);
     // clearing auto_managed makes the pause sticky → the torrent
@@ -102,7 +103,7 @@ fn auto_managed_queue_limits_downloads() {
         t.auto_managed = false;
         t.paused = true;
     }
-    ses.manage_queue(2, -1);
+    ses.manage_queue(&mut Vec::new());
     let queued2 = ses.torrents.values().filter(|t| t.queued).count();
     assert_eq!(queued2, 1);
     assert!(ses.torrents.get(&first).unwrap().paused);
@@ -118,6 +119,19 @@ fn smart_ban_disconnects_corrupt_peer() {
     let mut t = Torrent::new(ih, 1, 16384, Bitfield::with_size(1), StorageIndex(0));
     t.init_picker(true);
     t.add_peer(7, PeerConn::new(1, PeerPipeline::new(1000, 30, 250), 0));
+    // upstream `on_piece_verified` ignores pieces the picker doesn't
+    // consider finished — simulate the download completing.
+    if let Some(p) = t.picker.as_mut() {
+        for b in 0..p.blocks_in_piece(PieceIndex(0)) {
+            p.mark_as_finished(
+                PieceBlock {
+                    piece_index: PieceIndex(0),
+                    block_index: b,
+                },
+                None,
+            );
+        }
+    }
     let addr = |_| std::net::IpAddr::from([10, 0, 0, 1]);
     let digest = |b: PieceBlock| Some(Sha1Hash::from_bytes(&[b.block_index as u8; 20]).unwrap());
     // peer 7 wasn't a downloader → no CRC recorded, no ban, but the
@@ -128,6 +142,7 @@ fn smart_ban_disconnects_corrupt_peer() {
         16384,
         false,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut out,
         addr,
         digest,
@@ -171,25 +186,35 @@ fn pex_feeds_swarm_and_broadcasts() {
             id: 0,
             data: bitdaemon_bencode::bencode(&hs.build()).into(),
         },
-        0,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut out,
     );
 
-    // remote sends a pex message adding 10.1.2.3:6881
-    let added_ep = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)), 6881);
-    let (body, _sent) = build_pex_message(&[(added_ep, 0)], &BTreeSet::new());
+    // remote sends a pex message adding 203.0.113.9:6881 — a public
+    // endpoint (upstream ignores `is_local` adds unless the sender
+    // itself is local; peer 7's remote is public here)
+    t.peers.get_mut(&7).unwrap().remote = Some(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)),
+        6881,
+    ));
+    let added_ep = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 6881);
+    let (body, _sent, _in_msg) = build_pex_message(&[(added_ep, 0)], &BTreeSet::new());
     t.on_peer_message(
         7,
         &PeerMessage::Extended {
-            id: 2, // our local pex id (PeerConn::local_ut_pex)
+            id: 1, // our local pex id (`PeerConn::local_ut_pex` — upstream fixed id 1)
             data: body.into(),
         },
-        0,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut out,
     );
     assert_eq!(t.peer_list.num_peers(), 1);
+
+    // a second connected peer — upstream's peer tick skips pex
+    // entirely when `num_peers() <= 1`
+    t.add_peer(8, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
 
     // tick → we emit a pex diff to the peer (contains peer 7? we
     // advertise remote endpoints of our connections — none have
@@ -242,8 +267,8 @@ fn pex_advertises_only_completed_dialable_peers() {
             id: 0,
             data: bitdaemon_bencode::bencode(&hs.build()).into(),
         },
-        0,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut scratch,
     );
 
@@ -371,6 +396,19 @@ fn magnet_metadata_creates_storage() {
         remote,
         &mut out,
     );
+    // BEP-9: the peer's extended handshake advertised `ut_metadata`
+    // and its `metadata_size` — then our scheduler asks for piece 0
+    // (`maybe_send_request`). An unsolicited `piece` reply would be
+    // dropped upstream ("UNWANTED / TIMED OUT").
+    {
+        let t = s.torrents.get_mut(&ih).unwrap();
+        let conn = t.peers.get_mut(&1).unwrap();
+        conn.ext_ut_metadata = 1;
+        conn.metadata_size = Some(info.len() as i64);
+        let mut eff = Vec::new();
+        t.metadata_tick(&mut eff);
+        assert!(t.peers[&1].metadata_sent_requests.contains(&0));
+    }
     s.on_peer_message(
         &PeerPacket {
             info_hash: ih,
@@ -389,12 +427,25 @@ fn magnet_metadata_creates_storage() {
             peer: 1,
             remote,
             msg: PeerMessage::Extended {
-                id: 1,
+                id: 2, // `local_ut_metadata` — upstream fixed id 2
                 data: packet.into(),
             },
         },
         &mut out,
     );
+
+    // upstream `torrent::init` → `async_check_files` — interest is
+    // deferred until `files_checked` sets `m_connections_initialized`
+    // and replays `pc->init()` per conn. Deliver the check verdict.
+    s.disk_completions()
+        .send(bitdaemon_session::session::DiskCompleted::CheckFiles {
+            ih,
+            accepted: true,
+            status: 0,
+            err: Default::default(),
+        })
+        .unwrap();
+    s.drain_disk_completed(&mut out);
 
     let t = &s.torrents[&ih];
     assert!(t.ti.is_some());

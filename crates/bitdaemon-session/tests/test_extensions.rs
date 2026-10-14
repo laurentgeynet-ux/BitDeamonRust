@@ -104,20 +104,42 @@ fn add_extension_instantiates_and_sees_lifecycle() {
 
     // `torrent::files_checked` → `on_files_checked`.
     let mut out = Vec::new();
-    t.on_files_checked(true, &mut out);
+    t.on_files_checked(
+        true,
+        &Default::default(),
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out,
+    );
     assert_eq!(rec.files_checked.load(Ordering::Relaxed), 1);
 
     // `piece_verified` pass/fail → on_piece_pass/on_piece_failed.
+    // upstream `on_piece_verified` ignores pieces the picker doesn't
+    // consider finished — mark the blocks downloaded first.
+    for i in [0, 1] {
+        if let Some(p) = t.picker.as_mut() {
+            for b in 0..p.blocks_in_piece(PieceIndex(i)) {
+                p.mark_as_finished(
+                    bitdaemon_common::types::PieceBlock {
+                        piece_index: PieceIndex(i),
+                        block_index: b,
+                    },
+                    None,
+                );
+            }
+        }
+    }
     t.piece_verified(
         PieceIndex(0),
         true,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut out,
     );
     t.piece_verified(
         PieceIndex(1),
         false,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut out,
     );
     assert_eq!(rec.piece_pass.load(Ordering::Relaxed), 1);
@@ -137,7 +159,12 @@ fn late_add_extension_replays_files_checked() {
     let ih = Sha1Hash::from_bytes(&[6; 20]).unwrap();
     let mut t = torrent(ih);
     let mut out = Vec::new();
-    t.on_files_checked(true, &mut out);
+    t.on_files_checked(
+        true,
+        &Default::default(),
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out,
+    );
     assert!(t.files_checked);
 
     let rec = Arc::new(Recorder::default());
@@ -164,8 +191,8 @@ fn new_peer_connection_and_message_fanout() {
     t.on_peer_message(
         9,
         &PeerMessage::Have(PieceIndex(0)),
-        0,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut out,
     );
     assert_eq!(rec.peer_msgs.lock().unwrap().len(), 1);
@@ -191,8 +218,10 @@ fn on_pause_veto_keeps_torrent_running() {
 
     let mut out = Vec::new();
     s.set_paused(&ih, true, &mut out);
-    // veto → torrent stays unpaused, no TorrentPaused alert.
-    assert!(!s.torrents.get(&ih).unwrap().paused);
+    // upstream `set_paused` sets `m_paused` first — `on_pause`
+    // vetoes only the do_pause machinery (disconnects, stopped
+    // announce, TorrentPaused alert).
+    assert!(s.torrents.get(&ih).unwrap().paused);
     assert!(
         !s.pop_alerts()
             .iter()
@@ -217,6 +246,8 @@ fn metadata_verdict_distinguishes_retry_from_fatal() {
         t.set_metadata_verdict(
             b"d3:foo3:barde",
             &bitdaemon_core::torrent_info::LoadTorrentLimits::default(),
+            &bitdaemon_session::settings::SessionSettings::default(),
+            &bitdaemon_session::counters::Counters::default(),
             &mut out
         ),
         MetadataVerdict::HashMismatch

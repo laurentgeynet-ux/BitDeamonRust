@@ -84,19 +84,20 @@ impl ConnectionType {
     pub const HTTP_SEED: Self = Self(1 << 2);
 }
 
-/// `bandwidth_state_flags_t`.
+/// `bandwidth_state_flags_t` — upstream bit indices verbatim
+/// (`bw_idle = 0_bit` → the *value* 1, not 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BandwidthState(pub u8);
 
 impl BandwidthState {
-    /// `bw_idle`.
-    pub const IDLE: Self = Self(0);
+    /// `bw_idle` (bit 0 → 1).
+    pub const IDLE: Self = Self(1 << 0);
     /// `bw_limit` — waiting on the rate limiter.
-    pub const LIMIT: Self = Self(1 << 0);
+    pub const LIMIT: Self = Self(1 << 1);
     /// `bw_network` — waiting on socket i/o.
-    pub const NETWORK: Self = Self(1 << 1);
+    pub const NETWORK: Self = Self(1 << 2);
     /// `bw_disk` — waiting on the disk queue.
-    pub const DISK: Self = Self(1 << 2);
+    pub const DISK: Self = Self(1 << 4);
 }
 
 /// `peer_info` — snapshot for API/reporting (Tribler REST). Fields

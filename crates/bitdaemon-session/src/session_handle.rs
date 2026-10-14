@@ -113,6 +113,59 @@ impl SessionHandle {
     /// `session` ctor — build the core from params.
     #[must_use]
     pub fn new(params: SessionParams) -> Self {
+        let mut params = params;
+        // upstream `session` ctor: `params.dht_settings` fills flat
+        // `dht_*` keys that weren't explicitly set — the "settings"
+        // pack wins per-key. We approximate "unset" with "still at
+        // the settings default".
+        {
+            let def = crate::settings::SessionSettings::default();
+            let dht_def = bitdaemon_dht::dht_settings::DhtSettings::default();
+            let (s, d) = (&mut params.settings, &params.dht_settings);
+            macro_rules! merge {
+                ($f:ident, $df:ident) => {
+                    if s.$f == def.$f && d.$df != dht_def.$df {
+                        s.$f = d.$df.into();
+                    }
+                };
+                ($f:ident, $df:ident, dur) => {
+                    if s.$f == def.$f && d.$df != dht_def.$df {
+                        s.$f = std::time::Duration::from_secs(d.$df.max(0) as u64);
+                    }
+                };
+                ($f:ident, $df:ident, clamp) => {
+                    if s.$f == def.$f && d.$df != dht_def.$df {
+                        s.$f = i64::from(d.$df);
+                    }
+                };
+            }
+            merge!(dht_max_peers_reply, max_peers_reply);
+            merge!(dht_search_branching, search_branching);
+            merge!(dht_max_fail_count, max_fail_count);
+            merge!(dht_max_torrents, max_torrents);
+            merge!(dht_max_dht_items, max_dht_items);
+            merge!(dht_max_peers, max_peers);
+            merge!(dht_max_torrent_search_reply, max_torrent_search_reply);
+            merge!(dht_restrict_routing_ips, restrict_routing_ips);
+            merge!(dht_restrict_search_ips, restrict_search_ips);
+            merge!(dht_extended_routing_table, extended_routing_table);
+            merge!(dht_aggressive_lookups, aggressive_lookups);
+            merge!(dht_privacy_lookups, privacy_lookups);
+            merge!(dht_enforce_node_id, enforce_node_id);
+            merge!(dht_ignore_dark_internet, ignore_dark_internet);
+            merge!(dht_block_timeout, block_timeout, dur);
+            merge!(dht_block_ratelimit, block_ratelimit);
+            merge!(dht_read_only, read_only);
+            merge!(dht_item_lifetime, item_lifetime, dur);
+            merge!(dht_upload_rate_limit, upload_rate_limit, clamp);
+            merge!(
+                dht_sample_infohashes_interval,
+                sample_infohashes_interval,
+                dur
+            );
+            merge!(dht_max_infohashes_sample_count, max_infohashes_sample_count);
+            merge!(dht_prefer_verified_node_ids, prefer_verified_node_ids);
+        }
         let mut s = Session::new();
         if let Some(disk) = params.disk_io {
             s.set_disk(disk);
@@ -152,11 +205,17 @@ impl SessionHandle {
         }
     }
 
-    /// `remove_torrent`.
-    pub fn remove_torrent(&self, ih: &Sha1Hash) {
+    /// `remove_torrent` — `remove_flags_t` (`delete_files`/`delete_partfile`)
+    /// routes through the disk delete job; a plain remove only unregisters.
+    pub fn remove_torrent(&self, ih: &Sha1Hash, options: u8) {
         // the handle drains `stopped` announces — a real engine
-        // routes `Session::remove_torrent`'s out-effects itself
-        lock(&self.inner).remove_torrent(ih, &mut Vec::new());
+        // routes the session's out-effects itself
+        let mut s = lock(&self.inner);
+        if options != 0 {
+            s.delete_files(ih, options, &mut Vec::new());
+        } else {
+            s.remove_torrent(ih, &mut Vec::new());
+        }
     }
 
     /// `session_impl::add_torrent` — the real entry point:
@@ -193,19 +252,21 @@ impl SessionHandle {
         }
     }
 
-    /// `get_torrents` — one status per swarm.
+    /// `get_torrents` — one status per swarm. `flags` gates which
+    /// expensive fields fill (upstream `status_flags_t`).
     #[must_use]
-    pub fn torrent_statuses(&self) -> Vec<TorrentStatus> {
+    pub fn torrent_statuses(&self, flags: crate::status::StatusFlags) -> Vec<TorrentStatus> {
         let g = lock(&self.inner);
         g.torrents
             .iter()
-            .map(|(ih, t)| t.status(&g.settings, g.queue_position(ih)))
+            .map(|(ih, t)| t.status(&g.settings, g.queue_position(ih), flags, &g.peer_class_pool))
             .collect()
     }
 
     /// `post_torrent_updates` — posts `state_update_alert`.
-    pub fn post_torrent_updates(&self) {
-        lock(&self.inner).post_torrent_updates();
+    /// `flags` gates which fields fill.
+    pub fn post_torrent_updates(&self, flags: crate::status::StatusFlags) {
+        lock(&self.inner).post_torrent_updates(flags);
     }
 
     /// `pop_alerts` / `wait_for_alert` — drain the alert queue.
@@ -599,10 +660,11 @@ impl SessionHandle {
         lock(&self.inner).dht_add_node(addr);
     }
 
-    /// `add_dht_router` — upstream treats routers the same as nodes
-    /// plus bootstrap priority; our `add_node` seeds equivalently.
+    /// `add_dht_router` — routers land directly in the table and
+    /// persist across `start_dht`/`stop_dht` cycles
+    /// (`m_dht_router_nodes` upstream).
     pub fn add_dht_router(&self, addr: std::net::SocketAddr) {
-        lock(&self.inner).dht_add_node(addr);
+        lock(&self.inner).dht_add_router(addr);
     }
 
     /// `dht_get_peers` — start a `get_peers` traversal; replies
@@ -613,9 +675,10 @@ impl SessionHandle {
 
     /// `dht_announce` — user-level announce on all bound families;
     /// found peers post `dht_get_peers_reply_alert`, the write
-    /// phase runs `announce_peer` to token-holders.
-    pub fn dht_announce(&self, ih: Sha1Hash, port: u16) {
-        lock(&self.inner).dht_announce(ih, port);
+    /// phase runs `announce_peer` to token-holders. `flags` is
+    /// upstream's `dht::announce_flags_t` (seed/implied_port).
+    pub fn dht_announce(&self, ih: Sha1Hash, port: u16, flags: crate::session::DhtAnnounceFlags) {
+        lock(&self.inner).dht_announce(ih, port, flags);
     }
 
     /// `dht_get_item` (immutable) — BEP-44 `get`; the first `r.v`
@@ -664,12 +727,31 @@ impl SessionHandle {
         lock(&self.inner).dht_state()
     }
 
-    /// `set_dht_state` — feed saved state into the routing table.
+    /// `set_dht_state` — feed saved state into the routing table;
+    /// each bound family seeds its bootstrap from `concat(own,
+    /// cross)` like upstream `dht_tracker::start`. Also records
+    /// `nids` so a later bind resolves its stored node id.
     pub fn set_dht_state(&self, st: bitdaemon_dht::dht_state::DhtState) {
         let mut s = lock(&self.inner);
-        if let Some(n) = s.dht.get_node_mut(false) {
-            n.load_state(&st);
+        s.dht_state_seed = st.clone();
+        for v6 in [false, true] {
+            if let Some(n) = s.dht.get_node_mut(v6) {
+                n.load_state(&st);
+            }
         }
+    }
+
+    /// `session_handle::get_dht_settings` — the `dht_*` settings
+    /// keys packed as a `dht_settings` struct.
+    #[must_use]
+    pub fn get_dht_settings(&self) -> bitdaemon_dht::dht_settings::DhtSettings {
+        lock(&self.inner).dht_settings()
+    }
+
+    /// `session_handle::set_dht_settings` — writes the struct into
+    /// the flat `dht_*` keys and re-pushes the live nodes.
+    pub fn set_dht_settings(&self, st: bitdaemon_dht::dht_settings::DhtSettings) {
+        lock(&self.inner).set_dht_settings(st);
     }
 
     /// `post_dht_stats` — routing-table snapshot routed as an alert
@@ -786,9 +868,11 @@ impl SessionHandle {
     }
 
     /// `add_port_mapping` — register an arbitrary mapping with the
-    /// NAT-PMP/UPnP drivers; returns the `port_mapping_t` handle.
+    /// NAT-PMP/UPnP drivers; returns one `port_mapping_t` handle per
+    /// (listen socket × active mapper), matching upstream's
+    /// `std::vector<port_mapping_t>` (empty when no mapper runs).
     /// The actual map work runs on the engine's next tick.
-    pub fn add_port_mapping(&self, protocol: u8, external_port: u16, local_port: u16) -> i32 {
+    pub fn add_port_mapping(&self, protocol: u8, external_port: u16, local_port: u16) -> Vec<i32> {
         lock(&self.inner).add_port_mapping(protocol, external_port, local_port)
     }
 
@@ -828,9 +912,11 @@ impl SessionHandle {
             .map(|pc| pc.get_info())
     }
 
-    /// `set_port_filter` — port access filter for peers.
+    /// `set_port_filter` — port access filter for peers: stores the
+    /// filter and applies it (`port_filter_updated` sweeps every
+    /// torrent's peer list, disconnecting + erasing blocked ports).
     pub fn set_port_filter(&self, f: bitdaemon_net::ip_filter::PortFilter) {
-        lock(&self.inner).port_filter = f;
+        lock(&self.inner).set_port_filter(f, &mut Vec::new());
     }
 
     /// `session_stats_metrics` — the counter metric table
@@ -892,20 +978,30 @@ impl TorrentHandle {
         lock(&self.session).set_paused(&self.info_hash, paused, &mut Vec::new());
     }
 
-    /// `torrent::status`.
+    /// `torrent::status(flags)` — `flags` gates which expensive
+    /// fields fill (upstream `status_flags_t`, default empty).
     #[must_use]
-    pub fn status(&self) -> Option<TorrentStatus> {
+    pub fn status(&self, flags: crate::status::StatusFlags) -> Option<TorrentStatus> {
         let g = lock(&self.session);
-        g.torrents
-            .get(&self.info_hash)
-            .map(|t| t.status(&g.settings, g.queue_position(&self.info_hash)))
+        g.torrents.get(&self.info_hash).map(|t| {
+            t.status(
+                &g.settings,
+                g.queue_position(&self.info_hash),
+                flags,
+                &g.peer_class_pool,
+            )
+        })
     }
 
     /// `prioritize_files` — upstream `torrent_handle::prioritize_files`.
     pub fn prioritize_files(&self, prios: &[bitdaemon_common::types::DownloadPriority]) {
-        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.prioritize_files(prios);
+        let mut guard = lock(&self.session);
+        let s = &mut *guard;
+        let mut eff = Vec::new();
+        if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+            t.prioritize_files(prios, &s.settings, &s.counters, &mut eff);
         }
+        s.route_into_pending(self.info_hash, eff);
     }
 
     /// `file_priorities` — current per-file priorities.
@@ -919,9 +1015,17 @@ impl TorrentHandle {
 
     /// `prioritize_pieces` — direct per-piece overrides.
     pub fn prioritize_pieces(&self, prios: &[bitdaemon_common::types::DownloadPriority]) {
-        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.prioritize_pieces(prios);
+        let mut s = lock(&self.session);
+        let mut eff = Vec::new();
+        {
+            let crate::session::Session {
+                torrents, counters, ..
+            } = &mut *s;
+            if let Some(t) = torrents.get_mut(&self.info_hash) {
+                t.prioritize_pieces(prios, counters, &mut eff);
+            }
         }
+        s.route_into_pending(self.info_hash, eff);
     }
 
     /// `piece_priority`.
@@ -965,17 +1069,24 @@ impl TorrentHandle {
 
     /// `delete_files` — removes the torrent and schedules payload
     /// deletion; `torrent_deleted{,_failed}` arrives via alerts.
+    /// Upstream's `session_handle::delete_files` (`remove_flags_t`
+    /// bit 0) — the bit actually reaches `storage_utils::delete_files`.
     pub fn delete_files(&self, out: &mut SessionOutVec) {
-        lock(&self.session).delete_files(&self.info_hash, 0, out);
+        lock(&self.session).delete_files(
+            &self.info_hash,
+            bitdaemon_disk::storage::remove_flags::DELETE_FILES,
+            out,
+        );
     }
 
     /// `file_progress` — per-file downloaded bytes.
+    /// `piece_granularity` = upstream `file_progress_flags_t::piece_granularity`.
     #[must_use]
-    pub fn file_progress(&self) -> Vec<i64> {
+    pub fn file_progress(&self, piece_granularity: bool) -> Vec<i64> {
         lock(&self.session)
             .torrents
             .get(&self.info_hash)
-            .map_or_else(Vec::new, Torrent::file_progress)
+            .map_or_else(Vec::new, |t| t.file_progress(piece_granularity))
     }
 
     /// `set_piece_deadline` — time-critical pick + optional
@@ -990,15 +1101,23 @@ impl TorrentHandle {
     ) {
         if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
             let mut eff = Vec::new();
-            t.set_piece_deadline(piece, deadline_ms, alert_when_available, &mut eff);
+            t.set_piece_deadline(
+                piece,
+                deadline_ms,
+                alert_when_available,
+                &lock(&self.session).counters,
+                &mut eff,
+            );
             out.extend(eff.into_iter().map(crate::session::SessionOut::Torrent));
         }
     }
 
     /// `reset_piece_deadline`.
-    pub fn reset_piece_deadline(&self, piece: PieceIndex) {
+    pub fn reset_piece_deadline(&self, piece: PieceIndex, out: &mut SessionOutVec) {
         if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.reset_piece_deadline(piece);
+            let mut eff = Vec::new();
+            t.reset_piece_deadline(piece, &mut eff);
+            out.extend(eff.into_iter().map(crate::session::SessionOut::Torrent));
         }
     }
 
@@ -1022,8 +1141,16 @@ impl TorrentHandle {
     }
 
     /// `force_reannounce` — announce now (all trackers or one).
+    /// Upstream schedules rather than dispatches; `0` seconds lands
+    /// on the next announce pass.
     pub fn force_announce(&self, tracker_idx: Option<usize>, out: &mut SessionOutVec) {
-        lock(&self.session).force_announce(&self.info_hash, tracker_idx, out);
+        lock(&self.session).force_announce(
+            &self.info_hash,
+            tracker_idx,
+            0,
+            crate::session::ReannounceFlags::default(),
+            out,
+        );
     }
 
     /// `force_dht_announce` — `get_peers` traversal now.
@@ -1045,20 +1172,24 @@ impl TorrentHandle {
 
     /// `set_upload_limit` / `set_download_limit` — bytes/s, 0 = ∞.
     pub fn set_upload_limit(&self, bytes_per_sec: i64) {
-        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.set_upload_limit(bytes_per_sec);
+        let s = &mut *lock(&self.session);
+        if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+            t.set_upload_limit(bytes_per_sec, &mut s.peer_class_pool);
         }
     }
 
     /// `set_download_limit`.
     pub fn set_download_limit(&self, bytes_per_sec: i64) {
-        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.set_download_limit(bytes_per_sec);
+        let s = &mut *lock(&self.session);
+        if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+            t.set_download_limit(bytes_per_sec, &mut s.peer_class_pool);
         }
     }
 
-    /// `scrape_tracker` — immediate scrape of tracker entry `idx`.
-    pub fn scrape_tracker(&self, tracker_idx: usize, out: &mut SessionOutVec) {
+    /// `scrape_tracker` — immediate scrape of tracker entry `idx`;
+    /// `-1` (or out-of-range) picks `last_working` → `first`
+    /// upstream-style.
+    pub fn scrape_tracker(&self, tracker_idx: i32, out: &mut SessionOutVec) {
         lock(&self.session).scrape_tracker(&self.info_hash, tracker_idx, out);
     }
 
@@ -1095,8 +1226,17 @@ impl TorrentHandle {
 
     /// `connect_peer` — add `remote` as an immediate dial candidate.
     pub fn connect_peer(&self, remote: std::net::SocketAddr) {
-        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.connect_peer(remote);
+        let s = &mut *lock(&self.session);
+        if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+            // only `Alert` effects can arise here (filter gates) —
+            // route them so `peer_blocked_alert` posts.
+            let mut eff = Vec::new();
+            t.connect_peer(remote, &mut eff);
+            for e in eff {
+                if let crate::torrent::TorrentEffect::Alert(a) = e {
+                    s.alerts.post(a);
+                }
+            }
         }
     }
 
@@ -1134,15 +1274,33 @@ impl TorrentHandle {
         mask: bitdaemon_common::flags::TorrentFlags,
     ) {
         let mut s = lock(&self.session);
+        let mut eff = Vec::new();
+        let pause_req = {
+            let Session {
+                settings,
+                torrents,
+                counters,
+                ..
+            } = &mut *s;
+            torrents
+                .get_mut(&self.info_hash)
+                .and_then(|t| t.set_flags(flags, mask, settings, counters, &mut eff))
+        };
+        s.route_into_pending(self.info_hash, eff);
+        // upstream `set_flags(paused)` delegates to
+        // `pause(graceful_pause)` / `resume()` — `m_paused` is never
+        // written by the flag apply itself.
         let mut out = Vec::new();
-        let changed = s
-            .torrents
-            .get_mut(&self.info_hash)
-            .map(|t| t.set_flags(flags, mask));
-        if changed == Some(true) {
-            let paused = flags.contains(bitdaemon_common::flags::TorrentFlags::PAUSED);
-            s.set_paused(&self.info_hash, paused, &mut out);
+        if let Some(paused) = pause_req {
+            if paused {
+                s.set_paused_graceful(&self.info_hash, &mut out);
+            } else {
+                s.resume_torrent(&self.info_hash, &mut out);
+            }
         }
+        // `pause`/`resume` effects — `pending_out` drains on the
+        // next `tick`.
+        s.pending_out.append(&mut out);
     }
 
     /// `torrent_handle::unset_flags(flags)` shorthand.
@@ -1181,7 +1339,7 @@ impl TorrentHandle {
         {
             let mut s = lock(&self.session);
             if let Some(t) = s.torrents.get_mut(&self.info_hash) {
-                t.add_tracker(url, tier);
+                t.add_tracker(url, tier, crate::tracker_list::SOURCE_CLIENT);
             }
         }
     }
@@ -1316,9 +1474,12 @@ impl TorrentHandle {
         self.set_paused(true);
     }
 
-    /// `torrent_handle::resume`.
+    /// `torrent_handle::resume` — upstream `torrent::resume`
+    /// re-arms the announce flags even when the user flag was
+    /// already clear.
     pub fn resume(&self) {
-        self.set_paused(false);
+        let mut s = lock(&self.session);
+        s.resume_torrent(&self.info_hash, &mut Vec::new());
     }
 
     /// `torrent_handle::queue_position_up`.
@@ -1341,22 +1502,23 @@ impl TorrentHandle {
         self.queue_position_set(crate::session::QueueMove::Bottom);
     }
 
-    /// `torrent_handle::upload_limit` — current bytes/s (0 = ∞).
+    /// `torrent_handle::upload_limit` — current bytes/s (-1 = ∞,
+    /// upstream `limit_impl` semantics; 0 on invalid handle).
     #[must_use]
     pub fn upload_limit(&self) -> i64 {
-        lock(&self.session)
-            .torrents
+        let g = lock(&self.session);
+        g.torrents
             .get(&self.info_hash)
-            .map_or(0, |t| t.upload_limit)
+            .map_or(0, |t| t.upload_limit(&g.peer_class_pool))
     }
 
     /// `torrent_handle::download_limit`.
     #[must_use]
     pub fn download_limit(&self) -> i64 {
-        lock(&self.session)
-            .torrents
+        let g = lock(&self.session);
+        g.torrents
             .get(&self.info_hash)
-            .map_or(0, |t| t.download_limit)
+            .map_or(0, |t| t.download_limit(&g.peer_class_pool))
     }
 
     /// `torrent_handle::is_seed` — every piece verified.
@@ -1618,6 +1780,9 @@ impl TorrentHandle {
                     crate::torrent::TorrentEffect::DisconnectPeer {
                         peer: id,
                         reason: "clear_peers",
+                        // `torrent::clear_peers` → `abort` — normal
+                        // teardown, no failcount.
+                        failed: false,
                     },
                 ));
             }
@@ -1672,12 +1837,14 @@ impl TorrentHandle {
         index: bitdaemon_common::types::FileIndex,
         prio: bitdaemon_common::types::DownloadPriority,
     ) {
-        let mut ses = lock(&self.session);
+        let mut guard = lock(&self.session);
+        let ses = &mut *guard;
+        let mut eff = Vec::new();
         if let Some(t) = ses.torrents.get_mut(&self.info_hash) {
             let mut prios = t.file_priorities.clone();
             let err = if let Some(p) = prios.get_mut(index.0 as usize) {
                 *p = prio;
-                t.prioritize_files(&prios);
+                t.prioritize_files(&prios, &ses.settings, &ses.counters, &mut eff);
                 String::new()
             } else {
                 format!("file index {} out of range", index.0)
@@ -1688,15 +1855,16 @@ impl TorrentHandle {
                 error: err,
             });
         }
+        ses.route_into_pending(self.info_hash, eff);
     }
 
     /// `torrent_handle::write_resume_data` — bencoded resume blob.
     #[must_use]
     pub fn write_resume_data(&self) -> Vec<u8> {
-        lock(&self.session)
-            .torrents
+        let g = lock(&self.session);
+        g.torrents
             .get(&self.info_hash)
-            .map_or_else(Vec::new, Torrent::write_resume_data)
+            .map_or_else(Vec::new, |t| t.write_resume_data(&g.peer_class_pool))
     }
 
     /// `torrent_handle::info_hashes` — v1/v2 pair when metadata is
@@ -1768,6 +1936,8 @@ impl TorrentHandle {
     #[must_use]
     pub fn set_metadata(&self, metadata: &[u8]) -> bool {
         let mut s = lock(&self.session);
+        // reborrow through the guard so `torrents`/`settings` split.
+        let s = &mut *s;
         let Some(t) = s.torrents.get_mut(&self.info_hash) else {
             return false;
         };
@@ -1776,6 +1946,8 @@ impl TorrentHandle {
             t.set_metadata_verdict(
                 metadata,
                 &bitdaemon_core::torrent_info::LoadTorrentLimits::default(),
+                &s.settings,
+                &s.counters,
                 &mut eff,
             ),
             crate::torrent::MetadataVerdict::Ok
@@ -1789,35 +1961,49 @@ impl TorrentHandle {
         ok
     }
 
-    /// `torrent_handle::scrape_tracker(url)` — scrape by URL
-    /// (resolves to the tracker index; no-op when unknown).
+    /// `torrent_handle::scrape_tracker(url)` — scrape by URL;
+    /// an unknown url falls back to `last_working`/`first` upstream-style.
     pub fn scrape_tracker_url(&self, url: &str, out: &mut SessionOutVec) {
+        lock(&self.session).scrape_tracker_url(&self.info_hash, url, out);
+    }
+
+    /// `torrent_handle::force_reannounce(seconds, idx, flags)` —
+    /// schedule a manual reannounce on tracker `idx` at
+    /// `now + seconds` (`min_announce` still applies unless
+    /// `IGNORE_MIN_INTERVAL`).
+    pub fn force_reannounce(
+        &self,
+        seconds: i32,
+        idx: usize,
+        flags: crate::session::ReannounceFlags,
+        out: &mut SessionOutVec,
+    ) {
+        lock(&self.session).force_announce(
+            &self.info_hash,
+            Some(idx),
+            i64::from(seconds),
+            flags,
+            out,
+        );
+    }
+
+    /// `torrent_handle::force_reannounce(seconds, url, flags)` —
+    /// upstream resolves `url` to the tracker entry and schedules
+    /// the same manual announce; unknown URLs are ignored.
+    pub fn force_reannounce_url(
+        &self,
+        seconds: i32,
+        url: &str,
+        flags: crate::session::ReannounceFlags,
+        out: &mut SessionOutVec,
+    ) {
         let mut s = lock(&self.session);
         let idx = s
             .torrents
             .get(&self.info_hash)
             .and_then(|t| t.trackers.trackers.iter().position(|e| e.url == url));
         if let Some(i) = idx {
-            s.scrape_tracker(&self.info_hash, i, out);
-        }
-    }
-
-    /// `torrent_handle::force_reannounce(seconds, idx)` — reannounce
-    /// on tracker `idx` (the delay is approximated as immediate;
-    /// scheduling belongs to the engine tick).
-    pub fn force_reannounce(&self, _seconds: i32, idx: usize, out: &mut SessionOutVec) {
-        lock(&self.session).force_announce(&self.info_hash, Some(idx), out);
-    }
-
-    /// `torrent_handle::force_reannounce(seconds, url)`.
-    pub fn force_reannounce_url(&self, _seconds: i32, url: &str, out: &mut SessionOutVec) {
-        let mut s = lock(&self.session);
-        let idx = s
-            .torrents
-            .get(&self.info_hash)
-            .and_then(|t| t.trackers.trackers.iter().position(|e| e.url == url));
-        if let Some(i) = idx {
-            s.force_announce(&self.info_hash, Some(i), out);
+            s.force_announce(&self.info_hash, Some(i), i64::from(seconds), flags, out);
         }
     }
 
@@ -1825,10 +2011,16 @@ impl TorrentHandle {
 
     /// `torrent_handle::post_status` — upstream posts a
     /// `state_update_alert` containing just this torrent.
-    pub fn post_status(&self) {
+    /// `flags` gates which fields fill.
+    pub fn post_status(&self, flags: crate::status::StatusFlags) {
         let mut s = lock(&self.session);
         if let Some(t) = s.torrents.get(&self.info_hash) {
-            let st = t.status(&s.settings, s.queue_position(&self.info_hash));
+            let st = t.status(
+                &s.settings,
+                s.queue_position(&self.info_hash),
+                flags,
+                &s.peer_class_pool,
+            );
             s.alerts.post(Alert::StateUpdate { statuses: vec![st] });
         }
     }
@@ -1906,10 +2098,12 @@ impl TorrentHandle {
     }
 
     /// `torrent_handle::post_file_progress` → `file_progress_alert`.
-    pub fn post_file_progress(&self) {
+    /// `piece_granularity` = upstream `file_progress_flags_t::piece_granularity`:
+    /// report only completed pieces, skip partial-block accounting.
+    pub fn post_file_progress(&self, piece_granularity: bool) {
         let mut s = lock(&self.session);
         if let Some(t) = s.torrents.get(&self.info_hash) {
-            let files = t.file_progress();
+            let files = t.file_progress(piece_granularity);
             s.alerts.post(Alert::FileProgress {
                 ih: self.info_hash,
                 files,

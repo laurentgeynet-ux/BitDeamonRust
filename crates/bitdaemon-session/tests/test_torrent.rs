@@ -24,6 +24,22 @@ fn torrent(pieces: i32) -> Torrent {
     )
 }
 
+/// upstream `on_piece_verified` ignores pieces the picker doesn't
+/// consider finished — simulate the download completing.
+fn finish_piece(t: &mut Torrent, piece: PieceIndex) {
+    if let Some(p) = t.picker.as_mut() {
+        for b in 0..p.blocks_in_piece(piece) {
+            p.mark_as_finished(
+                bitdaemon_common::types::PieceBlock {
+                    piece_index: piece,
+                    block_index: b,
+                },
+                None,
+            );
+        }
+    }
+}
+
 #[test]
 fn peer_bitfield_refcounts_picker() {
     let mut t = torrent(8);
@@ -34,6 +50,11 @@ fn peer_bitfield_refcounts_picker() {
         &PeerMessage::Bitfield(bytes::Bytes::from(vec![0b1100_0000u8])),
         8,
         0x4000,
+        0x4000 * 8,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
         &mut eff,
     );
     t.add_peer(1, c);
@@ -42,6 +63,7 @@ fn peer_bitfield_refcounts_picker() {
         1,
         eff,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut out,
     );
     // pieces 0,1 now have refcount 1
@@ -51,7 +73,12 @@ fn peer_bitfield_refcounts_picker() {
 
     // disconnect → refcount back to 0
     let mut eff2 = Vec::new();
-    t.remove_peer(1, &mut eff2);
+    t.remove_peer(
+        1,
+        &bitdaemon_session::counters::Counters::default(),
+        &bitdaemon_net::peer_class::PeerClassPool::new(),
+        &mut eff2,
+    );
     assert_eq!(
         t.picker
             .as_ref()
@@ -68,11 +95,18 @@ fn piece_verified_broadcasts_have() {
     t.init_picker(true);
     t.add_peer(1, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
     t.add_peer(2, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
+    finish_piece(&mut t, PieceIndex(0));
+    // `announce_piece` skips conns still in handshake.
+    for c in t.peers.values_mut() {
+        c.connecting = false;
+        c.handshake_done = true;
+    }
     let mut out = Vec::new();
     t.piece_verified(
         PieceIndex(0),
         true,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut out,
     );
     // PiecePassed + have to both peers
@@ -99,11 +133,14 @@ fn piece_verified_broadcasts_have() {
 fn all_pieces_makes_seed() {
     let mut t = torrent(2);
     t.init_picker(true);
+    finish_piece(&mut t, PieceIndex(0));
+    finish_piece(&mut t, PieceIndex(1));
     let mut out = Vec::new();
     t.piece_verified(
         PieceIndex(0),
         true,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut out,
     );
     assert!(!t.finished);
@@ -111,6 +148,7 @@ fn all_pieces_makes_seed() {
         PieceIndex(1),
         true,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut out,
     );
     assert!(t.finished && t.is_seed());
@@ -129,25 +167,66 @@ fn rates_stay_nonnegative_on_disconnect() {
     c.stat_up_total = 500_000;
     t.add_peer(1, c);
     let t0 = std::time::Instant::now();
-    t.update_rates(t0);
+    t.update_rates(t0, &mut Vec::new());
     // peer leaves between ticks — its totals vanish from the sum
     let mut eff = Vec::new();
-    t.remove_peer(1, &mut eff);
-    t.update_rates(t0 + std::time::Duration::from_secs(1));
+    t.remove_peer(
+        1,
+        &bitdaemon_session::counters::Counters::default(),
+        &bitdaemon_net::peer_class::PeerClassPool::new(),
+        &mut eff,
+    );
+    t.update_rates(t0 + std::time::Duration::from_secs(1), &mut Vec::new());
     assert!(t.down_rate >= 0 && t.up_rate >= 0, "rates went negative");
     assert_eq!(t.down_rate, 0);
     assert_eq!(t.up_rate, 0);
+}
+
+/// upstream `m_total_uploaded`/`m_stat` payload channels are
+/// monotonic across disconnects — a departing conn folds its totals
+/// into the torrent accumulators (`remove_peer`), and resume data
+/// writes `all_time` seed + session payload.
+#[test]
+fn payload_totals_survive_disconnect() {
+    let mut t = torrent(4);
+    t.init_picker(true);
+    t.all_time_upload = 777; // resume seed (atp.total_uploaded)
+    t.all_time_download = 333;
+    let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
+    c.stat_down_total = 1_000_000;
+    c.stat_up_total = 500_000;
+    t.add_peer(1, c);
+    assert_eq!(t.total_download(), 1_000_000);
+    assert_eq!(t.total_upload(), 500_000);
+    let mut eff = Vec::new();
+    t.remove_peer(
+        1,
+        &bitdaemon_session::counters::Counters::default(),
+        &bitdaemon_net::peer_class::PeerClassPool::new(),
+        &mut eff,
+    );
+    // totals stay — upstream `m_stat`/`m_total_uploaded` never shrink
+    assert_eq!(t.total_download(), 1_000_000);
+    assert_eq!(t.total_upload(), 500_000);
+    // resume writes `m_total_uploaded` — seed + session payload
+    let mut atp = bitdaemon_core::AddTorrentParams::default();
+    let pool = bitdaemon_net::peer_class::PeerClassPool::new();
+    t.to_resume_data(&mut atp, &pool);
+    assert_eq!(atp.total_uploaded, 777 + 500_000);
+    assert_eq!(atp.total_downloaded, 333 + 1_000_000);
 }
 
 #[test]
 fn failed_piece_restores() {
     let mut t = torrent(3);
     t.init_picker(true);
+    finish_piece(&mut t, PieceIndex(1));
     let mut out = Vec::new();
     t.piece_verified(
         PieceIndex(1),
         false,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut out,
     );
     assert!(
@@ -195,7 +274,12 @@ fn fill_send_buffer_gates_reads_on_watermark() {
     t.add_peer(1, c);
 
     let mut out = Vec::new();
-    t.fill_send_buffer(1, &s, &mut out);
+    t.fill_send_buffer(
+        1,
+        &s,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out,
+    );
     // first read admitted, second held (16 KiB in flight >= 10 KiB)
     let reads: Vec<_> = out
         .iter()
@@ -213,7 +297,12 @@ fn fill_send_buffer_gates_reads_on_watermark() {
         c.send_buffer = 0x4000;
     }
     let mut out2 = Vec::new();
-    t.fill_send_buffer(1, &s, &mut out2);
+    t.fill_send_buffer(
+        1,
+        &s,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out2,
+    );
     assert_eq!(
         out2.iter()
             .filter(|e| matches!(e, TorrentEffect::DiskRead { .. }))
@@ -228,7 +317,12 @@ fn fill_send_buffer_gates_reads_on_watermark() {
         c.send_buffer = 0;
     }
     let mut out3 = Vec::new();
-    t.fill_send_buffer(1, &s, &mut out3);
+    t.fill_send_buffer(
+        1,
+        &s,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out3,
+    );
     assert_eq!(
         out3.iter()
             .filter(|e| matches!(e, TorrentEffect::DiskRead { .. }))
@@ -251,7 +345,12 @@ fn fill_send_buffer_gates_reads_on_watermark() {
     }
     t.add_peer(2, c2);
     let mut out4 = Vec::new();
-    t.fill_send_buffer(2, &s, &mut out4);
+    t.fill_send_buffer(
+        2,
+        &s,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out4,
+    );
     assert_eq!(
         out4.iter()
             .filter(|e| matches!(e, TorrentEffect::DiskRead { .. }))

@@ -8,6 +8,65 @@
 
 use bitdaemon_common::{Bitfield, Sha1Hash};
 
+/// `status_flags_t` — selects which expensive fields
+/// `torrent::status` populates (`torrent_handle::status(flags)`,
+/// `post_status`, `post_torrent_updates`, `get_torrent_status`,
+/// `refresh_torrent_status` all take one). Bit positions match
+/// upstream exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatusFlags(pub u32);
+
+impl StatusFlags {
+    /// `query_distributed_copies` (0_bit) — `distributed_*`.
+    pub const QUERY_DISTRIBUTED_COPIES: Self = Self(1 << 0);
+    /// `query_accurate_download_counters` (1_bit) — include
+    /// finished/writing blocks of in-flight pieces in
+    /// `total_done`/`total_wanted_done`.
+    pub const QUERY_ACCURATE_DOWNLOAD_COUNTERS: Self = Self(1 << 1);
+    /// `query_last_seen_complete` (2_bit) — upstream deprecated the
+    /// gate (`last_seen_complete` fills unconditionally); kept for
+    /// flag-bit parity.
+    pub const QUERY_LAST_SEEN_COMPLETE: Self = Self(1 << 2);
+    /// `query_pieces` (3_bit) — `pieces` bitfield.
+    pub const QUERY_PIECES: Self = Self(1 << 3);
+    /// `query_verified_pieces` (4_bit) — `verified_pieces`.
+    pub const QUERY_VERIFIED_PIECES: Self = Self(1 << 4);
+    /// `query_torrent_file` (5_bit) — `torrent_file`.
+    pub const QUERY_TORRENT_FILE: Self = Self(1 << 5);
+    /// `query_name` (6_bit) — `name`.
+    pub const QUERY_NAME: Self = Self(1 << 6);
+    /// `query_save_path` (7_bit) — `save_path`.
+    pub const QUERY_SAVE_PATH: Self = Self(1 << 7);
+    /// `query_renamed_files` (8_bit) — `renamed_files`.
+    pub const QUERY_RENAMED_FILES: Self = Self(1 << 8);
+    /// every field — convenience for callers that want it all.
+    pub const ALL: Self = Self(0x1ff);
+
+    /// `flags & other`.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// `flags | other`.
+    #[must_use]
+    pub const fn or(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// `torrent_status::error_file_none` — the error was not
+/// file-scoped.
+pub const ERROR_FILE_NONE: i32 = -1;
+/// `error_file_ssl_ctx` — the SSL context failed to build.
+pub const ERROR_FILE_SSL_CTX: i32 = -3;
+/// `error_file_metadata` — the error came from loading metadata.
+pub const ERROR_FILE_METADATA: i32 = -4;
+/// `error_file_exception` — a serious non-file error was reported.
+pub const ERROR_FILE_EXCEPTION: i32 = -5;
+/// `error_file_partfile` — the error touched the part file.
+pub const ERROR_FILE_PARTFILE: i32 = -6;
+
 /// `torrent_status::state_t` — the coarse lifecycle state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TorrentState {
@@ -84,12 +143,35 @@ pub struct TorrentStatus {
     /// `ip_filter_applies` — the session IP filter applies to this
     /// torrent's swarm.
     pub ip_filter_applies: bool,
-    /// `name` — torrent display name.
+    /// `flags` — the `torrent_flags_t` snapshot upstream fills with
+    /// `this->flags()` (paused, auto_managed, sequential_download,
+    /// seed_mode, upload_mode, share_mode, super_seeding,
+    /// stop_when_ready, apply_ip_filter…).
+    pub flags: bitdaemon_common::flags::TorrentFlags,
+    /// `sequential_download` — `m_sequential_download`.
+    pub sequential_download: bool,
+    /// `seed_mode` — `m_seed_mode` (resume promised all pieces).
+    pub seed_mode: bool,
+    /// `upload_mode` — `m_upload_mode`.
+    pub upload_mode: bool,
+    /// `share_mode` — `m_share_mode`.
+    pub share_mode: bool,
+    /// `super_seeding` — `m_super_seeding`.
+    pub super_seeding: bool,
+    /// `stop_when_ready` — auto-pause once the disk check lands.
+    pub stop_when_ready: bool,
+    /// `storage_mode` — `m_storage_mode` (allocate/sparse).
+    pub storage_mode: bitdaemon_core::StorageMode,
+    /// `name` — torrent display name (`query_name`-gated upstream).
     pub name: String,
-    /// `save_path`.
+    /// `save_path` (`query_save_path`-gated).
     pub save_path: String,
     /// `error` — last tracker/disk error string ("" = none).
     pub error: String,
+    /// `error_file` — index of the file the error touched, or a
+    /// negative sentinel (`ERROR_FILE_NONE`/`_SSL_CTX`/`_METADATA`/
+    /// `_EXCEPTION`/`_PARTFILE`).
+    pub error_file: i32,
     /// `num_peers` — connected peers.
     pub num_peers: usize,
     /// `num_seeds` — connected seeds (0 when unknown; upstream
@@ -200,7 +282,35 @@ pub struct TorrentStatus {
     /// `completed_time` — epoch seconds when the download finished
     /// (0 = unfinished).
     pub completed_time: i64,
-    /// `last_seen_complete` — epoch seconds of the last tracker
-    /// reply that reported a seed count (-1 = never).
+    /// `last_seen_complete` — `m_swarm_last_seen_complete`: the most
+    /// recent moment *any* source reported a complete copy — our own
+    /// `m_last_seen_complete` (seed-peer payload, resume data) maxed
+    /// over conns' BEP-21 `complete_ago` reports (-1 = never).
     pub last_seen_complete: i64,
+    /// `total` — `calc_bytes(all_pieces)`: the full payload size
+    /// (upstream field; differs from `total_wanted` when some
+    /// pieces/files are `dont_download`).
+    pub total: i64,
+    /// `time_since_upload` — seconds since last payload sent
+    /// (-1 = never). Upstream `st->time_since_upload`.
+    pub time_since_upload: i64,
+    /// `time_since_download` — seconds since last payload received.
+    pub time_since_download: i64,
+    /// `active_time` — deprecated duplicate of `active_duration`
+    /// (upstream still fills both).
+    pub active_time: i64,
+    /// `finished_time` — duplicate of `finished_duration`.
+    pub finished_time: i64,
+    /// `seeding_time` — duplicate of `seeding_duration`.
+    pub seeding_time: i64,
+    /// `torrent_file` — the metainfo (`query_torrent_file`-gated;
+    /// `None` for magnets until the info dict lands).
+    pub torrent_file: Option<std::sync::Arc<bitdaemon_core::TorrentInfo>>,
+    /// `verified_pieces` — `m_verified` bitfield: pieces confirmed
+    /// on disk while in `seed_mode` (`query_verified_pieces`-gated;
+    /// empty outside seed mode).
+    pub verified_pieces: Bitfield,
+    /// `renamed_files` — `file_index → renamed path`
+    /// (`query_renamed_files`-gated).
+    pub renamed_files: std::collections::BTreeMap<i32, String>,
 }

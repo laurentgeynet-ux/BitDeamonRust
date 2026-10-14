@@ -73,6 +73,21 @@ fn piece_verified_sends_not_interested() {
     };
     s.on_peer_message(&p, &mut out);
     out.clear();
+    // upstream `on_piece_verified` ignores pieces the picker doesn't
+    // consider finished — simulate the download completing first.
+    if let Some(t) = s.torrents.get_mut(&ih)
+        && let Some(p) = t.picker.as_mut()
+    {
+        for b in 0..p.blocks_in_piece(PieceIndex(0)) {
+            p.mark_as_finished(
+                bitdaemon_common::types::PieceBlock {
+                    piece_index: PieceIndex(0),
+                    block_index: b,
+                },
+                None,
+            );
+        }
+    }
     // we gain the only piece they had → NotInterested
     s.on_piece_verified(&ih, PieceIndex(0), true, &mut out);
     assert!(

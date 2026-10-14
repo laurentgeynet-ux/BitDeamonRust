@@ -280,12 +280,15 @@ pub fn build_full_list<'a>(peers: impl Iterator<Item = &'a PeerConn>) -> Vec<u8>
 pub fn apply_added(t: &mut crate::torrent::Torrent, added: &[Sha256Hash]) -> bool {
     let mut any = false;
     for h in added {
-        t.peer_list.add_peer_i2p(
-            h.as_bytes().to_vec(),
-            bitdaemon_common::flags::PeerSourceFlags::PEX,
-            true,
-        );
-        any = true;
+        any |= t
+            .peer_list
+            .add_peer_i2p(
+                h.as_bytes().to_vec(),
+                bitdaemon_common::flags::PeerSourceFlags::PEX,
+                bitdaemon_common::flags::PexFlags::NONE,
+                &t.peer_list_state,
+            )
+            .is_some();
     }
     any
 }

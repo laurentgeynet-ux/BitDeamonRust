@@ -968,7 +968,11 @@ const fn or(a: AlertCategory, b: AlertCategory) -> AlertCategory {
 }
 
 impl Alert {
-    /// `alert::type()` → upstream `*_alert::alert_type` id.
+    /// `alert::type()` → upstream `*_alert::alert_type` id. Ids
+    /// 1, 2, 63, 71, 72 are upstream gaps (alert types removed in
+    /// ABI v2); 69 is `mmap_cache_alert`, which only exists under
+    /// `TORRENT_ABI_VERSION == 1` upstream — both intentionally
+    /// absent here.
     #[must_use]
     pub const fn alert_type(&self) -> u32 {
         match self {
@@ -1345,6 +1349,14 @@ impl AlertManager {
         if cat.0 != 0 && !cat.matches(self.mask) {
             return;
         }
+        self.post_unconditional(a);
+    }
+
+    /// `emplace_alert` without the mask gate — upstream calls
+    /// `should_post<T>() || req.triggered_manually` for
+    /// `tracker_reply`/`scrape_reply` so a client-initiated
+    /// announce always reports its result.
+    pub fn post_unconditional(&mut self, a: Alert) {
         if self.pending.len() / (1 + a.priority() as usize) >= self.queue_limit {
             self.dropped.insert(a.alert_type());
             return;
@@ -1425,6 +1437,13 @@ pub trait SessionPlugin: Send + Sync {
     /// `true` vetoes the pause (first true wins, upstream iterates
     /// and stops).
     fn on_pause(&self) -> bool {
+        false
+    }
+
+    /// `torrent_plugin::on_resume` — torrent is resuming;
+    /// returning `true` vetoes the resume machinery (upstream
+    /// `do_resume` iterates and stops on the first true).
+    fn on_resume(&self) -> bool {
         false
     }
 

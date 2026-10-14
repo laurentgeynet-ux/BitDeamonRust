@@ -14,6 +14,15 @@ pub const RETRY_MIN: Duration = Duration::from_secs(5);
 /// `tracker_retry_delay_max`.
 pub const RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 
+/// `tracker_source::source_torrent` — came from the .torrent file.
+pub const SOURCE_TORRENT: u8 = 1;
+/// `tracker_source::source_client` — added via `add_tracker`.
+pub const SOURCE_CLIENT: u8 = 2;
+/// `tracker_source::source_magnet_link` — a magnet `tr=` param.
+pub const SOURCE_MAGNET: u8 = 4;
+/// `tracker_source::source_tex` — tracker exchange.
+pub const SOURCE_TEX: u8 = 8;
+
 /// `announce_infohash` — per-info-hash announce state on one
 /// endpoint. `fails` saturates at 7 bits like upstream.
 #[derive(Clone, Debug, Default)]
@@ -34,6 +43,13 @@ pub struct AnnounceInfohash {
     /// response so `sent()` can mark `start_sent`/`complete_sent`
     /// (upstream `tracker_connection` remembers its request).
     pub sent_event: i32,
+    /// `triggered_manually` — set by `trigger_announce`
+    /// (`force_reannounce`); consumed into `sent_manual` when the
+    /// request goes out.
+    pub triggered_manually: bool,
+    /// `tracker_request::triggered_manually` — the in-flight copy;
+    /// makes `tracker_reply`/`scrape_reply` alerts unconditional.
+    pub sent_manual: bool,
 }
 
 impl AnnounceInfohash {
@@ -45,14 +61,16 @@ impl AnnounceInfohash {
 
     /// `announce_infohash::failed` — quadratic backoff:
     /// `max(retry_interval, min(60min, 5s + fails²·5s·ratio/100))`.
+    /// The 60min cap applies to the backoff term only — a larger
+    /// `retry_interval` is honored verbatim.
     pub fn failed(&mut self, backoff_ratio: i32, retry_interval: Duration, now: Instant) {
         if self.fails < 127 {
             self.fails += 1;
         }
         let sq = i64::from(self.fails) * i64::from(self.fails);
-        let delay = retry_interval
-            .max(RETRY_MIN.mul_f64(1.0 + (sq * i64::from(backoff_ratio)) as f64 / 100.0));
-        let delay = delay.min(RETRY_MAX);
+        let backoff_secs =
+            (5 + sq * 5 * i64::from(backoff_ratio) / 100).min(RETRY_MAX.as_secs() as i64);
+        let delay = retry_interval.max(Duration::from_secs(backoff_secs.max(0) as u64));
         if !self.is_working() {
             self.next_announce = Some(now + delay);
         }
@@ -71,23 +89,26 @@ impl AnnounceInfohash {
         due && min_ok && (self.fails < fail_limit || fail_limit == 0) && !self.updating
     }
 
-    /// `announce_infohash::reset`.
+    /// `announce_infohash::reset` — clears `start_sent` and both
+    /// timers; `fails`/`updating`/`complete_sent` are preserved.
     pub fn reset(&mut self) {
-        *self = Self::default();
+        self.start_sent = false;
+        self.next_announce = None;
+        self.min_announce = None;
     }
 
     /// `announce_endpoint::sent` — successful response bookkeeping:
     /// clears `updating`/`fails`, schedules `next_announce` at
-    /// `now + interval`, `min_announce` at `now + min_interval`,
+    /// `now + interval`, `min_announce` at `now + min_interval`
+    /// (upstream assigns `min_announce` unconditionally — an absent
+    /// `min interval` parses as 30s/60s, clearing any earlier one),
     /// and records the lifecycle event actually delivered
     /// (`started`/`completed`) so it is never sent twice.
-    pub fn sent(&mut self, interval: Duration, min_interval: Option<Duration>, now: Instant) {
+    pub fn sent(&mut self, interval: Duration, min_interval: Duration, now: Instant) {
         self.updating = false;
         self.fails = 0;
         self.next_announce = Some(now + interval);
-        if let Some(m) = min_interval {
-            self.min_announce = Some(now + m);
-        }
+        self.min_announce = Some(now + min_interval);
         match self.sent_event {
             1 => self.complete_sent = true,
             2 => self.start_sent = true,
@@ -130,6 +151,38 @@ impl AnnounceEndpoint {
             .flatten()
             .min()
     }
+
+    /// `trigger_announce` — a client `force_reannounce` schedules
+    /// the entry at `t` (clamped to `min_announce`, +1s like
+    /// upstream) and marks the request manual so its reply posts
+    /// unconditionally.
+    /// `trigger_announce` per endpoint — `next_announce` becomes
+    /// `max(t, min_announce) + 1s`, or `t + 1s` under
+    /// `ignore_min_interval` (which also clears `min_announce`
+    /// like upstream's `time_point32::min`).
+    fn trigger(&mut self, t: Instant, ignore_min: bool) {
+        for slot in [&mut self.v1, &mut self.v2] {
+            slot.next_announce = Some(
+                if ignore_min {
+                    t
+                } else {
+                    slot.min_announce.map_or(t, |m| m.max(t))
+                } + Duration::from_secs(1),
+            );
+            if ignore_min {
+                slot.min_announce = None;
+            }
+            slot.triggered_manually = true;
+        }
+    }
+}
+
+/// `trigger_announce` entry-point helper — schedules every
+/// enabled endpoint of an `AnnounceEntry` at `t`.
+fn trigger_entry(e: &mut AnnounceEntry, t: Instant, ignore_min: bool) {
+    for ep in e.endpoints.iter_mut().filter(|ep| ep.enabled) {
+        ep.trigger(t, ignore_min);
+    }
 }
 
 /// `announce_entry` — one tracker URL and its endpoints.
@@ -147,6 +200,10 @@ pub struct AnnounceEntry {
     pub endpoints: Vec<AnnounceEndpoint>,
     /// `verified` — a working response came back once.
     pub verified: bool,
+    /// `source` bitmask — where we heard about this tracker
+    /// (`SOURCE_*`; dedup merges bits, `0` normalizes to
+    /// `SOURCE_CLIENT` like upstream's `announce_entry` ctor).
+    pub source: u8,
     /// scrape results (`complete`/`incomplete`/`downloaded` from
     /// the last scrape response; -1 = never scraped).
     pub scrape_complete: i64,
@@ -173,6 +230,7 @@ impl AnnounceEntry {
                 ..Default::default()
             }],
             verified: false,
+            source: 0,
             scrape_complete: -1,
             scrape_incomplete: -1,
             scrape_downloaded: -1,
@@ -207,15 +265,24 @@ impl AnnounceEntry {
 
     /// `sent` on every endpoint slot — the entry's announce covers
     /// all slots in this port (one exchange per tracker URL).
-    pub fn sent(&mut self, interval: Duration, min_interval: Option<Duration>, now: Instant) {
+    pub fn sent(&mut self, interval: Duration, min_interval: Duration, now: Instant) {
         for e in &mut self.endpoints {
+            let ev = e.v1.sent_event;
             e.v1.sent(interval, min_interval, now);
             // the v2 slot was held in-flight too — it shares the
-            // schedule (upstream announces each info-hash
-            // separately; our single exchange stands in for both).
+            // schedule and the delivered-event flags (upstream
+            // announces each info-hash separately; our single
+            // exchange stands in for both).
             e.v2.updating = false;
             e.v2.fails = 0;
             e.v2.next_announce = Some(now + interval);
+            e.v2.min_announce = Some(now + min_interval);
+            if ev == 1 {
+                e.v2.complete_sent = true;
+            }
+            if ev == 2 {
+                e.v2.start_sent = true;
+            }
         }
     }
 
@@ -233,12 +300,22 @@ impl AnnounceEntry {
 pub struct TrackerList {
     /// `m_trackers` — always kept sorted by tier.
     pub trackers: Vec<AnnounceEntry>,
+    /// `m_last_working_tracker` — url of the most recent tracker to
+    /// answer an announce (`record_working`; feeds
+    /// `torrent_status::current_tracker`). Empty = none yet.
+    pub last_working_url: String,
 }
 
 impl TrackerList {
-    /// `add_tracker` — insert keeping tier order, dedup by url.
+    /// `add_tracker` — insert keeping tier order, dedup by url;
+    /// a dup merges `source` bits into the existing entry.
     pub fn add(&mut self, e: AnnounceEntry) {
-        if self.trackers.iter().any(|t| t.url == e.url) {
+        let mut e = e;
+        if e.source == 0 {
+            e.source = SOURCE_CLIENT;
+        }
+        if let Some(k) = self.trackers.iter_mut().find(|t| t.url == e.url) {
+            k.source |= e.source;
             return;
         }
         let pos = self
@@ -262,15 +339,136 @@ impl TrackerList {
         self.trackers.iter().position(|t| t.url == url)
     }
 
-    /// `due_trackers` — entries whose `can_announce` fires, in
-    /// tier order (failover = first working tracker wins).
+    /// `announce_with_tracker`'s selection — the upstream
+    /// `announce_state` machine per listen socket (we have one
+    /// logical endpoint, driven by the v1 info-hash slot):
+    ///
+    /// - a *working* entry lowers `state.tier` and resets
+    ///   `sent_announce` — lowest-tier working tracker always wins;
+    /// - a working-but-not-due entry counts as covered
+    ///   (`sent_announce = true`);
+    /// - `announce_to_all_tiers` → at most one announce per tier;
+    /// - neither flag → stop after the first working announce
+    ///   (`state.done`).
     #[must_use]
-    pub fn due(&self, now: Instant, is_seed: bool) -> Vec<usize> {
-        self.trackers
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.can_announce(now, is_seed))
-            .map(|(i, _)| i)
-            .collect()
+    pub fn due(
+        &self,
+        now: Instant,
+        is_seed: bool,
+        to_all_tiers: bool,
+        to_all_trackers: bool,
+    ) -> Vec<usize> {
+        let mut picked = Vec::new();
+        let mut state_tier = i32::MAX;
+        let mut sent_announce = false;
+        let mut done = false;
+        for (i, ae) in self.trackers.iter().enumerate() {
+            if done {
+                break;
+            }
+            for ep in ae.endpoints.iter().filter(|e| e.enabled) {
+                let a = &ep.v1;
+                if to_all_tiers
+                    && !to_all_trackers
+                    && sent_announce
+                    && ae.tier <= state_tier
+                    && state_tier != i32::MAX
+                {
+                    continue;
+                }
+                if ae.tier > state_tier && sent_announce && !to_all_tiers {
+                    continue;
+                }
+                if a.is_working() {
+                    state_tier = ae.tier;
+                    sent_announce = false;
+                }
+                if !a.can_announce(now, is_seed, ae.fail_limit) {
+                    if a.is_working() {
+                        sent_announce = true;
+                        if !to_all_trackers && !to_all_tiers {
+                            done = true;
+                        }
+                    }
+                    continue;
+                }
+                picked.push(i);
+                sent_announce = true;
+                if a.is_working() && !to_all_trackers && !to_all_tiers {
+                    done = true;
+                }
+                // one exchange covers the whole entry (v2 slot
+                // is held in-flight alongside v1)
+                break;
+            }
+        }
+        picked
+    }
+
+    /// `tracker_list::reset` — per-slot `reset()` on every entry:
+    /// clears `start_sent`/`next_announce`/`min_announce` so the
+    /// next announce re-sends `started` (used by
+    /// `torrent::start_announcing` on resume).
+    pub fn reset(&mut self) {
+        for t in &mut self.trackers {
+            for e in &mut t.endpoints {
+                e.v1.reset();
+                e.v2.reset();
+            }
+        }
+    }
+
+    /// `torrent::force_tracker_request` — schedule a manual
+    /// announce for tracker `idx` (or all trackers for `None`) at
+    /// time `t`; `min_announce` still applies (upstream only
+    /// bypasses it under `ignore_min_interval`).
+    /// Returns whether any entry was actually scheduled.
+    pub fn trigger(&mut self, idx: Option<usize>, t: Instant, ignore_min: bool) -> bool {
+        let mut found = false;
+        match idx {
+            Some(i) => {
+                if let Some(e) = self.trackers.get_mut(i) {
+                    trigger_entry(e, t, ignore_min);
+                    found = true;
+                }
+            }
+            None => {
+                for e in &mut self.trackers {
+                    trigger_entry(e, t, ignore_min);
+                }
+                found = !self.trackers.is_empty();
+            }
+        }
+        found
+    }
+
+    /// `tracker_list::set_complete_sent` — latch `complete_sent` on
+    /// every slot. `files_checked` does this for torrents that check
+    /// out as seeds: the `completed` event is assumed sent, so
+    /// `finished()`→`completed()` must not announce it again.
+    pub fn set_complete_sent(&mut self) {
+        for t in &mut self.trackers {
+            for e in &mut t.endpoints {
+                e.v1.complete_sent = true;
+                e.v2.complete_sent = true;
+            }
+        }
+    }
+
+    /// `tracker_list::stop_announcing` — arms every slot at `now`
+    /// (the `stopped` announce sent right after goes out
+    /// immediately), and drops `updating` — upstream's in-flight
+    /// announces are aborted by `session_impl::pause`'s
+    /// `tracker_manager::abort_all_requests`.
+    pub fn stop_announcing(&mut self, now: Instant) {
+        for t in &mut self.trackers {
+            for e in &mut t.endpoints {
+                for a in [&mut e.v1, &mut e.v2] {
+                    a.next_announce = Some(now);
+                    a.min_announce = Some(now);
+                    a.updating = false;
+                }
+            }
+        }
     }
 }

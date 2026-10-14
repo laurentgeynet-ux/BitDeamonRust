@@ -29,7 +29,7 @@ fn ep(a: u8) -> SocketAddr {
 fn tracker_feed_gives_candidates() {
     let mut t = t();
     for n in 1..=4 {
-        t.add_swarm_peer(ep(n), PeerSourceFlags::TRACKER, true);
+        t.add_swarm_peer(ep(n), PeerSourceFlags::TRACKER, &mut Vec::new());
     }
     let st = PeerListState::default();
     let cands = t.connect_candidates(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled);
@@ -41,16 +41,26 @@ fn tracker_feed_gives_candidates() {
 fn seed_still_wants_peers_for_upload() {
     let mut t = t();
     t.finished = true;
+    // `want_peers` needs a dialable candidate — give the swarm one.
+    t.add_swarm_peer(ep(1), PeerSourceFlags::TRACKER, &mut Vec::new());
     // upstream `want_peers_finished`: seeds keep dialing (to serve
     // upload and feed ut_pex) unless seeding_outgoing_connections off
-    assert!(t.want_peers(true));
-    assert!(!t.want_peers(false));
+    let on = bitdaemon_session::settings::SessionSettings {
+        seeding_outgoing_connections: true,
+        ..Default::default()
+    };
+    assert!(t.want_peers(&on));
+    let off = bitdaemon_session::settings::SessionSettings {
+        seeding_outgoing_connections: false,
+        ..on
+    };
+    assert!(!t.want_peers(&off));
 }
 
 #[test]
 fn seed_skips_seed_candidates() {
     let mut t = t();
-    t.add_swarm_peer(ep(1), PeerSourceFlags::TRACKER, true);
+    t.add_swarm_peer(ep(1), PeerSourceFlags::TRACKER, &mut Vec::new());
     // remote is a seed, and we finished too → not a candidate
     t.finished = true;
     let i = t.peer_list.find_peer(ep(1).ip()).unwrap();

@@ -20,7 +20,7 @@ fn build_parse_round_trip() {
         (ep("1.2.3.4", 6881), flags::PEX_ENCRYPTION | flags::PEX_UTP),
         (ep("[2001:db8::1]", 51413), flags::PEX_SEED),
     ];
-    let (body, sent) = build_pex_message(&peers, &BTreeSet::new());
+    let (body, sent, _in_msg) = build_pex_message(&peers, &BTreeSet::new());
     let (added, dropped) = parse_pex_message(&body, 50, 0).expect("parse");
     assert_eq!(added.len(), 2);
     assert!(dropped.is_empty());
@@ -39,17 +39,17 @@ fn build_parse_round_trip() {
 fn diff_added_dropped() {
     let p1 = (ep("1.2.3.4", 1000), 0u8);
     let p2 = (ep("5.6.7.8", 2000), 0u8);
-    let (_body, sent) = build_pex_message(&[p1], &BTreeSet::new());
+    let (_body, sent, _in_msg) = build_pex_message(&[p1], &BTreeSet::new());
     // next round: p1 still there (re-listed as known, not added),
     // p2 new — but p1 disappears next round
-    let (body, sent2) = build_pex_message(&[p1, p2], &sent);
+    let (body, sent2, _in_msg) = build_pex_message(&[p1, p2], &sent);
     let (added, dropped) = parse_pex_message(&body, 50, 0).expect("parse");
     assert_eq!(added.len(), 1);
     assert_eq!(added[0].addr, p2.0);
     assert!(dropped.is_empty());
 
     // now p2 drops out → listed in `dropped`
-    let (body, _) = build_pex_message(&[p1], &sent2);
+    let (body, _, _in_msg) = build_pex_message(&[p1], &sent2);
     let (added, dropped) = parse_pex_message(&body, 50, 0).expect("parse");
     assert!(added.is_empty());
     assert_eq!(dropped, vec![p2.0]);
@@ -59,7 +59,7 @@ fn diff_added_dropped() {
 fn lt_v2_flag_stripped() {
     // a sender that (incorrectly) leaks the internal lt_v2 bit
     let peers = [(ep("1.2.3.4", 6881), flags::PEX_UTP | flags::PEX_LT_V2)];
-    let (body, _) = build_pex_message(&peers, &BTreeSet::new());
+    let (body, _, _in_msg) = build_pex_message(&peers, &BTreeSet::new());
     let (added, _) = parse_pex_message(&body, 50, 0).expect("parse");
     assert_eq!(added[0].flags, flags::PEX_UTP);
 }
@@ -67,7 +67,7 @@ fn lt_v2_flag_stripped() {
 #[test]
 fn max_peers_cap() {
     let peers: Vec<(SocketAddr, u8)> = (0..10).map(|i| (ep("10.0.0.1", 1000 + i), 0u8)).collect();
-    let (body, _) = build_pex_message(&peers, &BTreeSet::new());
+    let (body, _, _in_msg) = build_pex_message(&peers, &BTreeSet::new());
     // already at cap — nothing accepted
     let (added, _) = parse_pex_message(&body, 3, 3).expect("parse");
     assert!(added.is_empty());

@@ -23,7 +23,11 @@ fn ep(a: u8) -> SocketAddr {
 fn announce_cycle() {
     let ih = Sha1Hash::from_bytes(&[4; 20]).unwrap();
     let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
-    t.add_tracker("udp://tr/announce".into(), 0);
+    t.add_tracker(
+        "udp://tr/announce".into(),
+        0,
+        bitdaemon_session::tracker_list::SOURCE_CLIENT,
+    );
     let mut s = Session::new();
     s.add_torrent(t);
 
@@ -64,11 +68,15 @@ fn announce_cycle() {
         peers: vec![ep(1), ep(2)],
         peer_ids: vec![],
         external_ip: None,
+        ..Default::default()
     };
     s.on_announce_response(&ih, "udp://tr/announce", Ok(resp));
     let t = s.torrents.get(&ih).unwrap();
     assert_eq!(t.peer_list.num_peers(), 2);
-    assert_eq!(t.num_seeds, 3);
+    // upstream: announce `complete` is scrape population data —
+    // `m_num_seeds` counts connected seed peers only (none here).
+    assert_eq!(t.complete, 3);
+    assert_eq!(t.num_seeds, 0);
     let i = t.trackers.find("udp://tr/announce").unwrap();
     assert_eq!(t.trackers.trackers[i].tracker_id, "tid1");
     assert!(t.trackers.trackers[i].verified);
@@ -107,7 +115,11 @@ fn announce_cycle() {
 fn announce_failure_backs_off() {
     let ih = Sha1Hash::from_bytes(&[6; 20]).unwrap();
     let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
-    t.add_tracker("http://tr".into(), 0);
+    t.add_tracker(
+        "http://tr".into(),
+        0,
+        bitdaemon_session::tracker_list::SOURCE_CLIENT,
+    );
     let mut s = Session::new();
     s.add_torrent(t);
     s.on_announce_response(&ih, "http://tr", Err("timeout".into()));

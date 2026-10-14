@@ -983,6 +983,67 @@ impl Default for SessionSettings {
     }
 }
 
+impl SessionSettings {
+    /// `session_impl::get_dht_settings` — the `dht_*` keys packed
+    /// as a `dht_settings` struct. Upstream stores these flat in
+    /// the settings_pack and builds the struct on demand.
+    #[must_use]
+    pub fn dht_settings(&self) -> bitdaemon_dht::dht_settings::DhtSettings {
+        let mut s = bitdaemon_dht::dht_settings::DhtSettings::default();
+        s.max_peers_reply = self.dht_max_peers_reply;
+        s.search_branching = self.dht_search_branching;
+        s.max_fail_count = self.dht_max_fail_count;
+        s.max_torrents = self.dht_max_torrents;
+        s.max_dht_items = self.dht_max_dht_items;
+        s.max_peers = self.dht_max_peers;
+        s.max_torrent_search_reply = self.dht_max_torrent_search_reply;
+        s.restrict_routing_ips = self.dht_restrict_routing_ips;
+        s.restrict_search_ips = self.dht_restrict_search_ips;
+        s.extended_routing_table = self.dht_extended_routing_table;
+        s.aggressive_lookups = self.dht_aggressive_lookups;
+        s.privacy_lookups = self.dht_privacy_lookups;
+        s.enforce_node_id = self.dht_enforce_node_id;
+        s.ignore_dark_internet = self.dht_ignore_dark_internet;
+        s.block_timeout = self.dht_block_timeout.as_secs() as i32;
+        s.block_ratelimit = self.dht_block_ratelimit;
+        s.read_only = self.dht_read_only;
+        s.item_lifetime = self.dht_item_lifetime.as_secs() as i32;
+        s.upload_rate_limit = self.dht_upload_rate_limit.clamp(0, i64::from(i32::MAX)) as i32;
+        s.sample_infohashes_interval = self.dht_sample_infohashes_interval.as_secs() as i32;
+        s.max_infohashes_sample_count = self.dht_max_infohashes_sample_count;
+        s.prefer_verified_node_ids = self.dht_prefer_verified_node_ids;
+        s
+    }
+
+    /// `session_impl::set_dht_settings` — unpacks the struct into
+    /// the flat `dht_*` keys.
+    pub fn set_dht_settings(&mut self, s: &bitdaemon_dht::dht_settings::DhtSettings) {
+        self.dht_max_peers_reply = s.max_peers_reply;
+        self.dht_search_branching = s.search_branching;
+        self.dht_max_fail_count = s.max_fail_count;
+        self.dht_max_torrents = s.max_torrents;
+        self.dht_max_dht_items = s.max_dht_items;
+        self.dht_max_peers = s.max_peers;
+        self.dht_max_torrent_search_reply = s.max_torrent_search_reply;
+        self.dht_restrict_routing_ips = s.restrict_routing_ips;
+        self.dht_restrict_search_ips = s.restrict_search_ips;
+        self.dht_extended_routing_table = s.extended_routing_table;
+        self.dht_aggressive_lookups = s.aggressive_lookups;
+        self.dht_privacy_lookups = s.privacy_lookups;
+        self.dht_enforce_node_id = s.enforce_node_id;
+        self.dht_ignore_dark_internet = s.ignore_dark_internet;
+        self.dht_block_timeout = Duration::from_secs(s.block_timeout.max(0) as u64);
+        self.dht_block_ratelimit = s.block_ratelimit;
+        self.dht_read_only = s.read_only;
+        self.dht_item_lifetime = Duration::from_secs(s.item_lifetime.max(0) as u64);
+        self.dht_upload_rate_limit = i64::from(s.upload_rate_limit);
+        self.dht_sample_infohashes_interval =
+            Duration::from_secs(s.sample_infohashes_interval.max(0) as u64);
+        self.dht_max_infohashes_sample_count = s.max_infohashes_sample_count;
+        self.dht_prefer_verified_node_ids = s.prefer_verified_node_ids;
+    }
+}
+
 /// `session_params` — what `session` is constructed with. In Rust
 /// the storage/disk *constructor* is an injected trait object
 /// (`StorageFactory` seam — the OnionBit private-storage hook).

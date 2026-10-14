@@ -45,7 +45,7 @@ fn save_includes_unfinished_blocks() {
         );
     }
     let mut atp = AddTorrentParams::default();
-    t.to_resume_data(&mut atp);
+    t.to_resume_data(&mut atp, &bitdaemon_net::peer_class::PeerClassPool::new());
     let mask = atp.unfinished_pieces.get(&1).expect("piece 1 saved");
     assert!(mask.get_bit(0) && mask.get_bit(3));
     assert!(!mask.get_bit(1) && !mask.get_bit(7));
@@ -54,10 +54,16 @@ fn save_includes_unfinished_blocks() {
 
 #[test]
 fn load_restores_verified_and_unfinished() {
+    // upstream: resume `pieces` → `have`; `verified_pieces` only load
+    // under `seed_mode` into `m_verified` (tested separately below).
+    let mut have = Bitfield::with_size(4);
+    have.set_bit(0);
+    have.set_bit(2);
     let mut verified = Bitfield::with_size(4);
     verified.set_bit(0);
     verified.set_bit(2);
     let mut atp = AddTorrentParams {
+        have_pieces: have,
         verified_pieces: verified,
         ..Default::default()
     };
@@ -69,8 +75,10 @@ fn load_restores_verified_and_unfinished() {
 
     let mut t = t();
     let mut eff = Vec::new();
-    t.apply_resume_data(&atp, &mut eff);
+    t.apply_resume_data(&atp, &Default::default(), &Default::default(), &mut eff);
     assert!(t.have.get_bit(0) && t.have.get_bit(2));
+    // not seed mode → `verified_pieces` is ignored upstream
+    assert_eq!(t.num_verified, 0);
     let p = t.picker.as_ref().unwrap();
     assert_eq!(
         p.piece_priority(PieceIndex(0)),
@@ -88,6 +96,33 @@ fn load_restores_verified_and_unfinished() {
     );
 }
 
+/// upstream `on_resume_data_checked` `m_seed_mode` branch:
+/// `set_have_all(true)` marks every piece present and resume
+/// `verified_pieces` feed `m_verified` (lazy-verify ledger).
+#[test]
+fn load_seed_mode_sets_have_and_verified() {
+    use bitdaemon_common::flags::TorrentFlags;
+    let mut verified = Bitfield::with_size(4);
+    verified.set_bit(1);
+    verified.set_bit(3);
+    let atp = AddTorrentParams {
+        flags: TorrentFlags::SEED_MODE,
+        verified_pieces: verified,
+        ..Default::default()
+    };
+    let mut t = t();
+    t.seed_mode = true;
+    let mut eff = Vec::new();
+    t.apply_resume_data(&atp, &Default::default(), &Default::default(), &mut eff);
+    // `set_have_all` — every piece present on the seed promise
+    for i in 0..4 {
+        assert!(t.have.get_bit(i));
+    }
+    assert!(t.seed_verified.get_bit(1) && t.seed_verified.get_bit(3));
+    assert!(!t.seed_verified.get_bit(0));
+    assert_eq!(t.num_verified, 2);
+}
+
 #[test]
 fn load_full_unfinished_triggers_verify() {
     let mut atp = AddTorrentParams::default();
@@ -98,7 +133,7 @@ fn load_full_unfinished_triggers_verify() {
     atp.unfinished_pieces.insert(1, bf);
     let mut t = t();
     let mut eff = Vec::new();
-    t.apply_resume_data(&atp, &mut eff);
+    t.apply_resume_data(&atp, &Default::default(), &Default::default(), &mut eff);
     assert!(
         eff.iter()
             .any(|e| matches!(e, TorrentEffect::DiskHash { piece } if *piece == PieceIndex(1))),

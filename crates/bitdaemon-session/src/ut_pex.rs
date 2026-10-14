@@ -42,7 +42,9 @@ pub struct PexPeer {
 
 /// Build a pex update message (`pex` bencoded dict) from the
 /// current peer set vs. the previous one. Returns the encoded
-/// body and the new `old_peers` set (all sent endpoints).
+/// body, the new `old_peers` set (all sent endpoints), and the
+/// `m_peers_in_message` count (added + dropped entries — upstream
+/// suppresses the send entirely when it is 0).
 ///
 /// `peers` are `(endpoint, flags)` for currently connected,
 /// pex-eligible peers (the caller applies `send_peer` semantics).
@@ -52,7 +54,7 @@ pub struct PexPeer {
 pub fn build_pex_message(
     peers: &[(SocketAddr, u8)],
     prev_sent: &BTreeSet<SocketAddr>,
-) -> (Vec<u8>, BTreeSet<SocketAddr>) {
+) -> (Vec<u8>, BTreeSet<SocketAddr>, usize) {
     let mut added = Vec::new();
     let mut added_f = Vec::new();
     let mut added6 = Vec::new();
@@ -63,6 +65,7 @@ pub fn build_pex_message(
     let mut sent = BTreeSet::new();
     let mut prev = prev_sent.clone();
     let mut num_added = 0usize;
+    let mut peers_in_msg = 0usize;
 
     for (ep, fl) in peers {
         let is_new = !prev.contains(ep);
@@ -81,6 +84,7 @@ pub fn build_pex_message(
                 added6_f.push(*fl);
             }
             num_added += 1;
+            peers_in_msg += 1;
         }
         prev.remove(ep);
         sent.insert(*ep);
@@ -92,11 +96,12 @@ pub fn build_pex_message(
         } else {
             write_endpoint(ep, &mut dropped6);
         }
+        peers_in_msg += 1;
     }
 
     let mut e = Entry::Dict(Default::default());
     let Ok(d) = e.dict_mut() else {
-        return (Vec::new(), prev_sent.clone());
+        return (Vec::new(), prev_sent.clone(), 0);
     };
     d.insert(b"added".to_vec(), Entry::String(added));
     d.insert(b"added.f".to_vec(), Entry::String(added_f));
@@ -104,7 +109,7 @@ pub fn build_pex_message(
     d.insert(b"added6".to_vec(), Entry::String(added6));
     d.insert(b"added6.f".to_vec(), Entry::String(added6_f));
     d.insert(b"dropped6".to_vec(), Entry::String(dropped6));
-    (bencode(&e), sent)
+    (bencode(&e), sent, peers_in_msg)
 }
 
 /// Parse a received pex message. Returns `(added, dropped)` —

@@ -720,6 +720,7 @@ fn peer_conn_drive() {
         0,
         0,
         0,
+        &bitdaemon_session::counters::Counters::default(),
         &mut stats,
     );
     assert!(invoked);
@@ -734,10 +735,19 @@ fn peer_conn_drive() {
 #[test]
 fn peer_conn_suggest_have() {
     let mut conn = PeerConn::new(4, PeerPipeline::new(3, 10, 250), 0);
-    conn.on_suggest(p(3));
-    conn.on_suggest(p(3)); // dup ignored
-    conn.on_suggest(p(1));
-    assert_eq!(conn.suggested_pieces, vec![p(3), p(1)]);
+    // upstream `incoming_suggest`: no dedup, front-insert (newest
+    // = highest priority), capped at `max_suggest_pieces`.
+    conn.on_suggest(p(3), 16);
+    conn.on_suggest(p(3), 16);
+    conn.on_suggest(p(1), 16);
+    assert_eq!(conn.suggested_pieces, vec![p(1), p(3), p(3)]);
+    // upstream caps loosely: `size > max` trims to `max-1` *before*
+    // the insert, so the list oscillates `max`/`max+1` — after an
+    // even number of over-cap inserts it settles on `max+1`.
+    for i in 0..20 {
+        conn.on_suggest(PieceIndex(i + 100), 4);
+    }
+    assert_eq!(conn.suggested_pieces.len(), 5);
 
     // on_have marks the bit and reports interestingness
     let we_have = |i: PieceIndex| i == p(0);

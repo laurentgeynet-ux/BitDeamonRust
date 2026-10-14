@@ -49,7 +49,12 @@ fn mk() -> Torrent {
 fn file_priorities_drive_piece_priorities() {
     let mut t = mk();
     // file `a` → dont_download; piece 1 overlaps `b` → stays default
-    t.prioritize_files(&[DownloadPriority::DONT_DOWNLOAD, DownloadPriority::DEFAULT]);
+    t.prioritize_files(
+        &[DownloadPriority::DONT_DOWNLOAD, DownloadPriority::DEFAULT],
+        &Default::default(),
+        &bitdaemon_session::counters::Counters::default(),
+        &mut Vec::new(),
+    );
     let p = t.picker.as_ref().unwrap();
     assert_eq!(
         p.piece_priority(PieceIndex(0)),
@@ -60,7 +65,12 @@ fn file_priorities_drive_piece_priorities() {
     assert_eq!(t.file_priorities.len(), 2);
 
     // raise `a` to TOP → its pieces (0,1) take TOP; 1 keeps max
-    t.prioritize_files(&[DownloadPriority::TOP, DownloadPriority::DEFAULT]);
+    t.prioritize_files(
+        &[DownloadPriority::TOP, DownloadPriority::DEFAULT],
+        &Default::default(),
+        &bitdaemon_session::counters::Counters::default(),
+        &mut Vec::new(),
+    );
     let p = t.picker.as_ref().unwrap();
     assert_eq!(p.piece_priority(PieceIndex(0)), DownloadPriority::TOP);
     assert_eq!(p.piece_priority(PieceIndex(1)), DownloadPriority::TOP);
@@ -72,7 +82,7 @@ fn file_progress_counts_have_and_blocks() {
     let mut t = mk();
     // piece 0 fully verified — entirely inside file `a`
     t.have.set_bit(0);
-    let prog = t.file_progress();
+    let prog = t.file_progress(false);
     assert_eq!(prog[0], 0x10000);
     assert_eq!(prog[1], 0);
 
@@ -89,7 +99,7 @@ fn file_progress_counts_have_and_blocks() {
             None,
         );
     }
-    let prog = t.file_progress();
+    let prog = t.file_progress(false);
     assert_eq!(prog[0], 0x18000); // piece0 (0x10000) + a's part of piece1
     assert_eq!(prog[1], 0x8000); // b's part of piece1
 }

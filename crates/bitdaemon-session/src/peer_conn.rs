@@ -45,6 +45,9 @@ pub struct PeerConn {
     pub accept_fast_piece_cnt: Vec<i32>,
     /// `m_suggested_pieces` — BEP-6 suggested pieces.
     pub suggested_pieces: Vec<PieceIndex>,
+    /// `m_suggest_pieces` — pieces WE suggested to this peer
+    /// (upstream keeps them on the conn; cleared on choke).
+    pub suggest_sent: Vec<PieceIndex>,
     /// `m_request_queue`/`m_download_queue` + pipeline state.
     pub pipeline: PeerPipeline,
     /// `m_upload_only_id` etc. — BEP-10 remote extension ids.
@@ -60,18 +63,42 @@ pub struct PeerConn {
     pub ext_ut_pex: u8,
     /// `metadata_size` the remote advertised (its info dict size).
     pub metadata_size: Option<i64>,
+    /// `m_sent_requests` — `ut_metadata` pieces we have asked this
+    /// peer for and not yet gotten a reply to (upstream caps the
+    /// list at 2 outstanding; a `piece` or `dont_have` reply erases
+    /// its entry).
+    pub metadata_sent_requests: Vec<i32>,
+    /// `m_request_limit` — don't ask this peer for metadata before
+    /// this instant unless it advertised `metadata_size` (upstream
+    /// `has_metadata()` = advertised || limit expired). `dont_have`
+    /// pushes it +1 min; a failed hash check pushes it +20–70s
+    /// (with a +5 min base when the metadata is a single piece).
+    /// `None` = `min_time()` (always expired).
+    pub metadata_request_limit: Option<std::time::Instant>,
+    /// `m_has_metadata` — upstream ctor `true`; the ext handshake
+    /// clears it when `ut_metadata` is advertised without
+    /// `metadata_size` (the peer is still fetching the info dict);
+    /// any piece-level message (`have`/`have_none`/`dont_have`)
+    /// proves the peer has metadata and sets it back.
+    pub has_metadata: bool,
     /// OUR local ext ids — the ids we advertise in our own BEP-10
     /// handshake; inbound messages carry these (the remote's ids
-    /// above are for our sends). Session sets both to whatever it
-    /// advertises.
-    pub local_ut_metadata: u8,
-    /// our local `ut_pex` id.
+    /// above are for our sends). The values are upstream's fixed
+    /// constants (`bt_peer_connection.hpp`): `ut_pex`=1,
+    /// `ut_metadata`=2, `upload_only`=3, `ut_holepunch`=4,
+    /// `lt_donthave`=7, `share_mode`=8, `i2p_pex`=9.
     pub local_ut_pex: u8,
+    /// our local `ut_metadata` id.
+    pub local_ut_metadata: u8,
+    /// our local `upload_only` id — remote sends a 1-byte flag.
+    pub local_upload_only: u8,
     /// our local `ut_holepunch` id (BEP-55).
     pub local_ut_holepunch: u8,
     /// our local `lt_donthave` id — remote sends extended messages
     /// on this id to retract a piece.
     pub local_dont_have: u8,
+    /// our local `share_mode` id — remote sends a 1-byte flag.
+    pub local_share_mode: u8,
     /// `i2p_pex` — remote's message id from its handshake (`m`).
     pub ext_i2p_pex: u8,
     /// `local_i2p_pex` — our advertised id (upstream fixes it at 9).
@@ -112,12 +139,41 @@ pub struct PeerConn {
     /// never-interested peer still ages into the super-seed
     /// recovery window.
     pub became_uninterested_ms: i64,
+    /// `m_became_uninteresting` — conn-clock ms of the last
+    /// `NotInterested` we sent (connect-time default, like
+    /// upstream). Feeds `timed_out_no_interest`.
+    pub became_uninteresting_ms: i64,
+    /// `m_connect` — conn-clock ms at connect; the epoch the
+    /// handshake timeout measures against.
+    pub connect_ms: i64,
+    /// `m_last_sent` — conn-clock ms of the last message we wrote
+    /// (any kind); drives `keep_alive` (`peer_timeout / 2`).
+    pub last_sent_ms: i64,
+    /// `m_last_incoming_request` — conn-clock ms of the last
+    /// `Request` the peer sent us.
+    pub last_incoming_request_ms: i64,
+    /// `m_last_sent_payload` — conn-clock ms of the last piece
+    /// payload we sent.
+    pub last_sent_payload_ms: i64,
+    /// `m_last_unchoke` (ms) — conn-clock of our last unchoke of
+    /// this peer; part of the `timed_out_no_request` max.
+    pub last_unchoke_ms: i64,
+    /// `m_last_choke` (ms) — conn-clock of the last `Choke` we
+    /// sent. Requests from a still-choked peer stop being tolerated
+    /// 2 s after this stamp (upstream disconnects them).
+    pub last_choke_ms: i64,
+    /// `m_last_receive` (ms) — conn-clock of last inbound data
+    /// (complements `last_active`, which is session seconds).
+    pub last_receive_ms: i64,
     /// `peer_info::protocol_v2` — the connection was established
     /// with the v2 info-hash. Hash messages (`hash_request`/
     /// `hashes`/`hash_reject`) are a protocol violation without it.
     pub protocol_v2: bool,
     /// `m_upload_only` — remote told us it's upload-only.
     pub remote_upload_only: bool,
+    /// `share_mode` handshake bit — the remote runs share-mode and
+    /// doesn't count as a downloader in `recalc_share_mode`.
+    pub remote_share_mode: bool,
     /// `m_client_version` — remote's `v` string.
     pub client_version: Vec<u8>,
     /// `m_upload_queue` — peer's requests to us.
@@ -135,10 +191,36 @@ pub struct PeerConn {
     /// (`peer_conn::PeerWriteGates`): unlike the global disk-queue
     /// watermark, a peer is only held back by *its own* writes.
     pub outstanding_writing_bytes: i64,
+    /// `m_channel_state[download_channel] & peer_info::bw_disk` —
+    /// this conn is counted in `num_peers_down_disk` while its own
+    /// write queue keeps the read gate closed.
+    pub disk_blocked: bool,
+    /// `m_channel_state[upload_channel] & peer_info::bw_disk` —
+    /// counted in `num_peers_up_disk` while the send buffer is
+    /// drained with disk reads still in flight.
+    pub up_disk_blocked: bool,
+    /// `m_failed` — set when the disconnect ran at
+    /// `disconnect_severity_t > normal` (`failure`/`peer_error`);
+    /// `connection_closed` counts it against `failcount`.
+    pub failed: bool,
     /// `m_num_invalid_requests`.
     pub num_invalid_requests: i32,
+    /// `m_disk_read_failures` — consecutive failed disk reads serving
+    /// this peer; upstream disconnects at >100 and resets on success.
+    pub disk_read_failures: u32,
+    /// `m_outstanding_piece_verification` — in-flight seed-mode lazy
+    /// hash checks; upstream caps a peer at 3.
+    pub outstanding_piece_verification: i32,
+    /// `m_hash_requests` — v2 `hash_request`s we sent and still await
+    /// `hashes`/`hash_reject` for; upstream caps the set at 2 and
+    /// ignores replies it never asked for.
+    pub hash_requests: Vec<bitdaemon_net::peer_wire::HashRequestWire>,
     /// `m_num_pieces` — total pieces the peer announced.
     pub num_pieces: i32,
+    /// `m_last_seen_complete` — epoch seconds the peer reported via
+    /// BEP-21 `complete_ago` (0 = never/didn't say). Feeds
+    /// `torrent`'s `m_swarm_last_seen_complete`.
+    pub last_seen_complete: i64,
     /// `stat` rate sampling — last totals at the previous tick and
     /// the resulting bytes/sec the `peer_info` snapshot reports.
     pub rate_up_speed: i32,
@@ -148,8 +230,11 @@ pub struct PeerConn {
     pub last_up_total: i64,
     /// last sampled `stat_down_total` for rate computation.
     pub last_down_total: i64,
-    /// ms timestamp the connection was established (`m_connect`).
-    pub connect_ms: i64,
+    /// `m_download_rate_peak` — best payload download rate ever
+    /// measured on this conn (`peer_info` exposes it).
+    pub download_rate_peak: i32,
+    /// `m_upload_rate_peak`.
+    pub upload_rate_peak: i32,
     /// `m_supports_fast` — remote negotiated the FAST extension
     /// (reserved byte 7 bit 0x04). Rejects/allowed-fast only exist
     /// when set.
@@ -169,13 +254,41 @@ pub struct PeerConn {
     /// `m_interested` — WE sent `interested` (upstream tracks the
     /// wire state to avoid duplicate sends).
     pub we_sent_interested: bool,
-    /// `m_last_seen` — last session_time a message arrived (peer
-    /// timeout bookkeeping).
-    pub last_active: i32,
     /// remote endpoint (`m_remote`) — needed for `ut_pex` diffs.
     pub remote: Option<std::net::SocketAddr>,
     /// pex update bookkeeping — the set we last sent this peer.
     pub pex_sent: std::collections::BTreeSet<std::net::SocketAddr>,
+    /// `m_peers`/`m_peers6` — endpoints this peer has told us about
+    /// and not yet dropped (upstream dedups `added` against this and
+    /// erases on `dropped`).
+    pub pex_known: std::collections::BTreeSet<std::net::SocketAddr>,
+    /// `m_last_pex[6]` — receive timestamps of the last ≤6 pex
+    /// messages from this peer; a 7th inside 60s is a flood and
+    /// upstream disconnects (`too_frequent_pex`).
+    pub pex_rx_times: std::collections::VecDeque<std::time::Instant>,
+    /// `m_first_time` — this peer's first pex tick sends the full
+    /// peer list; later ticks send the diff (skipped when empty).
+    pub pex_first_time: bool,
+    /// transport is uTP — feeds the `pex_utp` flag on advertise.
+    pub is_utp: bool,
+    /// `socket_type_idx(m_socket)` — the conn's `socket_type_t`
+    /// index (tcp 0, socks5 1, http 2, utp 3, i2p 4, rtc 5,
+    /// tcp_ssl 6, socks5_ssl 7, http_ssl 8, utp_ssl 9); the
+    /// transports flatten into `peer_class_type_filter` classes via
+    /// `set_peer_classes`.
+    pub sock_type: u8,
+    /// `m_peer_class` — the conn's `peer_class_set`, assigned once at
+    /// attach from `peer_class_filter` + `peer_class_type_filter`
+    /// (`session_impl::set_peer_classes`). Refcounted in the session
+    /// pool on add/drop.
+    pub peer_classes: bitdaemon_net::peer_class::PeerClassSet,
+
+    /// `m_exceeded_limit` — admitted past the session
+    /// `connections_limit` via `connections_slack`; once the
+    /// handshake lands it must evict the disconnect-candidate
+    /// torrent's lowest-ranking conn or drop
+    /// (`peer_exceeds_limit`/`peer_disconnected_other`).
+    pub exceeded_limit: bool,
     /// `m_stat` payload accounting for the choker — lifetime bytes
     /// and bytes since the last unchoke round.
     pub stat_up_total: i64,
@@ -190,6 +303,10 @@ pub struct PeerConn {
     pub down_delta_prev: i64,
     /// `time_of_last_unchoke` (round-robin quota bookkeeping).
     pub last_unchoke: std::time::Instant,
+    /// `m_uploaded_at_last_unchoke` — payload total at the last
+    /// unchoke transition; `uploaded_since_unchoked` = `stat_up_total`
+    /// minus this.
+    pub uploaded_at_last_unchoke: i64,
     /// monotonic ms clock refreshed each `second_tick` — drives the
     /// pipeline's RTT samples and request-timeout bookkeeping.
     pub now_ms: i64,
@@ -218,6 +335,7 @@ impl PeerConn {
             accept_fast: Vec::new(),
             accept_fast_piece_cnt: Vec::new(),
             suggested_pieces: Vec::new(),
+            suggest_sent: Vec::new(),
             pipeline,
             ext_upload_only: 0,
             ext_holepunch: 0,
@@ -225,27 +343,56 @@ impl PeerConn {
             ext_ut_metadata: 0,
             ext_ut_pex: 0,
             metadata_size: None,
-            local_ut_metadata: 1,
-            local_ut_pex: 2,
-            local_ut_holepunch: 3,
+            metadata_sent_requests: Vec::new(),
+            metadata_request_limit: None,
+            has_metadata: true,
+            local_ut_pex: 1,
+            local_ut_metadata: 2,
+            local_upload_only: 3,
+            local_ut_holepunch: 4,
             superseed_pieces: [None, None],
             became_uninterested_ms: now_ms,
+            became_uninteresting_ms: now_ms,
+            connect_ms: now_ms,
+            last_sent_ms: now_ms,
+            last_incoming_request_ms: now_ms,
+            last_sent_payload_ms: now_ms,
+            last_unchoke_ms: now_ms,
+            last_choke_ms: now_ms,
+            last_receive_ms: now_ms,
             remote_upload_only: false,
+            remote_share_mode: false,
             client_version: Vec::new(),
             upload_queue: Vec::new(),
             send_buffer: 0,
             reading_bytes: 0,
             outstanding_writing_bytes: 0,
+            disk_blocked: false,
+            up_disk_blocked: false,
+            failed: false,
             num_invalid_requests: 0,
+            outstanding_piece_verification: 0,
+            hash_requests: Vec::new(),
+            disk_read_failures: 0,
             num_pieces: 0,
-            connect_ms: now_ms,
-            last_active: 0,
+            last_seen_complete: 0,
+
             remote: None,
             pex_sent: std::collections::BTreeSet::new(),
+            pex_known: std::collections::BTreeSet::new(),
+            pex_rx_times: std::collections::VecDeque::new(),
+            pex_first_time: true,
+            is_utp: false,
+            sock_type: 0,
+            peer_classes: bitdaemon_net::peer_class::PeerClassSet::default(),
+
+            exceeded_limit: false,
             stat_up_total: 0,
             stat_down_total: 0,
             rate_up_speed: 0,
             rate_down_speed: 0,
+            download_rate_peak: 0,
+            upload_rate_peak: 0,
             last_up_total: 0,
             last_down_total: 0,
             stat_up_round: 0,
@@ -255,7 +402,8 @@ impl PeerConn {
             pre_metadata_all: false,
             supports_dht: false,
             supports_encryption: false,
-            local_dont_have: 3,
+            local_dont_have: 7,
+            local_share_mode: 8,
             ext_i2p_pex: 0,
             local_i2p_pex: crate::i2p_pex::I2P_PEX_ID,
             i2p: None,
@@ -270,6 +418,7 @@ impl PeerConn {
             protocol_v2: false,
             we_sent_interested: false,
             last_unchoke: std::time::Instant::now(),
+            uploaded_at_last_unchoke: 0,
             now_ms,
             plugins: Vec::new(),
         }
@@ -306,9 +455,43 @@ impl PeerConn {
         false
     }
 
-    /// `incoming_have_none` — the peer sent no bitfield (means empty).
+    /// `is_seed()` — the peer claims every piece it knows the size
+    /// of (`m_num_pieces == m_have_piece.size()` upstream).
+    #[must_use]
+    pub fn is_seed(&self) -> bool {
+        self.peer_pieces.size() > 0 && self.num_pieces as usize == self.peer_pieces.size()
+    }
+
+    /// `peer_connection::ignore_unchoke_slots` — the *connection*
+    /// legs: an empty class set exempts, otherwise any member class
+    /// flagged `ignore_unchoke_slots` does. Upstream also ORs the
+    /// *torrent's* class set — callers fold that in via
+    /// `Torrent::ignores_unchoke_slots`. Evaluated live against the
+    /// pool so `set_peer_class` flag changes apply immediately.
+    /// Exempt conns don't count `num_peers_up_unchoked` or occupy
+    /// upload slots.
+    #[must_use]
+    pub fn ignores_unchoke_slots(&self, pool: &bitdaemon_net::peer_class::PeerClassPool) -> bool {
+        if self.peer_classes.num_classes() == 0 {
+            return true;
+        }
+        let mut ignore = false;
+        self.peer_classes.for_each(|c| {
+            if let Some(pc) = pool.at(c) {
+                ignore |= pc.ignore_unchoke_slots;
+            }
+        });
+        ignore
+    }
+
+    /// `incoming_have_none` — the peer sent no bitfield (means
+    /// empty). Upstream also drops its refcount share
+    /// (`peer_lost(m_have_piece)`) and unflags the seed — the caller
+    /// emits those effects from the old bitfield.
     pub fn on_have_none(&mut self) {
         self.bitfield_received = true;
+        self.peer_pieces.clear_all();
+        self.num_pieces = 0;
     }
 
     /// `incoming_have_all` — a seed.
@@ -340,12 +523,16 @@ impl PeerConn {
         self.peer_interested = false;
     }
 
-    /// `incoming_suggest` — BEP-6 suggest.
-    pub fn on_suggest(&mut self, index: PieceIndex) {
-        if self.has_piece(index) || self.suggested_pieces.contains(&index) {
-            return;
+    /// `incoming_suggest` (peer-conn half) — the torrent-side
+    /// checks run in `Torrent::apply_peer_effects`; this only keeps
+    /// the bounded front-insert (later suggestions sort first —
+    /// the picker ascribes them higher priority).
+    pub fn on_suggest(&mut self, index: PieceIndex, max_suggest_pieces: i32) {
+        if self.suggested_pieces.len() as i32 > max_suggest_pieces {
+            self.suggested_pieces
+                .truncate((max_suggest_pieces - 1).max(0) as usize);
         }
-        self.suggested_pieces.push(index);
+        self.suggested_pieces.insert(0, index);
     }
 
     /// `incoming_allowed_fast` — BEP-6 allowed-fast.
@@ -455,9 +642,25 @@ impl PeerConn {
     /// intact for parole peers (`clear_request_queue` early-outs on
     /// `peer_info_struct() == nullptr || !on_parole` — only parole
     /// peers with a picker entry skip the wipe).
-    pub fn on_choke_with_aborts(&mut self) -> Vec<PieceBlock> {
+    /// `peer_connection::set_endgame` — transition-counted
+    /// `num_peers_end_game` gauge.
+    pub fn set_endgame(&mut self, b: bool, counters: &crate::counters::Counters) {
+        if self.pipeline.endgame == b {
+            return;
+        }
+        self.pipeline.endgame = b;
+        counters.add(
+            crate::counters::Counter::NumPeersEndGame,
+            if b { 1 } else { -1 },
+        );
+    }
+
+    pub fn on_choke_with_aborts(
+        &mut self,
+        counters: &crate::counters::Counters,
+    ) -> Vec<PieceBlock> {
         self.peer_choked = true;
-        self.pipeline.endgame = false;
+        self.set_endgame(false, counters);
         if self.on_parole {
             return Vec::new();
         }
@@ -469,15 +672,27 @@ impl PeerConn {
             .collect()
     }
 
-    /// `incoming_request` — `validate_piece_request` then enqueue
-    /// for the upload path. `num_pieces` is the torrent's piece
-    /// count (0 when metadata unknown → reject).
-    pub fn validate_request(&mut self, r: &PeerRequest, num_pieces: i32) -> bool {
-        let ok = r.length > 0
-            && r.length <= 0x20000
+    /// `incoming_request`'s shape check — in-range piece,
+    /// `0 <= start < piece_size`, `0 < length <= block_size`, and
+    /// `start + length <= piece_size` (sub-block requests are legal;
+    /// `validate_piece_request`'s strict `to_req` match is for
+    /// *incoming pieces*, not requests). The `user_have_piece ||
+    /// predictive || seed_mode` leg runs torrent-side.
+    /// `num_pieces` == 0 when metadata is unknown → all reject.
+    pub fn validate_request(
+        &mut self,
+        r: &PeerRequest,
+        num_pieces: i32,
+        block_size: i32,
+        piece_size: i64,
+    ) -> bool {
+        let ok = r.piece.0 >= 0
+            && r.piece.0 < num_pieces
             && r.start >= 0
-            && r.piece.0 >= 0
-            && r.piece.0 < num_pieces;
+            && i64::from(r.start) < piece_size
+            && r.length > 0
+            && i64::from(r.length) + i64::from(r.start) <= piece_size
+            && r.length <= block_size;
         if !ok {
             self.num_invalid_requests += 1;
         }
@@ -492,6 +707,14 @@ impl PeerConn {
             piece_index: r.piece,
             block_index: r.start / block_size,
         };
+        // upstream `incoming_reject`: a rejected allowed-fast piece
+        // (while choked) leaves that set; unchoked, the rejected
+        // piece leaves our suggested set instead.
+        if self.peer_choked {
+            self.allowed_fast.retain(|&p| p != r.piece);
+        } else {
+            self.suggested_pieces.retain(|&p| p != r.piece);
+        }
         let _ = self.cancel_request(block);
         block
     }
@@ -507,6 +730,10 @@ impl PeerConn {
             block_index: r.start / block_size,
         };
         let _ = self.cancel_request(block);
+        // `incoming_piece` — suggested/allowed-fast entries for the
+        // piece we just got drop out of both sets.
+        self.suggested_pieces.retain(|&p| p != r.piece);
+        self.allowed_fast.retain(|&p| p != r.piece);
         self.pipeline.outstanding_bytes =
             (self.pipeline.outstanding_bytes - i64::from(r.length)).max(0);
         // upstream `incoming_piece`: sample `now - m_requested`
@@ -524,12 +751,14 @@ impl PeerConn {
     }
 
     /// `peer_connection::incoming_piece` — was this block actually
-    /// requested (present in request or download queue)?
+    /// requested (present in request or download queue)? `block_size`
+    /// is `t->block_size()` — `min(piece_length, 0x4000)`, so a
+    /// hardcoded 16 KiB divisor mis-indexes small-piece torrents.
     #[must_use]
-    pub fn was_requested(&self, r: &PeerRequest) -> bool {
+    pub fn was_requested(&self, r: &PeerRequest, block_size: i32) -> bool {
         let block = PieceBlock {
             piece_index: r.piece,
-            block_index: r.start / 0x4000,
+            block_index: r.start / block_size.max(1),
         };
         self.pipeline
             .download_queue
@@ -542,34 +771,112 @@ impl PeerConn {
     /// side-effects the torrent layer must run (picker updates,
     /// disk writes, uploads). `block_size` is the torrent's
     /// `t->block_size()` for mapping byte offsets to block indices.
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &mut self,
         msg: &bitdaemon_net::peer_wire::PeerMessage,
         num_pieces: i32,
         block_size: i32,
+        piece_length: i64,
+        files: Option<&bitdaemon_core::FileStorage>,
+        max_piece_count: i32,
+        max_in_queue: i32,
+        counters: &crate::counters::Counters,
         eff: &mut Vec<PeerEffect>,
     ) {
         use bitdaemon_net::peer_wire::PeerMessage as M;
         match *msg {
             M::Keepalive => {}
             M::Choke => {
-                for b in self.on_choke_with_aborts() {
+                // `num_peers_down_unchoked` — transition gauge
+                // (`incoming_choke` decs on the unchoked→choked edge).
+                if !self.peer_choked {
+                    counters.add(crate::counters::Counter::NumPeersDownUnchoked, -1);
+                }
+                for b in self.on_choke_with_aborts(counters) {
                     eff.push(PeerEffect::AbortDownload(b));
                 }
             }
             M::Unchoke => {
-                self.on_unchoke();
-                eff.push(PeerEffect::MaybePick);
-            }
-            M::Interested => self.on_interested(),
-            M::NotInterested => self.on_not_interested(),
-            M::Have(i) => {
-                if self.on_have(i, |_| false) {
-                    eff.push(PeerEffect::MaybePick);
+                if self.peer_choked {
+                    counters.add(crate::counters::Counter::NumPeersDownUnchoked, 1);
                 }
-                eff.push(PeerEffect::RefcountInc(i));
+                self.on_unchoke();
+                // `incoming_unchoke` — pick only when the peer is
+                // interesting; bumps `unchoke_piece_picks` on success.
+                if self.interesting {
+                    eff.push(PeerEffect::MaybePick(Some(
+                        crate::counters::Counter::UnchokePiecePicks,
+                    )));
+                }
+            }
+            M::Interested => {
+                // `incoming_interested` — `num_peers_up_interested`
+                // on the not-interested→interested edge.
+                if !self.peer_interested {
+                    counters.add(crate::counters::Counter::NumPeersUpInterested, 1);
+                }
+                self.on_interested();
+            }
+            M::NotInterested => {
+                if self.peer_interested {
+                    counters.add(crate::counters::Counter::NumPeersUpInterested, -1);
+                }
+                self.on_not_interested();
+                // `choke_this_peer` — an uninterested peer can't
+                // take payload; its upload slot is reclaimed
+                // (`choke_peer` no-ops when already choked).
+                eff.push(PeerEffect::PeerNotInterested);
+            }
+            M::Have(i) => {
+                // upstream: a `have` before any bitfield implies an
+                // omitted (empty) bitfield — `incoming_have_none`.
+                if !self.bitfield_received {
+                    self.bitfield_received = true;
+                }
+                // `suggest_read_cache`: the peer took a piece we
+                // suggested — refill it (checked before the bit
+                // lands; upstream reads `m_suggest_pieces`, the
+                // per-conn sent list).
+                if !self.choked && self.suggest_sent.contains(&i) {
+                    eff.push(PeerEffect::SuggestAck(i));
+                }
+                // `!valid_metadata && index >= end` — grow the
+                // bitfield to fit (capped at `max_piece_count`);
+                // a larger index is just ignored.
+                if num_pieces <= 0 && i.0 as usize >= self.peer_pieces.size() {
+                    if i.0 <= max_piece_count {
+                        self.peer_pieces.resize_with(i.0 as usize + 1, false);
+                    } else {
+                        return;
+                    }
+                }
+                // `invalid_have` — out-of-range indexes are a
+                // protocol violation upstream (disconnect).
+                if i.0 < 0 || i.0 as usize >= self.peer_pieces.size() {
+                    eff.push(PeerEffect::Disconnect("invalid have index", true));
+                    return;
+                }
+                // a peer sending piece-level messages has metadata
+                // (upstream `incoming_have` → `m_has_metadata = true`).
+                self.has_metadata = true;
+                // upstream returns early on a redundant `have` —
+                // no refcount, no seed re-check. No pick attempt
+                // here either (`incoming_have` only re-evaluates
+                // interest; `request_a_block` fires on unchoke/
+                // piece/reject/suggest/snub paths).
+                if !self.has_piece(i) {
+                    self.on_have(i, |_| false);
+                    eff.push(PeerEffect::RefcountInc(i));
+                    eff.push(PeerEffect::PeerSeed(self.is_seed()));
+                }
             }
             M::HaveAll => {
+                // `incoming_have_all` — a re-announced all-set drops
+                // the previous share first (`peer_lost`).
+                if self.bitfield_received && !self.peer_pieces.none_set() {
+                    eff.push(PeerEffect::RefcountBulk(self.peer_pieces.clone(), false));
+                }
                 self.on_have_all();
                 if num_pieces <= 0 {
                     // magnet with no metadata yet: a full bitfield
@@ -579,13 +886,46 @@ impl PeerConn {
                 }
                 // `peer_has_all` → `inc_refcount_all`: the peer is a
                 // seed; skip it in the refcount or `dec_refcount`
-                // underflows `m_seeds` on disconnect.
+                // underflows `m_seeds` on disconnect. Upstream's
+                // `incoming_have_all` doesn't kick `request_a_block`
+                // — interest recompute is enough.
                 let mut bf = bitdaemon_common::Bitfield::with_size(num_pieces.max(0) as usize);
                 bf.set_all();
                 eff.push(PeerEffect::RefcountBulk(bf, true));
-                eff.push(PeerEffect::MaybePick);
+                eff.push(PeerEffect::PeerSeed(true));
             }
-            M::HaveNone => self.on_have_none(),
+            M::HaveNone => {
+                // `peer_lost` on the old bitfield — the peer's
+                // previous pieces leave the refcount. have_none
+                // proves the peer has metadata (upstream sets
+                // `m_has_metadata` here).
+                let old = self.peer_pieces.clone();
+                self.on_have_none();
+                self.has_metadata = true;
+                eff.push(PeerEffect::RefcountBulk(old, false));
+                eff.push(PeerEffect::PeerSeed(false));
+            }
+            M::DontHave(i) => {
+                // upstream `incoming_dont_have` — beyond the
+                // torrent's piece range is just logged (magnets
+                // have `end_piece()==0` → every index returns),
+                // beyond the peer's own bitfield is a protocol
+                // violation.
+                if i.0 < 0 || i.0 >= num_pieces.max(0) {
+                    return;
+                }
+                if i.0 as usize >= self.peer_pieces.size() {
+                    eff.push(PeerEffect::Disconnect("invalid dont_have index", true));
+                    return;
+                }
+                // piece-level message — the peer has metadata
+                // (upstream `incoming_dont_have` → `m_has_metadata`).
+                self.has_metadata = true;
+                if self.on_dont_have(i) {
+                    eff.push(PeerEffect::RefcountDec(i));
+                    eff.push(PeerEffect::PeerSeed(false));
+                }
+            }
             M::Bitfield(ref bits) => {
                 // metadata still missing (magnet): `num_pieces` is 0
                 // and upstream has nowhere to put the bits — we store
@@ -599,17 +939,67 @@ impl PeerConn {
                 };
                 match bitdaemon_common::Bitfield::from_bytes(bits, expected) {
                     Some(bf) => {
+                        // repeat bitfield — `peer_lost(m_have_piece)`
+                        // decrements the old share before the new one
+                        // is counted (`peer_has` upstream).
+                        if self.bitfield_received && !self.peer_pieces.none_set() {
+                            eff.push(PeerEffect::RefcountBulk(self.peer_pieces.clone(), false));
+                        }
                         self.on_bitfield(&bf);
+                        let seed = self.is_seed();
+                        // upstream marks `seen_complete` only once a
+                        // seed-flagged peer has delivered payload —
+                        // a bare claim can't move the timestamp.
+                        if seed && self.stat_down_total > 0 {
+                            eff.push(PeerEffect::SeenComplete);
+                        }
                         eff.push(PeerEffect::RefcountBulk(bf, true));
+                        eff.push(PeerEffect::PeerSeed(seed));
                     }
-                    None => eff.push(PeerEffect::Disconnect("invalid bitfield size")),
+                    None => eff.push(PeerEffect::Disconnect("invalid bitfield size", true)),
                 }
             }
             M::Request(r) => {
-                if self.validate_request(&r, num_pieces) {
-                    self.upload_queue.push(r);
-                    eff.push(PeerEffect::ReadRequest(r));
+                // `incoming_request` — an omitted bitfield reads as
+                // `have_none` before the first request.
+                if !self.bitfield_received {
+                    self.bitfield_received = true;
+                }
+                // `!valid_metadata` — requests can't be honored before
+                // the layout exists; upstream rejects without the
+                // interested/invalid machinery.
+                if num_pieces <= 0 {
+                    eff.push(PeerEffect::RejectRequest(r));
+                    return;
+                }
+                // `piece_size` is only safe to resolve in-range —
+                // upstream's validity check short-circuits on
+                // `piece >= end_piece` before touching the layout.
+                let piece_size = if r.piece.0 >= 0 && r.piece.0 < num_pieces {
+                    files.map_or(piece_length, |f| i64::from(f.piece_size(r.piece)))
                 } else {
+                    i64::from(block_size)
+                };
+                // `max_allowed_in_request_queue` — reject floods before
+                // they grow the upload queue (`max_piece_requests`).
+                if self.upload_queue.len() as i64 > i64::from(max_in_queue) {
+                    eff.push(PeerEffect::RejectRequest(r));
+                    eff.push(PeerEffect::InvalidRequest(format!(
+                        "incoming request queue full {}",
+                        self.upload_queue.len()
+                    )));
+                    return;
+                }
+                // a request implies interest — upstream logs an
+                // `invalid_request_alert` then fakes `incoming_interested`.
+                if !self.peer_interested {
+                    eff.push(PeerEffect::InvalidRequest(format!(
+                        "request from not-interested peer: piece {} start {} length {}",
+                        r.piece.0, r.start, r.length
+                    )));
+                    self.on_interested();
+                }
+                if !self.validate_request(&r, num_pieces, block_size, piece_size) {
                     // upstream `incoming_request` rejects + posts
                     // `invalid_request_alert` for out-of-range
                     // piece/start/length — it does not disconnect
@@ -619,7 +1009,59 @@ impl PeerConn {
                         "out of range: piece {} start {} length {}",
                         r.piece.0, r.start, r.length
                     )));
+                    // every tenth invalid request while we still choke
+                    // the peer gets a reminder `Choke`; beyond 300 the
+                    // peer is dropped (`too_many_requests_when_choked`
+                    // — only while they haven't choked us back).
+                    if !self.peer_interested && self.num_invalid_requests % 10 == 0 && self.choked {
+                        if self.num_invalid_requests > 300 && !self.peer_choked {
+                            eff.push(PeerEffect::Disconnect(
+                                "too many requests when choked",
+                                true,
+                            ));
+                            return;
+                        }
+                        self.last_choke_ms = self.now_ms;
+                        eff.push(PeerEffect::SendChoke);
+                    }
+                    return;
                 }
+                // choked peers may only fetch `accept_fast` pieces; a
+                // fast piece stops being free after `3 * blocks_per_piece`
+                // requests, and non-fast requests are tolerated for 2 s
+                // past the last choke before the peer is dropped.
+                let fast_idx = self.accept_fast.iter().position(|&p| p == r.piece);
+                let blocks_per_piece = ((piece_length + i64::from(block_size) - 1)
+                    / i64::from(block_size).max(1)) as i32;
+                if self.choked {
+                    if let Some(idx) = fast_idx {
+                        if self.accept_fast_piece_cnt[idx] >= 3 * blocks_per_piece {
+                            eff.push(PeerEffect::Disconnect(
+                                "too many requests when choked",
+                                true,
+                            ));
+                            return;
+                        }
+                    } else {
+                        eff.push(PeerEffect::RejectRequest(r));
+                        if self.now_ms - self.last_choke_ms > 2000 {
+                            eff.push(PeerEffect::Disconnect(
+                                "too many requests when choked",
+                                true,
+                            ));
+                            return;
+                        }
+                        return;
+                    }
+                }
+                if let Some(idx) = fast_idx {
+                    self.accept_fast_piece_cnt[idx] += 1;
+                }
+                // `m_last_incoming_request` stamps only on accepted
+                // requests (upstream sets it inside the accept branch).
+                self.last_incoming_request_ms = self.now_ms;
+                self.upload_queue.push(r);
+                eff.push(PeerEffect::ReadRequest(r));
             }
             M::Cancel(r) => {
                 if let Some(pos) = self
@@ -629,6 +1071,12 @@ impl PeerConn {
                 {
                     self.upload_queue.remove(pos);
                     eff.push(PeerEffect::CancelRequest(r));
+                    // upstream `incoming_cancel` — the peer learns the
+                    // request was dropped via `write_reject_request`
+                    // (piece_rejects counts even when `supports_fast`
+                    // suppresses the actual message — the torrent
+                    // side gates the send).
+                    eff.push(PeerEffect::RejectRequest(r));
                 }
             }
             M::Piece {
@@ -636,11 +1084,39 @@ impl PeerConn {
                 offset,
                 ref data,
             } => {
+                // `incoming_piece` — an omitted bitfield reads as
+                // `have_none`; a piece-level message also proves the
+                // peer holds metadata (`m_has_metadata`).
+                if !self.bitfield_received {
+                    self.bitfield_received = true;
+                }
+                self.has_metadata = true;
                 let r = bitdaemon_common::PeerRequest {
                     piece,
                     start: offset,
                     length: data.len() as i32,
                 };
+                // BitComet quirk upstream: a zero-length `piece`
+                // message is used as a reject-request — process it as
+                // one (and report `peer_sent_empty_piece`).
+                if r.length == 0 {
+                    eff.push(PeerEffect::PeerError("peer sent empty piece"));
+                    let b = self.on_reject(&r, block_size);
+                    eff.push(PeerEffect::AbortDownload(b));
+                    eff.push(PeerEffect::GracefulCheck);
+                    // `incoming_reject` tail — the retry pick only
+                    // runs when the conn is nearly drained
+                    // (`request_queue.empty() && download_queue < 2`
+                    // upstream).
+                    if self.pipeline.request_queue.is_empty()
+                        && self.pipeline.download_queue.len() < 2
+                    {
+                        eff.push(PeerEffect::MaybePick(Some(
+                            crate::counters::Counter::RejectPiecePicks,
+                        )));
+                    }
+                    return;
+                }
                 // upstream `incoming_piece` runs the slow-start bump
                 // + `update_desired_queue_size` before checking
                 // whether the block was even requested.
@@ -653,14 +1129,34 @@ impl PeerConn {
                     piece_index: r.piece,
                     block_index: r.start / block_size,
                 };
-                if !self.was_requested(&r) {
-                    // upstream counts unsolicited blocks as invalid
-                    // and drops the payload — never touches disk
-                    // (`unwanted_block_alert` in `incoming_piece`).
-                    self.num_invalid_requests += 1;
-                    eff.push(PeerEffect::UnwantedBlock(block));
+                if !self.was_requested(&r, block_size) {
+                    // `incoming_piece` — unsolicited payload is
+                    // `piece_unknown` waste + `unwanted_block_alert`;
+                    // never touches disk or the invalid-request count.
+                    eff.push(PeerEffect::UnwantedBlock(block, r.length));
                     return;
                 }
+                // `incoming_piece` — the queue entry's flags pick the
+                // waste bucket when the block turns out already
+                // downloaded upstream reads them off the
+                // `m_download_queue` iterator before erasing.
+                let waste = self
+                    .pipeline
+                    .download_queue
+                    .iter()
+                    .chain(self.pipeline.request_queue.iter())
+                    .find(|b| b.block == block)
+                    .map_or(WasteReason::Unknown, |e| {
+                        if e.timed_out {
+                            WasteReason::TimedOut
+                        } else if e.not_wanted {
+                            WasteReason::Cancelled
+                        } else if e.busy {
+                            WasteReason::EndGame
+                        } else {
+                            WasteReason::Unknown
+                        }
+                    });
                 // `incoming_piece` clears snub only when the block
                 // arrived inside the request-timeout window.
                 if self.pipeline.maybe_unsnub(self.now_ms) {
@@ -669,16 +1165,36 @@ impl PeerConn {
                 let block = self.on_piece(&r, block_size);
                 eff.push(PeerEffect::MarkDownloaded(block));
                 eff.push(PeerEffect::BlockFinished(block));
-                eff.push(PeerEffect::DiskWrite(r, data.to_vec()));
-                eff.push(PeerEffect::MaybePick);
+                eff.push(PeerEffect::DiskWrite(r, data.to_vec(), waste));
+                // `check_graceful_pause` runs before the
+                // re-pick upstream (`is_disconnecting` then skips it).
+                eff.push(PeerEffect::GracefulCheck);
+                // `incoming_piece` tail — `request_a_block` bumps
+                // `incoming_piece_picks` (torrent-side swaps in
+                // `incoming_redundant_piece_picks` when the block
+                // turned out waste).
+                eff.push(PeerEffect::MaybePick(Some(
+                    crate::counters::Counter::IncomingPiecePicks,
+                )));
             }
             M::RejectRequest(r) => {
                 let b = self.on_reject(&r, block_size);
                 eff.push(PeerEffect::AbortDownload(b));
-                eff.push(PeerEffect::MaybePick);
+                // `incoming_reject` — `check_graceful_pause` before
+                // the retry pick (upstream order).
+                eff.push(PeerEffect::GracefulCheck);
+                // `incoming_reject` tail — pick only when nearly
+                // drained (`request_queue.empty() && download_queue
+                // .size() < 2` upstream), `reject_piece_picks`.
+                if self.pipeline.request_queue.is_empty() && self.pipeline.download_queue.len() < 2
+                {
+                    eff.push(PeerEffect::MaybePick(Some(
+                        crate::counters::Counter::RejectPiecePicks,
+                    )));
+                }
             }
             M::AllowedFast(i) => self.on_allowed_fast(i),
-            M::SuggestPiece(i) => self.on_suggest(i),
+            M::SuggestPiece(i) => eff.push(PeerEffect::SuggestPiece(i)),
             M::DhtPort(p) => eff.push(PeerEffect::DhtPort(p)),
             M::Extended { id, ref data } => {
                 if id == 0 {
@@ -693,7 +1209,25 @@ impl PeerConn {
                         self.ext_ut_pex = hs.messages.get("ut_pex").copied().unwrap_or(0) as u8;
                         self.ext_i2p_pex = hs.messages.get("i2p_pex").copied().unwrap_or(0) as u8;
                         self.metadata_size = hs.metadata_size;
+                        // `set_has_metadata(false)` — a peer that
+                        // advertised ut_metadata but no size is still
+                        // fetching the info dict itself.
+                        if self.ext_ut_metadata != 0 {
+                            self.has_metadata = hs.metadata_size.is_some_and(|sz| sz > 0);
+                        }
                         self.remote_upload_only = hs.upload_only;
+                        self.remote_share_mode = hs.share_mode;
+                        // BEP-21 `complete_ago` — when this peer last
+                        // saw a complete copy (upstream stores it as
+                        // `m_last_seen_complete` on the conn; the
+                        // torrent's `m_swarm_last_seen_complete`
+                        // maxes over conns).
+                        if hs.complete_ago >= 0 {
+                            self.last_seen_complete = std::time::SystemTime::now()
+                                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_secs() as i64)
+                                - hs.complete_ago;
+                        }
                         // ext-handshake `p` — the peer's listen port
                         // (upstream `update_peer_port` +
                         // `received_listen_port`); ut_pex uses it for
@@ -738,6 +1272,22 @@ impl PeerConn {
                     eff.push(PeerEffect::PexPacket(data.to_vec()));
                 } else if id == self.local_i2p_pex {
                     eff.push(PeerEffect::I2pPexPacket(data.to_vec()));
+                } else if id == self.local_upload_only {
+                    // `upload_only` — 1-byte flag (upstream checks
+                    // `packet_size() == 3` — ext id + 1 payload byte).
+                    if data.len() != 1 {
+                        return;
+                    }
+                    eff.push(PeerEffect::RemoteUploadOnly(data[0] != 0));
+                } else if id == self.local_share_mode {
+                    // `share_mode` — 1-byte flag; ignored when the
+                    // peer is a seed (upstream `set_share_mode`).
+                    if data.len() != 1 {
+                        return;
+                    }
+                    if !self.is_seed() {
+                        self.remote_share_mode = data[0] != 0;
+                    }
                 } else if id == self.local_ut_holepunch {
                     // `on_holepunch` — upstream drops the message when
                     // the remote never advertised the extension.
@@ -747,11 +1297,19 @@ impl PeerConn {
                         eff.push(PeerEffect::Holepunch(hp));
                     }
                 } else if id == self.local_dont_have && data.len() == 4 {
-                    // `incoming_dont_have` — peer retracted a piece.
+                    // `incoming_dont_have` — peer retracted a piece
+                    // (same validation as the wire `dont_have` arm).
                     let i = PieceIndex(i32::from_be_bytes([data[0], data[1], data[2], data[3]]));
+                    if i.0 < 0 || i.0 >= num_pieces.max(0) {
+                        return;
+                    }
+                    if i.0 as usize >= self.peer_pieces.size() {
+                        eff.push(PeerEffect::Disconnect("invalid dont_have index", true));
+                        return;
+                    }
                     if self.on_dont_have(i) {
                         eff.push(PeerEffect::RefcountDec(i));
-                        eff.push(PeerEffect::MaybePick);
+                        eff.push(PeerEffect::PeerSeed(false));
                     }
                 }
             }
@@ -824,6 +1382,29 @@ impl PeerConn {
         true
     }
 
+    /// `peer_connection::make_time_critical` — move an unsent
+    /// request-queue block into the time-critical prefix. Returns
+    /// false when the block isn't queued or is already critical.
+    pub fn make_time_critical(&mut self, block: PieceBlock) -> bool {
+        let Some(pos) = self
+            .pipeline
+            .request_queue
+            .iter()
+            .position(|b| b.block == block)
+        else {
+            return false;
+        };
+        if pos < self.pipeline.queued_time_critical as usize {
+            return false;
+        }
+        let b = self.pipeline.request_queue.remove(pos);
+        self.pipeline
+            .request_queue
+            .insert(self.pipeline.queued_time_critical as usize, b);
+        self.pipeline.queued_time_critical = self.pipeline.queued_time_critical.saturating_add(1);
+        true
+    }
+
     /// Build the `PeerRequestCtx` the picker glue needs from this
     /// connection's state.
     pub fn request_ctx(
@@ -885,6 +1466,7 @@ impl PeerConn {
         rate: i64,
         send_buffer_size: usize,
         now_ms: i64,
+        counters: &crate::counters::Counters,
         pc: &mut dyn PickerStats,
     ) -> (
         bool,
@@ -933,7 +1515,7 @@ impl PeerConn {
         if let Some(e) = endgame {
             // `m_endgame_mode` — upstream sets it inside
             // request_a_block, before the marks land.
-            self.pipeline.endgame = e;
+            self.set_endgame(e, counters);
         }
         let mut queued = Vec::new();
         for (b, busy) in picked {
@@ -987,6 +1569,24 @@ impl PeerConn {
     }
 }
 
+/// `aux::waste_reason` — why a received block's payload was thrown
+/// away; indexes the `waste_piece_*` stats counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasteReason {
+    /// `piece_timed_out` — a timed-out request's payload arrived late.
+    TimedOut,
+    /// `piece_cancelled` — the request was cancelled while in flight.
+    Cancelled,
+    /// `piece_unknown` — unrequested / already-picked-elsewhere.
+    Unknown,
+    /// `piece_seed` — we're a seed; all incoming payload is waste.
+    Seed,
+    /// `piece_end_game` — busy-block duplicate (end-game requester).
+    EndGame,
+    /// `piece_closing` — conn was disconnecting when it arrived.
+    Closing,
+}
+
 /// `peer_connection` incoming-side effects — the session runs
 /// these (picker/disk/wire/alerts).
 #[derive(Debug)]
@@ -997,8 +1597,11 @@ pub enum PeerEffect {
     RefcountDec(PieceIndex),
     /// bulk refcount from a bitfield (`true` = inc).
     RefcountBulk(bitdaemon_common::Bitfield, bool),
-    /// write a received block to disk.
-    DiskWrite(bitdaemon_common::PeerRequest, Vec<u8>),
+    /// write a received block to disk — the `WasteReason` carries the
+    /// queue-entry flags (`timed_out`/`not_wanted`/`busy`) upstream
+    /// reads off the `m_download_queue` iterator to bucket the block
+    /// when it turns out already-downloaded.
+    DiskWrite(bitdaemon_common::PeerRequest, Vec<u8>, WasteReason),
     /// serve a peer's request (upload path).
     ReadRequest(bitdaemon_common::PeerRequest),
     /// peer cancelled a request.
@@ -1007,8 +1610,16 @@ pub enum PeerEffect {
     MarkDownloaded(PieceBlock),
     /// `picker.abort_download` (reject/choke clearing).
     AbortDownload(PieceBlock),
-    /// drive `request_a_block` again.
-    MaybePick,
+    /// drive `request_a_block` again — the counter tags the pick
+    /// context (`incoming_piece_picks`, `reject_piece_picks`,
+    /// `unchoke_piece_picks`…) and bumps only when a pick lands.
+    /// `None` = uncounted context.
+    MaybePick(Option<crate::counters::Counter>),
+    /// `check_graceful_pause` — under `graceful_pause` a conn is
+    /// dropped once its `m_outstanding_bytes` drains to 0. Emitted
+    /// at upstream's check sites (`incoming_piece`/`incoming_reject`
+    /// tails; write completion is handled session-side).
+    GracefulCheck,
     /// BEP-5 port announcement.
     DhtPort(u16),
     /// BEP-10 extended handshake received.
@@ -1025,9 +1636,19 @@ pub enum PeerEffect {
     /// `yourip` from the BEP-10 handshake — the peer's view of our
     /// external address (`ip_voter` `source_peer`).
     YourIp(std::net::IpAddr),
+    /// `torrent::seen_complete` — a peer proved a complete copy
+    /// exists (upstream marks it on `have_all` with prior payload,
+    /// and on every `piece` a seed delivers).
+    SeenComplete,
+    /// `incoming_suggest` — BEP-6 SUGGEST payload; the checks live
+    /// on the torrent side (it owns `have_piece`/`valid_metadata`).
+    SuggestPiece(PieceIndex),
+    /// `incoming_have` — the peer took a suggested piece; under
+    /// `suggest_read_cache` refill the suggestion slot.
+    SuggestAck(PieceIndex),
     /// `unwanted_block_alert` — a `piece` message arrived for a
     /// block that is not in either request queue.
-    UnwantedBlock(PieceBlock),
+    UnwantedBlock(PieceBlock, i32),
     /// `block_finished_alert` — a `piece` message completed a
     /// requested block.
     BlockFinished(PieceBlock),
@@ -1042,8 +1663,32 @@ pub enum PeerEffect {
     /// range, super-seed mismatch, choked + not allowed-fast). The
     /// `msg` mirrors upstream's peer_log reason text.
     InvalidRequest(String),
-    /// protocol violation — drop the connection.
-    Disconnect(&'static str),
+    /// the peer's completeness flipped (`set_seed` upstream —
+    /// bitfield-full, `have_all`, or `have` reaching full → `true`;
+    /// `have_none`/shrinking bitfield → `false`).
+    PeerSeed(bool),
+    /// `set_upload_only` on the inbound `upload_only` message — the
+    /// remote toggled BEP-21 upload-only mode. The torrent side syncs
+    /// the peer-list `upload_only` bit and runs
+    /// `disconnect_if_redundant`.
+    RemoteUploadOnly(bool),
+    /// `write_choke` — the bare `Choke` re-send upstream issues as a
+    /// choked-state reminder every tenth invalid request; unlike
+    /// `choke_peer` it emits unconditionally and only updates
+    /// `m_last_choke` + the outgoing-choke counter.
+    SendChoke,
+    /// `incoming_not_interested` → `choke_this_peer` — a peer that
+    /// wants nothing from us forfeits its upload slot; the torrent
+    /// runs `choke_peer` (which clears optimistic state and re-runs
+    /// the unchoke pick on the next choker pass).
+    PeerNotInterested,
+    /// `peer_error_alert` — a non-fatal peer protocol complaint
+    /// (e.g. `peer_sent_empty_piece`); posted, no disconnect.
+    PeerError(&'static str),
+    /// protocol violation — drop the connection. `failed` mirrors
+    /// upstream `disconnect_severity_t > normal` (drives the
+    /// swarm-entry `failcount` bump in `connection_closed`).
+    Disconnect(&'static str, bool),
 }
 
 #[cfg(test)]

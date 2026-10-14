@@ -21,13 +21,33 @@ fn bitfield_then_have() {
     let mut eff = Vec::new();
     // bitfield of 10 pieces, peer has piece 0 and 1
     let bits = bytes::Bytes::from(vec![0b1100_0000u8, 0]);
-    c.dispatch(&PeerMessage::Bitfield(bits), 10, 0x4000, &mut eff);
+    c.dispatch(
+        &PeerMessage::Bitfield(bits),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
     assert!(c.bitfield_received);
     assert_eq!(c.num_pieces, 2);
     assert!(matches!(eff[0], PeerEffect::RefcountBulk(_, true)));
 
     eff.clear();
-    c.dispatch(&PeerMessage::Have(PieceIndex(2)), 10, 0x4000, &mut eff);
+    c.dispatch(
+        &PeerMessage::Have(PieceIndex(2)),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
     assert_eq!(c.num_pieces, 3);
     assert!(
         eff.iter()
@@ -55,7 +75,17 @@ fn choke_aborts_unsent_requests() {
         false,
     );
     let mut eff = Vec::new();
-    c.dispatch(&PeerMessage::Choke, 10, 0x4000, &mut eff);
+    c.dispatch(
+        &PeerMessage::Choke,
+        10,
+        0x4000,
+        0x40000,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
     assert!(c.peer_choked);
     assert_eq!(eff.len(), 2, "both queued requests aborted: {eff:?}");
 }
@@ -82,6 +112,11 @@ fn piece_marks_download_and_requests_more() {
         },
         10,
         0x4000,
+        0x40000,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
         &mut eff,
     );
     assert!(
@@ -89,7 +124,7 @@ fn piece_marks_download_and_requests_more() {
             .any(|e| matches!(e, PeerEffect::MarkDownloaded(_)))
     );
     assert!(eff.iter().any(|e| matches!(e, PeerEffect::DiskWrite(..))));
-    assert!(eff.iter().any(|e| matches!(e, PeerEffect::MaybePick)));
+    assert!(eff.iter().any(|e| matches!(e, PeerEffect::MaybePick(_))));
 }
 
 #[test]
@@ -101,14 +136,28 @@ fn invalid_request_rejected_and_alerted() {
         start: 0,
         length: 0x4000,
     };
-    c.dispatch(&PeerMessage::Request(req), 10, 0x4000, &mut eff);
-    // upstream `incoming_request`: write_reject_request +
-    // invalid_request_alert, num_invalid_requests += 1 — no
-    // disconnect until >300 invalid requests while choked.
-    assert!(matches!(eff[0], PeerEffect::RejectRequest(_)));
-    assert!(matches!(eff[1], PeerEffect::InvalidRequest(_)));
+    c.dispatch(
+        &PeerMessage::Request(req),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    // upstream `incoming_request`: a request from a not-interested
+    // peer posts `invalid_request_alert` then fakes `interested`;
+    // the out-of-range piece then gets `write_reject_request` +
+    // another alert. num_invalid_requests += 1 — no disconnect
+    // until >300 invalid requests while choked.
+    assert!(matches!(eff[0], PeerEffect::InvalidRequest(_)));
+    assert!(matches!(eff[1], PeerEffect::RejectRequest(_)));
+    assert!(matches!(eff[2], PeerEffect::InvalidRequest(_)));
+    assert!(c.peer_interested, "request fakes incoming_interested");
     assert_eq!(c.num_invalid_requests, 1);
-    assert_eq!(eff.len(), 2);
+    assert_eq!(eff.len(), 3);
 }
 
 #[test]
@@ -120,12 +169,188 @@ fn valid_request_queues_for_upload() {
         start: 0x4000,
         length: 0x4000,
     };
-    c.dispatch(&PeerMessage::Request(r), 10, 0x4000, &mut eff);
+    // interested + unchoked peers take the accept path directly
+    // (choked peers only get `accept_fast` pieces upstream).
+    c.peer_interested = true;
+    c.choked = false;
+    c.dispatch(
+        &PeerMessage::Request(r),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
     assert_eq!(c.upload_queue.len(), 1);
+    assert_eq!(eff.len(), 1);
     assert!(matches!(eff[0], PeerEffect::ReadRequest(_)));
-    // cancel removes it
+    // cancel removes it (+ the upstream `write_reject_request`)
     eff.clear();
-    c.dispatch(&PeerMessage::Cancel(r), 10, 0x4000, &mut eff);
+    c.dispatch(
+        &PeerMessage::Cancel(r),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
     assert!(c.upload_queue.is_empty());
     assert!(matches!(eff[0], PeerEffect::CancelRequest(_)));
+}
+
+#[test]
+fn choked_request_rejected_then_disconnects() {
+    // upstream `incoming_request`: a choked peer may only request
+    // `accept_fast` pieces; anything else is rejected, and past 2 s
+    // since our last Choke the peer is dropped.
+    let mut c = conn();
+    c.peer_interested = true;
+    let r = PeerRequest {
+        piece: PieceIndex(4),
+        start: 0,
+        length: 0x4000,
+    };
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Request(r),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(c.upload_queue.is_empty());
+    assert!(matches!(eff[0], PeerEffect::RejectRequest(_)));
+    assert!(!eff.iter().any(|e| matches!(e, PeerEffect::Disconnect(..))));
+
+    // past the 2 s grace window the same request disconnects
+    eff.clear();
+    c.now_ms += 2500;
+    c.dispatch(
+        &PeerMessage::Request(r),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(eff.iter().any(|e| matches!(e, PeerEffect::Disconnect(..))));
+}
+
+#[test]
+fn choked_accept_fast_request_served_with_budget() {
+    // `accept_fast` pieces are servicable while choked — up to
+    // `3 * blocks_per_piece` requests; beyond that upstream
+    // disconnects the peer (piece_length 0x40000 / block 0x4000
+    // → 16 blocks → budget 48).
+    let mut c = conn();
+    c.peer_interested = true;
+    c.accept_fast.push(PieceIndex(4));
+    c.accept_fast_piece_cnt.push(0);
+    let r = PeerRequest {
+        piece: PieceIndex(4),
+        start: 0,
+        length: 0x4000,
+    };
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Request(r),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert_eq!(c.upload_queue.len(), 1);
+    assert_eq!(c.accept_fast_piece_cnt[0], 1);
+    assert!(matches!(eff[0], PeerEffect::ReadRequest(_)));
+
+    // exhaust the budget → disconnect
+    c.accept_fast_piece_cnt[0] = 48;
+    eff.clear();
+    c.upload_queue.clear();
+    c.dispatch(
+        &PeerMessage::Request(r),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(eff.iter().any(|e| matches!(e, PeerEffect::Disconnect(..))));
+    assert!(c.upload_queue.is_empty());
+}
+
+#[test]
+fn request_queue_cap_rejects() {
+    // `max_allowed_in_request_queue` — beyond it upstream rejects
+    // without enqueueing.
+    let mut c = conn();
+    c.peer_interested = true;
+    c.choked = false;
+    let r = PeerRequest {
+        piece: PieceIndex(4),
+        start: 0,
+        length: 0x4000,
+    };
+    c.upload_queue.push(r);
+    c.upload_queue.push(r);
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Request(r),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        0x200000,
+        1,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert_eq!(c.upload_queue.len(), 2);
+    assert!(matches!(eff[0], PeerEffect::RejectRequest(_)));
+}
+
+#[test]
+fn request_before_metadata_rejected() {
+    // `!valid_metadata` — plain reject, no interested fake-up.
+    let mut c = conn();
+    let r = PeerRequest {
+        piece: PieceIndex(0),
+        start: 0,
+        length: 0x4000,
+    };
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Request(r),
+        0,
+        0x4000,
+        0x40000,
+        None,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert_eq!(eff.len(), 1);
+    assert!(matches!(eff[0], PeerEffect::RejectRequest(_)));
+    assert!(!c.peer_interested);
 }

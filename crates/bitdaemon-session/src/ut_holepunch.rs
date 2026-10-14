@@ -185,11 +185,12 @@ pub fn rendezvous(ep: &SocketAddr, target: Option<(bool, bool)>, remote_local: b
     let Some((supports, is_self)) = target else {
         return Rendezvous::Fail(HpError::NotConnected);
     };
-    if is_self {
-        return Rendezvous::Fail(HpError::NoSelf);
-    }
+    // upstream order: `no_support` is reported before `no_self`.
     if !supports {
         return Rendezvous::Fail(HpError::NoSupport);
+    }
+    if is_self {
+        return Rendezvous::Fail(HpError::NoSelf);
     }
     if bitdaemon_net::ip_helpers::is_local(&ep.ip()) != remote_local {
         return Rendezvous::Drop;
@@ -250,6 +251,11 @@ mod tests {
         assert!(matches!(
             rendezvous(&ep, Some((true, true)), false),
             Rendezvous::Fail(HpError::NoSelf)
+        ));
+        // self without support — upstream reports `no_support` first
+        assert!(matches!(
+            rendezvous(&ep, Some((false, true)), false),
+            Rendezvous::Fail(HpError::NoSupport)
         ));
         // ok — global ↔ global
         assert!(matches!(

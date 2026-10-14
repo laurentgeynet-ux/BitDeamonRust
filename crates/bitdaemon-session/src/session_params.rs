@@ -82,6 +82,11 @@ pub fn read_session_params_node(e: &BdecodeNode<'_>) -> SessionParams {
 
     let dht = e.dict_find_dict(b"dht");
     dht_load_state(&dht, &mut params.dht_settings);
+    // upstream `apply_deprecated_dht_settings`: the legacy "dht"
+    // dict's keys also land in the flat `dht_*` settings —
+    // applied *before* the "settings" dict, which then overrides
+    // per-key.
+    apply_dht_settings_dict(&mut params.settings, &dht);
 
     let st = e.dict_find_dict(b"dht state");
     if st.node_type() == NodeType::Dict {
@@ -90,7 +95,10 @@ pub fn read_session_params_node(e: &BdecodeNode<'_>) -> SessionParams {
 
     let sett = e.dict_find_dict(b"settings");
     if sett.node_type() == NodeType::Dict {
-        params.settings = read_settings_dict(&sett);
+        // sparse overlay on top of the dht-derived keys —
+        // `read_settings_dict` would reset to defaults and lose
+        // them.
+        apply_settings_dict(&mut params.settings, &sett);
     }
 
     let ext = e.dict_find_dict(b"extensions");
@@ -825,8 +833,80 @@ pub fn save_settings_to_dict(s: &SessionSettings) -> Entry {
 /// skipped (upstream ignores them too).
 #[must_use]
 pub fn read_settings_dict(n: &BdecodeNode<'_>) -> SessionSettings {
-    use std::time::Duration;
     let mut s = SessionSettings::default();
+    apply_settings_dict(&mut s, n);
+    s
+}
+
+/// upstream `apply_deprecated_dht_settings` — sparse overlay of
+/// the legacy `"dht"` dict's keys onto the flat `dht_*` settings
+/// fields; only keys the dict carries are touched.
+pub fn apply_dht_settings_dict(s: &mut SessionSettings, d: &BdecodeNode<'_>) {
+    use std::time::Duration;
+    if d.node_type() != NodeType::Dict {
+        return;
+    }
+    macro_rules! int_field {
+        ($k:literal, $f:ident) => {
+            let v = d.dict_find_int($k);
+            if v.node_type() == NodeType::Int {
+                s.$f = v.int_value() as _;
+            }
+        };
+        ($k:literal, $f:ident, dur) => {
+            let v = d.dict_find_int($k);
+            if v.node_type() == NodeType::Int {
+                s.$f = Duration::from_secs(v.int_value().max(0) as u64);
+            }
+        };
+        ($k:literal, $f:ident, bool) => {
+            let v = d.dict_find_int($k);
+            if v.node_type() == NodeType::Int {
+                s.$f = v.int_value() != 0;
+            }
+        };
+    }
+    int_field!(b"max_peers_reply", dht_max_peers_reply);
+    int_field!(b"search_branching", dht_search_branching);
+    int_field!(b"max_fail_count", dht_max_fail_count);
+    int_field!(b"max_torrents", dht_max_torrents);
+    int_field!(b"max_dht_items", dht_max_dht_items);
+    int_field!(b"max_peers", dht_max_peers);
+    int_field!(b"max_torrent_search_reply", dht_max_torrent_search_reply);
+    int_field!(b"restrict_routing_ips", dht_restrict_routing_ips, bool);
+    int_field!(b"restrict_search_ips", dht_restrict_search_ips, bool);
+    int_field!(b"extended_routing_table", dht_extended_routing_table, bool);
+    int_field!(b"aggressive_lookups", dht_aggressive_lookups, bool);
+    int_field!(b"privacy_lookups", dht_privacy_lookups, bool);
+    int_field!(b"enforce_node_id", dht_enforce_node_id, bool);
+    int_field!(b"ignore_dark_internet", dht_ignore_dark_internet, bool);
+    int_field!(b"block_timeout", dht_block_timeout, dur);
+    int_field!(b"block_ratelimit", dht_block_ratelimit);
+    int_field!(b"read_only", dht_read_only, bool);
+    int_field!(b"item_lifetime", dht_item_lifetime, dur);
+    int_field!(b"upload_rate_limit", dht_upload_rate_limit);
+    int_field!(
+        b"sample_infohashes_interval",
+        dht_sample_infohashes_interval,
+        dur
+    );
+    int_field!(
+        b"max_infohashes_sample_count",
+        dht_max_infohashes_sample_count
+    );
+    int_field!(
+        b"prefer_verified_node_ids",
+        dht_prefer_verified_node_ids,
+        bool
+    );
+}
+
+/// `apply_settings_pack_impl` — sparse overlay: only keys present
+/// in the dict are written into `s` (upstream's `settings_pack`
+/// carries just the serialized keys, so runtime values for absent
+/// keys survive `load_state`).
+pub fn apply_settings_dict(s: &mut SessionSettings, n: &BdecodeNode<'_>) {
+    use std::time::Duration;
     macro_rules! get {
         ($f:ident, $k:literal, str) => {
             let v = n.dict_find_string_value($k, &[]);
@@ -1361,5 +1441,4 @@ pub fn read_settings_dict(n: &BdecodeNode<'_>) -> SessionSettings {
     // BitDaemon extensions
     get!(web_seed_blocks_per_tick, b"web_seed_blocks_per_tick", i32);
     get!(save_resume_data_interval, b"save_resume_data_interval", sec);
-    s
 }

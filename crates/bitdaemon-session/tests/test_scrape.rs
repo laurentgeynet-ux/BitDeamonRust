@@ -24,8 +24,16 @@ fn session() -> Session {
 fn scrape_cycle() {
     let ih = Sha1Hash::from_bytes(&[7; 20]).unwrap();
     let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
-    t.add_tracker("http://tr/announce".into(), 0);
-    t.add_tracker("http://other/announce".into(), 1);
+    t.add_tracker(
+        "http://tr/announce".into(),
+        0,
+        bitdaemon_session::tracker_list::SOURCE_CLIENT,
+    );
+    t.add_tracker(
+        "http://other/announce".into(),
+        1,
+        bitdaemon_session::tracker_list::SOURCE_CLIENT,
+    );
     let mut s = session();
     s.add_torrent(t);
     s.pop_alerts(); // drain TorrentAdded
@@ -52,11 +60,15 @@ fn scrape_cycle() {
         peers: vec![],
         peer_ids: vec![],
         external_ip: None,
+        ..Default::default()
     };
     s.on_scrape_response(&ih, "http://tr/announce", Ok(resp));
 
     let t = s.torrents.get(&ih).unwrap();
-    assert_eq!(t.num_seeds, 42);
+    // upstream: scrape `complete` lands on `m_complete`; `m_num_seeds`
+    // is the connected-seed count (none here).
+    assert_eq!(t.complete, 42);
+    assert_eq!(t.num_seeds, 0);
     let i = t.trackers.find("http://tr/announce").unwrap();
     let e = &t.trackers.trackers[i];
     assert_eq!(e.scrape_complete, 42);
@@ -82,7 +94,11 @@ fn scrape_cycle() {
 fn scrape_failure_posts_alert() {
     let ih = Sha1Hash::from_bytes(&[9; 20]).unwrap();
     let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
-    t.add_tracker("http://tr/announce".into(), 0);
+    t.add_tracker(
+        "http://tr/announce".into(),
+        0,
+        bitdaemon_session::tracker_list::SOURCE_CLIENT,
+    );
     let mut s = session();
     s.add_torrent(t);
     s.pop_alerts();

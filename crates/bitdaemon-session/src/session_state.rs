@@ -2,11 +2,16 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `session_params::session_state` — the `.session` file. Upstream
-//! v2 serializes the whole session into one bencoded dict:
-//! `{"torrents": {info_hash: resume-data}, "dht": dht-state,
-//! "settings": …}`. We port the container; each torrent's resume
-//! blob is `write_resume_data_buf` output verbatim.
+//! BitDaemon `.session` container — **extension, not an upstream
+//! format**. Upstream persists the session as `session_params`
+//! (`write_session_params`: settings/dht/dht-state/extensions/
+//! ip-filter) and each torrent separately via `save_resume_data`;
+//! there is no upstream single-file "session + torrents" blob.
+//! This module is that convenience container for downstream users:
+//! `{"version": 1, "torrents": {info_hash: resume-blob}, "dht": blob,
+//! "settings": sparse-settings-dict, …}`. Each torrent's resume
+//! blob is `write_resume_data_buf` output verbatim, so it stays
+//! byte-compatible with libtorrent's per-torrent `.resume` files.
 
 use std::collections::BTreeMap;
 
@@ -69,6 +74,14 @@ pub fn save_session_state_buf(st: &SessionState) -> Vec<u8> {
 /// land in `extra`, bad blobs are skipped.
 pub fn load_session_state(buf: &[u8]) -> Option<SessionState> {
     let root = bdecode(buf);
+    load_session_state_node(&root)
+}
+
+/// `load_session_state` on an already-decoded root node (lets the
+/// caller keep `root` for a sparse settings overlay — upstream's
+/// `settings_pack` only contains the keys the file carries).
+#[must_use]
+pub fn load_session_state_node(root: &BdecodeNode<'_>) -> Option<SessionState> {
     if root.node_type() != bitdaemon_bencode::NodeType::Dict {
         return None;
     }

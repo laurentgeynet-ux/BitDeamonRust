@@ -102,14 +102,24 @@ fn files_checked_verdict() {
     // resume accepted, all pieces had → seed
     t.have.set_bit(0);
     t.have.set_bit(1);
-    t.on_files_checked(true, &mut eff);
+    t.on_files_checked(
+        true,
+        &Default::default(),
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
     assert!(t.seeding && t.finished);
     assert!(
         eff.iter()
             .any(|e| matches!(e, bitdaemon_session::torrent::TorrentEffect::BecameSeed))
     );
     // rejected → have cleared
-    t.on_files_checked(false, &mut eff);
+    t.on_files_checked(
+        false,
+        &Default::default(),
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
     assert_eq!(t.have.count(), 0);
     assert!(!t.finished && !t.seeding);
 }

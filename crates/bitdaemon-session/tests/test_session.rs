@@ -81,7 +81,7 @@ fn disconnect_cleans_up() {
     };
     let mut out = Vec::new();
     s.on_peer_message(&p, &mut out);
-    s.peer_disconnected(&ih, 9, &mut out);
+    s.peer_disconnected(&ih, 9, false, &mut out);
     assert_eq!(s.num_peers(), 0);
 }
 
@@ -107,6 +107,26 @@ fn verified_piece_emits_have_to_peers() {
         &mut out,
     );
 
+    // upstream `on_piece_verified` ignores pieces the picker doesn't
+    // consider finished, and `announce_piece` skips handshaking
+    // conns — finish the download and complete the handshakes.
+    if let Some(t) = s.torrents.get_mut(&ih) {
+        if let Some(p) = t.picker.as_mut() {
+            for b in 0..p.blocks_in_piece(PieceIndex(0)) {
+                p.mark_as_finished(
+                    bitdaemon_common::types::PieceBlock {
+                        piece_index: PieceIndex(0),
+                        block_index: b,
+                    },
+                    None,
+                );
+            }
+        }
+        for c in t.peers.values_mut() {
+            c.connecting = false;
+            c.handshake_done = true;
+        }
+    }
     let mut out = Vec::new();
     s.on_piece_verified(&ih, PieceIndex(0), true, &mut out);
     let haves = out
@@ -143,6 +163,7 @@ fn hash_mismatch_fails_piece() {
             piece: PieceIndex(0),
             hash: bad,
             block_hashes: Vec::new(),
+            picker_gen: 0,
             err: Default::default(),
         })
         .unwrap();
@@ -196,14 +217,18 @@ fn connect_candidates_backoff_on_failure() {
         StorageIndex(0),
     );
     let ep = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 6881);
-    t.add_swarm_peer(ep, bitdaemon_common::flags::PeerSourceFlags::TRACKER, true);
+    t.add_swarm_peer(
+        ep,
+        bitdaemon_common::flags::PeerSourceFlags::TRACKER,
+        &mut Vec::new(),
+    );
     s.add_torrent(t);
     let mut _o = Vec::new();
     s.tick(&mut _o); // session_time = 1 (0 means "never connected" upstream)
 
     let st = PeerListState {
         is_finished: false,
-        external_ip: None,
+        external_ip: bitdaemon_net::ip_voter::ExternalIp::default(),
         external_port: 6881,
         min_reconnect_time: 60,
         max_peerlist_size: 0,
@@ -263,11 +288,15 @@ fn ip_filter_bans_and_disconnects() {
     );
     let bad = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 66, 0, 1)), 6881);
     let good = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 66, 0, 2)), 6881);
-    t.add_swarm_peer(bad, bitdaemon_common::flags::PeerSourceFlags::TRACKER, true);
+    t.add_swarm_peer(
+        bad,
+        bitdaemon_common::flags::PeerSourceFlags::TRACKER,
+        &mut Vec::new(),
+    );
     t.add_swarm_peer(
         good,
         bitdaemon_common::flags::PeerSourceFlags::TRACKER,
-        true,
+        &mut Vec::new(),
     );
     t.add_peer(1, PeerConn::new(1, PeerPipeline::new(1, 1, 1), 0));
     s.add_torrent(t);
@@ -338,6 +367,83 @@ fn pause_announces_stopped() {
 }
 
 #[test]
+fn session_pause_is_a_second_layer() {
+    use bitdaemon_session::session::SessionOut;
+    let mut s = Session::new();
+    let ih = Sha1Hash::from_bytes(&[23; 20]).unwrap();
+    let mut t = Torrent::new(
+        ih,
+        1,
+        16384,
+        bitdaemon_common::Bitfield::with_size(1),
+        StorageIndex(0),
+    );
+    let mut e = bitdaemon_session::tracker_list::AnnounceEntry::new("http://t/announce", 0);
+    e.endpoints
+        .push(bitdaemon_session::tracker_list::AnnounceEndpoint::default());
+    t.trackers.trackers.push(e);
+    s.add_torrent(t);
+
+    // session pause → effective pause without touching m_paused
+    let mut out = Vec::new();
+    s.set_session_paused(true, &mut out);
+    {
+        let t = s.torrents.get(&ih).unwrap();
+        assert!(!t.paused && t.session_paused && t.is_paused());
+    }
+
+    // a user resume under a paused session is a no-op
+    // (`m_paused` was already false — the effective state never
+    // flips, exactly like upstream `torrent::set_paused(false)`).
+    s.set_paused(&ih, false, &mut out);
+    assert!(s.torrents.get(&ih).unwrap().is_paused());
+
+    // session resume → start_announcing (`started` again)
+    out.clear();
+    s.set_session_paused(false, &mut out);
+    {
+        let t = s.torrents.get(&ih).unwrap();
+        assert!(!t.is_paused() && !t.session_paused);
+    }
+    let started = out.iter().any(|o| {
+        matches!(
+            o,
+            SessionOut::TrackerAnnounce { ih: i, params, .. }
+                if *i == ih && params.event == 2
+        )
+    });
+    assert!(started, "session resume should re-announce `started`");
+}
+
+#[test]
+fn do_pause_disconnects_peers() {
+    use bitdaemon_session::session::SessionOut;
+    use bitdaemon_session::torrent::TorrentEffect;
+    let mut s = Session::new();
+    let ih = Sha1Hash::from_bytes(&[24; 20]).unwrap();
+    let mut t = Torrent::new(
+        ih,
+        1,
+        16384,
+        bitdaemon_common::Bitfield::with_size(1),
+        StorageIndex(0),
+    );
+    let pid = 7;
+    t.add_peer(pid, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
+    s.add_torrent(t);
+
+    // non-graceful pause → disconnect_all(errors::torrent_paused)
+    let mut out = Vec::new();
+    s.set_paused(&ih, true, &mut out);
+    assert!(out.iter().any(|o| matches!(
+        o,
+        SessionOut::Torrent(TorrentEffect::DisconnectPeer { peer, .. })
+            if *peer == pid
+    )));
+    assert!(s.torrents.get(&ih).unwrap().is_paused());
+}
+
+#[test]
 fn idle_peer_times_out() {
     let mut s = Session::new();
     s.settings.peer_timeout = std::time::Duration::from_secs(5);
@@ -349,14 +455,18 @@ fn idle_peer_times_out() {
         bitdaemon_common::Bitfield::with_size(1),
         StorageIndex(0),
     );
-    t.add_peer(1, PeerConn::new(1, PeerPipeline::new(1, 1, 1), 0));
+    // the engine registers conns post-handshake — mirror that.
+    let mut c = PeerConn::new(1, PeerPipeline::new(1, 1, 1), 0);
+    c.connecting = false;
+    c.handshake_done = true;
+    t.add_peer(1, c);
     s.add_torrent(t);
-    // last_active=0; session_time=0 → no timeout yet
+    // last_receive_ms=0; now_ms≈0 → no timeout yet
     let mut out = Vec::new();
     s.tick(&mut out);
     assert_eq!(s.torrents[&ih].peers.len(), 1);
-    // age the peer past the timeout
-    s.session_time = 100;
+    // age the conn-clock past `peer_timeout` (5 s)
+    s.torrents.get_mut(&ih).unwrap().now_ms = 100_000;
     s.tick(&mut out);
     assert!(
         s.torrents[&ih].peers.is_empty(),
@@ -492,7 +602,9 @@ fn unchoke_tick_unchokes_top_peer() {
     use bitdaemon_session::session::SessionOut;
 
     let mut s = Session::new();
-    s.settings.unchoke_slots_limit = 1;
+    // 2 slots: `unchoke_set = allowed - max(1, allowed/5) = 1`
+    // regular slot (the other goes to the optimistic rotation).
+    s.settings.unchoke_slots_limit = 2;
     let mut t = mk_torrent(4);
     t.init_picker(true);
     let ih = s.add_torrent(t);
@@ -508,12 +620,16 @@ fn unchoke_tick_unchokes_top_peer() {
         // mark them interested + give pid 1 the best upload rate
         let t = s.torrents.get_mut(&ih).unwrap();
         let c = t.peers.get_mut(&pid).unwrap();
+        c.connecting = false;
         c.peer_interested = true;
         c.stat_up_round = (4 - pid as i64) * 1000;
+        // deterministic round-robin tiebreak: pid 1 waited longest
+        c.last_unchoke =
+            std::time::Instant::now() - std::time::Duration::from_secs(100 * (4 - pid));
     }
-    // run 10 session ticks (the choker round fires at %10)
+    // run 15 session ticks (the choker round fires at `unchoke_interval`)
     let mut unchoked = Vec::new();
-    for _ in 0..10 {
+    for _ in 0..15 {
         let mut out = Vec::new();
         s.tick(&mut out);
         for e in &out {
@@ -542,7 +658,10 @@ fn dht_announce_tick_issues_get_peers() {
         None,
         bitdaemon_dht::dht_settings::DhtSettings::default(),
     );
-    s.dht_add_node("9.9.9.9:51413".parse().unwrap());
+    // upstream `add_dht_router` — routers land in the table
+    // directly and seed the traversal; `add_dht_node` would
+    // ping-verify first and leave the table empty.
+    s.dht_add_router("9.9.9.9:51413".parse().unwrap());
     let mut t = mk_torrent(4);
     t.init_picker(true);
     s.add_torrent(t);
@@ -579,7 +698,7 @@ fn seed_mode_leave_rechecks() {
     t.seed_verifying = Bitfield::with_size(4);
     t.seeding = true;
     assert!(t.is_seed());
-    t.leave_seed_mode(true);
+    t.leave_seed_mode(true, &mut Vec::new());
     assert!(!t.seed_mode);
     assert!(!t.is_seed());
     assert_eq!(t.num_verified, 0);
@@ -590,7 +709,49 @@ fn seed_mode_leave_rechecks() {
     let mut t2 = mk_torrent(4);
     t2.seed_mode = true;
     t2.seeding = true;
-    t2.leave_seed_mode(false);
+    t2.leave_seed_mode(false, &mut Vec::new());
     assert!(!t2.seed_mode);
     assert!(!t2.checking);
+}
+
+#[test]
+fn peer_class_assignment() {
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+    let mut out = Vec::new();
+    // private addr over TCP → `local` (2) + `tcp` (1) classes; the
+    // local class flags the conn `ignore_unchoke_slots`.
+    s.peer_connected(
+        &ih,
+        1,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        "10.0.0.5:6881".parse().unwrap(),
+        &mut out,
+    );
+    let c = &s.torrents[&ih].peers[&1];
+    assert!(c.peer_classes.has_class(1));
+    assert!(c.peer_classes.has_class(2));
+    assert!(c.ignores_unchoke_slots(&s.peer_class_pool));
+    // public addr over TCP → `global` (0) + `tcp` (1); not exempt.
+    s.peer_connected(
+        &ih,
+        2,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        "8.8.8.8:6881".parse().unwrap(),
+        &mut out,
+    );
+    let c = &s.torrents[&ih].peers[&2];
+    assert!(c.peer_classes.has_class(0));
+    assert!(c.peer_classes.has_class(1));
+    assert!(!c.peer_classes.has_class(2));
+    assert!(!c.ignores_unchoke_slots(&s.peer_class_pool));
+    // uTP keeps only the ip classes — the `tcp` class isn't added.
+    let mut c3 = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
+    c3.sock_type = 3; // socket_type_t::utp
+    s.peer_connected(&ih, 3, c3, "8.8.4.4:6881".parse().unwrap(), &mut out);
+    let c = &s.torrents[&ih].peers[&3];
+    assert!(c.peer_classes.has_class(0));
+    assert!(!c.peer_classes.has_class(1));
 }

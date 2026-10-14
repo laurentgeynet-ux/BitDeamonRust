@@ -19,7 +19,11 @@ fn dht_calls_without_node_are_noops() {
     let ih = Sha1Hash::from_bytes(&[7u8; 20]).unwrap_or_default();
     // none of these should panic or queue work without a node.
     s.dht_get_peers(ih);
-    s.dht_announce(ih, 6881);
+    s.dht_announce(
+        ih,
+        6881,
+        bitdaemon_session::session::DhtAnnounceFlags::default(),
+    );
     s.dht_get_item(ih);
     s.dht_get_item_mut([1u8; 32], b"salt".to_vec());
     s.dht_sample_infohashes("1.2.3.4:6881".parse().unwrap(), ih);
@@ -47,8 +51,11 @@ fn dht_calls_without_node_are_noops() {
 #[test]
 fn portmap_handle_lifecycle() {
     let mut s = session();
-    // `add_port_mapping` hands out a handle and queues the engine op.
-    let h = s.add_port_mapping(1, 6881, 6881);
+    // `add_port_mapping` returns one handle per (socket × active
+    // mapper) — 1 socket × {natpmp, upnp} = 2 handles upstream-style.
+    let hs = s.add_port_mapping(1, 6881, 6881);
+    assert_eq!(hs.len(), 2);
+    let h = hs[0];
     let mut out = Vec::new();
     s.tick(&mut out);
     assert!(
@@ -120,9 +127,16 @@ fn portmap_error_and_log_alerts() {
 #[test]
 fn listen_and_incoming_alerts() {
     let mut s = session();
+    // upstream drops inbound conns on an idle session unless
+    // `incoming_starts_queued_torrents` is on — enable it so the
+    // accept leg (and its alert) runs.
+    s.settings.incoming_starts_queued_torrents = true;
     s.on_listen_succeeded("0.0.0.0:6881".into(), 0);
     s.on_listen_failed("0.0.0.0:6882".into(), "bind".into(), "in use".into(), 0);
-    s.on_incoming_connection("1.2.3.4:5".parse().unwrap(), 0);
+    assert_eq!(
+        s.on_incoming_connection("1.2.3.4:5".parse().unwrap(), 0),
+        bitdaemon_session::session::IncomingVerdict::Accept
+    );
     let alerts = s.pop_alerts();
     assert!(alerts.iter().any(
         |a| matches!(a, Alert::ListenSucceeded { remote, kind: 0 } if remote == "0.0.0.0:6881")

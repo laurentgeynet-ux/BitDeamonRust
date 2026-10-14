@@ -59,12 +59,16 @@ fn piece_priorities_and_sequential() {
     t.piece_hashes = Some(vec![Sha1Hash::from_bytes(&[0; 20]).unwrap(); 4]);
     t.init_picker(false);
 
-    t.prioritize_pieces(&[
-        DownloadPriority::TOP,
-        DownloadPriority::DONT_DOWNLOAD,
-        DownloadPriority::DEFAULT,
-        DownloadPriority::DEFAULT,
-    ]);
+    t.prioritize_pieces(
+        &[
+            DownloadPriority::TOP,
+            DownloadPriority::DONT_DOWNLOAD,
+            DownloadPriority::DEFAULT,
+            DownloadPriority::DEFAULT,
+        ],
+        &bitdaemon_session::counters::Counters::default(),
+        &mut Vec::new(),
+    );
     assert_eq!(t.piece_priority(PieceIndex(0)), Some(DownloadPriority::TOP));
     assert_eq!(
         t.piece_priority(PieceIndex(1)),
@@ -99,6 +103,21 @@ fn save_resume_data_alert_and_interval() {
     );
 
     // verify a piece → dirty → save posts the blob alert
+    // (picker must consider the piece finished first — upstream
+    // `on_piece_verified` ignores unfinished pieces).
+    if let Some(t) = s.torrents.get_mut(&ih)
+        && let Some(p) = t.picker.as_mut()
+    {
+        for b in 0..p.blocks_in_piece(PieceIndex(0)) {
+            p.mark_as_finished(
+                bitdaemon_common::types::PieceBlock {
+                    piece_index: PieceIndex(0),
+                    block_index: b,
+                },
+                None,
+            );
+        }
+    }
     s.on_piece_verified(&ih, PieceIndex(0), true, &mut Vec::new());
     s.pop_alerts();
     s.save_resume_data(&ih, true);
@@ -132,13 +151,78 @@ fn force_announce_emits_effects() {
     use bitdaemon_session::session::SessionOut;
     let ih = Sha1Hash::from_bytes(&[4; 20]).unwrap();
     let mut t = Torrent::new(ih, 2, 128 * 1024, Bitfield::with_size(2), StorageIndex(0));
-    t.add_tracker("http://a/announce".into(), 0);
-    t.add_tracker("http://b/announce".into(), 1);
+    t.add_tracker(
+        "http://a/announce".into(),
+        0,
+        bitdaemon_session::tracker_list::SOURCE_CLIENT,
+    );
+    t.add_tracker(
+        "http://b/announce".into(),
+        1,
+        bitdaemon_session::tracker_list::SOURCE_CLIENT,
+    );
     let mut s = session();
     s.add_torrent(t);
 
     let mut out = Vec::new();
-    s.force_announce(&ih, None, &mut out);
+    s.force_announce(
+        &ih,
+        None,
+        0,
+        bitdaemon_session::session::ReannounceFlags::HIGH_PRIORITY,
+        &mut out,
+    );
+    let urls: Vec<_> = out
+        .iter()
+        .filter_map(|e| {
+            if let SessionOut::TrackerAnnounce { url, .. } = e {
+                Some(url.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    // upstream `force_reannounce(-1)` marks every tracker due but the
+    // announce_state failover still applies: with the default
+    // announce_to_all_tiers/trackers=false, only the first working
+    // tracker announces.
+    assert_eq!(urls, vec!["http://a/announce"]);
+
+    // single index — `force_tracker_request(idx)` bypasses the tier
+    // failover and reaches entry 1 directly.
+    out.clear();
+    s.force_announce(
+        &ih,
+        Some(1),
+        0,
+        bitdaemon_session::session::ReannounceFlags::default(),
+        &mut out,
+    );
+    assert!(matches!(
+        &out[0],
+        SessionOut::TrackerAnnounce { url, .. } if url == "http://b/announce"
+    ));
+
+    // with announce_to_all_tiers the scan reaches every due tracker.
+    // both are in-flight from the announces above — upstream
+    // `can_announce` blocks on `updating`, so complete them first.
+    use bitdaemon_net::http_tracker::TrackerResponse;
+    let reply = TrackerResponse {
+        interval: 0,
+        min_interval: 0,
+        ..TrackerResponse::default()
+    };
+    s.on_announce_response(&ih, "http://a/announce", Ok(reply.clone()));
+    s.on_announce_response(&ih, "http://b/announce", Ok(reply));
+    s.settings.announce_to_all_tiers = true;
+    out.clear();
+    s.force_announce(
+        &ih,
+        None,
+        0,
+        bitdaemon_session::session::ReannounceFlags::HIGH_PRIORITY,
+        &mut out,
+    );
     let urls: Vec<_> = out
         .iter()
         .filter_map(|e| {
@@ -150,14 +234,6 @@ fn force_announce_emits_effects() {
         })
         .collect();
     assert_eq!(urls, vec!["http://a/announce", "http://b/announce"]);
-
-    // single index
-    out.clear();
-    s.force_announce(&ih, Some(1), &mut out);
-    assert!(matches!(
-        &out[0],
-        SessionOut::TrackerAnnounce { url, .. } if url == "http://b/announce"
-    ));
 
     // flush_cache posts cache_flushed once the job completes
     use bitdaemon_session::alerts::Alert;
@@ -205,8 +281,16 @@ fn queue_position_moves() {
     // ih0(-1) < ih2(1) < ih1(2)
     assert_eq!((pos!(0), pos!(1), pos!(2)), (0, 2, 1));
 
-    // paused → -1
+    // upstream `m_download_queue` — paused downloaders keep their
+    // slot; only `finished`/`aborted` drop out (`no_pos` = -1).
     s.torrents.get_mut(&ihs[1]).unwrap().paused = true;
+    assert_eq!(s.queue_position(&ihs[1]), 2);
+    s.torrents.get_mut(&ihs[1]).unwrap().finished = true;
+    assert_eq!(s.queue_position(&ihs[1]), -1);
+    // …which also re-packs the survivors' indices.
+    assert_eq!((pos!(0), pos!(2)), (0, 1));
+    // a finished torrent rejects re-queueing upstream.
+    s.queue_position_set(&ihs[1], QueueMove::Top);
     assert_eq!(s.queue_position(&ihs[1]), -1);
 }
 
@@ -224,7 +308,13 @@ fn piece_deadline_and_read_piece() {
     // already-haved piece + alert_when_available → ReadPiece now
     t.have.set_bit(1);
     let mut eff = Vec::new();
-    t.set_piece_deadline(PieceIndex(1), 5000, true, &mut eff);
+    t.set_piece_deadline(
+        PieceIndex(1),
+        5000,
+        true,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
     assert!(matches!(
         eff[0],
         TorrentEffect::ReadPiece {
@@ -234,16 +324,36 @@ fn piece_deadline_and_read_piece() {
 
     // missing piece → top priority + time_critical + cancel non-critical
     let mut eff = Vec::new();
-    t.set_piece_deadline(PieceIndex(2), 5000, true, &mut eff);
+    t.set_piece_deadline(
+        PieceIndex(2),
+        5000,
+        true,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
     assert_eq!(t.piece_priority(PieceIndex(2)), Some(DownloadPriority::TOP));
     assert!(t.time_critical.contains_key(&PieceIndex(2)));
 
     // verify piece 2 → removed from critical + ReadPiece effect
+    // (upstream `on_piece_verified` ignores pieces the picker doesn't
+    // consider finished — mark its blocks downloaded first).
+    if let Some(p) = t.picker.as_mut() {
+        for b in 0..p.blocks_in_piece(PieceIndex(2)) {
+            p.mark_as_finished(
+                bitdaemon_common::types::PieceBlock {
+                    piece_index: PieceIndex(2),
+                    block_index: b,
+                },
+                None,
+            );
+        }
+    }
     let mut eff = Vec::new();
     t.piece_verified(
         PieceIndex(2),
         true,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut eff,
     );
     assert!(!t.time_critical.contains_key(&PieceIndex(2)));
@@ -349,26 +459,73 @@ fn v2_piece_verifies_via_merkle_blocks() {
     ct.set_hash2(FileIndex(0), 0, root).unwrap();
     let buf = ct.generate_buf().unwrap();
     let atp = load_torrent_buffer(&buf, &LoadTorrentLimits::default()).unwrap();
-    let mut t = Torrent::from_params(&atp, StorageIndex(0), &mut Vec::new()).unwrap();
+    let mut t = Torrent::from_params(
+        &atp,
+        StorageIndex(0),
+        &Default::default(),
+        &Default::default(),
+        &mut bitdaemon_net::peer_class::PeerClassPool::new(),
+        &mut Vec::new(),
+    )
+    .unwrap();
     assert!(t.is_v2_only());
-    assert!(t.verify_v2_blocks(PieceIndex(0), &blocks));
+    let s = bitdaemon_session::settings::SessionSettings::default();
+    let mut eff = Vec::new();
+    assert_eq!(
+        t.verify_v2_blocks(
+            PieceIndex(0),
+            &blocks,
+            &s,
+            &bitdaemon_session::counters::Counters::default(),
+            &mut eff
+        ),
+        Some(true)
+    );
 
     // corrupt one block hash → piece must fail
     let mut bad = blocks.clone();
     bad[2] = Sha256Hash::from_bytes(&[0xff; 32]).unwrap();
-    assert!(!t.verify_v2_blocks(PieceIndex(0), &bad));
+    assert_eq!(
+        t.verify_v2_blocks(
+            PieceIndex(0),
+            &bad,
+            &s,
+            &bitdaemon_session::counters::Counters::default(),
+            &mut eff
+        ),
+        Some(false)
+    );
 
     // resume round-trip exports + restores the merkle state
-    t.verify_v2_blocks(PieceIndex(0), &blocks);
+    let _ = t.verify_v2_blocks(
+        PieceIndex(0),
+        &blocks,
+        &s,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
     let mut atp2 = Default::default();
-    t.to_resume_data(&mut atp2);
+    t.to_resume_data(&mut atp2, &bitdaemon_net::peer_class::PeerClassPool::new());
     assert_eq!(atp2.merkle_trees.len(), 1);
     assert!(!atp2.merkle_trees[0].is_empty());
     let blob = bitdaemon_core::resume_data::write_resume_data_buf(&atp2);
     let atp3 = bitdaemon_core::resume_data::read_resume_data(&blob, &LoadTorrentLimits::default())
         .unwrap();
-    let mut t2 = Torrent::from_params(&atp, StorageIndex(0), &mut Vec::new()).unwrap();
-    t2.apply_resume_data(&atp3, &mut Vec::new());
+    let mut t2 = Torrent::from_params(
+        &atp,
+        StorageIndex(0),
+        &Default::default(),
+        &Default::default(),
+        &mut bitdaemon_net::peer_class::PeerClassPool::new(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    t2.apply_resume_data(
+        &atp3,
+        &Default::default(),
+        &Default::default(),
+        &mut Vec::new(),
+    );
     // the block leaf verified before save must still be in the tree
     assert!(t2.merkle_trees[0].has_node(0));
 }
@@ -414,7 +571,15 @@ fn v2_hash_request_serve_and_add() {
     };
     let buf = mk();
     let atp = load_torrent_buffer(&buf, &LoadTorrentLimits::default()).unwrap();
-    let mut t = Torrent::from_params(&atp, StorageIndex(0), &mut Vec::new()).unwrap();
+    let mut t = Torrent::from_params(
+        &atp,
+        StorageIndex(0),
+        &Default::default(),
+        &Default::default(),
+        &mut bitdaemon_net::peer_class::PeerClassPool::new(),
+        &mut Vec::new(),
+    )
+    .unwrap();
 
     // a peer asks for the 4 leaf hashes → we serve them from the tree
     let req = HashRequestWire {
@@ -449,12 +614,26 @@ fn v2_hash_request_serve_and_add() {
         }
     ));
 
-    // receive the same hashes → trees accept → piece verifies
+    // receive the same hashes → trees accept → piece verifies.
+    // Upstream `on_hashes` drops payloads that match no outstanding
+    // `m_hash_requests` — model the conn + the request having been
+    // sent.
+    t.peers.insert(
+        7,
+        bitdaemon_session::peer_conn::PeerConn::new(
+            10,
+            bitdaemon_session::peer_pipeline::PeerPipeline::new(1000, 30, 250),
+            0,
+        ),
+    );
+    t.peers.get_mut(&7).unwrap().hash_requests.push(req.clone());
     let mut out = Vec::new();
     t.on_hashes(
+        7,
         &req,
         &piece_roots,
         &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
         &mut out,
     );
     let _ = out;
@@ -531,7 +710,15 @@ fn hybrid_multifile_pad_files_dont_panic() {
 
     // previously: assertion failed !f.pad_file at file_num_blocks,
     // then blocks > 0 at merkle_num_leafs for the empty file
-    let t = Torrent::from_params(&atp, StorageIndex(0), &mut Vec::new()).unwrap();
+    let t = Torrent::from_params(
+        &atp,
+        StorageIndex(0),
+        &Default::default(),
+        &Default::default(),
+        &mut bitdaemon_net::peer_class::PeerClassPool::new(),
+        &mut Vec::new(),
+    )
+    .unwrap();
     assert_eq!(t.merkle_trees.len(), num_files as usize);
     assert!(!t.is_v2_only());
 }
