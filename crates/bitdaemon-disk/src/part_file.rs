@@ -278,14 +278,18 @@ impl PartFile {
         Ok(())
     }
 
-    /// `export_file` — call `f(offset, bytes)` for each stored block
-    /// covering `[offset, offset+size)`; pieces fully inside the range
-    /// are *freed* afterwards (upstream erases full-piece slots).
+    /// `export_file` — call `f(file_offset, bytes)` for each stored
+    /// block covering `[offset, offset+size)`; `file_offset` is
+    /// *relative to the start of the exported range* (0-based), like
+    /// upstream. Pieces fully inside the range are *freed* afterwards
+    /// (upstream erases full-piece slots). A `f` error aborts the
+    /// export immediately — the current piece keeps its slot, like
+    /// upstream's exception-unwound `export_file`.
     pub fn export_file(
         &self,
         offset: i64,
         size: i64,
-        mut f: impl FnMut(i64, &[u8]),
+        mut f: impl FnMut(i64, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
         let piece_size = i64::from(self.piece_size);
         // nothing stored → nothing to do
@@ -325,7 +329,7 @@ impl PartFile {
                 f(
                     file_offset,
                     &buf[..usize::try_from(block_to_copy).unwrap_or(0)],
-                );
+                )?;
 
                 if block_to_copy == piece_size {
                     let mut g = self.lock();
@@ -559,6 +563,7 @@ mod tests {
         let mut got = Vec::new();
         pf.export_file(1024, 2048, |off, bytes| {
             got.push((off, bytes.to_vec()));
+            Ok(())
         })
         .unwrap();
         assert_eq!(got.len(), 2);

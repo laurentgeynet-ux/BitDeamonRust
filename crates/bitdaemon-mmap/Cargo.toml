@@ -10,3 +10,4 @@ bitdaemon-common.workspace = true
 bitdaemon-core.workspace = true
 bitdaemon-disk.workspace = true
 memmap2.workspace = true
+libc.workspace = true

@@ -44,6 +44,8 @@ pub enum Operation {
     Symlink,
     /// `operation_t::check_resume`.
     CheckResume,
+    /// `operation_t::file_mmap` — `mmap`/`MapViewOfFile` failure.
+    FileMmap,
     /// `operation_t::alloc_cache_piece`.
     AllocCachePiece,
     /// `operation_t::partfile_*` / misc disk ops.
@@ -81,6 +83,7 @@ impl Operation {
             Self::Mkdir => "mkdir",
             Self::Symlink => "symlink",
             Self::CheckResume => "check_resume",
+            Self::FileMmap => "file_mmap",
             Self::AllocCachePiece => "alloc_cache_piece",
             Self::PartfileWrite => "partfile_write",
             Self::PartfileRead => "partfile_read",

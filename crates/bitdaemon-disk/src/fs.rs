@@ -209,6 +209,195 @@ pub fn drive_info(path: &Path) -> io::Result<DriveInfo> {
     })
 }
 
+/// `aux::drive_info` — rotational/solid-state class of the volume
+/// hosting a path (`drive_info.cpp`). Only the mmap backend consumes
+/// it: `remote` disables full allocation and `auto_mmap_write` keys
+/// off `SsdDax`. (Distinct from [`drive_info`] which reports free
+/// space — upstream overloads the name too.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DriveKind {
+    /// `drive_info::spinning` — upstream's conservative fallback for
+    /// every detection failure.
+    #[default]
+    Spinning,
+    /// `drive_info::ssd_disk` — flash without DAX.
+    SsdDisk,
+    /// `drive_info::ssd_dax` — DAX or RAM-backed volume (tmpfs/ramfs
+    /// on linux, `DRIVE_RAMDISK`/`FILE_DAX_VOLUME` on Windows).
+    SsdDax,
+    /// `drive_info::remote` — network filesystem (NFS/SMB/FUSE),
+    /// where mmap writes are unreliable upstream.
+    Remote,
+}
+
+/// `aux::get_drive_info` — classify the volume hosting `path`.
+/// Failures return `Spinning`, upstream's conservative default.
+#[must_use]
+pub fn drive_kind(path: &Path) -> DriveKind {
+    drive_kind_impl(path)
+}
+
+/// linux — `statfs` magic + `/sys/block` rotational/dax scan
+/// (drive_info.cpp:99-175). Sole `unsafe` site beside `file::posix`/
+/// `win32` (ADR-0022 §3): one read-only `statfs` FFI call.
+#[cfg(target_os = "linux")]
+fn drive_kind_impl(path: &Path) -> DriveKind {
+    linux_drive::classify(path)
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod linux_drive {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    use super::DriveKind;
+
+    // filesystem magics — `linux/magic.h` (upstream defines them
+    // locally for old kernel headers, drive_info.cpp:106-109).
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const RAMFS_MAGIC: u64 = 0x8584_58f6;
+    const FUSE_MAGIC: u64 = 0x6573_5546;
+    const NFS_MAGIC: u64 = 0x6969;
+    const SMB_MAGIC: u64 = 0x517B;
+    const CIFS_MAGIC: u64 = 0xFF53_4D42;
+    const SMB2_MAGIC: u64 = 0xFE53_4D42;
+
+    pub(super) fn classify(path: &Path) -> DriveKind {
+        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return DriveKind::Spinning;
+        };
+        // SAFETY: `c_path` is a live NUL-terminated string; `st` is a
+        // valid out-param of statfs.
+        let mut st = unsafe { std::mem::zeroed::<libc::statfs>() };
+        if unsafe { libc::statfs(c_path.as_ptr(), &mut st) } == 0 {
+            // f_type is signed (__fsword_t); the magics are unsigned —
+            // upstream casts to unsigned for the comparison.
+            #[allow(clippy::cast_sign_loss)]
+            let f_type = st.f_type as u64;
+            // tmpfs/ramfs are RAM-backed — mmap is free there.
+            if f_type == TMPFS_MAGIC || f_type == RAMFS_MAGIC {
+                return DriveKind::SsdDax;
+            }
+            // fuse/nfs/smb/cifs don't handle memory-mapped files well.
+            if f_type == FUSE_MAGIC
+                || f_type == NFS_MAGIC
+                || f_type == SMB_MAGIC
+                || f_type == CIFS_MAGIC
+                || f_type == SMB2_MAGIC
+            {
+                return DriveKind::Remote;
+            }
+        }
+        // map st_dev → /sys/block/<dev>, then `queue/rotational`/`dax`.
+        let Ok(md) = std::fs::metadata(path) else {
+            return DriveKind::Spinning;
+        };
+        // SAFETY: pure arithmetic on a dev_t.
+        let device_id = unsafe { format!("{}:{}\n", libc::major(md.dev()), libc::minor(md.dev())) };
+        let Ok(entries) = std::fs::read_dir("/sys/block") else {
+            return DriveKind::Spinning;
+        };
+        for entry in entries.flatten() {
+            let base = entry.path();
+            let Ok(devno) = std::fs::read_to_string(base.join("dev")) else {
+                continue;
+            };
+            if devno != device_id {
+                continue;
+            }
+            match std::fs::read_to_string(base.join("queue/rotational")).as_deref() {
+                Ok("1\n") => return DriveKind::Spinning,
+                Ok("0\n") => {
+                    return if std::fs::read_to_string(base.join("queue/dax")).as_deref()
+                        == Ok("1\n")
+                    {
+                        DriveKind::SsdDax
+                    } else {
+                        DriveKind::SsdDisk
+                    };
+                }
+                _ => continue,
+            }
+        }
+        DriveKind::Spinning
+    }
+}
+
+/// windows — `GetVolumePathNameW` + `GetDriveTypeW` +
+/// `FILE_DAX_VOLUME` (drive_info.cpp:179-206). The upstream
+/// seek-penalty `DeviceIoControl` chain only distinguishes `ssd_disk`
+/// from `spinning` — a distinction the sole consumer (`auto` mmap
+/// writes / remote check) never makes — so we return the conservative
+/// default it would produce.
+#[cfg(windows)]
+fn drive_kind_impl(path: &Path) -> DriveKind {
+    win32_drive::classify(path)
+}
+
+/// Scoped `#[allow(unsafe_code)]` for the volume-classification FFI —
+/// same ADR-0022 §3 carve-out as `file::{win32,posix}`: read-only
+/// volume queries, no safe-std equivalent.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod win32_drive {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW,
+    };
+
+    use super::DriveKind;
+
+    // winbase.h — stable API constants.
+    const DRIVE_REMOTE: u32 = 4;
+    const DRIVE_RAMDISK: u32 = 6;
+    const FILE_DAX_VOLUME: u32 = 0x2000_0000;
+
+    pub fn classify(path: &Path) -> DriveKind {
+        let mut native: Vec<u16> = path.as_os_str().encode_wide().collect();
+        native.push(0);
+        let mut volume = [0u16; 300];
+        // SAFETY: NUL-terminated `native`; `volume` is a writable
+        // 300-wchar buffer per the API contract.
+        unsafe {
+            if GetVolumePathNameW(native.as_ptr(), volume.as_mut_ptr(), volume.len() as u32) == 0 {
+                return DriveKind::Spinning;
+            }
+            match GetDriveTypeW(volume.as_ptr()) {
+                DRIVE_REMOTE => return DriveKind::Remote,
+                DRIVE_RAMDISK => return DriveKind::SsdDax,
+                _ => {}
+            }
+            let mut fs_flags = 0u32;
+            if GetVolumeInformationW(
+                volume.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut fs_flags,
+                std::ptr::null_mut(),
+                0,
+            ) != 0
+                && fs_flags & FILE_DAX_VOLUME != 0
+            {
+                return DriveKind::SsdDax;
+            }
+        }
+        DriveKind::Spinning
+    }
+}
+
+/// non-linux unix + everything else — upstream returns `spinning`
+/// (drive_info.cpp:283-286).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn drive_kind_impl(_path: &Path) -> DriveKind {
+    DriveKind::Spinning
+}
+
 /// `aux::canonicalize_path` — resolve `.`/`..`/links to an absolute
 /// normalized path. Falls back to the input when the path doesn't
 /// exist yet (upstream tolerates this for files being created).

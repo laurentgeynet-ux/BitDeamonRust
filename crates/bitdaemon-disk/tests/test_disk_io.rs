@@ -89,6 +89,7 @@ fn write_job(piece: i32, fill: u8, io: &PreadDiskIo, done: Arc<AtomicUsize>) -> 
             offset: 0,
             buffer_size: 1024,
             force_flush: false,
+            volatile: false,
         }),
     })
 }
@@ -109,6 +110,7 @@ fn read_job(piece: i32, got: Arc<Mutex<Vec<u8>>>, done: Arc<AtomicUsize>) -> Box
             piece: PieceIndex(piece),
             offset: 0,
             volatile: false,
+            flush: false,
             sequential: false,
         }),
     })
@@ -318,6 +320,7 @@ fn hash_job_computes_piece_sha1() {
                 piece_hash: Sha1Hash::default(),
                 v1_hash: true,
                 volatile: false,
+                flush: false,
                 sequential: false,
             }),
         }),
@@ -450,6 +453,7 @@ fn hash_parked_behind_inflight_write_is_released() {
                 piece_hash: Sha1Hash::default(),
                 v1_hash: true,
                 volatile: false,
+                flush: false,
                 sequential: false,
             }),
         }),

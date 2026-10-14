@@ -1015,6 +1015,7 @@ mod tests {
                 offset: 0,
                 buffer_size: 0,
                 force_flush: false,
+                volatile: false,
             }),
         })
     }

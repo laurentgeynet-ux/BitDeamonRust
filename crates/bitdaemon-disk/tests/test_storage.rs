@@ -108,6 +108,36 @@ fn part_file_redirection() {
     stdfs::remove_dir_all(&d).unwrap();
 }
 
+/// Lifting `dont_download` on a file at index > 0 exports the parked
+/// bytes into the real file at the *file-relative* offset (regression:
+/// adding `file_offset` again wrote past EOF and dropped the data).
+#[test]
+fn part_file_export_lands_in_file() {
+    let d = dir("export");
+    let fs = make_fs();
+    // start: a.bin wanted, b.bin parked in the part file
+    let prio = vec![DownloadPriority::DEFAULT, DownloadPriority::DONT_DOWNLOAD];
+    let mut st = storage(&fs, &d, &prio);
+    st.set_storage_index(StorageIndex(0));
+    st.initialize().unwrap();
+
+    let b_bytes: Vec<u8> = (0..1000u32).map(|i| (i % 193) as u8).collect();
+    // piece 0: a.bin[0..1000] + b.bin[0..24]; piece 1: b.bin[24..1000]
+    let mut p0 = vec![0x11u8; 1000];
+    p0.extend_from_slice(&b_bytes[..24]);
+    st.write(&p0, PieceIndex(0), 0, OpenMode::WRITE).unwrap();
+    st.write(&b_bytes[24..], PieceIndex(1), 0, OpenMode::WRITE)
+        .unwrap();
+
+    st.set_file_priority(&[DownloadPriority::DEFAULT, DownloadPriority::DEFAULT])
+        .unwrap();
+
+    let on_disk = stdfs::read(d.join("t/b.bin")).unwrap();
+    assert_eq!(on_disk.len(), 1000);
+    assert_eq!(on_disk, b_bytes);
+    stdfs::remove_dir_all(&d).unwrap();
+}
+
 #[test]
 fn initialize_creates_zero_files() {
     let d = dir("init");

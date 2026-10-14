@@ -82,6 +82,9 @@ pub struct ReadJob {
     pub offset: i32,
     /// `volatile_read` — hint not to cache (upstream flag).
     pub volatile: bool,
+    /// `flush_piece` — `page_out` the read range (upstream passes
+    /// `j->flags` wholesale into `storage::read`; mmap-only effect).
+    pub flush: bool,
     /// `sequential_access` — more sequential reads follow
     /// (upstream `file_mode_for_job` → `open_mode::sequential_access`).
     pub sequential: bool,
@@ -102,6 +105,8 @@ pub struct PartialReadJob {
     /// carried over from the `Read` job — upstream keeps `j->flags`
     /// when the job is converted, so `volatile_read` still applies.
     pub volatile: bool,
+    /// `flush_piece`, same carry-over.
+    pub flush: bool,
     /// `sequential_access`, same carry-over.
     pub sequential: bool,
 }
@@ -121,6 +126,9 @@ pub struct WriteJob {
     /// upstream `j->flags & flush_piece` — the caller asked for an
     /// immediate flush once the block lands in the cache.
     pub force_flush: bool,
+    /// upstream `j->flags & volatile_read` — `dont_need` the written
+    /// range (mmap backend; the flush run ORs the writers' flags).
+    pub volatile: bool,
 }
 
 /// `job::hash` — SHA-1 over a whole piece (+ block SHA-256s).
@@ -140,6 +148,9 @@ pub struct HashJob {
     pub v1_hash: bool,
     /// `volatile_read` — `advise_dont_need` on the read path.
     pub volatile: bool,
+    /// `flush_piece` — `page_out` the hashed range (mmap backend;
+    /// `verify_piece` sets it for `write_through`/`disable_os_cache`).
+    pub flush: bool,
     /// `sequential_access` — `fadvise(SEQUENTIAL)`/SCAN on open.
     pub sequential: bool,
 }
@@ -156,6 +167,8 @@ pub struct Hash2Job {
     pub piece_hash2: Sha256Hash,
     /// `volatile_read` — `advise_dont_need` on the read path.
     pub volatile: bool,
+    /// `flush_piece` — `page_out` the hashed range (mmap backend).
+    pub flush: bool,
     /// `sequential_access` — `fadvise(SEQUENTIAL)`/SCAN on open.
     pub sequential: bool,
 }

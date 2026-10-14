@@ -448,6 +448,70 @@ Until `1.0.0`, breaking changes may occur in any release.
   deterministic `hash_parked_behind_inflight_write_is_released`
   regression test.
 
+### Fixed — `bitdaemon-mmap` upstream-fidelity alignment
+
+`bitdaemon-mmap` (`file_view_pool`/`mmap_storage`) and the shared
+`bitdaemon-disk` storage paths were re-audited against upstream
+`mmap.cpp`/`mmap_storage.cpp`/`file_view_pool.hpp`/`file_pool_impl`/
+`mmap_disk_io.cpp` @ `v2.1.2-45-gc019e80ef` and every discrepancy was
+repaired:
+
+- **Part-file export offset** (`export_file` consumers, both
+  backends): the callback receives an offset *relative to the
+  exported range*; the write sites added `file_offset` a second time,
+  so any file at index > 0 wrote past the end of its view/handle —
+  silently returning 0 bytes while the part-file slots were freed
+  (data loss on `dont_download`→wanted transitions). Export closure
+  now propagates `Result` so a failed write aborts the export and
+  keeps the slots, like upstream's exception path.
+- **Zero-sized and small files**: `file_view_entry` now opens the fd
+  but skips the mapping when the range is empty or `no_mmap` is set
+  (`has_memory_map()==false` → `pread`/`pwrite` positioned I/O), and
+  `mmap_file_size_cutoff` (40 × 16 KiB blocks upstream default) routes
+  small files through `no_mmap`. `initialize` on a torrent with a
+  0-byte file no longer dies on `CreateFileMapping`/`mmap` EINVAL.
+- **View pool keyed by `(StorageIndex, FileIndex)`** like upstream
+  `file_pool_impl`, with serialized concurrent opens (hits/misses/
+  stalls counters), deferred destroy outside the lock, per-file
+  open/unmap serialization, write-upgrade and size-change
+  invalidation, scoped `release_one`/`release_storage`/`release_all`,
+  `close_oldest`, `get_status` and `resize`. Clearing a torrent's
+  views no longer evicts every torrent in a shared pool.
+- **mmap write policy**: `initialize` resolves `m_use_mmap_writes`
+  from `disk_write_mode` (`always_pwrite`/`always_mmap_write`/
+  `auto_mmap_write` → `drive_info` `ssd_dax` gate) and disables full
+  allocation on remote drives (`get_drive_info` ported to
+  `fs::drive_kind` — Linux sysfs/DAX, Windows `GetDriveType`/DAX).
+  `volatile_read`/`flush_piece` job flags translate into
+  `madvise(MADV_COLD|DONTNEED)` and `page_out`/`msync` advice on the
+  mapped range like upstream `hash`/`read`/`write` paths.
+- **Priority transitions**: `set_file_priority` assigns the new
+  priority before the transition work (the prio-lift `open_file` no
+  longer opens `sparse`), restores the old priority on failure, opens
+  the target file unconditionally, then exports part-file data.
+- **Maintenance machinery**: `DiskStorage` grew `set_need_tick`/
+  `do_tick`/`close_oldest`/`file_status`/`set_open_mode_extra`/
+  `set_mmap_file_size_cutoff`/`set_disk_write_mode`/`set_no_cow`
+  (default no-ops keep downstream `DiskStorage` impls source-compat).
+  `disk_io` schedules deferred part-file metadata ticks ~2 min after
+  uncached writes and kicks `close_oldest` on the
+  `close_file_interval` cadence; the session pushes `no_atime`,
+  `allow_set_file_valid_data`, `no_cow`, `no_cache`, write-mode and
+  cutoff settings on `set_disk`/`apply_settings`.
+- **View release coverage**: pooled views are released on
+  `release_files`, `rename_file`, `move_storage`, `delete_files`,
+  storage `Drop`, and after `initialize` (upstream closes the
+  temporary open handles).
+- `Operation::FileMmap` added so mapping failures surface with the
+  right alert operation instead of `file_open`.
+
+Regression tests: `part_file_export_lands_in_file` (both backends),
+`zero_sized_file_initialize`, `below_cutoff_uses_fd_fallback`,
+`read_missing_file_no_dirs`, `volatile_and_flush_hints_roundtrip`,
+`precomputed_v2_roundtrip`, `release_is_scoped_to_storage`,
+`external_view_survives_delete`, `status_and_close_oldest`,
+`move_storage_reopens_at_new_path`.
+
 ### Fixed — `bitdaemon-dht` upstream-fidelity audit (full crate sweep)
 
 Every module of `bitdaemon-dht` was re-audited line-by-line against

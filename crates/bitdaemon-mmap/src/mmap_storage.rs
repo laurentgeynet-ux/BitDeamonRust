@@ -17,13 +17,17 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bitdaemon_common::types::{DownloadPriority, FileIndex, PieceIndex, StorageIndex};
 use bitdaemon_core::file_storage::{FileFlags, FileStorage, RenamedFiles};
 use bitdaemon_core::path::bytes_to_path;
+use bitdaemon_disk::file_pool::OpenFileState;
+use bitdaemon_disk::fs::DriveKind;
 use bitdaemon_disk::open_mode::OpenMode;
 use bitdaemon_disk::part_file::PartFile;
+use bitdaemon_disk::precomputed_block_hashes::PrecomputedBlockHashes;
 use bitdaemon_disk::readwrite::{readwrite_buf, readwrite_mut};
 use bitdaemon_disk::stat_cache::StatCache;
 use bitdaemon_disk::storage::{
@@ -46,7 +50,8 @@ pub struct MmapStorage {
     pool: Arc<FileViewPool>,
     /// `m_allocate_files` — `storage_mode_allocate`: reserve the
     /// file's blocks (`posix_fallocate`/`SetFileValidData`) on its
-    /// first write-open.
+    /// first write-open. `initialize` clears it on remote drives
+    /// (mmap_storage.cpp:328-333).
     allocate_files: bool,
     /// `m_file_created` — files already sized to their final length
     /// this session (upstream adds `open_mode::truncate` on the first
@@ -54,7 +59,7 @@ pub struct MmapStorage {
     file_created: Mutex<Vec<bool>>,
     /// `open_mode_extra` — settings-driven flags snapshot
     /// (`allow_set_file_valid_data`, `no_atime`) pushed by `DiskIo`.
-    open_mode_extra: std::sync::atomic::AtomicU32,
+    open_mode_extra: AtomicU32,
     v1: bool,
     v2: bool,
     file_priority: Vec<DownloadPriority>,
@@ -62,7 +67,25 @@ pub struct MmapStorage {
     part_file: Mutex<Option<PartFile>>,
     stat_cache: StatCache,
     storage_index: Mutex<StorageIndex>,
-    need_tick: std::sync::atomic::AtomicBool,
+    need_tick: AtomicBool,
+    /// `m_precomputed_v2` — v2 block hashes saved by hash jobs so
+    /// later `hash2` requests skip the disk read.
+    precomputed: PrecomputedBlockHashes,
+    /// `m_use_mmap_writes` — resolved in `initialize` from
+    /// `settings_pack::disk_write_mode` (+ `drive_info` for `auto`).
+    /// Upstream member default is `false` (mmap_storage.hpp:137).
+    use_mmap_writes: AtomicBool,
+    /// pushed `settings_pack::disk_write_mode` (`mmap_write_mode_t`:
+    /// 0=`always_pwrite`, 1=`always_mmap_write`, 2=`auto_mmap_write`).
+    disk_write_mode: AtomicI64,
+    /// pushed `settings_pack::mmap_file_size_cutoff` — files at or
+    /// below this many 16 KiB blocks open `no_mmap`, served through
+    /// the fd fallback (upstream default 40).
+    mmap_file_size_cutoff: AtomicI64,
+    /// pushed `settings_pack::disk_disable_copy_on_write` →
+    /// `open_mode::no_cow` on truncate-opens (mmap_storage.cpp:948 —
+    /// upstream applies it in the mmap backend only).
+    no_cow: AtomicBool,
 }
 
 impl MmapStorage {
@@ -85,7 +108,7 @@ impl MmapStorage {
             pool,
             allocate_files: params.mode == StorageMode::Allocate,
             file_created: Mutex::new(vec![false; params.files.num_files() as usize]),
-            open_mode_extra: std::sync::atomic::AtomicU32::new(0),
+            open_mode_extra: AtomicU32::new(0),
             v1: params.v1,
             v2: params.v2,
             file_priority: params.priorities.to_vec(),
@@ -93,7 +116,15 @@ impl MmapStorage {
             part_file: Mutex::new(None),
             stat_cache: StatCache::new(),
             storage_index: Mutex::new(StorageIndex(0)),
-            need_tick: std::sync::atomic::AtomicBool::new(false),
+            need_tick: AtomicBool::new(false),
+            precomputed: PrecomputedBlockHashes::new(),
+            use_mmap_writes: AtomicBool::new(false),
+            // `settings_pack::disk_write_mode` default
+            // (`always_mmap_write`)
+            disk_write_mode: AtomicI64::new(1),
+            // `settings_pack::mmap_file_size_cutoff` default
+            mmap_file_size_cutoff: AtomicI64::new(40),
+            no_cow: AtomicBool::new(false),
         }
     }
 
@@ -185,14 +216,24 @@ impl MmapStorage {
         {
             mode |= OpenMode::SPARSE;
         }
-        let view = self
-            .pool
-            .open(
-                &self.resolve_path(index),
-                self.files.file_size(index) as u64,
-                mode,
-            )
-            .map_err(|e| StorageError::new(e, index, Operation::FileOpen))?;
+        // mmap_storage.cpp:948 — btrfs CoW opt-out (truncate path).
+        if self.no_cow.load(Ordering::Relaxed) {
+            mode |= OpenMode::NO_COW;
+        }
+        // mmap_storage.cpp:951-953 — small files take the fd path:
+        // `no_mmap` leaves `has_memory_map() == false` and every op
+        // falls back to positioned I/O.
+        if self.files.file_size(index) / 0x4000
+            <= self.mmap_file_size_cutoff.load(Ordering::Relaxed)
+        {
+            mode |= OpenMode::NO_MMAP;
+        }
+        let view = self.pool.open_file_at(
+            (self.storage_index(), index),
+            &self.resolve_path(index),
+            self.files.file_size(index) as u64,
+            mode,
+        )?;
         if mode.contains(OpenMode::TRUNCATE) {
             self.file_created.lock().unwrap_or_else(|e| e.into_inner())[index.get()] = true;
         }
@@ -246,14 +287,17 @@ impl MmapStorage {
 
     /// `read(buffer, piece, offset, mode, flags)` — views instead of
     /// `pread`; pad files yield zeroes; `dont_download` files are
-    /// served from the part file.
+    /// served from the part file. `volatile`/`flush` map to upstream's
+    /// `volatile_read`/`flush_piece` job flags: `dont_need` /
+    /// `page_out` hints on the mapped range (mmap_storage.cpp:577-580).
     pub fn read(
         &self,
         buffer: &mut [u8],
         piece: PieceIndex,
         offset: i64,
         mode: OpenMode,
-        _volatile_read: bool,
+        volatile_read: bool,
+        flush_piece: bool,
     ) -> StorageResult<i64> {
         readwrite_mut(
             &self.files,
@@ -284,22 +328,34 @@ impl MmapStorage {
                     return Ok(usize::try_from(n).unwrap_or(0));
                 }
                 let view = self.open_file(file_index, mode)?;
+                let off = u64::try_from(file_offset).unwrap_or(0);
                 let n = view
-                    .read_at(u64::try_from(file_offset).unwrap_or(0), buf)
+                    .read_at(off, buf)
                     .map_err(|e| StorageError::new(e, file_index, Operation::FileRead))?;
+                if volatile_read {
+                    view.dont_need(off, n);
+                }
+                if flush_piece {
+                    view.page_out(off, n);
+                }
                 Ok(n)
             },
         )
     }
 
     /// `write(buffer, piece, offset, mode, flags)` — views instead of
-    /// `pwrite`; `dont_download` files go to the part file.
+    /// `pwrite` (`!m_use_mmap_writes || !has_memory_map()` → `pwrite`
+    /// upstream, mmap_storage.cpp:659); `dont_download` files go to the
+    /// part file; `volatile`/`flush` are the job's `volatile_read`/
+    /// `flush_piece` flags.
     pub fn write(
         &self,
         buffer: &[u8],
         piece: PieceIndex,
         offset: i64,
         mode: OpenMode,
+        volatile_read: bool,
+        flush_piece: bool,
     ) -> StorageResult<i64> {
         readwrite_buf(
             &self.files,
@@ -329,15 +385,36 @@ impl MmapStorage {
                     return Ok(usize::try_from(n).unwrap_or(0));
                 }
                 let view = self.open_file(file_index, mode | OpenMode::WRITE)?;
+                let off = u64::try_from(file_offset).unwrap_or(0);
+                // writes invalidate the cached stat entry —
+                // `m_stat_cache.set_dirty(file_index)` upstream
+                // (mmap_storage.cpp:647); the pread backend does the
+                // same in `storage.rs`.
+                self.stat_cache.set_dirty(file_index);
+                if !self.use_mmap_writes.load(Ordering::Relaxed) || !view.has_memory_map() {
+                    return view
+                        .write_at_fd(off, buf)
+                        .map_err(|e| StorageError::new(e, file_index, Operation::FileWrite));
+                }
                 let n = view
-                    .write_at(u64::try_from(file_offset).unwrap_or(0), buf)
+                    .write_at(off, buf)
                     .map_err(|e| StorageError::new(e, file_index, Operation::FileWrite))?;
+                if volatile_read {
+                    view.dont_need(off, buf.len());
+                }
+                if flush_piece {
+                    view.page_out(off, buf.len());
+                }
                 Ok(n)
             },
         )
     }
 
-    /// `hash` — feed every byte of the range to `feed` (view reads).
+    /// `hash`/`hash2` — feed every byte of the range to `feed` (view
+    /// reads; the fd path falls back to `pread` like upstream
+    /// `!has_memory_map()` → `pread_all`); `volatile`/`flush` →
+    /// `dont_need`/`page_out` on the mapped range.
+    #[allow(clippy::too_many_arguments)]
     pub fn hash_with(
         &self,
         mut feed: impl FnMut(&[u8]),
@@ -345,7 +422,8 @@ impl MmapStorage {
         piece: PieceIndex,
         offset: i64,
         mode: OpenMode,
-        _volatile_read: bool,
+        volatile_read: bool,
+        flush_piece: bool,
     ) -> StorageResult<i64> {
         let mut scratch: Vec<u8> = Vec::new();
         let len_usize = usize::try_from(len).unwrap_or(0);
@@ -380,11 +458,18 @@ impl MmapStorage {
                     return Ok(data.len());
                 }
                 let view = self.open_file(file_index, mode)?;
+                let off = u64::try_from(file_offset).unwrap_or(0);
                 scratch.resize(buf.len(), 0);
                 let n = view
-                    .read_at(u64::try_from(file_offset).unwrap_or(0), &mut scratch)
+                    .read_at(off, &mut scratch)
                     .map_err(|e| StorageError::new(e, file_index, Operation::FileRead))?;
                 feed(&scratch[..n]);
+                if volatile_read {
+                    view.dont_need(off, n);
+                }
+                if flush_piece {
+                    view.page_out(off, n);
+                }
                 Ok(n)
             },
         )
@@ -396,11 +481,13 @@ impl MmapStorage {
         &self.file_priority
     }
 
-    /// `release_files` — drop every cached view, flush the part file
-    /// and clear the stat cache (upstream order and coverage).
+    /// `release_files` — drop this storage's cached views, flush the
+    /// part file and clear the stat cache (upstream order and
+    /// coverage — `m_pool.release(storage_index())` is storage-scoped
+    /// upstream, not a pool-wide clear).
     pub fn release_files(&self) -> StorageResult<()> {
         self.tick();
-        self.pool.clear();
+        self.pool.release_storage(self.storage_index());
         self.stat_cache.clear();
         Ok(())
     }
@@ -413,10 +500,11 @@ impl MmapStorage {
         }
     }
 
-    /// `rename_file` — unmap first (a live view pins the name on
-    /// Windows), then rename on disk or record it.
+    /// `rename_file` — unmap the file first (a live view pins the
+    /// name on Windows; upstream releases exactly `(storage, index)`
+    /// — mmap_storage.cpp:420), then rename on disk or record it.
     pub fn rename_file(&mut self, index: FileIndex, new_filename: &[u8]) -> StorageResult<()> {
-        self.pool.clear();
+        self.pool.release_one(self.storage_index(), index);
         let save_path = self.save_path();
         storage_utils::rename_file(
             &self.files,
@@ -429,10 +517,29 @@ impl MmapStorage {
 
     /// `initialize` — directories + part-file bookkeeping (upstream
     /// `mmap_storage::initialize` shares `pread_storage` logic; the
-    /// only difference is files are touched through views).
+    /// only difference is files are touched through views). Also
+    /// resolves `m_allocate_files`/`m_use_mmap_writes` from
+    /// `drive_info` + `disk_write_mode` like upstream
+    /// (mmap_storage.cpp:328-340).
     pub fn initialize(&mut self) -> StorageResult<u8> {
         self.stat_cache
             .reserve(usize::try_from(self.files.num_files()).unwrap_or(0));
+        let di = bitdaemon_disk::fs::drive_kind(&self.save_path());
+        if di == DriveKind::Remote {
+            // don't do full file allocations on network drives
+            self.allocate_files = false;
+        }
+        match self.disk_write_mode.load(Ordering::Relaxed) {
+            // `always_pwrite`
+            0 => self.use_mmap_writes.store(false, Ordering::Relaxed),
+            // `auto_mmap_write` — mmap writes only pay off on
+            // RAM-backed/DAX volumes upstream.
+            2 => self
+                .use_mmap_writes
+                .store(di == DriveKind::SsdDax, Ordering::Relaxed),
+            // `always_mmap_write` (default)
+            _ => self.use_mmap_writes.store(true, Ordering::Relaxed),
+        }
         let mut ret = 0u8;
         for i in 0..self.files.num_files() {
             let i = FileIndex(i);
@@ -468,6 +575,9 @@ impl MmapStorage {
             |i| self.open_file(i, OpenMode::WRITE).map(|_| ()),
             |_i, _size| ret |= disk_status::OVERSIZED_FILE,
         )?;
+        // close files that were opened in write mode
+        // (mmap_storage.cpp:383-384 — they pin sparse/alloc state).
+        self.pool.release_storage(self.storage_index());
         Ok(ret)
     }
 
@@ -480,7 +590,7 @@ impl MmapStorage {
         new_save_path: PathBuf,
         flags: MoveFlags,
     ) -> (u8, PathBuf, Option<StorageError>) {
-        self.pool.clear(); // unmap before moving files (Windows locks)
+        self.pool.release_storage(self.storage_index()); // unmap first (Windows locks)
         let save_path = self.save_path();
         let part_dir = self.part_file_dir.clone();
         let mut pf = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
@@ -517,7 +627,7 @@ impl MmapStorage {
     /// delegate.
     pub fn delete_files(&self, options: u8) -> StorageResult<()> {
         if options & remove_flags::DELETE_FILES != 0 {
-            self.pool.clear();
+            self.pool.release_storage(self.storage_index());
         }
         self.part_file
             .lock()
@@ -534,9 +644,10 @@ impl MmapStorage {
     }
 
     /// `set_file_priority` — export out of the part file through the
-    /// view on `dont_download`→wanted transitions. Priorities are
-    /// applied in place like upstream (`m_file_priority[i]`), so a
-    /// failure leaves the earlier files' new priorities committed.
+    /// view on `dont_download`→wanted transitions. Upstream assigns
+    /// `m_file_priority[i] = new_prio` eagerly and restores it on
+    /// error (`scope_end`), so a failed file keeps its old priority
+    /// for retry while earlier files keep theirs.
     pub fn set_file_priority(&mut self, prio: &[DownloadPriority]) -> StorageResult<()> {
         if prio.len() > self.file_priority.len() {
             self.file_priority
@@ -551,45 +662,62 @@ impl MmapStorage {
                 continue;
             }
             let old_prio = self.file_priority[idx];
+            // upstream sets the new priority *before* the transition —
+            // `open_file` during export must see it (a priority-0 view
+            // would open `sparse`).
+            self.file_priority[idx] = new;
 
-            if old_prio == DownloadPriority::DONT_DOWNLOAD && new != DownloadPriority::DONT_DOWNLOAD
-            {
-                let has_part = self
-                    .part_file
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .is_some();
-                if has_part && self.use_partfile(i) {
-                    let view = self.open_file(i, OpenMode::WRITE)?;
-                    let file_offset = self.files.file_offset(i);
-                    let size = self.files.file_size(i);
-                    let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(pf) = g.as_ref() {
-                        let mut write_err = None;
-                        pf.export_file(file_offset, size, |off, buf| {
-                            let abs = file_offset + off;
-                            if write_err.is_none()
-                                && let Err(e) = view.write_at(u64::try_from(abs).unwrap_or(0), buf)
-                            {
-                                write_err = Some(e);
-                            }
-                        })
-                        .map_err(|e| StorageError::new(e, i, Operation::PartfileWrite))?;
-                        if let Some(e) = write_err {
-                            return Err(StorageError::new(e, i, Operation::PartfileWrite));
+            let transition = |st: &mut Self| -> StorageResult<()> {
+                if old_prio == DownloadPriority::DONT_DOWNLOAD
+                    && new != DownloadPriority::DONT_DOWNLOAD
+                {
+                    // move stuff out of the part file — upstream opens
+                    // the target file unconditionally, even with no
+                    // part file (the view open is what creates/sizes
+                    // it: mmap_storage.cpp:190).
+                    let view = st.open_file(i, OpenMode::WRITE)?;
+                    let has_part = st
+                        .part_file
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some();
+                    if has_part && st.use_partfile(i) {
+                        let file_offset = st.files.file_offset(i);
+                        let size = st.files.file_size(i);
+                        let g = st.part_file.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(pf) = g.as_ref() {
+                            // `off` is relative to the exported range
+                            // — write it into the *file-relative* view
+                            // (upstream: `range().subspan(file_offset)`
+                            // for mapped, `pwrite` at `file_offset`
+                            // for fd; `write_at` picks by map state).
+                            pf.export_file(file_offset, size, |off, buf| {
+                                view.write_at(u64::try_from(off).unwrap_or(0), buf)
+                                    .map(|_| ())
+                            })
+                            .map_err(|e| StorageError::new(e, i, Operation::PartfileWrite))?;
                         }
                     }
+                } else if old_prio != DownloadPriority::DONT_DOWNLOAD
+                    && new == DownloadPriority::DONT_DOWNLOAD
+                {
+                    // move stuff into the part file — not implemented
+                    // upstream either; just stop using the part file
+                    // when the file exists on disk.
+                    let p = st.resolve_path(i);
+                    let exists = p
+                        .try_exists()
+                        .map_err(|e| StorageError::new(e, i, Operation::FileStat))?;
+                    st.set_use_partfile(i, !exists);
                 }
-            } else if old_prio != DownloadPriority::DONT_DOWNLOAD
-                && new == DownloadPriority::DONT_DOWNLOAD
-            {
-                let p = self.resolve_path(i);
-                let exists = p
-                    .try_exists()
-                    .map_err(|e| StorageError::new(e, i, Operation::FileStat))?;
-                self.set_use_partfile(i, !exists);
+                Ok(())
+            };
+            if let Err(e) = transition(self) {
+                // `restore_prio` — the failed file reverts so a retry
+                // can run again.
+                self.file_priority[idx] = old_prio;
+                return Err(e);
             }
-            self.file_priority[idx] = new;
 
             if self.file_priority[idx] == DownloadPriority::DONT_DOWNLOAD && self.use_partfile(i) {
                 self.need_partfile();
@@ -645,6 +773,28 @@ impl MmapStorage {
     }
 }
 
+impl Drop for MmapStorage {
+    fn drop(&mut self) {
+        // ~mmap_storage (mmap_storage.cpp:109-117) — flush part-file
+        // metadata (its own `Drop` runs on the `take`) and release
+        // this torrent's views; may run on a foreign thread upstream
+        // — ours is `Send`-safe.
+        if let Some(pf) = self
+            .part_file
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = pf.flush_metadata();
+        }
+        let idx = *self
+            .storage_index
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner());
+        self.pool.release_storage(idx);
+    }
+}
+
 impl DiskStorage for MmapStorage {
     fn set_storage_index(&self, idx: StorageIndex) {
         MmapStorage::set_storage_index(self, idx);
@@ -663,7 +813,18 @@ impl DiskStorage for MmapStorage {
         mode: OpenMode,
         volatile: bool,
     ) -> StorageResult<i64> {
-        MmapStorage::read(self, buf, piece, offset, mode, volatile)
+        MmapStorage::read(self, buf, piece, offset, mode, volatile, false)
+    }
+    fn read_with_hints(
+        &self,
+        buf: &mut [u8],
+        piece: PieceIndex,
+        offset: i64,
+        mode: OpenMode,
+        volatile: bool,
+        flush: bool,
+    ) -> StorageResult<i64> {
+        MmapStorage::read(self, buf, piece, offset, mode, volatile, flush)
     }
     fn write(
         &self,
@@ -672,7 +833,18 @@ impl DiskStorage for MmapStorage {
         offset: i64,
         mode: OpenMode,
     ) -> StorageResult<i64> {
-        MmapStorage::write(self, buf, piece, offset, mode)
+        MmapStorage::write(self, buf, piece, offset, mode, false, false)
+    }
+    fn write_with_hints(
+        &self,
+        buf: &[u8],
+        piece: PieceIndex,
+        offset: i64,
+        mode: OpenMode,
+        volatile: bool,
+        flush: bool,
+    ) -> StorageResult<i64> {
+        MmapStorage::write(self, buf, piece, offset, mode, volatile, flush)
     }
     fn hash_with(
         &self,
@@ -683,7 +855,20 @@ impl DiskStorage for MmapStorage {
         mode: OpenMode,
         volatile: bool,
     ) -> StorageResult<i64> {
-        MmapStorage::hash_with(self, |d| feed(d), len, piece, offset, mode, volatile)
+        MmapStorage::hash_with(self, |d| feed(d), len, piece, offset, mode, volatile, false)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn hash_with_hints(
+        &self,
+        feed: &mut dyn FnMut(&[u8]),
+        len: i64,
+        piece: PieceIndex,
+        offset: i64,
+        mode: OpenMode,
+        volatile: bool,
+        flush: bool,
+    ) -> StorageResult<i64> {
+        MmapStorage::hash_with(self, |d| feed(d), len, piece, offset, mode, volatile, flush)
     }
     fn release_files(&self) -> StorageResult<()> {
         MmapStorage::release_files(self)
@@ -713,8 +898,54 @@ impl DiskStorage for MmapStorage {
         MmapStorage::has_any_file(self)
     }
     fn set_open_mode_extra(&self, mode: OpenMode) {
-        self.open_mode_extra
-            .store(mode.bits(), std::sync::atomic::Ordering::Relaxed);
+        self.open_mode_extra.store(mode.bits(), Ordering::Relaxed);
+    }
+    fn set_need_tick(&self) -> bool {
+        MmapStorage::set_need_tick(self)
+    }
+    fn do_tick(&self) {
+        MmapStorage::do_tick(self);
+    }
+    fn close_oldest(&self) {
+        // the mmap backend's pooled resource is the view pool —
+        // upstream's `m_file_pool.close_oldest()` under mmap_disk_io.
+        self.pool.close_oldest();
+    }
+    fn file_status(&self) -> Vec<OpenFileState> {
+        self.pool.get_status(self.storage_index())
+    }
+    fn set_mmap_file_size_cutoff(&self, blocks: i64) {
+        self.mmap_file_size_cutoff.store(blocks, Ordering::Relaxed);
+    }
+    fn set_disk_write_mode(&self, mode: i32) {
+        self.disk_write_mode
+            .store(i64::from(mode), Ordering::Relaxed);
+    }
+    fn set_no_cow(&self, v: bool) {
+        self.no_cow.store(v, Ordering::Relaxed);
+    }
+    fn store_precomputed_v2(
+        &self,
+        piece: PieceIndex,
+        block: i32,
+        h: &bitdaemon_common::Sha256Hash,
+    ) {
+        // upstream forwards to `m_precomputed_v2.store` with
+        // `files().blocks_in_piece2(piece)` (mmap_storage.cpp:126-130)
+        // — same computation `PreadStorage` performs.
+        let bs = bitdaemon_disk::disk_cache::DEFAULT_BLOCK_SIZE as i32;
+        let num = (self.files.piece_size2(piece) + bs - 1) / bs;
+        self.precomputed.store(piece, block, num, h);
+    }
+    fn take_precomputed_v2_block(
+        &self,
+        piece: PieceIndex,
+        block: i32,
+    ) -> Option<bitdaemon_common::Sha256Hash> {
+        self.precomputed.take_block(piece, block)
+    }
+    fn drop_precomputed_v2(&self, piece: PieceIndex) {
+        self.precomputed.drop(piece);
     }
 }
 

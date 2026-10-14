@@ -1844,6 +1844,12 @@ impl Session {
         io.set_cache_expiry(self.settings.cache_expiry.as_secs());
         io.set_no_recheck_incomplete_resume(self.settings.no_recheck_incomplete_resume);
         io.set_open_mode_extra(open_mode_extra(&self.settings));
+        io.set_mmap_file_size_cutoff(i64::from(self.settings.mmap_file_size_cutoff));
+        io.set_disk_write_mode(self.settings.disk_write_mode as i32);
+        io.set_no_cow(self.settings.disk_disable_copy_on_write);
+        io.set_close_file_interval(
+            i64::try_from(self.settings.close_file_interval.as_secs()).unwrap_or(i64::MAX),
+        );
         self.disk = Some(io);
     }
 
@@ -4271,6 +4277,12 @@ impl Session {
             d.set_cache_expiry(s.cache_expiry.as_secs());
             d.set_no_recheck_incomplete_resume(s.no_recheck_incomplete_resume);
             d.set_open_mode_extra(open_mode_extra(&s));
+            d.set_mmap_file_size_cutoff(i64::from(s.mmap_file_size_cutoff));
+            d.set_disk_write_mode(s.disk_write_mode as i32);
+            d.set_no_cow(s.disk_disable_copy_on_write);
+            d.set_close_file_interval(
+                i64::try_from(s.close_file_interval.as_secs()).unwrap_or(i64::MAX),
+            );
             // `session_impl::update_disk_threads` — `aio_threads` and
             // `hashing_threads` resize their pools live upstream.
             d.set_max_threads(s.aio_threads);
@@ -7599,6 +7611,15 @@ fn open_mode_extra(s: &crate::settings::SessionSettings) -> bitdaemon_disk::open
     let mut m = OpenMode::NONE;
     if s.no_atime_storage {
         m |= OpenMode::NO_ATIME;
+    }
+    // upstream `open_file` (pread_storage.cpp:780-784 /
+    // mmap_storage.cpp:955-959): `disable_os_cache`/`write_through`
+    // add `no_cache` on *every* open, not just job-driven paths.
+    if matches!(
+        s.disk_io_write_mode,
+        crate::settings::DiskIoMode::DisableOsCache | crate::settings::DiskIoMode::WriteThrough
+    ) {
+        m |= OpenMode::NO_CACHE;
     }
     // upstream pread_storage.cpp:730-735 — `#ifdef _WIN32` only.
     #[cfg(windows)]

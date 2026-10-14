@@ -726,53 +726,63 @@ impl PreadStorage {
                 continue;
             }
             let old_prio = self.file_priority[idx];
+            // upstream assigns `m_file_priority[i] = new_prio` *before*
+            // the transition work and restores it on failure
+            // (`scope_end` guard) — a failed file keeps its old
+            // priority for retry while earlier files keep theirs.
+            // Assigning early also means the priority-lift `open_file`
+            // below doesn't open `sparse` (prio-0 → sparse upstream).
+            self.file_priority[idx] = new;
 
-            if old_prio == DownloadPriority::DONT_DOWNLOAD && new != DownloadPriority::DONT_DOWNLOAD
-            {
-                // `m_part_file && use_partfile(i)` — move data out of
-                // the part file. `open_file` doesn't take the
-                // part-file mutex but is kept out of the guard anyway.
-                let has_part = self
-                    .part_file
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .is_some();
-                if has_part && self.use_partfile(i) {
-                    let handle = self.open_file(i, OpenMode::WRITE)?;
-                    let file_offset = self.files.file_offset(i);
-                    let size = self.files.file_size(i);
-                    let g = self.part_file.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(pf) = g.as_ref() {
-                        let mut write_err = None;
-                        pf.export_file(file_offset, size, |off, buf| {
-                            let abs = file_offset + off;
-                            if write_err.is_none() {
-                                if let Err(e) =
-                                    pwrite_all(handle.file(), buf, u64::try_from(abs).unwrap_or(0))
-                                {
-                                    write_err = Some(e);
-                                }
-                            }
-                        })
-                        .map_err(|e| StorageError::new(e, i, Operation::PartfileWrite))?;
-                        if let Some(e) = write_err {
-                            return Err(StorageError::new(e, i, Operation::PartfileWrite));
+            let transition = |st: &mut Self| -> StorageResult<()> {
+                if old_prio == DownloadPriority::DONT_DOWNLOAD
+                    && new != DownloadPriority::DONT_DOWNLOAD
+                {
+                    // move stuff out of the part file — upstream opens
+                    // the file unconditionally (pread_storage.cpp
+                    // mirror of mmap_storage.cpp:190), *then* exports
+                    // if `m_part_file && use_partfile(i)`.
+                    let handle = st.open_file(i, OpenMode::WRITE)?;
+                    let has_part = st
+                        .part_file
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some();
+                    if has_part && st.use_partfile(i) {
+                        let file_offset = st.files.file_offset(i);
+                        let size = st.files.file_size(i);
+                        let g = st.part_file.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(pf) = g.as_ref() {
+                            // `off` is relative to the exported range —
+                            // the target offset inside file `i`. (The
+                            // old code added `file_offset` again —
+                            // for file index > 0 it wrote past EOF
+                            // while the part-file slots were freed.)
+                            pf.export_file(file_offset, size, |off, buf| {
+                                pwrite_all(handle.file(), buf, u64::try_from(off).unwrap_or(0))
+                                    .map(|_| ())
+                            })
+                            .map_err(|e| StorageError::new(e, i, Operation::PartfileWrite))?;
                         }
                     }
+                } else if old_prio != DownloadPriority::DONT_DOWNLOAD
+                    && new == DownloadPriority::DONT_DOWNLOAD
+                {
+                    // move stuff into the part file — not implemented
+                    // upstream either; just stop using the part file when
+                    // the file exists on disk
+                    let p = st.resolve_path(i);
+                    let exists = p
+                        .try_exists()
+                        .map_err(|e| StorageError::new(e, i, Operation::FileStat))?;
+                    st.set_use_partfile(i, !exists);
                 }
-            } else if old_prio != DownloadPriority::DONT_DOWNLOAD
-                && new == DownloadPriority::DONT_DOWNLOAD
-            {
-                // move stuff into the part file — not implemented
-                // upstream either; just stop using the part file when
-                // the file exists on disk
-                let p = self.resolve_path(i);
-                let exists = p
-                    .try_exists()
-                    .map_err(|e| StorageError::new(e, i, Operation::FileStat))?;
-                self.set_use_partfile(i, !exists);
+                Ok(())
+            };
+            if let Err(e) = transition(self) {
+                self.file_priority[idx] = old_prio;
+                return Err(e);
             }
-            self.file_priority[idx] = new;
 
             if self.file_priority[idx] == DownloadPriority::DONT_DOWNLOAD && self.use_partfile(i) {
                 self.need_partfile();
@@ -806,6 +816,19 @@ impl PreadStorage {
             &self.stat_cache,
             &self.save_path(),
         )
+    }
+}
+
+impl Drop for PreadStorage {
+    fn drop(&mut self) {
+        // ~pread_storage (pread_storage.cpp:61-68) — release this
+        // torrent's pooled handles; the part file's own `Drop`
+        // flushes its metadata.
+        let idx = *self
+            .storage_index
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner());
+        self.pool.release_storage(idx);
     }
 }
 
@@ -910,6 +933,82 @@ pub trait DiskStorage: Send + Sync {
     /// them from `settings_interface` inside `open_file`. Default
     /// no-op keeps injected storages source-compatible.
     fn set_open_mode_extra(&self, _mode: OpenMode) {}
+    /// `set_need_tick` — a write job marked this storage's part-file
+    /// metadata dirty; the disk-io loop enqueues it for a deferred
+    /// `do_tick` (~2 min upstream, `m_need_tick`). The first setter
+    /// returns `false` so the caller enqueues the storage once
+    /// (upstream's `if (!st->set_need_tick()) push`).
+    fn set_need_tick(&self) -> bool {
+        false
+    }
+    /// `do_tick`/`tick` — deferred maintenance: flush part-file
+    /// metadata. Driven by the disk-io worker's maintenance pass.
+    fn do_tick(&self) {}
+    /// `file_pool_impl::close_oldest` — shed the storage's LRU pooled
+    /// resource on `close_file_interval` cadence. The shared fd pool
+    /// is closed by `disk_io` itself; this targets storage-owned
+    /// pools (the mmap view pool).
+    fn close_oldest(&self) {}
+    /// `file_pool::get_status(storage_index)` — per-file open state
+    /// reported through `disk_io::get_status` (`open_file_state`
+    /// upstream — the mmapped bit distinguishes view vs fd opens).
+    fn file_status(&self) -> Vec<crate::file_pool::OpenFileState> {
+        Vec::new()
+    }
+    /// `settings_pack::mmap_file_size_cutoff` — files at or below
+    /// this many 16 KiB blocks open `no_mmap` (mmap backend only).
+    fn set_mmap_file_size_cutoff(&self, _blocks: i64) {}
+    /// `settings_pack::disk_write_mode` (`mmap_write_mode_t` ordinal:
+    /// 0=`always_pwrite`, 1=`always_mmap_write`, 2=`auto_mmap_write`)
+    /// — resolved in `initialize` (mmap backend only).
+    fn set_disk_write_mode(&self, _mode: i32) {}
+    /// `settings_pack::disk_disable_copy_on_write` — `no_cow` on
+    /// truncate-opens (upstream applies it in the mmap backend only).
+    fn set_no_cow(&self, _v: bool) {}
+    /// `read` + `disk_job_flags_t` — upstream's mmap backend also
+    /// honors `flush_piece` (`page_out` the read range); fd storages
+    /// have no page machinery so the default folds to `read`.
+    fn read_with_hints(
+        &self,
+        buf: &mut [u8],
+        piece: PieceIndex,
+        offset: i64,
+        mode: OpenMode,
+        volatile: bool,
+        flush: bool,
+    ) -> StorageResult<i64> {
+        let _ = flush;
+        self.read(buf, piece, offset, mode, volatile)
+    }
+    /// `write` + `disk_job_flags_t` — same deal: `volatile_read` →
+    /// `dont_need`, `flush_piece` → `page_out` on the mapped range.
+    fn write_with_hints(
+        &self,
+        buf: &[u8],
+        piece: PieceIndex,
+        offset: i64,
+        mode: OpenMode,
+        volatile: bool,
+        flush: bool,
+    ) -> StorageResult<i64> {
+        let _ = (volatile, flush);
+        self.write(buf, piece, offset, mode)
+    }
+    /// `hash`/`hash2` + `disk_job_flags_t` — same deal.
+    #[allow(clippy::too_many_arguments)]
+    fn hash_with_hints(
+        &self,
+        feed: &mut dyn FnMut(&[u8]),
+        len: i64,
+        piece: PieceIndex,
+        offset: i64,
+        mode: OpenMode,
+        volatile: bool,
+        flush: bool,
+    ) -> StorageResult<i64> {
+        let _ = flush;
+        self.hash_with(feed, len, piece, offset, mode, volatile)
+    }
 }
 
 impl DiskStorage for PreadStorage {
@@ -1004,6 +1103,15 @@ impl DiskStorage for PreadStorage {
     fn set_open_mode_extra(&self, mode: OpenMode) {
         self.open_mode_extra
             .store(mode.bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+    fn set_need_tick(&self) -> bool {
+        PreadStorage::set_need_tick(self)
+    }
+    fn do_tick(&self) {
+        PreadStorage::do_tick(self);
+    }
+    fn file_status(&self) -> Vec<crate::file_pool::OpenFileState> {
+        self.pool.get_status(self.storage_index())
     }
 }
 

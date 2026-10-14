@@ -19,7 +19,7 @@
 //! posted through the injected `DrainPoster` (`disk_completed_queue`).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bitdaemon_common::types::{FileIndex, PieceIndex, StorageIndex};
@@ -186,6 +186,34 @@ pub struct PreadDiskIo {
     /// `check_fastresume` never emits `need_full_check` (upstream
     /// reads it straight from `settings_interface` in `do_job`).
     no_recheck_incomplete_resume: AtomicBool,
+    /// `m_need_tick` — storages a write marked dirty (part-file
+    /// metadata); entries are due 2 min after the write
+    /// (upstream `time_now() + minutes(2)`). Resolved by index at
+    /// drain — a removed torrent simply isn't found (upstream's
+    /// `weak_ptr` expiry).
+    need_tick: Mutex<VecDeque<(std::time::Instant, StorageIndex)>>,
+    /// `settings_pack::close_file_interval` (default 240 s) —
+    /// `close_oldest` cadence in the maintenance pass.
+    close_file_interval: AtomicI64,
+    /// upstream `m_file_pool.close_oldest()` throttle state —
+    /// `next_close_oldest_file` in `thread_fun`.
+    close_oldest_due: Mutex<std::time::Instant>,
+    /// upstream `thread_id == pool.first_thread_id()`: exactly one
+    /// generic-pool worker runs the maintenance pass. Claimed on the
+    /// first popped job, released on thread exit so a respawned
+    /// worker picks it up.
+    maintenance_claimed: AtomicBool,
+    /// `settings_pack::mmap_file_size_cutoff` (default 40, 16 KiB
+    /// blocks) — pushed to every storage; only the mmap backend
+    /// consumes it.
+    mmap_file_size_cutoff: AtomicI64,
+    /// `settings_pack::disk_write_mode` (`mmap_write_mode_t` ordinal)
+    /// — pushed to storages; the mmap backend resolves
+    /// `m_use_mmap_writes` from it in `initialize`.
+    disk_write_mode: AtomicI64,
+    /// `settings_pack::disk_disable_copy_on_write` — pushed to
+    /// storages; `open_mode::no_cow` on truncate-opens (mmap only).
+    disk_disable_cow: AtomicBool,
 }
 
 impl PreadDiskIo {
@@ -258,6 +286,19 @@ impl PreadDiskIo {
             flush_pool,
             open_mode_extra: std::sync::atomic::AtomicU32::new(0),
             no_recheck_incomplete_resume: AtomicBool::new(false),
+            need_tick: Mutex::new(VecDeque::new()),
+            // `settings_pack` defaults (settings_pack.cpp):
+            // close_file_interval 240 on Windows, 0 elsewhere;
+            // mmap_file_size_cutoff 40; disk_write_mode 1
+            // (`always_mmap_write` — resolved to `use_mmap_writes` at
+            // `initialize`, like upstream whose member default is
+            // also "write through mmap").
+            close_file_interval: AtomicI64::new(if cfg!(windows) { 240 } else { 0 }),
+            close_oldest_due: Mutex::new(std::time::Instant::now()),
+            maintenance_claimed: AtomicBool::new(false),
+            mmap_file_size_cutoff: AtomicI64::new(40),
+            disk_write_mode: AtomicI64::new(1),
+            disk_disable_cow: AtomicBool::new(false),
         });
         // upstream `pread_disk_io` ctor:
         // `m_cache.set_max_size(max_queued_disk_bytes / 0x4000)` with
@@ -382,7 +423,7 @@ impl PreadDiskIo {
         let mut g = self.storages.lock().unwrap_or_else(|e| e.into_inner());
         let storage = (self.factory)(params, Arc::clone(&self.file_pool));
         storage.set_storage_index(idx);
-        storage.set_open_mode_extra(self.open_mode_extra());
+        self.push_storage_settings(&*storage);
         g.insert(
             idx,
             Arc::new(StorageEntry {
@@ -401,7 +442,7 @@ impl PreadDiskIo {
     /// Register a pre-built storage (tests / custom wiring).
     pub fn insert_storage(&self, idx: StorageIndex, storage: Box<dyn DiskStorage>) {
         storage.set_storage_index(idx);
-        storage.set_open_mode_extra(self.open_mode_extra());
+        self.push_storage_settings(&*storage);
         self.storages
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1001,28 +1042,111 @@ impl PreadDiskIo {
     }
 
     /// `immediate_execute` — 0-thread fallback: run queued jobs inline.
+    /// Upstream still runs the thread_fun maintenance block when the
+    /// pool has no threads (jobs execute on the io_context thread), so
+    /// the same pass runs here.
     fn immediate_execute(&self, pool: &Arc<DiskIoThreadPool>) {
         loop {
             let Some(j) = pool.pop_front() else {
                 break;
             };
+            self.maintenance();
             self.execute_and_complete(j);
+        }
+    }
+
+    /// `mmap_disk_io::thread_fun`'s maintenance block — drains due
+    /// `m_need_tick` entries (deferred part-file metadata flush,
+    /// ~2 min after the write) and sheds pooled fds/views on
+    /// `close_file_interval` cadence (≤ 0 → recheck in one minute,
+    /// in case the setting changed). Upstream gates this on
+    /// `thread_id == pool.first_thread_id()` of the generic pool.
+    fn maintenance(&self) {
+        let now = std::time::Instant::now();
+        loop {
+            let idx = {
+                let mut q = self.need_tick.lock().unwrap_or_else(|e| e.into_inner());
+                match q.front() {
+                    Some((due, _)) if *due < now => q.pop_front().map(|(_, i)| i),
+                    _ => None,
+                }
+            };
+            let Some(idx) = idx else { break };
+            // upstream re-locks around `st->tick()` — ours pops first,
+            // then ticks; a removed torrent resolves to `None` here
+            // (the `weak_ptr` expiry upstream).
+            if let Some(e) = self.storage(idx) {
+                e.storage
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .do_tick();
+            }
+        }
+        let mut due = self
+            .close_oldest_due
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if now > *due {
+            let interval = self.close_file_interval.load(Ordering::Relaxed);
+            if interval <= 0 {
+                // check again in one minute, in case the setting changed
+                *due = now + std::time::Duration::from_secs(60);
+            } else {
+                *due = now + std::time::Duration::from_secs(u64::try_from(interval).unwrap_or(0));
+                self.file_pool.close_oldest();
+                // `m_file_pool` under the mmap backend *is* the view
+                // pool — each storage forwards the call to its own
+                // pooled resource (a no-op for storages without one;
+                // pools dedupe the per-storage fan-out internally).
+                for e in self
+                    .storages
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .values()
+                {
+                    e.storage
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .close_oldest();
+                }
+            }
         }
     }
 
     /// worker loop (`thread_fun`) — wait, pop, perform, complete.
     fn worker_loop(&self, pool: &Arc<DiskIoThreadPool>) {
+        // `thread_id == pool.first_thread_id()` — one generic-pool
+        // worker owns the maintenance pass. Claimed on the first
+        // popped job, released on exit so a respawned worker picks it
+        // up (upstream's `first_thread_id` is fixed; ours must be
+        // re-claimable because threads exit on reap).
+        let mut owns_maintenance = false;
         loop {
             match pool.wait_for_job() {
                 WaitResult::NewJob => {
                     let Some(j) = pool.pop_front() else { continue };
+                    if Arc::ptr_eq(pool, &self.pool)
+                        && (owns_maintenance
+                            || self
+                                .maintenance_claimed
+                                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                                .is_ok())
+                    {
+                        owns_maintenance = true;
+                        self.maintenance();
+                    }
                     self.execute_and_complete(j);
                 }
                 WaitResult::Interrupt => continue,
                 // `exit_thread` — the exit token was consumed inside
                 // `wait_for_job` (upstream `try_thread_exit` runs in
                 // the wait loop, not the worker); just end the thread.
-                WaitResult::ExitThread => return,
+                WaitResult::ExitThread => {
+                    if owns_maintenance {
+                        self.maintenance_claimed.store(false, Ordering::Release);
+                    }
+                    return;
+                }
             }
         }
     }
@@ -1348,16 +1472,29 @@ impl PreadDiskIo {
                 } else {
                     OpenMode::WRITE
                 };
+                // upstream `j->flags` on the write job reach
+                // `st->write`: `volatile_read` → `dont_need`,
+                // `flush_piece` → `page_out` on the range (mmap
+                // backend). Our coalesced flush aggregates the
+                // parked writers' flags.
+                let (volatile, flush) = f.writers.iter().fold((false, false), |(v, p), w| {
+                    let JobKind::Write(w) = &w.action else {
+                        return (v, p);
+                    };
+                    (v || w.volatile, p || w.force_flush)
+                });
                 let tw = std::time::Instant::now();
                 // one physical write in flight per storage — see
                 // `StorageEntry::write_serializer`.
                 let r = {
                     let _serial = e.write_serializer.lock().unwrap_or_else(|p| p.into_inner());
-                    st.write(
+                    st.write_with_hints(
                         &flat,
                         f.piece,
                         i64::from(f.first_block) * crate::disk_cache::DEFAULT_BLOCK_SIZE,
                         mode,
+                        volatile,
+                        flush,
                     )
                 };
                 self.write_us
@@ -1366,6 +1503,19 @@ impl PreadDiskIo {
                     .fetch_add(flat_len as u64, Ordering::Relaxed);
                 match r {
                     Ok(_) => {
+                        // upstream `do_write`: a landed write marks the
+                        // storage for a deferred part-file metadata
+                        // flush (~2 min, drained by the maintenance
+                        // pass). Upstream marks only its uncached
+                        // write path — our Flush *is* the physical
+                        // write path, so marking here is the upstream
+                        // intent (cached `writev` upstream misses it).
+                        if !st.set_need_tick() {
+                            self.need_tick
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .push_back((tw + std::time::Duration::from_secs(120), j.storage));
+                        }
                         // `piece_hasher` role (ADR-0016): SHA-256 per
                         // flushed block, stored on the cache entry —
                         // `hash2` jobs reuse them without a re-read.
@@ -1573,12 +1723,13 @@ fn read_job(
         );
     };
     let want = usize::from(r.buffer_size).min(buf.len());
-    match st.read(
+    match st.read_with_hints(
         &mut buf[..want],
         r.piece,
         i64::from(r.offset),
         read_mode(no_cache, r.sequential),
         r.volatile,
+        r.flush,
     ) {
         Ok(n) => {
             r.buffer_size = u16::try_from(n).unwrap_or(0);
@@ -1664,6 +1815,7 @@ fn prepare_read(e: &StorageEntry, j: &mut DiskJob) -> bool {
         let piece = r.piece;
         let offset = r.offset;
         let volatile = r.volatile;
+        let flush = r.flush;
         let sequential = r.sequential;
         let handler = std::mem::replace(&mut r.handler, Box::new(|_, _| {}));
         let buf = std::mem::replace(
@@ -1689,6 +1841,7 @@ fn prepare_read(e: &StorageEntry, j: &mut DiskJob) -> bool {
             piece,
             offset: missing_offset,
             volatile,
+            flush,
             sequential,
         });
         return false;
@@ -1737,12 +1890,13 @@ fn partial_read_job(
     };
     let off = usize::from(r.buffer_offset);
     let want = usize::from(r.buffer_size).min(buf.len().saturating_sub(off));
-    match st.read(
+    match st.read_with_hints(
         &mut buf[off..off + want],
         r.piece,
         i64::from(r.offset),
         read_mode(no_cache, r.sequential),
         r.volatile,
+        r.flush,
     ) {
         Ok(n) => {
             let n = usize::try_from(n).unwrap_or(0);
@@ -1844,12 +1998,13 @@ fn hash_job(
         let end = (i * BS).min(piece_len);
         if r.is_ok() {
             r = st
-                .read(
+                .read_with_hints(
                     &mut buf[off..end],
                     h.piece,
                     i64::try_from(off).unwrap_or(0),
                     read_mode(no_cache, h.sequential),
                     h.volatile,
+                    h.flush,
                 )
                 .map(|_| ());
         }
@@ -1948,13 +2103,14 @@ fn hash2_job(
         h.piece_hash2 = hash;
         return StorageError::default();
     }
-    let r = st.hash_with(
+    let r = st.hash_with_hints(
         &mut |d| sha.update(d),
         i64::try_from(DEFAULT_BLOCK_SIZE).unwrap_or(0),
         h.piece,
         i64::from(h.offset),
         read_mode(no_cache, h.sequential),
         h.volatile,
+        h.flush,
     );
     match r {
         Ok(_) => {
@@ -2034,6 +2190,61 @@ impl PreadDiskIo {
         }
     }
 
+    /// push a storage-scoped setting to every constructed storage —
+    /// same live-update semantics as [`Self::set_open_mode_extra`]
+    /// (upstream reads `settings_interface` inside `open_file`/
+    /// `initialize`).
+    fn fan_out_storages(&self, f: impl Fn(&dyn DiskStorage)) {
+        for e in self
+            .storages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            f(&**e.storage.read().unwrap_or_else(|e2| e2.into_inner()));
+        }
+    }
+
+    /// `settings_pack::mmap_file_size_cutoff` — 16 KiB blocks; files
+    /// at or below it take the fd path under the mmap backend.
+    pub fn set_mmap_file_size_cutoff(&self, blocks: i64) {
+        self.mmap_file_size_cutoff.store(blocks, Ordering::Relaxed);
+        self.fan_out_storages(|st| st.set_mmap_file_size_cutoff(blocks));
+    }
+
+    /// `settings_pack::disk_write_mode` (`mmap_write_mode_t` ordinal)
+    /// — `always_pwrite`/`always_mmap_write`/`auto_mmap_write`.
+    pub fn set_disk_write_mode(&self, mode: i32) {
+        self.disk_write_mode
+            .store(i64::from(mode), Ordering::Relaxed);
+        self.fan_out_storages(|st| st.set_disk_write_mode(mode));
+    }
+
+    /// `settings_pack::disk_disable_copy_on_write` — `no_cow` opens
+    /// (mmap backend upstream).
+    pub fn set_no_cow(&self, v: bool) {
+        self.disk_disable_cow.store(v, Ordering::Relaxed);
+        self.fan_out_storages(|st| st.set_no_cow(v));
+    }
+
+    /// `settings_pack::close_file_interval` — seconds between
+    /// `close_oldest` kicks in the maintenance pass.
+    pub fn set_close_file_interval(&self, secs: i64) {
+        self.close_file_interval.store(secs, Ordering::Relaxed);
+    }
+
+    /// storage-scoped settings pushed on construction — mirrors the
+    /// `open_file`/`initialize` reads upstream makes from
+    /// `settings_interface`.
+    fn push_storage_settings(&self, storage: &dyn DiskStorage) {
+        storage.set_open_mode_extra(self.open_mode_extra());
+        storage.set_mmap_file_size_cutoff(self.mmap_file_size_cutoff.load(Ordering::Relaxed));
+        storage.set_disk_write_mode(
+            i32::try_from(self.disk_write_mode.load(Ordering::Relaxed)).unwrap_or(1),
+        );
+        storage.set_no_cow(self.disk_disable_cow.load(Ordering::Relaxed));
+    }
+
     /// currently applied extra open flags.
     #[must_use]
     pub fn open_mode_extra(&self) -> crate::open_mode::OpenMode {
@@ -2080,6 +2291,7 @@ impl DiskIo for PreadDiskIo {
             piece: r.piece,
             offset: r.start,
             volatile: flags & io_flags::VOLATILE_READ != 0,
+            flush: flags & io_flags::FLUSH_PIECE != 0,
             sequential: flags & io_flags::SEQUENTIAL_ACCESS != 0,
         }));
         self.add_job(storage, j);
@@ -2121,6 +2333,7 @@ impl DiskIo for PreadDiskIo {
             offset: r.start,
             buffer_size: u16::try_from(r.length).unwrap_or(u16::MAX),
             force_flush: flags & io_flags::FLUSH_PIECE == io_flags::FLUSH_PIECE,
+            volatile: flags & io_flags::VOLATILE_READ != 0,
         }));
         j.storage = storage;
         // upstream `m_abort`: a write submitted during shutdown is
@@ -2176,6 +2389,7 @@ impl DiskIo for PreadDiskIo {
             piece_hash: Sha1Hash::default(),
             v1_hash: flags & io_flags::V1_HASH != 0,
             volatile: flags & io_flags::VOLATILE_READ != 0,
+            flush: flags & io_flags::FLUSH_PIECE != 0,
             sequential: flags & io_flags::SEQUENTIAL_ACCESS != 0,
         }));
         self.add_job(storage, j);
@@ -2195,6 +2409,7 @@ impl DiskIo for PreadDiskIo {
             offset,
             piece_hash2: Sha256Hash::default(),
             volatile: flags & io_flags::VOLATILE_READ != 0,
+            flush: flags & io_flags::FLUSH_PIECE != 0,
             sequential: flags & io_flags::SEQUENTIAL_ACCESS != 0,
         }));
         self.add_job(storage, j);
@@ -2330,7 +2545,17 @@ impl DiskIo for PreadDiskIo {
     }
 
     fn get_status(&self, storage: StorageIndex) -> Vec<crate::file_pool::OpenFileState> {
-        self.file_pool.get_status(storage)
+        // upstream asks the backend's own pool — `m_file_pool` is the
+        // fd pool under pread and the view pool under mmap; the
+        // storage reports whichever pooled resource it holds.
+        self.storage(storage)
+            .map(|e| {
+                e.storage
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .file_status()
+            })
+            .unwrap_or_default()
     }
 
     fn abort(&self, wait: bool) {
@@ -2363,6 +2588,22 @@ impl DiskIo for PreadDiskIo {
 
     fn set_open_mode_extra(&self, mode: crate::open_mode::OpenMode) {
         PreadDiskIo::set_open_mode_extra(self, mode);
+    }
+
+    fn set_mmap_file_size_cutoff(&self, blocks: i64) {
+        PreadDiskIo::set_mmap_file_size_cutoff(self, blocks);
+    }
+
+    fn set_disk_write_mode(&self, mode: i32) {
+        PreadDiskIo::set_disk_write_mode(self, mode);
+    }
+
+    fn set_no_cow(&self, v: bool) {
+        PreadDiskIo::set_no_cow(self, v);
+    }
+
+    fn set_close_file_interval(&self, secs: i64) {
+        PreadDiskIo::set_close_file_interval(self, secs);
     }
 
     fn set_max_threads(&self, n: i64) {

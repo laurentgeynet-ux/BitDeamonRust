@@ -207,6 +207,26 @@ pub trait DiskIo: Send + Sync {
     /// Default no-op for storages without tunable open flags.
     fn set_open_mode_extra(&self, _mode: crate::open_mode::OpenMode) {}
 
+    /// `settings_pack::mmap_file_size_cutoff` — file-size threshold in
+    /// 16 KiB blocks below which the mmap backend opens the fd path
+    /// (`open_mode::no_mmap`). Pushed to storages at construction and
+    /// on settings changes (upstream reads it inside `open_file`).
+    fn set_mmap_file_size_cutoff(&self, _blocks: i64) {}
+
+    /// `settings_pack::disk_write_mode` (`mmap_write_mode_t` ordinal:
+    /// 0=`always_pwrite`, 1=`always_mmap_write`, 2=`auto_mmap_write`)
+    /// — resolved to `use_mmap_writes` in `initialize` upstream.
+    fn set_disk_write_mode(&self, _mode: i32) {}
+
+    /// `settings_pack::disk_disable_copy_on_write` — `no_cow` flag on
+    /// truncate-opens (upstream applies it in the mmap backend only).
+    fn set_no_cow(&self, _v: bool) {}
+
+    /// `settings_pack::close_file_interval` — seconds between
+    /// `close_oldest` kicks on the backend's pooled file resource
+    /// (upstream: the first generic disk thread's timer block).
+    fn set_close_file_interval(&self, _secs: i64) {}
+
     /// `session_impl::update_disk_threads` — resize the generic job
     /// pool (`aio_threads` → `m_generic_threads.set_max_threads`).
     fn set_max_threads(&self, _n: i64) {}
