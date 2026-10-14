@@ -97,7 +97,9 @@ pub struct TorrentPeer {
     pub connection: Option<Arc<dyn PeerStats>>,
 
     /// `peer_rank` — lazily computed BEP-40 priority (0 = not set).
-    pub peer_rank: u32,
+    /// `Cell`: upstream's `rank()` is `const` but memoizes into the
+    /// `mutable` bitfield member, and `compare_peer` only holds `&`.
+    pub peer_rank: std::cell::Cell<u32>,
 
     /// `last_optimistically_unchoked` — seconds since session start,
     /// wraps at ~18.2 h.
@@ -158,7 +160,7 @@ impl TorrentPeer {
             prev_amount_upload: 0,
             prev_amount_download: 0,
             connection: None,
-            peer_rank: 0,
+            peer_rank: std::cell::Cell::new(0),
             last_optimistically_unchoked: 0,
             last_connected: 0,
             port,
@@ -257,22 +259,25 @@ impl TorrentPeer {
         }
     }
 
-    /// `rank(external)` — lazily computes `peer_priority` against our
-    /// external address; `external_port` is our listen port. For i2p
-    /// peers or mismatched families returns 0 (no rank).
+    /// `rank(external, external_port)` — lazily computes
+    /// `peer_priority` between the external address of the peer's
+    /// family (`external_ip::external_address` — unspecified when
+    /// unset) and the peer's endpoint. Upstream does not special-case
+    /// i2p (`address()` → v4-unspecified) or missing externals — the
+    /// CRC runs on whatever pair results.
     #[must_use]
-    pub fn rank(&mut self, external: IpAddr, external_port: u16) -> u32 {
-        if self.peer_rank == 0 {
-            if let Some(local) = self.addr.address() {
-                if local.is_ipv4() == external.is_ipv4() {
-                    self.peer_rank = peer_priority(
-                        SocketAddr::new(external, external_port),
-                        SocketAddr::new(local, self.port),
-                    );
-                }
-            }
+    pub fn rank(&self, external: &crate::ip_voter::ExternalIp, external_port: u16) -> u32 {
+        if self.peer_rank.get() == 0 {
+            let local = self
+                .addr
+                .address()
+                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+            self.peer_rank.set(peer_priority(
+                SocketAddr::new(external.external_address(&local), external_port),
+                SocketAddr::new(local, self.port),
+            ));
         }
-        self.peer_rank
+        self.peer_rank.get()
     }
 }
 
@@ -298,7 +303,12 @@ fn apply_mask(b: &mut [u8], mask: &[u8]) {
 /// are always unmasked.
 #[must_use]
 pub fn peer_priority(e1: SocketAddr, e2: SocketAddr) -> u32 {
-    assert_eq!(e1.is_ipv4(), e2.is_ipv4());
+    debug_assert_eq!(e1.is_ipv4(), e2.is_ipv4());
+    if e1.is_ipv4() != e2.is_ipv4() {
+        // upstream TORRENT_ASSERTs on the caller; a mixed pair can
+        // only come from a bug — return 0 rather than panic.
+        return 0;
+    }
     let (e1, e2) = if e1 > e2 { (e2, e1) } else { (e1, e2) };
 
     if e1.ip() == e2.ip() {
@@ -350,6 +360,6 @@ pub fn peer_priority(e1: SocketAddr, e2: SocketAddr) -> u32 {
             buf[4..].copy_from_slice(&b2);
             crc32c(&buf)
         }
-        _ => unreachable!("mixed address families"),
+        _ => 0,
     }
 }

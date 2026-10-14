@@ -167,9 +167,36 @@ struct DialDone {
     /// `m_encrypted` — the conn went through the MSE handshake
     /// (`supports_encryption()`, feeds `pex_encryption`).
     encrypted: bool,
+    /// remote's peer_id from the handshake (`set_pid`).
+    pid: Option<bitdaemon_common::PeerId>,
     /// negotiated RC4 stream state when `crypto_select == RC4` —
     /// moved into the io pump to wrap all wire traffic.
     rc4: Option<bitdaemon_net::pe_crypto::Rc4Handler>,
+    /// `peer_exceeds_limit` — the accept admitted us past
+    /// `connections_limit` inside `connections_slack`; eviction
+    /// re-evaluates at attach (`m_exceeded_limit` upstream).
+    exceeded: bool,
+    /// `socket_type_idx` — the transport's `socket_type_t` index
+    /// (feeds `PeerConn::sock_type` → `set_peer_classes`).
+    kind: u8,
+}
+
+/// `socket_type_idx` — `TransportKind` → `socket_type_t` index
+/// (upstream enum order: tcp 0, socks5 1, http 2, utp 3, i2p 4,
+/// rtc 5, tcp_ssl 6, socks5_ssl 7, http_ssl 8, utp_ssl 9).
+fn transport_socket_type(k: &bitdaemon_net::instantiate::TransportKind) -> u8 {
+    use bitdaemon_net::instantiate::TransportKind as TK;
+    match k {
+        TK::Tcp => 0,
+        TK::Socks => 1,
+        TK::HttpStream => 2,
+        TK::Utp => 3,
+        TK::I2p => 4,
+        TK::SslTcp => 6,
+        TK::SslSocks => 7,
+        TK::SslHttpStream => 8,
+        TK::SslUtp => 9,
+    }
 }
 
 /// A web-seed fetch completion: per-block data or the failed
@@ -191,13 +218,16 @@ pub struct NatpmpState {
     pub ttl: u32,
 }
 
-/// A UPnP SOAP response back to the engine loop — `Ip` answers
-/// `GetExternalIPAddress`, `Map` answers add/delete posts.
+/// A UPnP SOAP response back to the engine loop — `kind` routes to
+/// the upstream reply handler (`on_upnp_get_ip_address_response`,
+/// `on_upnp_map_response`, `on_upnp_unmap_response`).
 struct UpnpReply {
     dev: usize,
     mapping: usize,
-    is_ip_query: bool,
-    body: Result<String, String>,
+    kind: bitdaemon_net::upnp::SoapKind,
+    /// Ok(status, content-type, body, header_finished) —
+    /// Err on transport/connect failure (`e && e != eof` upstream).
+    reply: Result<(i32, Option<String>, String, bool), String>,
 }
 
 /// `Engine` — everything outside `Session` that upstream does in
@@ -268,6 +298,12 @@ pub struct Engine {
     upnp_dev_rx: mpsc::UnboundedReceiver<bitdaemon_net::upnp::RootDevice>,
     /// SSDP `LOCATION`s already fetched (dedup across M-SEARCH bursts).
     ssdp_seen: std::collections::HashSet<String>,
+    /// `m_retry_count` — M-SEARCH resend counter; upstream resends
+    /// every `2*retry_count` s while `retry < 12 && (no devices ||
+    /// retry < 4)`.
+    ssdp_retry_count: u32,
+    /// `m_broadcast_timer` — next resend deadline.
+    ssdp_next: Option<Instant>,
     upnp_tx: mpsc::UnboundedSender<UpnpReply>,
     /// spawned task handles (kept for abort on drop).
     tasks: Vec<JoinHandle<()>>,
@@ -384,6 +420,8 @@ impl Engine {
             upnp_dev_tx,
             upnp_dev_rx,
             ssdp_seen: std::collections::HashSet::new(),
+            ssdp_retry_count: 0,
+            ssdp_next: None,
             upnp_tx,
             tasks: Vec::new(),
             known_ihs: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
@@ -453,7 +491,9 @@ impl Engine {
         }
         if slock(&self.session).settings.enable_incoming_utp {
             let acc = bitdaemon_net::utp_stream::UtpAcceptor::new(manager.clone(), dg, cfg).await;
-            self.start_acceptor_at(Arc::new(acc), None, 6);
+            // `socket_type_t::utp` = 3 — the tag feeds alerts and
+            // `peer_class_type_filter` (`set_peer_classes`).
+            self.start_acceptor_at(Arc::new(acc), None, 3);
         }
         self.utp_manager = Some(manager);
         self.utp_enabled = true;
@@ -650,7 +690,9 @@ impl Engine {
         }
         while let Ok((ih, peer)) = self.gone_rx.try_recv() {
             self.writers.remove(&(ih, peer));
-            slock(&self.session).peer_disconnected(&ih, peer, &mut out);
+            // transport-initiated close: no severity of its own —
+            // `peer_disconnected` ORs in the conn's `failed` flag.
+            slock(&self.session).peer_disconnected(&ih, peer, false, &mut out);
         }
         while let Ok((ih, peer, bytes)) = self.sent_rx.try_recv() {
             slock(&self.session).on_peer_sent(&ih, peer, bytes, &mut out);
@@ -702,8 +744,11 @@ impl Engine {
             }
         }
         while let Ok(a) = self.dhtnode_rx.try_recv() {
-            trace!(%a, "dht_add_node drain");
-            slock(&self.session).dht_add_node(a);
+            // upstream resolves `dht_bootstrap_nodes` through the
+            // *router* path (`m_dht_router_nodes`) — they seed the
+            // table directly and persist across DHT restarts.
+            trace!(%a, "dht_add_router drain");
+            slock(&self.session).dht_add_router(a);
         }
         while let Ok(r) = self.upnp_rx.try_recv() {
             self.on_upnp_reply(r);
@@ -721,15 +766,20 @@ impl Engine {
             .set_limit(slock(&self.session).settings.download_rate_limit);
         self.download_limiter.refill(1000);
         // per-torrent channels — `torrent::set_{up,down}load_limit`
-        for (ih, t) in &slock(&self.session).torrents {
-            self.torrent_up_limiters
-                .entry(*ih)
-                .or_insert_with(|| Arc::new(RateLimiter::new(t.upload_limit)))
-                .set_limit(t.upload_limit);
-            self.torrent_down_limiters
-                .entry(*ih)
-                .or_insert_with(|| Arc::new(RateLimiter::new(t.download_limit)))
-                .set_limit(t.download_limit);
+        {
+            let ses = slock(&self.session);
+            for (ih, t) in &ses.torrents {
+                let up = t.upload_limit(&ses.peer_class_pool);
+                let down = t.download_limit(&ses.peer_class_pool);
+                self.torrent_up_limiters
+                    .entry(*ih)
+                    .or_insert_with(|| Arc::new(RateLimiter::new(up)))
+                    .set_limit(up);
+                self.torrent_down_limiters
+                    .entry(*ih)
+                    .or_insert_with(|| Arc::new(RateLimiter::new(down)))
+                    .set_limit(down);
+            }
         }
         self.torrent_up_limiters
             .retain(|ih, _| slock(&self.session).torrents.contains_key(ih));
@@ -753,6 +803,7 @@ impl Engine {
         slock(&self.session).tracker_announce_due(now, 0, &mut out);
         self.dispatch(out).await;
         self.natpmp_renew().await;
+        self.upnp_ssdp_tick(now).await;
         slock(&self.session).pop_alerts()
     }
 
@@ -774,13 +825,30 @@ impl Engine {
 
     fn send_msgs_to_peers(&mut self, out: Vec<SessionOut>) {
         for e in out {
-            if let SessionOut::ToPeer { ih, peer, msg } = e {
-                if let Some(tx) = self.writers.get(&(ih, peer)) {
-                    if tx.send(msg).is_err() {
-                        self.writers.remove(&(ih, peer));
+            match e {
+                SessionOut::ToPeer { ih, peer, msg } => {
+                    if let Some(tx) = self.writers.get(&(ih, peer)) {
+                        if tx.send(msg).is_err() {
+                            self.writers.remove(&(ih, peer));
+                        }
                     }
                 }
+                SessionOut::Torrent(
+                    bitdaemon_session::torrent::TorrentEffect::DisconnectPeer { peer, .. },
+                ) => self.disconnect_writer(peer),
+                _ => {}
             }
+        }
+    }
+
+    /// `peer_connection::disconnect` — drop the conn's write channel;
+    /// the pump's `rx.recv()` then returns `None`, the task exits and
+    /// the socket closes (`gone_tx` reaps whatever session state
+    /// remains — usually none, since the emitting torrent already ran
+    /// `remove_peer`).
+    fn disconnect_writer(&mut self, peer: u64) {
+        if let Some(key) = self.writers.keys().find(|(_, p)| *p == peer).copied() {
+            self.writers.remove(&key);
         }
     }
 
@@ -899,11 +967,14 @@ impl Engine {
                     if let bitdaemon_session::torrent::TorrentEffect::DisconnectPeer {
                         peer,
                         reason,
+                        ..
                     } = &e
                     {
                         warn!(peer = peer, reason = reason, "peer disconnect");
+                        // `m_ses.close_connection` — actually close the
+                        // socket (the torrent already ran remove_peer).
+                        self.disconnect_writer(*peer);
                     }
-                    // routed upstream via alerts already
                 }
                 SessionOut::Alert(_) => {}
                 SessionOut::PortmapAdd {
@@ -945,6 +1016,10 @@ impl Engine {
         let resolver = self.resolver.clone();
         self.tasks_forget();
         let handle = tokio::spawn(async move {
+            let mut params = params;
+            params.url = url.clone();
+            params.tracker_id = tracker_id.clone().into_bytes();
+            let opts = bitdaemon_net::http_tracker::AnnounceOptions::default();
             let result = match bitdaemon_net::parse_url::parse_url_components(&url) {
                 Ok(c) if c.protocol == "udp" => {
                     let Some(dg) = datagram else {
@@ -958,14 +1033,17 @@ impl Engine {
                     };
                     let port = u16::try_from(c.port).unwrap_or(80);
                     let v4 = DatagramSocket::local_addr(dg.as_ref()).is_ipv4();
-                    match resolve_for_socket(&resolver, &c.hostname, port, v4).await {
+                    match resolve_for_socket(&resolver, &c.hostname, port, v4)
+                        .await
+                        .and_then(|a| filter_tracker_addr(&params.filter, a))
+                    {
                         Ok(addr) => announce_udp(
                             dg.as_ref(),
                             &demux,
                             addr,
                             &params,
+                            &opts,
                             std::time::Duration::from_secs(15),
-                            2,
                         )
                         .await
                         .map_err(|e: AnnounceError| e.to_string()),
@@ -977,7 +1055,10 @@ impl Engine {
                     // upstream never delivers peer lists here, only
                     // RTC offers + interval/complete stats
                     let port = u16::try_from(c.port).unwrap_or(80);
-                    match resolve(&resolver, &c.hostname, port).await {
+                    match resolve(&resolver, &c.hostname, port)
+                        .await
+                        .and_then(|a| filter_tracker_addr(&params.filter, a))
+                    {
                         Ok(addr) => match connector.clone().connect(addr).await {
                             Ok(mut s) => {
                                 let host = if c.port < 0 {
@@ -989,7 +1070,7 @@ impl Engine {
                                     .map(|_| format!("{:02x}", rand::random::<u8>()))
                                     .collect();
                                 let payload =
-                                    bitdaemon_net::ws_tracker::build_announce(&params, &[], 0);
+                                    bitdaemon_net::ws_tracker::build_announce(&params, &[]);
                                 bitdaemon_net::ws_tracker::announce_ws(
                                     &mut s, &host, &c.path, &key, &payload,
                                 )
@@ -1016,7 +1097,10 @@ impl Engine {
                     let https = c.protocol == "https";
                     let default_port = if https { 443 } else { 80 };
                     let port = u16::try_from(c.port).unwrap_or(default_port);
-                    match resolve(&resolver, &c.hostname, port).await {
+                    match resolve(&resolver, &c.hostname, port)
+                        .await
+                        .and_then(|a| filter_tracker_addr(&params.filter, a))
+                    {
                         Ok(addr) => match connector.clone().connect(addr).await {
                             Ok(s) => {
                                 let mut s: BoxedPeerStream = if https {
@@ -1042,26 +1126,9 @@ impl Engine {
                                 } else {
                                     s
                                 };
-                                let host = if c.port < 0 {
-                                    c.hostname.clone()
-                                } else {
-                                    format!("{}:{}", c.hostname, port)
-                                };
-                                announce_http(
-                                    &mut s,
-                                    &host,
-                                    &c.path,
-                                    &params,
-                                    if tracker_id.is_empty() {
-                                        None
-                                    } else {
-                                        Some(tracker_id.as_bytes())
-                                    },
-                                    &[],
-                                    1024 * 1024,
-                                )
-                                .await
-                                .map_err(|e| e.to_string())
+                                announce_http(&mut s, &params, &opts, &[], 1024 * 1024)
+                                    .await
+                                    .map_err(|e| e.to_string())
                             }
                             Err(e) => Err(format!("connect: {e}")),
                         },
@@ -1070,6 +1137,18 @@ impl Engine {
                 }
                 Err(e) => Err(format!("bad tracker url {url}: {e}")),
             };
+            // dict-style `peers` may carry hostnames — upstream
+            // `on_peer_name_lookup` resolves them and feeds
+            // `add_peer` (the ip_filter gate runs downstream in
+            // `add_swarm_peer`, same as upstream).
+            let mut result = result;
+            if let Ok(r) = &mut result {
+                for hp in r.hostname_peers.clone() {
+                    if let Ok(a) = resolve(&resolver, &hp.ip, hp.port).await {
+                        r.peers.push(a);
+                    }
+                }
+            }
             let _ = tx.send(AnnounceDone {
                 ih,
                 url,
@@ -1110,7 +1189,6 @@ impl Engine {
                             addr,
                             ih.as_bytes(),
                             std::time::Duration::from_secs(15),
-                            2,
                         )
                         .await
                         .map(|r| bitdaemon_net::http_tracker::TrackerResponse {
@@ -1147,23 +1225,15 @@ impl Engine {
                     let port = u16::try_from(c.port).unwrap_or(80);
                     match resolve(&resolver, &c.hostname, port).await {
                         Ok(addr) => match connector.clone().connect(addr).await {
-                            Ok(mut s) => {
-                                let host = if c.port < 0 {
-                                    c.hostname.clone()
-                                } else {
-                                    format!("{}:{}", c.hostname, port)
-                                };
-                                bitdaemon_net::tracker_client::scrape_http(
-                                    &mut s,
-                                    &host,
-                                    &c.path,
-                                    ih.as_bytes(),
-                                    &[],
-                                    1024 * 1024,
-                                )
-                                .await
-                                .map_err(|e| e.to_string())
-                            }
+                            Ok(mut s) => bitdaemon_net::tracker_client::scrape_http(
+                                &mut s,
+                                &scrape,
+                                ih.as_bytes(),
+                                &[],
+                                1024 * 1024,
+                            )
+                            .await
+                            .map_err(|e| e.to_string()),
                             Err(e) => Err(format!("connect: {e}")),
                         },
                         Err(e) => Err(e),
@@ -1195,10 +1265,26 @@ impl Engine {
         single_file: bool,
         reqs: Vec<PeerRequest>,
     ) {
-        use bitdaemon_net::web_seed::{WebSeedHeaders, build_piece_request, fetch_block};
+        use bitdaemon_net::web_seed::{WebSeedHeaders, fetch_block};
         let tx = self.webseed_tx.clone();
         let connector = self.connector.clone();
         let resolver = self.resolver.clone();
+        // upstream `add_headers` sends `User-Agent` on the first
+        // request (or always with `always_send_user_agent`) unless
+        // anonymous_mode is on.
+        let session = Arc::clone(&self.session);
+        let (user_agent, anonymous, always_ua, ip_filter) = {
+            let s = slock(&self.session);
+            (
+                String::from_utf8_lossy(&s.settings.user_agent).into_owned(),
+                s.settings.anonymous_mode,
+                s.settings.always_send_user_agent,
+                // `connect_web_seed`'s resolved-endpoint filter —
+                // `m_ip_filter` applies to web seeds unconditionally
+                // (no `m_apply_ip_filter` gate upstream).
+                s.torrents.get(&ih).and_then(|t| t.ip_filter.clone()),
+            )
+        };
         self.tasks_forget();
         let handle = tokio::spawn(async move {
             // report the completed blocks, then release the rest —
@@ -1227,24 +1313,68 @@ impl Engine {
             };
             let mut done: Vec<(PeerRequest, Vec<u8>)> = Vec::with_capacity(reqs.len());
             let port = u16::try_from(c.port).unwrap_or(80);
-            let Ok(addr) = resolve(&resolver, &c.hostname, port).await else {
+            let addr = match resolve(&resolver, &c.hostname, port).await {
+                Ok(a) => a,
+                Err(_) => {
+                    report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs);
+                    return;
+                }
+            };
+            // upstream `on_name_lookup`/`connect_web_seed` — a
+            // filtered resolved address posts `peer_blocked_alert`
+            // and aborts the connect.
+            if ip_filter
+                .as_ref()
+                .is_some_and(|f| f.access(addr.ip()) == bitdaemon_net::ip_filter::BLOCKED)
+            {
+                slock(&session).alerts.post(Alert::PeerBlocked {
+                    ih,
+                    remote: addr.to_string(),
+                    reason: "ip_filter".into(),
+                });
                 report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs);
                 return;
-            };
-            let host = if c.port < 0 {
-                c.hostname.clone()
-            } else {
-                format!("{}:{}", c.hostname, port)
-            };
-            let headers = WebSeedHeaders {
+            }
+            // `format_host_header` — omit the default http port
+            let host =
+                bitdaemon_net::string_util::format_host_header(c.hostname.clone(), c.port, 80);
+            let mut headers = WebSeedHeaders {
                 host,
-                send_user_agent: false,
+                user_agent,
+                always_send_user_agent: always_ua,
+                anonymous_mode: anonymous,
                 ..Default::default()
             };
-            let mut conn: Option<BoxedPeerStream> = None;
-            for i in 0..reqs.len() {
+            // URL-embedded credentials → `Authorization: Basic
+            // <b64>` (upstream `m_basic_auth`); an explicit
+            // web_seed_entry `auth` would take precedence.
+            if !c.auth.is_empty() {
+                headers.authorization = format!(
+                    "Basic {}",
+                    String::from_utf8_lossy(&bitdaemon_core::escape_string::base64encode(
+                        c.auth.as_bytes()
+                    ))
+                );
+            }
+            // conn state per base — `web_seed_t` upstream is one
+            // connection per seed; 3xx redirects add ephemeral seeds
+            // (`web_seed_t::redirects` routes per file).
+            let default_base = bitdaemon_net::parse_url::split_url(&url)
+                .map(|(b, _)| b)
+                .unwrap_or_else(|_| url.clone());
+            let mut bases: std::collections::HashMap<String, SocketAddr> =
+                [(default_base.clone(), addr)].into_iter().collect();
+            let mut conns: std::collections::HashMap<String, BoxedPeerStream> =
+                std::collections::HashMap::new();
+            let mut redirects: std::collections::HashMap<
+                usize,
+                bitdaemon_net::web_seed::RedirectTarget,
+            > = std::collections::HashMap::new();
+            let mut num_redirects = 0usize;
+            let mut i = 0usize;
+            'outer: while i < reqs.len() {
                 let r = reqs[i];
-                let wreq = build_piece_request(
+                let groups = bitdaemon_net::web_seed::plan_piece_request(
                     &files,
                     piece_length,
                     r.piece,
@@ -1253,51 +1383,122 @@ impl Engine {
                     &url,
                     &c.path,
                     single_file,
-                    false,
-                    &headers,
+                    &redirects,
                 );
-                // `Connection: close` (incl. implicit HTTP/1.0)
-                // invalidates the stream — upstream reconnects per
-                // request batch (`http_connection::close` handling
-                // in `web_peer_connection`).
-                if conn.is_none() {
-                    match connector.clone().connect(addr).await {
-                        Ok(s) => conn = Some(s),
+                let mut data = Vec::with_capacity(r.length as usize);
+                for g in &groups {
+                    // `Connection: close` (incl. implicit HTTP/1.0)
+                    // invalidates the stream — upstream reconnects
+                    // per request batch; a fresh conn restarts
+                    // `m_first_request`.
+                    let first = !conns.contains_key(&g.base);
+                    if first {
+                        let Some(&baddr) = bases.get(&g.base) else {
+                            continue;
+                        };
+                        match connector.clone().connect(baddr).await {
+                            Ok(s) => {
+                                conns.insert(g.base.clone(), s);
+                            }
+                            Err(_) => {
+                                report!(done, reqs[i..].to_vec());
+                                return;
+                            }
+                        }
+                    }
+                    let wreq = bitdaemon_net::web_seed::render_web_request(
+                        &files, g, &headers, false, first,
+                    );
+                    let Some(s) = conns.get_mut(&g.base) else {
+                        report!(done, reqs[i..].to_vec());
+                        return;
+                    };
+                    match fetch_block(s, &wreq, 4 * 1024 * 1024).await {
+                        Ok((segs, close)) => {
+                            if close {
+                                conns.remove(&g.base);
+                            }
+                            // reassemble in `m_file_requests` order —
+                            // pad slices contribute zeroes
+                            let mut it = segs.into_iter();
+                            for f in &g.files {
+                                if f.got_get {
+                                    if let Some((_, _, b)) = it.next() {
+                                        data.extend_from_slice(&b);
+                                    }
+                                } else {
+                                    data.resize(data.len() + f.length as usize, 0);
+                                }
+                            }
+                        }
+                        Err(bitdaemon_net::web_seed::WebSeedError::Redirect {
+                            file_index,
+                            location,
+                        }) => {
+                            conns.remove(&g.base);
+                            num_redirects += 1;
+                            if num_redirects > 64 {
+                                report!(done, reqs[i..].to_vec());
+                                return;
+                            }
+                            // upstream `handle_redirect`:
+                            // resolve → maybe_url_encode → split_url
+                            // → new ephemeral seed carrying
+                            // `redirects[file_index]`; auth only on
+                            // same origin.
+                            let loc = bitdaemon_net::parse_url::maybe_url_encode(
+                                &bitdaemon_net::http_parser::resolve_redirect_location(
+                                    &url, &location,
+                                ),
+                            );
+                            let Ok((rbase, rpath)) = bitdaemon_net::parse_url::split_url(&loc)
+                            else {
+                                report!(done, reqs[i..].to_vec());
+                                return;
+                            };
+                            let Ok(rc) = bitdaemon_net::parse_url::parse_url_components(&loc)
+                            else {
+                                report!(done, reqs[i..].to_vec());
+                                return;
+                            };
+                            let rport = u16::try_from(rc.port).unwrap_or(80);
+                            let Ok(raddr) = resolve(&resolver, &rc.hostname, rport).await else {
+                                report!(done, reqs[i..].to_vec());
+                                return;
+                            };
+                            let auth = if bitdaemon_net::parse_url::same_origin(&url, &loc) {
+                                headers.authorization.clone()
+                            } else {
+                                String::new()
+                            };
+                            // single-file: the location is the seed
+                            // URL verbatim; multi-file: the seed is
+                            // the base, the path lives in redirects.
+                            let target_url = if single_file {
+                                loc.clone()
+                            } else {
+                                rbase.clone()
+                            };
+                            redirects.insert(
+                                file_index,
+                                bitdaemon_net::web_seed::RedirectTarget {
+                                    url: target_url,
+                                    path: rpath,
+                                    base: rbase.clone(),
+                                    authorization: auth,
+                                },
+                            );
+                            bases.entry(rbase).or_insert(raddr);
+                            continue 'outer;
+                        }
                         Err(_) => {
                             report!(done, reqs[i..].to_vec());
                             return;
                         }
                     }
                 }
-                let Some(s) = conn.as_mut() else {
-                    report!(done, reqs[i..].to_vec());
-                    return;
-                };
-                match fetch_block(s, &wreq, 4 * 1024 * 1024).await {
-                    Ok((segs, close)) => {
-                        if close {
-                            conn = None;
-                        }
-                        // reassemble in `m_file_requests` order —
-                        // pad slices contribute zeroes
-                        let mut data = Vec::with_capacity(r.length as usize);
-                        let mut it = segs.into_iter();
-                        for f in &wreq.files {
-                            if f.got_get {
-                                if let Some((_, _, b)) = it.next() {
-                                    data.extend_from_slice(&b);
-                                }
-                            } else {
-                                data.resize(data.len() + f.length as usize, 0);
-                            }
-                        }
-                        done.push((r, data));
-                    }
-                    Err(_) => {
-                        report!(done, reqs[i..].to_vec());
-                        return;
-                    }
-                }
+                done.push((r, data));
+                i += 1;
             }
             report!(done, Vec::<PeerRequest>::new());
         });
@@ -1368,15 +1569,43 @@ impl Engine {
                     &std::net::IpAddr::V4(ip),
                 );
             }
+            NatPmpResponse::UnsupportedVersion => {
+                // `pcp_unsupp_version` → upstream resends the
+                // outstanding requests as NAT-PMP on a v4 socket.
+                // We only ever send NAT-PMP, so the fallback is a
+                // plain re-send of the pending mappings.
+                if let Some(n) = &self.natpmp
+                    && let Some(dg) = self.datagram.clone()
+                {
+                    let gw = n.gateway;
+                    let ttl = n.ttl;
+                    let resends: Vec<_> = n.mappings.iter().map(|m| (m.0, m.1, m.2)).collect();
+                    for (proto, local, ext) in resends {
+                        let req = bitdaemon_net::natpmp::build_map_request(proto, local, ext, ttl);
+                        let dg = dg.clone();
+                        self.tasks.push(tokio::spawn(async move {
+                            let _ = dg.send_to(&req, gw).await;
+                        }));
+                    }
+                }
+            }
             NatPmpResponse::Map {
                 protocol,
                 private_port,
                 public_port,
                 lifetime,
                 result,
+                ..
             } => {
                 if let Some(n) = &mut self.natpmp {
-                    if let Some(m) = n.mappings.iter_mut().find(|m| m.1 == private_port) {
+                    // upstream matches the reply to the outstanding
+                    // request by opcode-derived proto + private port
+                    // (PCP adds a nonce match — we only send NAT-PMP)
+                    if let Some(m) = n
+                        .mappings
+                        .iter_mut()
+                        .find(|m| m.0 == protocol && m.1 == private_port)
+                    {
                         if result == 0 {
                             m.2 = public_port;
                             // renew at half the lease (upstream
@@ -1422,18 +1651,55 @@ impl Engine {
         if !slock(&self.session).services.upnp || slock(&self.session).settings.anonymous_mode {
             return;
         }
+        if self.datagram.is_none() {
+            return;
+        }
+        self.send_msearch().await;
+        // `resend_request` upstream: retry at `2*retry_count` s while
+        // `retry < 12 && (no devices || retry < 4)`.
+        self.ssdp_retry_count = 1;
+        self.ssdp_next = Some(Instant::now() + std::time::Duration::from_secs(2));
+    }
+
+    /// emit one M-SEARCH (upstream sends on the multicast *and*
+    /// unicast sockets; we have the single injected datagram).
+    async fn send_msearch(&self) {
         let Some(dg) = self.datagram.clone() else {
             return;
         };
-        let msearch = bitdaemon_net::upnp::msearch_request();
         let target = SocketAddr::new(
             std::net::IpAddr::V4(bitdaemon_net::upnp::SSDP_ADDR),
             bitdaemon_net::upnp::SSDP_PORT,
         );
-        // upstream sends the discovery burst 3×, ~250 ms apart.
-        for _ in 0..3 {
-            let _ = dg.send_to(msearch.as_bytes(), target).await;
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let _ = dg
+            .send_to(bitdaemon_net::upnp::msearch_request().as_bytes(), target)
+            .await;
+    }
+
+    /// `resend_request` — the broadcast-timer arm of discovery:
+    /// re-send M-SEARCH on the growing backoff until a device is
+    /// found (≤4 sends once one is) or 12 tries pass with none
+    /// (upstream then `disable`s — nothing to kill here beyond the
+    /// retry timer itself). Called from `tick`.
+    async fn upnp_ssdp_tick(&mut self, now: Instant) {
+        let Some(due) = self.ssdp_next else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        let devices_empty = self.ssdp_seen.is_empty();
+        if self.ssdp_retry_count < 12 && (devices_empty || self.ssdp_retry_count < 4) {
+            if slock(&self.session).services.upnp && !slock(&self.session).settings.anonymous_mode {
+                self.send_msearch().await;
+            }
+            self.ssdp_retry_count += 1;
+            self.ssdp_next =
+                Some(now + std::time::Duration::from_secs(2 * u64::from(self.ssdp_retry_count)));
+        } else {
+            // upstream `disable(errors::no_router)` when nothing
+            // ever answered
+            self.ssdp_next = None;
         }
     }
 
@@ -1445,11 +1711,12 @@ impl Engine {
         let resolver = self.resolver.clone();
         self.tasks_forget();
         self.tasks.push(tokio::spawn(async move {
-            let Ok(c) = bitdaemon_net::parse_url::parse_url_components(&location) else {
+            // `on_reply` upstream: reject non-http schemes, port 0
+            // and invalid/unroutable hosts before fetching.
+            let Some((host, port, path)) = bitdaemon_net::upnp::validate_location(&location) else {
                 return;
             };
-            let port = u16::try_from(c.port).unwrap_or(80);
-            let Ok(addr) = resolve(&resolver, &c.hostname, port).await else {
+            let Ok(addr) = resolve(&resolver, &host, port).await else {
                 return;
             };
             // upstream reads `c.socket().local_endpoint()` on the
@@ -1463,42 +1730,41 @@ impl Engine {
                 return;
             };
             let r = async {
-                bitdaemon_net::http_conn::send_request(
-                    &mut s,
-                    "GET",
-                    &c.path,
-                    &c.hostname,
-                    &[],
-                    &[],
-                )
-                .await?;
+                bitdaemon_net::http_conn::send_request(&mut s, "GET", &path, &host, &[], &[])
+                    .await?;
                 bitdaemon_net::http_conn::recv_response(&mut s, 256 * 1024).await
             }
             .await;
             let Ok(resp) = r else { return };
-            let body = String::from_utf8_lossy(&resp.body()).into_owned();
-            let mut dev = bitdaemon_net::upnp::parse_device_description(&body);
-            dev.local_addr = local_addr;
-            if dev.control_url.is_empty() || dev.service_namespace.is_empty() {
+            // upstream: `p.status_code() != 200` → `d.disabled`
+            if resp.status() != 200 {
                 return;
             }
-            bitdaemon_net::upnp::resolve_control_url(&mut dev, &location);
+            let body = String::from_utf8_lossy(&resp.body()).into_owned();
+            let mut dev = bitdaemon_net::upnp::parse_device_description(&body);
+            dev.url = location.clone();
+            dev.local_addr = local_addr;
+            // `resolve_control_url` also fills hostname/port/path and
+            // rejects empty/unusable/unsafe control URLs (`disabled`).
+            if !bitdaemon_net::upnp::resolve_control_url(&mut dev, &location) {
+                return;
+            }
             tracing::info!(model = %dev.model, control = %dev.control_url, "upnp: IGD discovered");
             let _ = tx.send(dev);
         }));
     }
 
-    /// `stop_upnp` — `DeletePortMapping` on every mapped slot, then
-    /// drop the device list (upstream `close` semantics).
+    /// `stop_upnp` — `upnp::close()`: queue `DeletePortMapping` for
+    /// mapped slots (pending adds die silently), then drop the
+    /// device list.
     pub fn stop_upnp(&mut self) {
         for idx in 0..self.upnp_devices.len() {
-            let outs = (0..self.upnp_devices[idx].mappings.len())
-                .flat_map(|i| self.upnp_devices[idx].delete_mapping(i))
-                .collect::<Vec<_>>();
+            let outs = self.upnp_devices[idx].close();
             self.drive_upnp_outs(idx, outs);
         }
         self.upnp_devices.clear();
         self.ssdp_seen.clear();
+        self.ssdp_next = None;
     }
 
     /// `upnp` device registration — a discovered `RootDevice`
@@ -1516,8 +1782,15 @@ impl Engine {
             return;
         }
         let local_addr = dev.local_addr.map(|a| a.to_string()).unwrap_or_default();
-        let mut d = UpnpDriver::new(dev, 3600, description);
-        let outs = d.set_mappings(vec![
+        let d = UpnpDriver::new(dev, 3600, description);
+        self.upnp_devices.push(d);
+        let idx = self.upnp_devices.len() - 1;
+        // ask for the router's external address first (upstream
+        // chains discovery → GetExternalIPAddress → AddPortMapping).
+        // `discover()` sets `pending` — the `set_mappings` posts stay
+        // queued until the reply lands (one connection per device).
+        let get_ip = self.upnp_devices[idx].discover();
+        let queued = self.upnp_devices[idx].set_mappings(vec![
             (
                 PortmapProtocol::Tcp,
                 local_port,
@@ -1526,13 +1799,7 @@ impl Engine {
             ),
             (PortmapProtocol::Udp, local_port, local_port, local_addr),
         ]);
-        self.upnp_devices.push(d);
-        let idx = self.upnp_devices.len() - 1;
-        // ask for the router's external address first (upstream
-        // chains discovery → GetExternalIPAddress → AddPortMapping)
-        let outs = std::iter::once(self.upnp_devices[idx].discover())
-            .chain(outs)
-            .collect::<Vec<_>>();
+        let outs = std::iter::once(get_ip).chain(queued).collect::<Vec<_>>();
         self.drive_upnp_outs(idx, outs);
     }
 
@@ -1544,11 +1811,11 @@ impl Engine {
             match o {
                 UpnpOut::Post {
                     mapping,
-                    action,
-                    body,
+                    kind,
+                    request,
                 } => {
-                    debug!(dev, mapping, %action, "upnp soap post");
-                    self.spawn_upnp_post(dev, mapping, action, body);
+                    debug!(dev, mapping, ?kind, "upnp soap post");
+                    self.spawn_upnp_post(dev, mapping, kind, request);
                 }
                 UpnpOut::Mapped {
                     mapping,
@@ -1603,37 +1870,60 @@ impl Engine {
                         format!("AddPortMapping failed: UPnP error {code}"),
                     );
                 }
+                UpnpOut::Unmapped {
+                    mapping: _,
+                    proto: _,
+                    code,
+                } => {
+                    // `on_upnp_unmap_response` fires the callback with
+                    // an error code *always* upstream (a clean delete
+                    // reports `error_code(-1, upnp_category())` — the
+                    // session treats it as informational).
+                    let model = self
+                        .upnp_devices
+                        .get(dev)
+                        .map(|d| d.dev.model.clone())
+                        .unwrap_or_default();
+                    slock(&self.session).portmap_log(
+                        1,
+                        model,
+                        format!("DeletePortMapping finished (code {code})"),
+                    );
+                }
             }
         }
     }
 
-    /// one SOAP POST through the injected transport, result back
-    /// through `upnp_tx`.
-    fn spawn_upnp_post(&mut self, dev: usize, mapping: usize, action: String, body: String) {
+    /// one SOAP POST through the injected transport — `request` is
+    /// sent verbatim (upstream writes `post()`'s exact bytes into
+    /// `m_sendbuffer`), the reply (status/content-type/body/
+    /// header-finished) comes back through `upnp_tx`.
+    fn spawn_upnp_post(
+        &mut self,
+        dev: usize,
+        mapping: usize,
+        kind: bitdaemon_net::upnp::SoapKind,
+        request: String,
+    ) {
         let Some(d) = self.upnp_devices.get(dev) else {
             return;
         };
-        let is_ip_query = action.contains("GetExternalIPAddress");
-        let url = d.dev.control_url.clone();
+        let host = d.dev.hostname.clone();
+        let port = u16::try_from(d.dev.port).unwrap_or(80);
         let tx = self.upnp_tx.clone();
         let connector = self.connector.clone();
         let resolver = self.resolver.clone();
         self.tasks_forget();
         self.tasks.push(tokio::spawn(async move {
-            let send = |b: Result<String, String>| async move {
+            let send = |b: Result<(i32, Option<String>, String, bool), String>| async move {
                 let _ = tx.send(UpnpReply {
                     dev,
                     mapping,
-                    is_ip_query,
-                    body: b,
+                    kind,
+                    reply: b,
                 });
             };
-            let Ok(c) = bitdaemon_net::parse_url::parse_url_components(&url) else {
-                send(Err("bad control url".into())).await;
-                return;
-            };
-            let port = u16::try_from(c.port).unwrap_or(80);
-            let Ok(addr) = resolve(&resolver, &c.hostname, port).await else {
+            let Ok(addr) = resolve(&resolver, &host, port).await else {
                 send(Err("resolve".into())).await;
                 return;
             };
@@ -1641,56 +1931,62 @@ impl Engine {
                 send(Err("connect".into())).await;
                 return;
             };
-            let host = if c.port < 0 {
-                c.hostname.clone()
-            } else {
-                format!("{}:{}", c.hostname, port)
-            };
-            let headers = [
-                ("Content-Type".to_string(), "text/xml".to_string()),
-                ("SOAPAction".to_string(), action),
-            ];
             let r = async {
-                bitdaemon_net::http_conn::send_request(
-                    &mut s,
-                    "POST",
-                    &c.path,
-                    &host,
-                    &headers,
-                    body.as_bytes(),
-                )
-                .await?;
+                use tokio::io::AsyncWriteExt;
+                s.write_all(request.as_bytes()).await?;
                 bitdaemon_net::http_conn::recv_response(&mut s, 64 * 1024).await
             }
             .await;
             match r {
                 Ok(resp) => {
-                    send(Ok(String::from_utf8_lossy(&resp.body()).into_owned())).await;
+                    send(Ok((
+                        resp.status(),
+                        resp.header("content-type").map(str::to_string),
+                        String::from_utf8_lossy(&resp.body()).into_owned(),
+                        resp.parser.header_finished(),
+                    )))
+                    .await;
                 }
                 Err(e) => send(Err(e.to_string())).await,
             }
         }));
     }
 
-    /// feed a SOAP response back into the driver's state machine.
+    /// feed a SOAP response back into the driver's state machine —
+    /// the reply handler is the one upstream bound when the request
+    /// went out (`kind`), not a guess from the payload.
     fn on_upnp_reply(&mut self, r: UpnpReply) {
-        let body = match r.body {
-            Ok(b) => b,
+        use bitdaemon_net::upnp::SoapReply;
+        let reply = match &r.reply {
             Err(e) => {
                 debug!(err = %e, "upnp soap post failed");
-                return; // transport errors drop like upstream timeouts
+                SoapReply::TransportError
+            }
+            Ok((status, ct, body, header_finished)) => {
+                debug!(dev = r.dev, kind = ?r.kind, body = %body.get(..160).unwrap_or(body), "upnp soap reply");
+                if *header_finished {
+                    SoapReply::Full {
+                        status: *status,
+                        content_type: ct.as_deref(),
+                        body,
+                    }
+                } else {
+                    SoapReply::Incomplete
+                }
             }
         };
-        debug!(dev = r.dev, ip_query = r.is_ip_query, body = %body.get(..160).unwrap_or(&body), "upnp soap reply");
-        let outs = if r.is_ip_query {
-            self.upnp_devices
-                .get_mut(r.dev)
-                .map(|d| d.on_ip_response(&body))
-        } else {
-            self.upnp_devices
-                .get_mut(r.dev)
-                .map(|d| d.on_map_response(r.mapping, &body, rand::random::<u16>()))
-        };
+        let outs = self.upnp_devices.get_mut(r.dev).map(|d| match r.kind {
+            bitdaemon_net::upnp::SoapKind::GetIp => d.on_ip_response(match reply {
+                SoapReply::Full {
+                    status: 200, body, ..
+                } => Some(body),
+                _ => None,
+            }),
+            bitdaemon_net::upnp::SoapKind::Add => {
+                d.on_map_response(r.mapping, reply, rand::random::<u16>())
+            }
+            bitdaemon_net::upnp::SoapKind::Delete => d.on_unmap_response(r.mapping, reply),
+        });
         if let Some(outs) = outs {
             self.drive_upnp_outs(r.dev, outs);
         }
@@ -1728,13 +2024,16 @@ impl Engine {
                 2 => bitdaemon_net::upnp::PortmapProtocol::Udp,
                 _ => bitdaemon_net::upnp::PortmapProtocol::Tcp,
             };
-            let outs = self.upnp_devices[dev].add_mapping(
+            // `add_mapping` → Option: None when the slot table is
+            // full (upstream returns -1) or the device is disabled
+            if let Some((_idx, outs)) = self.upnp_devices[dev].add_mapping(
                 proto_up,
                 external_port,
                 local_port,
                 String::new(),
-            );
-            self.drive_upnp_outs(dev, outs);
+            ) {
+                self.drive_upnp_outs(dev, outs);
+            }
         }
     }
 
@@ -1820,11 +2119,19 @@ impl Engine {
         remote: SocketAddr,
         encrypted: bool,
     ) -> std::io::Result<u64> {
+        // `num_peers_half_open` — conn exists (upstream ctor) from
+        // dial start until the handshake completes or fails.
+        slock(&self.session)
+            .counters
+            .inc(bitdaemon_session::counters::Counter::NumPeersHalfOpen);
         let s_res = self.connector.clone().connect(remote).await;
         let mut s = match s_res {
             Ok(s) => s,
             Err(e) => {
-                slock(&self.session).peer_connect_failed(ih, remote);
+                let mut ses = slock(&self.session);
+                ses.counters
+                    .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+                ses.peer_connect_failed(ih, remote);
                 return Err(std::io::Error::other(e));
             }
         };
@@ -1843,31 +2150,46 @@ impl Engine {
         // the MSE path; the negotiated RC4 state follows the conn
         // into the io pump.
         let mut mse_rc4 = None;
+        // `set_pid` — the remote's peer_id from its handshake rides
+        // into the conn (pid dedup + self-connection checks).
+        let remote_pid;
         if encrypted {
             match bitdaemon_net::bt_peer_conn::run_handshake_encrypted_initiator(
                 &mut s, ih, &pid, dht, fast, enc_level, 0,
             )
             .await
             {
-                Ok((_hs, mse)) => {
+                Ok((hs, mse)) => {
+                    remote_pid = Some(hs.peer_id);
                     if mse.rc4_encrypted {
                         mse_rc4 = Some(mse.rc4);
                     }
                 }
                 Err(e) => {
-                    slock(&self.session).peer_connect_failed(ih, remote);
+                    let mut ses = slock(&self.session);
+                    ses.counters
+                        .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+                    ses.peer_connect_failed(ih, remote);
                     return Err(std::io::Error::other(e));
                 }
             }
         } else {
             match run_handshake(&mut s, ih, &pid, dht, fast).await {
-                Ok(_hs) => {}
+                Ok(hs) => remote_pid = Some(hs.peer_id),
                 Err(e) => {
-                    slock(&self.session).peer_connect_failed(ih, remote);
+                    let mut ses = slock(&self.session);
+                    ses.counters
+                        .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+                    ses.peer_connect_failed(ih, remote);
                     return Err(std::io::Error::other(e));
                 }
             }
         };
+        // handshake done — the conn leaves half-open state
+        // (`peer_connection::on_connection_complete`).
+        slock(&self.session)
+            .counters
+            .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
 
         let num_pieces = slock(&self.session)
             .torrents
@@ -1876,7 +2198,7 @@ impl Engine {
         // BEP-10: advertise our extension ids right after the handshake
         let _ = bitdaemon_net::bt_peer_conn::send_extended_handshake(
             &mut s,
-            &self.ext_handshake(ih),
+            &self.ext_handshake(ih, true, Some(remote.ip())),
             mse_rc4.as_mut(),
         )
         .await;
@@ -1895,6 +2217,7 @@ impl Engine {
         conn.connecting = false;
         conn.handshake_done = true;
         conn.supports_encryption = encrypted;
+        conn.peer_id = remote_pid;
         let mut out = Vec::new();
         slock(&self.session).peer_connected(ih, peer, conn, remote, &mut out);
         self.attach_stream(*ih, peer, remote, s, mse_rc4);
@@ -1928,6 +2251,11 @@ impl Engine {
     /// register the peer + attach io tasks, or report the failure
     /// for the reconnect backoff.
     fn on_dial_done(&mut self, d: DialDone) {
+        // the handshake window closed either way — `m_half_open`
+        // clears on attach or failure.
+        slock(&self.session)
+            .counters
+            .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
         let s = match d.stream {
             Ok(s) => s,
             Err(e) => {
@@ -1969,6 +2297,11 @@ impl Engine {
         // `m_encrypted` → `supports_encryption()` (drives the
         // `pex_encryption` flag + `pi->pe_support` re-arm).
         conn.supports_encryption = d.encrypted;
+        conn.peer_id = d.pid;
+        // `peer_exceeds_limit` — slack-admitted conns owe an eviction
+        // at attach; `sock_type` feeds `set_peer_classes`.
+        conn.exceeded_limit = d.exceeded;
+        conn.sock_type = d.kind;
         let mut out = Vec::new();
         slock(&self.session).peer_connected(&d.ih, peer, conn, remote, &mut out);
         self.attach_stream(d.ih, peer, remote, s, d.rc4);
@@ -2039,8 +2372,13 @@ impl Engine {
         };
         let resolver = self.resolver.clone();
         let fast = true;
-        let ext = self.ext_handshake(&ih);
+        let ext = self.ext_handshake(&ih, true, Some(remote.ip()));
         let session = Arc::clone(&self.session);
+        // `num_peers_half_open` — the dial task owns the conn until
+        // `on_dial_done` attaches or drops it.
+        slock(&session)
+            .counters
+            .inc(bitdaemon_session::counters::Counter::NumPeersHalfOpen);
         debug!(%remote, ih = %crate::common::hex::to_hex(&ih.as_bytes()[..8]), "dial spawned");
         let h = tokio::spawn(async move {
             let send_err = |e: String| {
@@ -2052,7 +2390,10 @@ impl Engine {
                     fast: false,
                     dht: false,
                     encrypted: false,
+                    pid: None,
                     rc4: None,
+                    exceeded: false,
+                    kind: transport_socket_type(&kind),
                 });
             };
             // `instantiate` resolved the socket type — map it back to
@@ -2209,7 +2550,10 @@ impl Engine {
                 fast: hs.supports_fast(),
                 dht: hs.supports_dht(),
                 encrypted,
+                pid: Some(hs.peer_id),
                 rc4: mse_rc4,
+                exceeded: false,
+                kind: transport_socket_type(&kind),
             });
         });
         self.tasks.push(h);
@@ -2254,10 +2598,28 @@ impl Engine {
                     }
                 };
                 let mut s = s0;
-                slock(&session).on_incoming_connection(
+                // `num_peers_half_open` — the accepted conn exists
+                // until attach/drop (`peer_connection` ctor→complete).
+                slock(&session)
+                    .counters
+                    .inc(bitdaemon_session::counters::Counter::NumPeersHalfOpen);
+                // `on_incoming_connection` — session conn-cap gates:
+                // past `limit + slack` the socket drops, inside slack
+                // it attaches flagged `m_exceeded_limit`.
+                let verdict = slock(&session).on_incoming_connection(
                     remote.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
                     kind,
                 );
+                let exceeded = match verdict {
+                    bitdaemon_session::session::IncomingVerdict::Accept => false,
+                    bitdaemon_session::session::IncomingVerdict::AcceptExceeded => true,
+                    bitdaemon_session::session::IncomingVerdict::Reject => {
+                        slock(&session)
+                            .counters
+                            .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+                        continue;
+                    }
+                };
                 // upstream `on_receive`: probe as plaintext, fall back
                 // to MSE per `in_enc_policy` (the 20 probe bytes are
                 // re-interpreted as the DH key head).
@@ -2304,11 +2666,17 @@ impl Engine {
                             fast: hs.supports_fast(),
                             dht: hs.supports_dht(),
                             encrypted,
+                            pid: Some(hs.peer_id),
                             rc4,
+                            exceeded,
+                            kind,
                         });
                     }
                     Err(e) => {
                         warn!(err = %e, "inbound handshake failed");
+                        slock(&session)
+                            .counters
+                            .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
                     }
                 }
             }
@@ -2330,7 +2698,7 @@ impl Engine {
         &mut self,
         acceptor: Arc<dyn bitdaemon_net::transport::PeerAcceptor>,
     ) {
-        self.start_ssl_acceptor_at(acceptor, None, 1);
+        self.start_ssl_acceptor_at(acceptor, None, 6);
     }
 
     /// `start_ssl_acceptor` variant carrying the bound endpoint +
@@ -2378,12 +2746,29 @@ impl Engine {
                     }
                 };
                 let remote = remote.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-                slock(&session).on_incoming_connection(remote, kind);
+                // `num_peers_half_open` — accepted conn until
+                // attach/drop (`on_dial_done` clears it).
+                slock(&session)
+                    .counters
+                    .inc(bitdaemon_session::counters::Counter::NumPeersHalfOpen);
+                let exceeded = match slock(&session).on_incoming_connection(remote, kind) {
+                    bitdaemon_session::session::IncomingVerdict::Accept => false,
+                    bitdaemon_session::session::IncomingVerdict::AcceptExceeded => true,
+                    bitdaemon_session::session::IncomingVerdict::Reject => {
+                        slock(&session)
+                            .counters
+                            .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+                        continue;
+                    }
+                };
                 let tls = match bitdaemon_net::ssl_stream::ssl_accept(s0, remote, cfg.clone()).await
                 {
                     Ok(t) => t,
                     Err(e) => {
                         warn!(err = %e, "ssl handshake failed");
+                        slock(&session)
+                            .counters
+                            .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
                         continue;
                     }
                 };
@@ -2407,11 +2792,17 @@ impl Engine {
                             dht: hs.supports_dht(),
                             // upstream: SSL sockets never run MSE.
                             encrypted: false,
+                            pid: Some(hs.peer_id),
                             rc4: None,
+                            exceeded,
+                            kind,
                         });
                     }
                     Err(e) => {
                         warn!(err = %e, "inbound ssl handshake failed");
+                        slock(&session)
+                            .counters
+                            .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
                     }
                 }
             }
@@ -2461,9 +2852,29 @@ impl Engine {
     pub fn peer_list_state(&self) -> bitdaemon_net::peer_list::PeerListState {
         let guard = slock(&self.session);
         let s = &guard.settings;
+        // `torrent_state::ip` — the `external_ip` aggregate: slot in
+        // the elected WAN address by family (upstream builds it from
+        // per-interface `listen_socket_t::external_address`).
+        let mut ext = bitdaemon_net::ip_voter::ExternalIp::default();
+        if let Some(ip) = guard.ip_voter.external_address() {
+            ext = match ip {
+                std::net::IpAddr::V4(v4) => bitdaemon_net::ip_voter::ExternalIp::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    std::net::IpAddr::V4(v4),
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                ),
+                std::net::IpAddr::V6(v6) => bitdaemon_net::ip_voter::ExternalIp::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    std::net::IpAddr::V6(v6),
+                ),
+            };
+        }
         bitdaemon_net::peer_list::PeerListState {
             is_finished: false,
-            external_ip: None,
+            external_ip: ext,
             external_port: guard.listen_port,
             min_reconnect_time: s.min_reconnect_time,
             max_peerlist_size: s.max_peerlist_size,
@@ -2572,24 +2983,70 @@ impl Engine {
     /// our BEP-10 offer — `ut_metadata`/`ut_pex` ids (matching
     /// `PeerConn::local_ut_*` defaults) + listen port and the
     /// torrent's metadata size when known.
-    fn ext_handshake(&self, ih: &Sha1Hash) -> bitdaemon_net::bep10::ExtendedHandshake {
+    fn ext_handshake(
+        &self,
+        ih: &Sha1Hash,
+        outgoing: bool,
+        remote: Option<std::net::IpAddr>,
+    ) -> bitdaemon_net::bep10::ExtendedHandshake {
+        let ses = slock(&self.session);
         let mut hs = bitdaemon_net::bep10::ExtendedHandshake {
-            listen_port: Some(i64::from(slock(&self.session).listen_port)),
-            reqq: i64::from(self.max_out_request_queue),
+            // upstream sends `p` only on outgoing connections — the
+            // other end of an incoming one already knows our port —
+            // and only when non-zero.
+            listen_port: (outgoing && ses.listen_port > 0).then(|| i64::from(ses.listen_port)),
+            // `yourip` — the peer's external address as we see it
+            // (skipped on i2p sockets upstream — `None` here covers
+            // that since i2p peers have no IP remote).
+            your_ip: remote.map(|ip| match ip {
+                std::net::IpAddr::V4(v4) => v4.octets().to_vec(),
+                std::net::IpAddr::V6(v6) => v6.octets().to_vec(),
+            }),
+            // `reqq` is `max_allowed_in_request_queue` upstream
+            // (how many requests *they* may queue on us).
+            reqq: i64::from(ses.settings.max_allowed_in_request_queue),
             ..Default::default()
         };
-        hs.messages.insert("ut_metadata".into(), 1);
-        hs.messages.insert("ut_pex".into(), 2);
-        hs.messages.insert("lt_donthave".into(), 3);
-        if let Some(t) = slock(&self.session).torrents.get(ih) {
+        if !ses.settings.anonymous_mode {
+            hs.client_version = Some(if ses.settings.handshake_client_version.is_empty() {
+                ses.settings.user_agent.clone()
+            } else {
+                ses.settings.handshake_client_version.clone()
+            });
+        }
+        // upstream fixed extension ids (`bt_peer_connection.hpp`):
+        // ut_pex=1, ut_metadata=2, upload_only=3, ut_holepunch=4,
+        // lt_donthave=7, share_mode=8, i2p_pex=9.
+        hs.messages.insert("upload_only".into(), 3);
+        hs.messages.insert("ut_holepunch".into(), 4);
+        if ses.settings.support_share_mode {
+            hs.messages.insert("share_mode".into(), 8);
+        }
+        hs.messages.insert("lt_donthave".into(), 7);
+        if let Some(t) = ses.torrents.get(ih) {
+            let is_priv = t.ti.as_ref().is_some_and(|ti| ti.is_private());
+            let is_i2p = t.ti.as_ref().is_some_and(|ti| ti.is_i2p());
+            // `create_ut_pex_plugin` — skipped for private torrents
+            // and pure-i2p torrents without `allow_i2p_mixed`.
+            if !is_priv && !(is_i2p && !ses.settings.allow_i2p_mixed) {
+                hs.messages.insert("ut_pex".into(), 1);
+            }
+            // `i2p_pex` only exists on i2p sockets upstream; the
+            // torrent-level approximation here is the i2p flag.
+            if is_i2p {
+                hs.messages.insert("i2p_pex".into(), 9);
+            }
+            hs.messages.insert("ut_metadata".into(), 2);
             if let Some(md) = &t.metadata_raw {
                 hs.metadata_size = Some(md.len() as i64);
             }
-            // BEP-21 — `is_upload_only() && !share_mode() &&
-            // !super_seeding()` (upstream `write_extensions`);
-            // `share_mode` is advertised on its own key.
-            hs.upload_only = (t.is_seed() || t.upload_mode) && !t.share_mode && !t.super_seeding;
-            hs.share_mode = t.share_mode;
+            hs.complete_ago = t.time_since_complete();
+            // upstream `write_extensions`: suppress `upload_only`
+            // while super-seeding, in share mode, and before
+            // metadata is valid.
+            hs.upload_only =
+                t.is_upload_only() && !t.share_mode && t.valid_metadata() && !t.super_seeding;
+            hs.share_mode = ses.settings.support_share_mode && t.share_mode;
         }
         hs
     }
@@ -2617,6 +3074,23 @@ impl Engine {
         let (pid, dht) = {
             let ses = slock(&self.session);
             (ses.peer_id, ses.settings.enable_dht)
+        };
+        // `num_peers_half_open` — the accepted conn exists from here
+        // until attach or handshake failure (`peer_connection` ctor).
+        slock(&self.session)
+            .counters
+            .inc(bitdaemon_session::counters::Counter::NumPeersHalfOpen);
+        // `on_incoming_connection` gates — conn cap + slack; the
+        // injected-transport entry point has no socket type (tcp = 0).
+        let exceeded = match slock(&self.session).on_incoming_connection(remote, 0) {
+            bitdaemon_session::session::IncomingVerdict::Accept => false,
+            bitdaemon_session::session::IncomingVerdict::AcceptExceeded => true,
+            bitdaemon_session::session::IncomingVerdict::Reject => {
+                slock(&self.session)
+                    .counters
+                    .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+                return Ok(None);
+            }
         };
         let (ih_known, in_policy, skeys, pe) = {
             let ses = slock(&self.session);
@@ -2647,12 +3121,23 @@ impl Engine {
             Err(bitdaemon_net::bt_peer_conn::PeerConnError::WrongInfoHash(ih))
                 if bitdaemon_dht::node_id::verify_secret_id(&ih) =>
             {
-                slock(&self.session).ban_ip(remote.ip());
+                let mut ses = slock(&self.session);
+                ses.counters
+                    .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+                ses.ban_ip(remote.ip());
                 return Ok(None);
             }
-            Err(e) => return Err(std::io::Error::other(e)),
+            Err(e) => {
+                slock(&self.session)
+                    .counters
+                    .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+                return Err(std::io::Error::other(e));
+            }
         };
-        let (hs, rc4, encrypted) = hs;
+        slock(&self.session)
+            .counters
+            .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+        let (hs, mut rc4, encrypted) = hs;
         let num_pieces = slock(&self.session)
             .torrents
             .get(&hs.info_hash)
@@ -2672,6 +3157,19 @@ impl Engine {
         conn.connecting = false;
         conn.handshake_done = true;
         conn.supports_encryption = encrypted;
+        conn.peer_id = Some(hs.peer_id);
+        conn.exceeded_limit = exceeded;
+        conn.sock_type = 0;
+        // upstream `write_handshake` sends our BEP-10 handshake on
+        // both directions when the peer set the extension bit —
+        // without it the remote never learns our `ut_metadata`/
+        // `ut_pex`/`lt_donthave` ids and can't send them to us.
+        if hs.supports_extension() {
+            let ext = self.ext_handshake(&hs.info_hash, false, Some(remote.ip()));
+            let _ =
+                bitdaemon_net::bt_peer_conn::send_extended_handshake(&mut s, &ext, rc4.as_mut())
+                    .await;
+        }
         let mut out = Vec::new();
         slock(&self.session).peer_connected(&hs.info_hash, peer, conn, remote, &mut out);
         self.attach_stream(hs.info_hash, peer, remote, s, rc4);
@@ -2869,16 +3367,17 @@ impl Engine {
         state: &bitdaemon_net::peer_list::PeerListState,
         max_peers: usize,
     ) -> Vec<(Sha1Hash, SocketAddr, bool)> {
-        let (seeding_outgoing, out_policy) = {
-            let ses = slock(&self.session);
-            (
-                ses.settings.seeding_outgoing_connections,
-                ses.pe_settings.out_enc_policy,
-            )
-        };
+        let out_policy = slock(&self.session).pe_settings.out_enc_policy;
         let mut dialing = Vec::new();
-        for (ih, t) in &mut slock(&self.session).torrents {
-            if dialing.len() >= max_peers || !t.want_peers(seeding_outgoing) {
+        let mut guard = slock(&self.session);
+        let ses = &mut *guard;
+        // `try_connect_more_peers` — the session conn cap gates all
+        // new dials (`num_connections` includes half-open conns).
+        if ses.num_connections() >= i64::from(ses.settings.connections_limit) {
+            return dialing;
+        }
+        for (ih, t) in &mut ses.torrents {
+            if dialing.len() >= max_peers || !t.want_peers(&ses.settings) {
                 continue;
             }
             for (ep, enc) in t.connect_candidates(session_time, state, out_policy) {
@@ -2901,6 +3400,23 @@ impl Engine {
 /// resolve `hostname:port` — IP literal short-circuit, else the
 /// injected `Resolver` (anonymous deployment MUST inject one; without
 /// it hostname trackers fail instead of leaking a DNS query).
+/// `http_tracker_connection::on_filter` — a resolved tracker
+/// endpoint blocked by `req.filter` is dropped; with a single
+/// resolved addr that means the announce fails
+/// `banned_by_ip_filter` (upstream fails the whole request the
+/// same way once every endpoint is filtered).
+fn filter_tracker_addr(
+    f: &Option<std::sync::Arc<bitdaemon_net::ip_filter::IpFilter>>,
+    addr: SocketAddr,
+) -> Result<SocketAddr, String> {
+    match f {
+        Some(f) if f.access(addr.ip()) == bitdaemon_net::ip_filter::BLOCKED => {
+            Err("banned_by_ip_filter".into())
+        }
+        _ => Ok(addr),
+    }
+}
+
 async fn resolve(
     r: &Option<BoxedResolver>,
     hostname: &str,

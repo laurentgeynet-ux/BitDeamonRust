@@ -92,9 +92,12 @@ pub async fn run_handshake_responder(
 }
 
 /// MSE then BT handshake — initiator side (`write_pe1_2_dhkey` +
-/// `write_pe3_sync` → `on_connected`). Returns the negotiated crypto
-/// state: `rc4_encrypted` decides whether subsequent traffic must go
-/// through the `_rc4` variants (plaintext select = plain wire).
+/// `write_pe3_sync` → `on_connected`). Our handshake rides inside
+/// PE3 as the IA (upstream `len(ia) = handshake_len`), so only the
+/// peer's handshake is read afterwards. Returns the negotiated
+/// crypto state: `rc4_encrypted` decides whether subsequent traffic
+/// must go through the `_rc4` variants (plaintext select = plain
+/// wire).
 pub async fn run_handshake_encrypted_initiator(
     s: &mut BoxedPeerStream,
     info_hash: &Sha1Hash,
@@ -104,8 +107,18 @@ pub async fn run_handshake_encrypted_initiator(
     crypto_provide: u32,
     pad_len: usize,
 ) -> Result<(Handshake, MseResult), PeerConnError> {
-    let mut mse = mse_initiator(s, info_hash, crypto_provide, pad_len).await?;
-    let hs = exchange_handshake(s, info_hash, our_peer_id, dht, fast, &mut mse, true).await?;
+    let ours = write_handshake(info_hash, our_peer_id, dht, true, fast, false);
+    let mut mse = mse_initiator(s, info_hash, crypto_provide, &ours, pad_len).await?;
+    // ours went out as IA — just read theirs
+    let mut theirs = [0u8; HANDSHAKE_LEN];
+    s.read_exact(&mut theirs).await?;
+    if mse.rc4_encrypted {
+        mse.rc4.decrypt(&mut theirs);
+    }
+    let hs = parse_handshake(&theirs).map_err(|_| PeerConnError::Protocol("bad handshake"))?;
+    if hs.info_hash != *info_hash {
+        return Err(PeerConnError::WrongInfoHash(hs.info_hash));
+    }
     Ok((hs, mse))
 }
 
@@ -248,29 +261,8 @@ async fn write_bt_handshake(
     Ok(())
 }
 
-/// symmetric handshake exchange (initiator): write ours, read theirs,
-/// validate the info_hash — RC4 iff negotiated.
-async fn exchange_handshake(
-    s: &mut BoxedPeerStream,
-    info_hash: &Sha1Hash,
-    our_peer_id: &PeerId,
-    dht: bool,
-    fast: bool,
-    mse: &mut MseResult,
-    check_ih: bool,
-) -> Result<Handshake, PeerConnError> {
-    write_bt_handshake(s, info_hash, our_peer_id, dht, fast, mse).await?;
-    let mut theirs = [0u8; HANDSHAKE_LEN];
-    s.read_exact(&mut theirs).await?;
-    if mse.rc4_encrypted {
-        mse.rc4.decrypt(&mut theirs);
-    }
-    let hs = parse_handshake(&theirs).map_err(|_| PeerConnError::Protocol("bad handshake"))?;
-    if check_ih && hs.info_hash != *info_hash {
-        return Err(PeerConnError::WrongInfoHash(hs.info_hash));
-    }
-    Ok(hs)
-}
+/// `send_extended_handshake` — id 0 extended message, RC4'd iff
+/// negotiated.
 pub async fn send_extended_handshake(
     s: &mut BoxedPeerStream,
     hs: &ExtendedHandshake,

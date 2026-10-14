@@ -306,7 +306,11 @@ impl RtcSignaling {
         }
     }
 
-    /// `timer` expiry — call on the session tick.
+    /// `timer` expiry — call on the session tick. Unlike the
+    /// `Failed` path, a timeout only *drops* the connection:
+    /// upstream's `on_data_channel` never touches the offer batch
+    /// (only the description handler — [`RtcEvent::Failed`] —
+    /// decrements it), so an expired offer leaves the batch open.
     pub fn tick(&mut self, now: Instant) {
         let expired: Vec<RtcOfferId> = self
             .connections
@@ -315,8 +319,19 @@ impl RtcSignaling {
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
-            self.on_data_channel(id, None);
+            self.remove_connection(id);
         }
+    }
+
+    /// `on_data_channel` conn removal, without the batch accounting
+    /// (upstream only erases + decrements `m_num_incoming_connections`).
+    fn remove_connection(&mut self, offer_id: RtcOfferId) {
+        if let Some(conn) = self.connections.remove(&offer_id) {
+            if conn.incoming {
+                self.num_incoming -= 1;
+            }
+        }
+        self.pending_offers.remove(&offer_id);
     }
 
     /// Drain completed outputs (offers/answers/ready channels).
@@ -377,31 +392,32 @@ impl RtcSignaling {
     }
 
     /// `on_data_channel` — conn lifecycle end (success or failure).
+    /// On `Failed`, upstream's `onStateChange` posts *both* the
+    /// description handler (`on_generated_offer(ec)` → batch `--count`)
+    /// and `on_data_channel(ec)` → conn removal. Mirror both here.
     fn on_data_channel(&mut self, offer_id: RtcOfferId, dc: Option<Arc<dyn RtcChannel>>) {
-        let Some(conn) = self.connections.remove(&offer_id) else {
+        let Some(conn) = self.connections.get(&offer_id).map(|c| c.incoming) else {
             return;
         };
-        if conn.incoming {
-            self.num_incoming -= 1;
-        }
-        self.pending_offers.remove(&offer_id);
-        let Some(dc) = dc else {
-            // negotiation failed — count it against the open batch
+        if dc.is_none() && !conn {
+            // negotiation failed before the channel opened —
+            // `on_generated_offer(ec)` → `offer_batch::add(ec)`
             if let Some(b) = self.offer_batches.front_mut() {
-                if !conn.incoming {
-                    b.add(None);
-                    self.flush_batches();
-                }
+                b.add(None);
+                self.flush_batches();
             }
-            return;
-        };
+        }
+        self.remove_connection(offer_id);
+        let Some(dc) = dc else { return };
         self.outbox.push_back(RtcSigOut::StreamReady {
             channel: dc,
             inbound: Arc::new(Mutex::new(RtcInbound {
                 queue: VecDeque::new(),
                 pending: VecDeque::new(),
                 closed: false,
+                bad_message: false,
                 waker: None,
+                write_waker: None,
             })),
         });
     }
@@ -590,7 +606,20 @@ mod tests {
         let id = *s.connections.keys().next().unwrap();
         s.tick(now + Duration::from_secs(11));
         assert!(!s.connections.contains_key(&id));
-        // failed offer counts against the batch → batch completes empty
+        // upstream: timeout only erases the conn — the batch stays open
+        // (only the description-handler failure path decrements it)
+        assert!(s.poll_out().is_none());
+    }
+
+    #[test]
+    fn failed_offer_counts_against_batch() {
+        let (mut s, _f) = sig();
+        let now = Instant::now();
+        s.generate_offers(1, now);
+        let id = *s.connections.keys().next().unwrap();
+        // `onStateChange(Failed)` → description handler error + conn drop
+        s.on_event(id, RtcEvent::Failed);
+        assert!(!s.connections.contains_key(&id));
         assert!(offers(&mut s).is_empty());
     }
 

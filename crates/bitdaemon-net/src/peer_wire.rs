@@ -168,6 +168,9 @@ pub enum PeerMessage {
     HaveAll,
     /// `msg_have_none`.
     HaveNone,
+    /// `msg_dont_have` — upstream reuses the `have_none` wire id
+    /// (`0x0f`) with a 4-byte piece-index payload; `write_dont_have`.
+    DontHave(PieceIndex),
     /// `msg_reject_request`.
     RejectRequest(PeerRequest),
     /// `msg_allowed_fast`.
@@ -393,6 +396,12 @@ pub fn encode(msg: &PeerMessage) -> Bytes {
             write_u32(1, &mut out);
             write_u8(MessageId::HaveNone as u8, &mut out);
         }
+        // `write_dont_have` — `have_none` id + piece payload.
+        PeerMessage::DontHave(p) => {
+            write_u32(5, &mut out);
+            write_u8(MessageId::HaveNone as u8, &mut out);
+            write_u32(p.0 as u32, &mut out);
+        }
         PeerMessage::RejectRequest(r) => {
             write_request(&mut out, MessageId::RejectRequest, r);
         }
@@ -437,7 +446,10 @@ pub fn wire_len(msg: &PeerMessage) -> usize {
         | PeerMessage::NotInterested
         | PeerMessage::HaveAll
         | PeerMessage::HaveNone => 5,
-        PeerMessage::Have(_) | PeerMessage::SuggestPiece(_) | PeerMessage::AllowedFast(_) => 9,
+        PeerMessage::Have(_)
+        | PeerMessage::SuggestPiece(_)
+        | PeerMessage::DontHave(_)
+        | PeerMessage::AllowedFast(_) => 9,
         PeerMessage::Bitfield(b) => 5 + b.len(),
         PeerMessage::Request(_) | PeerMessage::Cancel(_) | PeerMessage::RejectRequest(_) => 17,
         PeerMessage::Piece { data, .. } => 13 + data.len(),
@@ -475,9 +487,23 @@ fn read_hash_req(cur: &mut crate::socket_io::Cursor<'_>) -> Result<HashRequestWi
     })
 }
 
+/// Exact-size check — upstream `dispatch`/`on_*` disconnects
+/// (`invalid_*`) when `packet_size` doesn't match the message's fixed
+/// size. `want` counts the bytes after the 4-byte len (id included),
+/// matching upstream's `packet_size()` semantics.
+fn expect_len(buf_len: usize, want: usize, id: u8) -> Result<(), WireError> {
+    if buf_len != want {
+        return Err(WireError::BadLength { id, len: buf_len });
+    }
+    Ok(())
+}
+
 /// `decode(buf)` — decode one message payload (the bytes *after* the
-/// 4-byte length prefix). Returns `Ok(None)` for keepalive framing
-/// handled at the stream level; here a zero-length body = keepalive.
+/// 4-byte length prefix). A zero-length body = keepalive.
+/// Fixed-size messages must match exactly (upstream disconnects
+/// `invalid_message` otherwise). Bitfield size is validated by the
+/// session against `num_pieces` (`invalid_bitfield_size`) — it needs
+/// torrent context the codec doesn't have.
 pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
     if buf.is_empty() {
         return Ok(PeerMessage::Keepalive);
@@ -486,14 +512,37 @@ pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
     let payload = &buf[1..];
     let mut cur = crate::socket_io::Cursor::new(payload);
     Ok(match MessageId::from_u8(id) {
-        Some(MessageId::Choke) => PeerMessage::Choke,
-        Some(MessageId::Unchoke) => PeerMessage::Unchoke,
-        Some(MessageId::Interested) => PeerMessage::Interested,
-        Some(MessageId::NotInterested) => PeerMessage::NotInterested,
-        Some(MessageId::Have) => PeerMessage::Have(PieceIndex(read_u32(&mut cur)? as i32)),
+        Some(MessageId::Choke) => {
+            expect_len(buf.len(), 1, id)?;
+            PeerMessage::Choke
+        }
+        Some(MessageId::Unchoke) => {
+            expect_len(buf.len(), 1, id)?;
+            PeerMessage::Unchoke
+        }
+        Some(MessageId::Interested) => {
+            expect_len(buf.len(), 1, id)?;
+            PeerMessage::Interested
+        }
+        Some(MessageId::NotInterested) => {
+            expect_len(buf.len(), 1, id)?;
+            PeerMessage::NotInterested
+        }
+        Some(MessageId::Have) => {
+            expect_len(buf.len(), 5, id)?;
+            PeerMessage::Have(PieceIndex(read_u32(&mut cur)? as i32))
+        }
         Some(MessageId::Bitfield) => PeerMessage::Bitfield(Bytes::copy_from_slice(payload)),
-        Some(MessageId::Request) => PeerMessage::Request(read_request(&mut cur)?),
+        Some(MessageId::Request) => {
+            expect_len(buf.len(), 13, id)?;
+            PeerMessage::Request(read_request(&mut cur)?)
+        }
         Some(MessageId::Piece) => {
+            // id + index + begin ≥ 9; the block-size cap is the
+            // session's (`packet_too_large` > `block_size`).
+            if buf.len() < 9 {
+                return Err(WireError::BadLength { id, len: buf.len() });
+            }
             let piece = PieceIndex(read_u32(&mut cur)? as i32);
             let offset = read_u32(&mut cur)? as i32;
             PeerMessage::Piece {
@@ -502,32 +551,77 @@ pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
                 data: Bytes::copy_from_slice(cur.tail()),
             }
         }
-        Some(MessageId::Cancel) => PeerMessage::Cancel(read_request(&mut cur)?),
+        Some(MessageId::Cancel) => {
+            expect_len(buf.len(), 13, id)?;
+            PeerMessage::Cancel(read_request(&mut cur)?)
+        }
         Some(MessageId::DhtPort) => {
+            expect_len(buf.len(), 3, id)?;
             PeerMessage::DhtPort(cur.read_u16().map_err(|_| WireError::Truncated("u16"))?)
         }
         Some(MessageId::SuggestPiece) => {
+            expect_len(buf.len(), 5, id)?;
             PeerMessage::SuggestPiece(PieceIndex(read_u32(&mut cur)? as i32))
         }
-        Some(MessageId::HaveAll) => PeerMessage::HaveAll,
-        Some(MessageId::HaveNone) => PeerMessage::HaveNone,
-        Some(MessageId::RejectRequest) => PeerMessage::RejectRequest(read_request(&mut cur)?),
+        Some(MessageId::HaveAll) => {
+            expect_len(buf.len(), 1, id)?;
+            PeerMessage::HaveAll
+        }
+        Some(MessageId::HaveNone) => {
+            // upstream `incoming_packet`: the same id carries
+            // `have_none` (len 1) and `dont_have` (len 5 = id +
+            // piece index).
+            match buf.len() {
+                1 => PeerMessage::HaveNone,
+                5 => PeerMessage::DontHave(PieceIndex(read_u32(&mut cur)? as i32)),
+                _ => return Err(WireError::BadLength { id, len: buf.len() }),
+            }
+        }
+        Some(MessageId::RejectRequest) => {
+            expect_len(buf.len(), 13, id)?;
+            PeerMessage::RejectRequest(read_request(&mut cur)?)
+        }
         Some(MessageId::AllowedFast) => {
+            expect_len(buf.len(), 5, id)?;
             PeerMessage::AllowedFast(PieceIndex(read_u32(&mut cur)? as i32))
         }
         Some(MessageId::Extended) => {
+            // upstream: packet_size < 2 → invalid_extended
             if payload.is_empty() {
-                return Err(WireError::Truncated("extended id"));
+                return Err(WireError::BadLength { id, len: buf.len() });
             }
             PeerMessage::Extended {
                 id: payload[0],
                 data: Bytes::copy_from_slice(&payload[1..]),
             }
         }
-        Some(MessageId::HashRequest) => PeerMessage::HashRequest(read_hash_req(&mut cur)?),
+        Some(MessageId::HashRequest) => {
+            expect_len(buf.len(), 49, id)?;
+            PeerMessage::HashRequest(read_hash_req(&mut cur)?)
+        }
         Some(MessageId::Hashes) => {
+            if buf.len() < 49 {
+                return Err(WireError::BadLength { id, len: buf.len() });
+            }
             let req = read_hash_req(&mut cur)?;
-            let mut hashes = Vec::new();
+            // upstream computes the exact expected size:
+            // 49 + (count + proof_hashes) * 32, where proof_hashes =
+            // max(0, proof_layers - (depth(count) - 1)).
+            let count = i64::from(req.count);
+            let depth = if count > 0 {
+                bitdaemon_core::merkle::merkle_num_layers(bitdaemon_core::merkle::merkle_num_leafs(
+                    count as usize,
+                )) as i64
+                    - 1
+            } else {
+                0
+            };
+            let proof_hashes = (i64::from(req.proof_layers) - depth).max(0);
+            let want = 49 + (count + proof_hashes) * 32;
+            if buf.len() as i64 != want {
+                return Err(WireError::BadLength { id, len: buf.len() });
+            }
+            let mut hashes = Vec::with_capacity((count + proof_hashes).max(0) as usize);
             while cur.remaining() >= 32 {
                 hashes.push(
                     Sha256Hash::from_bytes(cur.read_bytes(32).unwrap_or_default())
@@ -536,7 +630,10 @@ pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
             }
             PeerMessage::Hashes { req, hashes }
         }
-        Some(MessageId::HashReject) => PeerMessage::HashReject(read_hash_req(&mut cur)?),
+        Some(MessageId::HashReject) => {
+            expect_len(buf.len(), 49, id)?;
+            PeerMessage::HashReject(read_hash_req(&mut cur)?)
+        }
         None => return Err(WireError::UnknownId(id)),
     })
 }

@@ -84,7 +84,9 @@ pub fn socks5_unwrap(buf: &[u8]) -> Option<(Socks5From<'_>, &[u8])> {
             let port = u16::from_be_bytes([buf[20], buf[21]]);
             Some((Socks5From::Addr(SocketAddr::from((ip, port))), &buf[22..]))
         }
-        3 => {
+        // upstream: *any* atyp other than 1/4 is parsed as a
+        // hostname record (`else` branch, not `atyp == 3`)
+        _ => {
             let len = usize::from(buf[4]);
             if len + 2 > buf.len() - 5 {
                 return None;
@@ -102,7 +104,6 @@ pub fn socks5_unwrap(buf: &[u8]) -> Option<(Socks5From<'_>, &[u8])> {
                 Some((Socks5From::Hostname(hostname), &buf[5 + len + 2..]))
             }
         }
-        _ => None,
     }
 }
 

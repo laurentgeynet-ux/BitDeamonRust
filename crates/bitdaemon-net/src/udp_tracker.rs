@@ -64,8 +64,8 @@ pub struct AnnounceRequest {
     pub event: i32,
     /// announce_ip override (0 = default).
     pub announce_ip: Ipv4Addr,
-    /// `req.key` — randomized peer key.
-    pub key: i32,
+    /// `req.key` — randomized peer key (`std::uint32_t` upstream).
+    pub key: u32,
     /// `req.num_want` (-1 = tracker default).
     pub num_want: i32,
     /// `req.listen_port`.
@@ -80,6 +80,8 @@ pub struct AnnounceResponse {
     /// `resp.interval` (seconds — the caller clamps with
     /// `min_announce_interval` like upstream).
     pub interval: i32,
+    /// `resp.min_interval` — fixed 60s for UDP upstream.
+    pub min_interval: i32,
     /// `resp.incomplete` — leechers.
     pub incomplete: i32,
     /// `resp.complete` — seeders.
@@ -132,10 +134,11 @@ pub fn build_announce(connection_id: u64, transaction_id: u32, req: &AnnounceReq
     out.extend(req.num_want.to_be_bytes());
     out.extend(req.listen_port.to_be_bytes());
     if !req.request_string.is_empty() {
-        let s = &req.request_string[..req.request_string.len().min(255)];
+        let s = req.request_string.as_bytes();
+        let s = &s[..s.len().min(255)];
         out.push(2u8); // URL trailer marker
         out.push(s.len() as u8);
-        out.extend(s.as_bytes());
+        out.extend(s);
     }
     out
 }
@@ -189,6 +192,7 @@ pub fn parse_announce_response(
     }
     let mut resp = AnnounceResponse {
         interval: rd_i32(buf, 8),
+        min_interval: 60,
         incomplete: rd_i32(buf, 12),
         complete: rd_i32(buf, 16),
         ..Default::default()
@@ -218,14 +222,19 @@ pub fn parse_connect_response(buf: &[u8], expected_tid: u32) -> Result<u64, UdpT
     if buf.len() < 16 {
         return Err(UdpTrackerError::Truncated);
     }
-    let action = rd_i32(buf, 0);
     let tid = rd_i32(buf, 4) as u32;
+    // upstream on_receive() checks the transaction id first — stale
+    // error packets are ignored, not reported as failures.
+    if tid != expected_tid {
+        return Err(UdpTrackerError::UnexpectedReply);
+    }
+    let action = rd_i32(buf, 0);
     if action == ACTION_ERROR {
         return Err(UdpTrackerError::Tracker(
             String::from_utf8_lossy(&buf[8..]).into_owned(),
         ));
     }
-    if tid != expected_tid || action != ACTION_CONNECT {
+    if action != ACTION_CONNECT {
         return Err(UdpTrackerError::UnexpectedReply);
     }
     Ok(rd_i64(buf, 8) as u64)
@@ -250,7 +259,9 @@ pub fn parse_scrape_response(
         return Err(UdpTrackerError::UnexpectedReply);
     }
     let entries = &buf[8..];
-    if entries.len() % 12 != 0 {
+    // upstream requires at least one 12-byte entry and reads exactly
+    // one; extra trailing bytes are ignored, not an error.
+    if entries.len() < 12 {
         return Err(UdpTrackerError::BadLength);
     }
     Ok(entries

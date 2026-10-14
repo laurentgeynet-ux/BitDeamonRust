@@ -9,6 +9,84 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- `torrent::second_tick` ordering parity: `want_tick` tests the raw
+  `m_paused` bit (session-paused torrents keep ticking stats), a
+  paused non-graceful torrent now early-returns after its stat tick
+  exactly like upstream (no conn work, web seeds, time-critical
+  picks or `is_inactive` debounce while paused), plugin/extension
+  ticks and `stats_alert` are tick-list-scoped, `disconnecting`
+  conns are skipped by the per-conn tick (upstream's
+  `m_disconnecting` early-out), and `request_time_critical_pieces`
+  re-drives deadline pieces every tick while not in upload mode.
+- Monotonic payload accounting (`m_stat`/`m_total_uploaded`
+  parity): `total_upload`/`total_download`/`total_payload_*` no
+  longer shrink when a peer disconnects — conn stat channels fold
+  into torrent accumulators at `remove_peer`; resume
+  `total_uploaded`/`total_downloaded` write the all-time counter
+  (resume seed + session payload) like upstream; share-mode targets
+  compare against the same all-time value; `state_updated()` marks
+  on nonzero low-pass rate and `need_save_resume` marks on payload
+  movement (`if_counters_changed`), so auto-save and
+  `save_resume_data(only_if_modified)` behave like upstream.
+- Peer-class subsystem wired end-to-end (`peer_class.cpp` +
+  `session_impl`/`torrent`/`peer_connection` consumers): session pool
+  + `init_peer_class_filter` defaults (global/tcp/local — local gets
+  `ignore_unchoke_slots` + a 150% `connection_limit_factor`),
+  attach-time `set_peer_classes` (address filter ∩ socket-type
+  filter), `ignore_unchoke_slots()` evaluated live over the conn's
+  *and* the torrent's class sets at every upstream gate (choke/unchoke
+  gauges, `remove_peer` decrement, status `num_uploads`, the
+  unlimited-slots sweep), and `peer_connection::maybe_unchoke_this_peer`
+  — exempt conns unchoke right after the handshake, others via
+  `preemptive_unchoke`. Connection caps are class-scaled
+  (`max_connections * 100 / factor`) at both `peer_connected` and the
+  engine's `on_incoming_connection` (plus the no-active-torrents
+  silent-drop and `connections_slack`/`exceeded_limit` ladder with
+  `find_disconnect_candidate_torrent` eviction). New
+  `Session::{create,delete,set,get}_peer_class` + filter accessors;
+  `apply_settings` pushes `upload_rate_limit`/`download_rate_limit`
+  onto the global class channels, deprecated `local_*` onto the local
+  class, `rate_limit_utp` toggles the type-filter's global-class bit
+  on (SSL-)uTP, `ignore_limits_on_local_network` rebuilds the address
+  filter, and `mixed_mode_algorithm`'s `peer_proportional` split runs
+  per tick. Torrents carry a lazily-created `peer_class` now:
+  `set_limit_impl`/`limit_impl` route per-torrent up/down limits
+  through its `BandwidthChannel`s (upstream `-1`-for-unlimited API
+  semantics, resume round-trip included), `setup_peer_class` fires on
+  the first nonzero limit, and the class is released on
+  `remove_torrent`/`abort`. Deferred until `BandwidthManager` wiring:
+  class-channel consumption (`use_quota_overhead`,
+  `rate_limit_ip_overhead` debits, `bw_network`/`bw_limit` channel
+  state — `peer_proportional` currently counts with `!disk_blocked`
+  as the `bw_network` stand-in).
+- Disconnect severity propagation (`peer_connection::disconnect(ec, op,
+  severity)` → `m_failed` → `peer_list::connection_closed` failcount):
+  `PeerEffect::Disconnect`/`TorrentEffect::DisconnectPeer` now carry the
+  upstream severity; protocol errors (invalid HAVE/DONT_HAVE/bitfield,
+  too-many-requests-while-choked, invalid messages, PEX errors),
+  `peer_banned`, self-connections and dial failures bump `failcount`,
+  while timeouts, pause, duplicate peer-id, upload-upload, finished and
+  ip/port-filter sweeps run at normal severity. `PeerConn::failed`
+  survives into `peer_disconnected_addr` so `connection_closed` gets the
+  real verdict; `Session::peer_disconnected` ORs it with the effect's
+  flag (first disconnect wins, like upstream).
+- `ip_filter`/`port_filter` semantics completed: `Session::set_ip_filter`
+  now disconnects banned conns *before* erasing swarm entries (upstream
+  `apply_ip_filter` order — `connection_closed` bookkeeping stays
+  intact), drops the sockets via `DisconnectPeer`, and posts
+  `peer_blocked_alert(ip_filter)` per banned address. New
+  `Session::set_port_filter` runs the matching `apply_port_filter`
+  sweep; `session_handle::set_port_filter` now applies instead of
+  storing inert. `privileged_port_updated` got the same ordering fix.
+  `Torrent` holds shared `Arc` copies of both filters (`m_ip_filter`/
+  `m_ses.get_port_filter()` upstream), `add_swarm_peer` gates
+  inserts with `peer_blocked_alert` (`ip_filter` gated on
+  `apply_ip_filter`, `port_filter` unconditional), `peer_connected`
+  refuses filtered attachers, `ban_ip` rebuilds + re-shares the filter
+  and runs the full sweep, tracker announces carry `req.filter` when
+  `apply_ip_filter_to_trackers` (resolved endpoints filtered →
+  `banned_by_ip_filter` failure), and web-seed connects filter resolved
+  endpoints like upstream's `on_name_lookup`.
 - `on_parole`/`trust_points`/`hashfails` wiring — `piece_finished`'s
   trust loop and `penalize_peers` are now live: a passing piece clears
   parole and bumps trust (+1, cap 8) on every contributing peer; a
@@ -29,6 +107,27 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- **Pause is now two-layered like upstream** — `m_paused` (user) and
+  `m_session_paused` are distinct; `is_paused()` is their OR, so a
+  user-resumed torrent stays paused under a paused session. Pause
+  runs the real `do_pause` machinery: `announce_to_*` flags off,
+  `disconnect_all` (graceful mode chokes peers with data in flight
+  after `clear_request_queue` and disconnects only idle ones),
+  `stop_announcing` + the `stopped` event; `do_resume` re-arms the
+  announce flags, resets the tracker list (`started` again) and
+  announces immediately. The extension `on_pause`/`on_resume` veto
+  now fires *inside* `do_pause`/`do_resume` — the flag still
+  flips, only the machinery is skipped, matching upstream. The
+  auto-manage queue routes through `set_paused` (graceful
+  demotion) instead of flipping flags, and
+  `set_flags(flag_paused)` delegates to `pause(graceful_pause)` /
+  `resume()` as upstream does.
+- **`force_announce` honors tracker failover** —
+  `force_reannounce(-1)` triggers every tracker but the
+  `announce_state` selection still applies (one working tracker
+  under default settings; `announce_to_all_tiers` reaches the
+  rest), while `force_announce(idx)` dispatches that single entry
+  directly, bypassing failover like upstream `announce_tracker_now`.
 - **`part_file` on-disk format is now upstream-compatible**: header
   and slot table are big-endian (was little-endian — written part
   files were unreadable by libtorrent and vice versa), free slots are
@@ -303,6 +402,189 @@ Until `1.0.0`, breaking changes may occur in any release.
   Released jobs now go straight to the pool (`enqueue`); covered by a
   deterministic `hash_parked_behind_inflight_write_is_released`
   regression test.
+
+### Fixed — `bitdaemon-dht` upstream-fidelity audit (full crate sweep)
+
+Every module of `bitdaemon-dht` was re-audited line-by-line against
+`libtorrent @ v2.1.2-45-gc019e80ef` (`src/kademlia/*` +
+`include/libtorrent/kademlia/*`; `docs/PORTING.md` statuses were *not*
+trusted). Corrections per subsystem:
+
+- `lookups`: the `nodes6` reply key was read as `nodes2`, corrupting
+  the 38-byte IPv6 compact-node stride (fixed); Mainline's single-blob
+  `values` reply form is now decoded alongside libtorrent's
+  list-of-endpoints form; bootstrap targets `make_id_secret(nid)`
+  (re-read from the live node id at invoke time) and sets `a.bs=1` on
+  initial/router seeds like upstream `bootstrap`.
+- `dht_node::incoming_request` restructured to upstream order and
+  codes: top-level `verify_message` (203 on schema violation), `a.id`
+  must be a 20-byte string, `heard_about` feeds the router-node pool
+  on incoming queries, replies carry `ip`, `r.id`, source-port `r.p`
+  and client version `v`. `put` derives its target from `pk‖salt`
+  whenever `k` is present (not only on signed items), enforces the
+  1000-byte value / 64-byte salt caps, the token *before* immutable
+  stores, negative-seq rejection, CAS mismatch → 301, old seq → 302,
+  bad signature → 206.
+- `want` (`n4`/`n6`) cross-family replies now consult the sibling
+  node's routing table through the injected `foreign` reference —
+  upstream `m_get_foreign_node`.
+- Write tokens harvested in `find_data::done` are capped to the
+  `bucket_size` closest *alive* nodes like upstream (was: every
+  token-holder got an announce/put).
+- `obfuscated_get_peers` now runs upstream's phase 2: once the
+  obfuscated traversal finishes, a new clear `get_peers` is spawned
+  seeded by the ≤16 closest alive responders.
+- `traversal`: `set_id` now re-sorts pending results
+  (`resort_result`), zero node-ids become `NO_ID` observers with
+  generated stand-in ids (exempt from `restrict_search_ips` like
+  upstream), and `finish()` no longer clears `results` before the
+  lookup's `done()` can collect write tokens.
+- `rpc`: replies now report the real measured RTT to `node_seen`
+  (was a hardcoded 0), and `unreachable()` fails pending
+  transactions on transport errors — wired through
+  `dht_tracker::incoming_error`.
+- `routing_table`: `is_full` gained the upstream guards
+  (`live ≥ limit ∧ replacements ≥ bucket_size ∧ bucket <
+  num_buckets`), `next_refresh` returns the *node* (the caller
+  computes `159 - distance_exp` like `node::send_single_refresh`),
+  and a read-only `find_node_ref` serves sibling `want` queries.
+- `dht_storage`: `values` is emitted whenever the entry exists (even
+  empty — upstream `lookup_peers`), peer `name` is truncated to 100
+  **bytes** on a UTF-8 boundary (was 100 chars), and full-table
+  `no_token` semantics withhold the write token.
+- `dht_tracker`: upload quota (`has_quota` token bucket, 3 s burst)
+  is enforced on outgoing packets; `dht_ignore_dark_internet`
+  (default on) drops packets from upstream's class-A list
+  (9.x/56.x/…) before decode; `nids` (`addr → node_id`) persist in
+  `dht_state` and are restored at `bind` like `new_socket`;
+  `update_node_id` propagates the storage `node_ids` to both nodes.
+- `dos_blocker` gained the upstream `set_block_timer`/`set_rate_limit`
+  setters used by `refresh_timeout`.
+- Session: `bind` now receives the persisted `DhtState` so `nids`
+  seed the node id on rebind; `unchoke_sort` no longer calls
+  `select_nth` on an empty candidate list (panic found by the
+  workspace suite).
+- New regression suite `tests/test_dht_protocol.rs` covering query
+  schema errors (203), BEP-44 immutable/mutable put round-trips, CAS
+  301 / old-seq 302 / bad-token rejections, `get` sequence filters,
+  `get_peers` wire shape (nodes+token+values+name), announce
+  implied-port, `want` cross-family, bootstrap `bs`/`make_id_secret`,
+  write-token preservation and RPC unreachable/timeout paths.
+
+### Fixed — `bitdaemon-net` upstream-fidelity audit (full crate sweep)
+
+Every module of `bitdaemon-net` was re-audited line-by-line against
+`libtorrent @ v2.1.2-45-gc019e80ef` (`docs/PORTING.md` statuses were
+*not* trusted). Corrections per subsystem:
+
+- **HTTP layer**: `http_parser` `read_until` now skips consecutive
+  delimiters (`"HTTP/1.1  404"` parses), the reason phrase keeps the
+  full rest of the status line, `content-length`/`content-range` use
+  C `strtoll` prefix semantics (garbage → 0), chunk tail-headers dedup
+  first-wins, and the missing helpers `is_ok_status`, `is_redirect`,
+  `header_duration` and `resolve_redirect_location` are ported.
+  `http_conn`/`http_get` now emits `GET` + `Connection: close`
+  verbatim, resolves redirects against the base URL with the
+  same-origin authorization rule, and non-SSL HTTP proxies send
+  `GET <absolute-url>` without CONNECT like upstream.
+- **Trackers**: HTTP announce params follow upstream's verbatim order
+  and include the missing ones (`redundant_download`,
+  `announce_crypto_support`, `min_announce_interval` clamp);
+  `scrape_url` uses `find` not `rfind`; `event_t`/`key` encodings
+  fixed. **UDP tracker sends each datagram exactly once** — upstream
+  `m_attempts` is a write-only counter and `on_timeout` fails
+  outright; the resend loop was removed and stray/malformed packets
+  restart the receive deadline instead (`announce_udp`/`scrape_udp`
+  signatures dropped `max_tries`). Tracker defaults now match
+  `settings_pack` (`num_want` 200, `min_announce_interval` 300,
+  `report_redundant_bytes`/`ssrf_mitigation`/`announce_crypto_support`
+  true).
+- **Peer encryption**: `mse` initiator writes `len_ia = handshake_len`
+  and sends the BT handshake encrypted inline (BEP-8 IA), `ia_len > 68`
+  disconnects, padding is bounded ≤ 511; `peer_wire::decode` enforces
+  upstream's exact `packet_size()` checks; `receive_buffer::
+  mutable_buffer()` returns `subspan(recv_start, recv_pos)` not
+  `[start, end)`.
+- **uTP**: `micros_now` reads the monotonic clock (was wall clock —
+  NTP jumps broke LEDBAT), `remove_sack_header` preserves the
+  extension chain (a `close_reason` after SACK is kept), SACK
+  `acked_bytes` is assigned not accumulated, `insert_packet` drops the
+  superseded seq from `needs_resend`, the fast-resend counter is
+  incremented *before* `experienced_loss` (upstream dedup guard), and
+  the missing `init_mtu`/`restrict_mtu`/`mtu_for_dest` per-destination
+  MTU learning plus the SYN-flood cap are ported to `UtpManager`.
+- **Proxies/transports**: SOCKS5 error-code mapping, domain `BND`
+  replies and SOCKS4 `general_failure` corrected; `http_stream`
+  CONNECT status parses via `parse_decimal` (digit prefix);
+  `proxy_settings` defaults `proxy_hostnames`/`proxy_peer_connections`/
+  `proxy_tracker_connections` to `true` and gains
+  `send_host_in_connect`; `ssl_stream` SNI callback resolves a 40-hex
+  info-hash to the torrent's SSL context like upstream.
+- **I2P SAM**: the session control socket is now persistent —
+  `NAMING LOOKUP` reuses it without a second HELLO, `.i2p` names go
+  through lookup while raw destinations are used verbatim, the
+  accept path reads the `DESTINATION=` line after `STREAM STATUS`,
+  and `format_command` enforces the 1024-byte upstream cap.
+- **WebSocket/WebRTC**: `RTC_MAX_SDP_SIZE` is 64 KiB (was 4 KiB),
+  tracker replies read `min_interval`/`failure reason`, data frames
+  are `Binary` (was `Text`), the spurious `Sec-WebSocket-Protocol`
+  header is gone, fragmented frames reassemble and pings auto-reply.
+  `rtc_signaling` completes a batch only via the description handler
+  (timeouts no longer close it); `rtc_stream` chunks writes at
+  `maxMessageSize`, reports `would_block` on `bufferedAmount > 0`,
+  treats incoming text as `bad_message`, maps `onClosed` to
+  `connection_reset`, and `rtc_parse_endpoint` matches `stoul`
+  semantics (u16 truncation, sign/prefix accepted).
+- **Port mapping**: `natpmp` ports the full PCP variant (60-octet
+  request with nonce + v6-mapped addresses, exact 60-octet reply,
+  `pcp_unsupp_version` → NAT-PMP fallback) and requires `== 16` bytes
+  for NAT-PMP map replies; `upnp` M-SEARCH is byte-verbatim
+  (`ST:upnp:rootdevice`, `MAN:"ssdp:discover"`, `MX:3`), renewal uses
+  `lease*3/4`, `failcount` resets on success, error codes 716/727 are
+  handled, `resolve_control_url` follows upstream's prefix/concat
+  rules, delete replies route to a separate `on_upnp_unmap_response`,
+  and `next()` performs the upstream wraparound sweep; `lsd` requires
+  `ih_str.size() == 40` (v1), skips all-zero hashes and parses
+  port/cookie with `strtol`/`strtoul` semantics.
+- **Peer bookkeeping**: `torrent_peer::rank` takes `&ExternalIp` with
+  no family guard (upstream feeds the unspecified address in),
+  `compare_peer` ranks `primary_source`, `add_peer` rejects
+  unspecified/port-0/port-1/v6-link-local addresses, dedups by
+  `(addr, port)`, inserts sorted (i2p last, IP by address only), caps
+  at `max_peerlist_size`, `update_peer` decrements `failcount` on
+  tracker source and applies pex flags, `connection_closed` and
+  `apply_ip_filter` (erases connected peers too) match upstream,
+  `erase_peers` is the single-sweep variant, `compare_peer_for_erase`
+  direction is fixed with the `trust_points` tiebreak, incoming peers
+  are `connectable=false`, and `clear_peer_prio` is ported.
+  `close_reason` table is now verbatim (no extra mappings).
+- **Web seeds**: the request path is split into `plan`/`render` so
+  headers are emitted at send time per connection —
+  `m_first_request` flips per GET like upstream (`Connection:
+  keep-alive` only on the first request/proxy). `Host` uses
+  `format_host_header` (default port elided), `User-Agent` honors
+  `anonymous_mode`/`always_send_user_agent`, URL-embedded
+  `user:pass@` becomes `Authorization: Basic` (new `base64encode` in
+  `escape_string`), proxy requests carry `Proxy-Authorization` +
+  `Proxy-Connection: keep-alive` + absolute-form URIs, extra headers
+  pass verbatim. Redirects are upstream-faithful: any 3xx resolves
+  `Location` via `resolve_redirect_location` + `maybe_url_encode`,
+  `split_url` produces a per-file ephemeral base with same-origin
+  authorization forwarding, redirect loops are bounded, and the file
+  index is surfaced so the engine registers `web_seed_t::redirects`.
+  Only 200/206 are accepted, body length must match the requested
+  slice exactly, and pad files synthesize zeroes without a GET.
+- **Misc**: `parse_decimal` accepts digit prefixes (`"80x"` → 80,
+  `from_chars` parity), `parse_comma_separated_string` keeps empty
+  elements, `IpInterface` gains `flags`/`state`/`friendly_name`/
+  `description` and keeps loopbacks flagged, `resolver` ports the
+  `abort_on_shutdown` flag and clears cached failures on success,
+  `parse_url` gains `maybe_url_encode`, `dht_storage::announce_peer`
+  enforces the `/56` cap.
+- Engine glue in `crates/bitdaemon`: `spawn_web_seed` rewired for
+  per-base connections, redirect registration and settings-aware
+  headers; UPnP/NAT-PMP drivers adapted to the corrected reply
+  parsing; tracker call sites updated to the single-send UDP API.
 
 ### Fixed — real-swarm differential findings (vs libtorrent v2.1.2)
 
@@ -1942,6 +2224,50 @@ traversals for `ubuntu-24.04.4-live-server-amd64.iso` returned
   `test_sha1_hash.cpp` shift/bitops/leading-zero vectors, `stat` formula
   checks — all green; `clippy -D warnings` clean, `cargo fmt --check`
   clean.
+
+### Fixed — `bitdaemon-common` upstream-fidelity audit (full crate sweep)
+
+Every module of `bitdaemon-common` was re-audited line-by-line against
+`libtorrent @ v2.1.2-45-gc019e80ef`. Corrections:
+
+- **`identify_client` is now a single canonical implementation** in
+  `common::identify_client` — `core::fingerprint::identify_client`
+  delegates to it (the two copies had already drifted: different digit
+  checks, different `name_map` key types). Fidelity fixes vs
+  `identify_client.cpp`: `parse_az_style` now rejects `id[2] < '0'`
+  like upstream (and bytes ≥ 0x80, which are negative under upstream's
+  signed-`char` comparisons — the whole `id[2..7]` range now uses
+  signed-char semantics); `parse_shadow_style` drops the dead
+  `> 127` tests (unreachable on signed-`char` builds) and
+  **sign-extends** binary version fields, so `S\x85…` reports
+  `Shadow -123.x.x` exactly like upstream; `parse_mainline_style`
+  reproduces `sscanf "%3d"` faithfully — whitespace skip *plus*
+  optional sign inside the 3-char field (`"M-4-3-6--"` →
+  `Mainline -4.3.6` upstream, and now here); `lookup` binary-searches
+  the raw 2-byte client code like `compare_id`/`lower_bound`.
+  `Fingerprint` fields renamed to the upstream `*_version` names.
+- **`ffs::log2p1(0)` returns 0**, matching the DeBruijn-table result
+  upstream actually produces (the previous `-1` sentinel contradicted
+  the ported doc). Full `test_ffs.cpp` vectors ported: all 22
+  `count_leading_zeros` hex cases plus the `count_trailing_ones` u32
+  table (host-order convention documented).
+- **`platform::max_open_files` returns upstream's real constants**:
+  10 000 000 for `unlimited`/cap (was `i32::MAX`), 1024 on query
+  failure (was `i32::MAX`), 10 000 on non-rlimit platforms — the
+  simulator's 256 is a build define, noted in `PORTING.md`.
+- **`time::minutes`/`seconds32` saturate** at the i32-ms cap instead
+  of overflowing into a debug panic (upstream stores minutes/seconds,
+  not ms — a >35 792-minute call used to wrap).
+- `LtError` message table confirmed against the **ABI-2** layout
+  (mechanical diff of all 221 codes + 254-string table); the ABI-1
+  bdecode strings kept at codes 190-196 are a documented deviation —
+  upstream ABI-2 returns `""` there.
+
+`docs/PORTING.md` updated: `identify_client` single-source note,
+`platform_util` constant table, `ffs` DeBruijn/`test_ffs` coverage,
+`version.hpp` numeric constants recorded as intentionally unported
+(they identify libtorrent, not BitDaemon), `time.cpp` wall-clock
+helpers recorded as unused (`SystemTime` covers the need).
 
 [Unreleased]: https://github.com/laurentgeynet-ux/BitDeamonRust/compare/main...HEAD
 - Phase C networking: `UdpSocket` adapter over `DatagramSocket`, `CachingResolver` (LRU 700, TTL 1200s, failed-DNS TTL/8, single-flight), `ssl_stream` via rustls/tokio-rustls (peer verify-none + tracker root-store + `SniResolver`), `instantiate` transport decision table, `core::xml_parse` byte-level scanner port.

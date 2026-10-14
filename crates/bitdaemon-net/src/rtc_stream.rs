@@ -17,29 +17,52 @@ use std::task::{Context, Poll, Waker};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-/// `rtc_parse_endpoint` — `"host:port"` split at the last colon
-/// (no bracket handling, verbatim upstream).
+/// `rtc_parse_endpoint` — `"address:port"` split at the last colon
+/// (no bracket handling). The port goes through `std::stoul`
+/// upstream: leading whitespace, an optional sign and a digit
+/// *prefix* are accepted, and the value is truncated to `u16`.
+fn stoul_u16(s: &str) -> Option<u16> {
+    let t = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (neg, t) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let digits: usize = t.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let v: u64 = t[..digits].parse().ok()?; // out_of_range → parse_failed
+    let v = if neg { v.wrapping_neg() } else { v };
+    Some(v as u16)
+}
+
 pub fn rtc_parse_endpoint(addr: &str) -> io::Result<SocketAddr> {
-    let pos = addr
-        .rfind(':')
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "parse_failed"))?;
+    let bad = || io::Error::new(io::ErrorKind::InvalidInput, "parse_failed");
+    let pos = addr.rfind(':').ok_or_else(bad)?;
     let host = &addr[..pos];
-    let port: u16 = addr[pos + 1..]
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "parse_failed"))?;
-    let ip: std::net::IpAddr = host
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "parse_failed"))?;
+    let port = stoul_u16(&addr[pos + 1..]).ok_or_else(bad)?;
+    let ip: std::net::IpAddr = host.parse().map_err(|_| bad())?;
     Ok(SocketAddr::new(ip, port))
 }
 
 /// Injected WebRTC data channel — the `rtc::DataChannel` seam
 /// (ADR-0008; a `webrtc` crate or OnionBit's lanes implement it).
 pub trait RtcChannel: Send + Sync + Debug + 'static {
-    /// `channel.send(binary)` — queues a binary message.
+    /// `channel.send(binary)` — one datachannel message per call.
     fn send(&self, data: &[u8]);
     /// `channel.availableAmount()` — bytes buffered inbound.
     fn available(&self) -> usize;
+    /// `channel.bufferedAmount()` — unsent bytes the channel still
+    /// holds. Upstream returns `would_block` while this is > 0 and
+    /// resumes writes on `onBufferedAmountLow`.
+    fn buffered_amount(&self) -> usize {
+        0
+    }
+    /// `channel.maxMessageSize()` — upper bound of one `send`
+    /// (libdatachannel default is 256 KiB).
+    fn max_message_size(&self) -> usize {
+        256 * 1024
+    }
     /// `is_open` — channel established.
     fn is_open(&self) -> bool;
     /// `channel.close()`.
@@ -54,10 +77,15 @@ pub struct RtcInbound {
     pub queue: VecDeque<Vec<u8>>,
     /// `m_read_buffer` remainder of a partially-read message.
     pub pending: VecDeque<u8>,
-    /// channel closed while data may still be queued.
+    /// channel closed — upstream delivers `connection_reset` to
+    /// pending ops and `not_connected` to later ones.
     pub closed: bool,
+    /// a text (non-binary) message arrived — upstream `bad_message`.
+    pub bad_message: bool,
     /// read waker for `poll_read` starvation.
     pub waker: Option<Waker>,
+    /// write waker — woken by [`RtcStream::notify_buffered_low`].
+    pub write_waker: Option<Waker>,
 }
 
 /// `rtc_stream` — AsyncRead/Write over an [`RtcChannel`].
@@ -92,12 +120,35 @@ impl RtcStream {
         }
     }
 
-    /// channel closed (`onClosed` upstream) — pending reads see EOF
-    /// once the queue drains.
+    /// channel closed (`onClosed` upstream) — pending reads get
+    /// `connection_reset`, later reads `not_connected`; both map to
+    /// an error here rather than a clean EOF.
     pub fn notify_closed(inb: &Arc<Mutex<RtcInbound>>) {
         let mut g = inb.lock().unwrap_or_else(|e| e.into_inner());
         g.closed = true;
         if let Some(w) = g.waker.take() {
+            w.wake();
+        }
+        if let Some(w) = g.write_waker.take() {
+            w.wake();
+        }
+    }
+
+    /// a non-binary message arrived (`rtc::string` upstream) → the
+    /// pending read completes with `bad_message`.
+    pub fn feed_bad_message(inb: &Arc<Mutex<RtcInbound>>) {
+        let mut g = inb.lock().unwrap_or_else(|e| e.into_inner());
+        g.bad_message = true;
+        if let Some(w) = g.waker.take() {
+            w.wake();
+        }
+    }
+
+    /// `onBufferedAmountLow` — the channel drained below its
+    /// threshold; blocked writers retry.
+    pub fn notify_buffered_low(inb: &Arc<Mutex<RtcInbound>>) {
+        let mut g = inb.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(w) = g.write_waker.take() {
             w.wake();
         }
     }
@@ -106,6 +157,14 @@ impl RtcStream {
     #[must_use]
     pub fn is_open(&self) -> bool {
         self.chan.is_open()
+    }
+
+    /// `available()` — queued inbound bytes + the channel's own
+    /// `availableAmount`.
+    #[must_use]
+    pub fn available(&self) -> usize {
+        let g = self.inb.lock().unwrap_or_else(|e| e.into_inner());
+        g.queue.iter().map(Vec::len).sum::<usize>() + self.chan.available()
     }
 }
 
@@ -116,6 +175,21 @@ impl AsyncRead for RtcStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut g = self.inb.lock().unwrap_or_else(|e| e.into_inner());
+        // upstream `onClosed` → `connection_reset`; a closed channel
+        // errors reads even with queued data
+        if g.closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "rtc channel closed",
+            )));
+        }
+        if g.bad_message {
+            g.bad_message = false;
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad_message",
+            )));
+        }
         if let Some(front) = g.queue.front_mut() {
             let take = front.len().min(buf.remaining());
             buf.put_slice(&front[..take]);
@@ -126,9 +200,6 @@ impl AsyncRead for RtcStream {
             }
             return Poll::Ready(Ok(()));
         }
-        if g.closed {
-            return Poll::Ready(Ok(())); // EOF
-        }
         g.waker = Some(cx.waker().clone());
         Poll::Pending
     }
@@ -137,7 +208,7 @@ impl AsyncRead for RtcStream {
 impl AsyncWrite for RtcStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if !self.chan.is_open() {
@@ -146,20 +217,35 @@ impl AsyncWrite for RtcStream {
                 "rtc channel closed",
             )));
         }
-        // upstream flushes the backlog first (ordered stream)
-        if self.write_buf.is_empty() {
-            self.chan.send(buf);
-            return Poll::Ready(Ok(buf.len()));
+        // upstream `write_some`: would_block while the channel holds
+        // unsent data; writes resume on `onBufferedAmountLow`
+        if self.chan.buffered_amount() > 0 {
+            self.write_buf.extend(buf.iter().copied());
+            let mut g = self.inb.lock().unwrap_or_else(|e| e.into_inner());
+            g.write_waker = Some(cx.waker().clone());
+            return Poll::Pending;
         }
-        self.write_buf.extend(buf.iter().copied());
-        let n = buf.len();
-        // try to flush
-        let mut take = Vec::with_capacity(self.write_buf.len());
-        while let Some(b) = self.write_buf.pop_front() {
-            take.push(b);
+        // `issue_write` — drain the backlog + this buffer as
+        // `max_message_size`-bounded datachannel messages
+        let max = self.chan.max_message_size().max(1);
+        let mut pending = std::mem::take(&mut self.write_buf)
+            .into_iter()
+            .chain(buf.iter().copied())
+            .collect::<Vec<u8>>();
+        let mut sent = 0usize;
+        while sent < pending.len() {
+            let end = (sent + max).min(pending.len());
+            self.chan.send(&pending[sent..end]);
+            sent = end;
+            if self.chan.buffered_amount() > 0 && sent < pending.len() {
+                // channel started buffering mid-flush — keep the rest
+                self.write_buf.extend(pending.drain(sent..));
+                let mut g = self.inb.lock().unwrap_or_else(|e| e.into_inner());
+                g.write_waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
         }
-        self.chan.send(&take);
-        Poll::Ready(Ok(n))
+        Poll::Ready(Ok(buf.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -199,7 +285,9 @@ mod tests {
             queue: VecDeque::new(),
             pending: VecDeque::new(),
             closed: false,
+            bad_message: false,
             waker: None,
+            write_waker: None,
         }));
         let ch = Arc::new(Echo(
             Mutex::new(Vec::new()),
@@ -234,8 +322,8 @@ mod tests {
         let n = s.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b" world");
         RtcStream::notify_closed(&inb);
-        let n = s.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0);
+        // upstream onClosed → connection_reset, not a clean EOF
+        assert!(s.read(&mut buf).await.is_err());
     }
 
     #[tokio::test]

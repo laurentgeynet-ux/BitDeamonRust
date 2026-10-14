@@ -14,15 +14,23 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn params() -> AnnounceParams {
     AnnounceParams {
+        url: "http://tracker.example/announce".into(),
         info_hash: [0x11; 20],
         peer_id: [0x22; 20],
         port: 6881,
         uploaded: 0,
         downloaded: 0,
         left: 1024,
+        corrupt: 0,
+        redundant: 0,
         event: 2,
         num_want: 50,
         key: 0xABCD,
+        tracker_id: Vec::new(),
+        ipv4: Vec::new(),
+        ipv6: Vec::new(),
+        i2p: false,
+        filter: None,
     }
 }
 
@@ -39,7 +47,7 @@ async fn http_announce_e2e() {
         assert!(req.starts_with("GET /announce?"));
         assert!(req.contains("info_hash="));
         assert!(req.contains("event=started"));
-        assert!(req.contains("&key=abcd"));
+        assert!(req.contains("&key=0000ABCD"));
         // announce reply: interval + one compact peer
         let mut body = b"d8:completei2e10:incompletei1e8:intervali1800e5:peers6:".to_vec();
         body.extend([10, 0, 0, 9, 0x1A, 0xE1]);
@@ -50,10 +58,8 @@ async fn http_announce_e2e() {
     });
     let r = announce_http(
         &mut cli,
-        "tracker.example",
-        "/announce",
         &params(),
-        None,
+        &bitdaemon_net::http_tracker::AnnounceOptions::default(),
         &[],
         1024 * 1024,
     )
@@ -81,8 +87,8 @@ async fn udp_announce_e2e() {
         &udp.demux,
         target,
         &params(),
+        &bitdaemon_net::http_tracker::AnnounceOptions::default(),
         Duration::from_secs(5),
-        3,
     )
     .await
     .unwrap();

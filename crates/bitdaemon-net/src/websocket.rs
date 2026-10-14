@@ -91,9 +91,15 @@ pub async fn ws_upgrade(
     user_agent: &str,
     key: &str,
 ) -> Result<(), WsError> {
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: binary\r\nUser-Agent: {user_agent}\r\n\r\n"
+    // upstream beast's `async_handshake` writes exactly these fields;
+    // the decorator adds `User-Agent` only when non-empty
+    let mut req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
     );
+    if !user_agent.is_empty() {
+        req.push_str(&format!("User-Agent: {user_agent}\r\n"));
+    }
+    req.push_str("\r\n");
     s.write_all(req.as_bytes()).await?;
     Ok(())
 }
@@ -150,15 +156,14 @@ pub async fn ws_write_frame(
     Ok(())
 }
 
-/// read one frame — returns `(opcode, payload)`. Server→client
+/// read one frame — returns `(opcode, payload, fin)`. Server→client
 /// frames are unmasked; masked input is unmasked transparently.
-pub async fn ws_read_frame(s: &mut BoxedPeerStream) -> Result<(WsOpcode, Vec<u8>), WsError> {
+/// Fragmentation is legal (beast reassembles it upstream), so callers
+/// wanting message semantics should use [`ws_read_message`].
+pub async fn ws_read_frame(s: &mut BoxedPeerStream) -> Result<(WsOpcode, Vec<u8>, bool), WsError> {
     let mut hdr = [0u8; 2];
     s.read_exact(&mut hdr).await?;
     let fin = hdr[0] & 0x80 != 0;
-    if !fin {
-        return Err(WsError::Protocol("fragmented frames unsupported".into()));
-    }
     let opcode = match hdr[0] & 0x0F {
         0x0 => WsOpcode::Continuation,
         0x1 => WsOpcode::Text,
@@ -193,5 +198,43 @@ pub async fn ws_read_frame(s: &mut BoxedPeerStream) -> Result<(WsOpcode, Vec<u8>
             *b ^= mask[i % 4];
         }
     }
-    Ok((opcode, payload))
+    Ok((opcode, payload, fin))
+}
+
+/// `websocket::stream::async_read` — read one complete *message*:
+/// reassemble fragmented frames, auto-answer Ping with Pong, drop
+/// Pong, and fail on Close (what beast does upstream).
+pub async fn ws_read_message(s: &mut BoxedPeerStream) -> Result<(WsOpcode, Vec<u8>), WsError> {
+    let mut msg = Vec::new();
+    let mut msg_op = WsOpcode::Continuation;
+    loop {
+        let (op, data, fin) = ws_read_frame(s).await?;
+        match op {
+            WsOpcode::Ping => {
+                ws_write_frame(s, WsOpcode::Pong, &data, rand::random::<u32>()).await?;
+            }
+            WsOpcode::Pong => {}
+            WsOpcode::Close => return Err(WsError::Closed),
+            WsOpcode::Continuation => {
+                if msg.is_empty() {
+                    return Err(WsError::Protocol("continuation without start".into()));
+                }
+                msg.extend_from_slice(&data);
+                if fin {
+                    return Ok((msg_op, msg));
+                }
+            }
+            op => {
+                if !fin {
+                    if !msg.is_empty() {
+                        return Err(WsError::Protocol("interleaved message".into()));
+                    }
+                    msg_op = op;
+                    msg.extend_from_slice(&data);
+                } else {
+                    return Ok((op, data));
+                }
+            }
+        }
+    }
 }

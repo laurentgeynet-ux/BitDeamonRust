@@ -163,9 +163,10 @@ impl ReceiveBuffer {
         &self.buf[self.recv_start..self.recv_start + self.recv_pos]
     }
 
-    /// `mutable_buffer()` — `[start, end)` for crypto in-place work.
+    /// `mutable_buffer()` — `[start, start + pos)` for crypto
+    /// in-place work (upstream `subspan(m_recv_start, m_recv_pos)`).
     pub fn mutable_buffer(&mut self) -> &mut [u8] {
-        &mut self.buf[self.recv_start..self.recv_end]
+        &mut self.buf[self.recv_start..self.recv_start + self.recv_pos]
     }
 
     /// `mutable_buffer(bytes)` — the last `bytes` received.

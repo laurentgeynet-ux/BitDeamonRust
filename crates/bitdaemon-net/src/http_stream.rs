@@ -97,16 +97,19 @@ pub async fn http_connect<S: AsyncRead + AsyncWrite + Unpin>(
         }
     }
 
-    // "HTTP/1.x CODE ..." — the code follows the first space
+    // "HTTP/1.x CODE ..." — the code follows the first space; upstream
+    // parses it with `parse_decimal` (leading digit prefix, trailing
+    // bytes ignored), not a strict numeric parse.
     let status = buf
         .iter()
         .position(|&b| b == b' ')
         .ok_or(HttpConnectError::Rejected)?;
-    let code_str = std::str::from_utf8(&buf[status + 1..])
+    let digits = &buf[status + 1..];
+    let code_len = digits.iter().take_while(|b| b.is_ascii_digit()).count();
+    let code = std::str::from_utf8(&digits[..code_len])
         .ok()
-        .and_then(|s| s.split_whitespace().next())
-        .unwrap_or("");
-    if code_str.parse::<u32>() != Ok(200) {
+        .and_then(|s| s.parse::<u32>().ok());
+    if code != Some(200) {
         return Err(HttpConnectError::Rejected);
     }
     Ok(())

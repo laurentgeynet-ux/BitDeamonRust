@@ -79,18 +79,14 @@ pub enum CloseReason {
 #[must_use]
 pub fn error_to_close_reason(ec: LtError) -> CloseReason {
     match ec {
-        LtError::InvalidSwarmMetadata => CloseReason::InvalidMetadata,
-        LtError::SessionIsClosing
-        | LtError::DestructingTorrent
+        LtError::DestructingTorrent
         | LtError::TorrentPaused
         | LtError::TorrentAborted
         | LtError::TorrentRemoved
         | LtError::TorrentNotReady
         | LtError::SessionClosing
         | LtError::StoppingTorrent => CloseReason::TorrentRemoved,
-        LtError::PeerSentEmptyPiece | LtError::InvalidPiece | LtError::InvalidPieceSize => {
-            CloseReason::InvalidPieceMessage
-        }
+        LtError::InvalidPiece | LtError::InvalidPieceSize => CloseReason::InvalidPieceMessage,
         LtError::MismatchingInfoHash | LtError::InvalidInfoHash => CloseReason::InvalidInfoHash,
         LtError::PortBlocked | LtError::BannedByPortFilter => CloseReason::PortBlocked,
         LtError::TimedOut => CloseReason::Timeout,
@@ -148,6 +144,10 @@ pub fn error_to_close_reason(ec: LtError) -> CloseReason {
         LtError::InvalidPexMessage => CloseReason::InvalidPexMessage,
         LtError::TooFrequentPex => CloseReason::PexTooFrequent,
         LtError::InvalidDontHave => CloseReason::InvalidDontHaveMessage,
+        // upstream maps every `http_category` (status-code) error to
+        // `no_memory`; `LtError` has no http-category variant — the
+        // `http_errors` enum lives in `http_parser`'s error space.
+        // `errors::http_error` itself is lt-category and unmapped → none.
         _ => CloseReason::None,
     }
 }

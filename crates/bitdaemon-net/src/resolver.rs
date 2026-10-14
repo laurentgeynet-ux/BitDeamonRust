@@ -15,13 +15,18 @@ use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
-/// `resolver_flags::cache_only` — answer only from the cache; a miss
-/// fails instead of triggering a network lookup (upstream uses this
-/// during shutdown paths).
+/// `resolver_interface::resolver_flags`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ResolveFlags {
-    /// `cache_only`.
+    /// `cache_only` (bit 0) — answer only from the cache; a miss
+    /// fails instead of triggering a network lookup (upstream uses
+    /// this during shutdown paths).
     pub cache_only: bool,
+    /// `abort_on_shutdown` (bit 1) — a non-critical lookup; upstream
+    /// routes it through a cancellable resolver that `abort()` kills
+    /// at shutdown. Here it's passed through to the injected resolver,
+    /// which decides how to honor it.
+    pub abort_on_shutdown: bool,
 }
 
 /// `resolver_interface::async_resolve` — resolve `host` (no port) to
@@ -215,6 +220,9 @@ impl Resolver for CachingResolver {
                 let mut g = st.lock().unwrap_or_else(|e| e.into_inner());
                 match &res {
                     Ok(addrs) => {
+                        // upstream erases any failed-cache entry for
+                        // the host on success.
+                        g.failed.remove(&host_owned);
                         if g.cache.len() >= max_size
                             && let Some(oldest) = g
                                 .cache

@@ -15,10 +15,10 @@ use serde_json::{Value, json};
 
 use crate::tracker_client::AnnounceParams;
 use crate::transport::BoxedPeerStream;
-use crate::websocket::{WsError, WsOpcode, ws_read_frame, ws_upgrade, ws_write_frame};
+use crate::websocket::{WsError, WsOpcode, ws_read_message, ws_upgrade, ws_write_frame};
 
 /// `aux::RTC_MAX_SDP_SIZE` upstream.
-pub const RTC_MAX_SDP: usize = 4096;
+pub const RTC_MAX_SDP: usize = 64 * 1024;
 
 /// `rtc_offer` — an inbound WebRTC offer (opaque to us; routed to
 /// whoever owns the RTC stack).
@@ -62,6 +62,9 @@ pub struct WsTrackerResponse {
     pub offer: Option<RtcOffer>,
     /// an answer to one of our offers.
     pub answer: Option<RtcAnswer>,
+    /// `failure reason` — a tracker-side error string; present even
+    /// when no `info_hash` allows correlating the response.
+    pub failure_reason: Option<String>,
 }
 
 /// latin-1 byte string → UTF-8 (`aux::latin1_utf8`).
@@ -77,11 +80,11 @@ pub fn utf8_latin1(s: &str) -> Vec<u8> {
 }
 
 /// `do_send` — the announce payload, verbatim field names. `event`
-/// is our wire encoding (0 none, 1 completed, 2 started, 3 stopped);
-/// upstream adds `"paused"` at index 4 which we can't produce from
-/// `AnnounceParams` (upstream `event_t::paused` maps there).
+/// matches upstream's `event_t` table (`1..=4` → completed, started,
+/// stopped, paused); `corrupt` comes from `AnnounceParams` like
+/// upstream `tracker_req().corrupt`.
 #[must_use]
-pub fn build_announce(p: &AnnounceParams, offers: &[(Vec<u8>, String)], corrupt: i64) -> String {
+pub fn build_announce(p: &AnnounceParams, offers: &[(Vec<u8>, String)]) -> String {
     const EVENT_STRING: [&str; 4] = ["completed", "started", "stopped", "paused"];
     let mut payload = json!({
         "action": "announce",
@@ -89,7 +92,7 @@ pub fn build_announce(p: &AnnounceParams, offers: &[(Vec<u8>, String)], corrupt:
         "uploaded": p.uploaded,
         "downloaded": p.downloaded,
         "left": p.left,
-        "corrupt": corrupt,
+        "corrupt": p.corrupt,
         "numwant": p.num_want,
         "key": format!("{:08X}", p.key),
         "peer_id": latin1_utf8(&p.peer_id),
@@ -136,16 +139,28 @@ pub fn build_answer(
 pub fn parse_response(data: &[u8]) -> Result<WsTrackerResponse, String> {
     let v: Value = serde_json::from_slice(data).map_err(|e| e.to_string())?;
     let obj = v.as_object().ok_or("not a json object")?;
-    let ih = obj
-        .get("info_hash")
+    let failure = obj
+        .get("failure reason")
         .and_then(Value::as_str)
-        .ok_or("no info hash in message")?;
+        .map(String::from);
+    let Some(ih) = obj.get("info_hash").and_then(Value::as_str) else {
+        // no info_hash: a `failure reason` is still a valid response
+        // upstream (uncorrelated tracker error)
+        if failure.is_some() {
+            return Ok(WsTrackerResponse {
+                failure_reason: failure,
+                ..Default::default()
+            });
+        }
+        return Err("no info hash in message".into());
+    };
     let raw = utf8_latin1(ih);
     if raw.len() != 20 {
         return Err(format!("invalid info hash size {}", raw.len()));
     }
     let mut r = WsTrackerResponse {
         info_hash: raw.try_into().unwrap_or([0; 20]),
+        failure_reason: failure,
         ..Default::default()
     };
 
@@ -199,7 +214,7 @@ pub fn parse_response(data: &[u8]) -> Result<WsTrackerResponse, String> {
     let get_i = |k: &str, d: i64| obj.get(k).and_then(Value::as_i64).unwrap_or(d);
     if obj.contains_key("interval") {
         r.interval = get_i("interval", 120);
-        r.min_interval = get_i("min interval", 60);
+        r.min_interval = get_i("min_interval", 60);
         r.complete = get_i("complete", -1);
         r.incomplete = get_i("incomplete", -1);
         r.downloaded = get_i("downloaded", -1);
@@ -244,18 +259,14 @@ pub async fn announce_ws(
             .then(|| l.split(':').nth(1).unwrap_or_default().trim().to_string())
     });
     crate::websocket::validate_handshake(status, accept.as_deref(), ws_key)?;
-    ws_write_frame(s, WsOpcode::Text, payload.as_bytes(), rand::random::<u32>()).await?;
-    loop {
-        let (op, data) = ws_read_frame(s).await?;
-        match op {
-            WsOpcode::Text | WsOpcode::Binary => {
-                return parse_response(&data).map_err(WsError::Protocol);
-            }
-            WsOpcode::Ping => {
-                ws_write_frame(s, WsOpcode::Pong, &data, rand::random::<u32>()).await?
-            }
-            WsOpcode::Close => return Err(WsError::Closed),
-            _ => {}
-        }
-    }
+    // beast's websocket stream sends binary frames by default upstream
+    ws_write_frame(
+        s,
+        WsOpcode::Binary,
+        payload.as_bytes(),
+        rand::random::<u32>(),
+    )
+    .await?;
+    let (_op, data) = ws_read_message(s).await?;
+    parse_response(&data).map_err(WsError::Protocol)
 }

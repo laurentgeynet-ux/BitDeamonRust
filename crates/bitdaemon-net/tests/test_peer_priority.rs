@@ -1,7 +1,7 @@
 //! Conformance port of upstream `test_peer_priority.cpp` — BEP 40
 //! CRC32C endpoint ranking — plus `torrent_peer` record semantics.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use bitdaemon_common::PeerSourceFlags;
 use bitdaemon_common::crc32c::crc32c;
@@ -139,16 +139,23 @@ fn torrent_peer_flags_and_accounting() {
 
 #[test]
 fn torrent_peer_rank() {
-    let mut p = TorrentPeer::new(
+    let p = TorrentPeer::new(
         PeerAddr::V4("230.12.123.3".parse().unwrap()),
         0x12c,
         true,
         PeerSourceFlags::DHT,
     );
-    let ext: IpAddr = "98.76.54.32".parse().unwrap();
-    let r1 = p.rank(ext, 6881);
+    // upstream `rank` takes `aux::external_ip` and picks the
+    // external address of the peer's family
+    let ext = bitdaemon_net::ip_voter::ExternalIp::new(
+        "98.76.54.32".parse().unwrap(),
+        "98.76.54.32".parse().unwrap(),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    );
+    let r1 = p.rank(&ext, 6881);
     // cached — recomputes identical value
-    let r2 = p.rank(ext, 9999);
+    let r2 = p.rank(&ext, 9999);
     assert_eq!(r1, r2);
     assert_ne!(r1, 0);
     assert_eq!(
@@ -156,7 +163,12 @@ fn torrent_peer_rank() {
         peer_priority(ep("98.76.54.32", 6881), ep("230.12.123.3", 0x12c))
     );
 
-    // v6 peer with v4 external: no rank
-    let mut p6 = TorrentPeer::new_v6(ep("::1", 6881), true, PeerSourceFlags::TRACKER);
-    assert_eq!(p6.rank(ext, 6881), 0);
+    // v6 peer with no v6 external: upstream still computes a rank —
+    // `external_address(::1)` yields the unspecified v6, and
+    // `peer_priority` runs on the (unspec, ::1) pair
+    let p6 = TorrentPeer::new_v6(ep("::1", 6881), true, PeerSourceFlags::TRACKER);
+    assert_eq!(
+        p6.rank(&ext, 6881),
+        peer_priority(ep("::", 6881), ep("::1", 6881),)
+    );
 }

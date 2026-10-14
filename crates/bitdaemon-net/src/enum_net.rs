@@ -12,6 +12,63 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::ip_helpers::{is_global, is_local};
 
+bitdaemon_common::bitfield_flag! {
+    /// `interface_flags` (`if_flags::*`).
+    InterfaceFlags, u32
+}
+
+#[allow(dead_code)]
+impl InterfaceFlags {
+    /// `if_flags::up`.
+    pub const UP: Self = Self::bit(0);
+    /// `if_flags::broadcast`.
+    pub const BROADCAST: Self = Self::bit(1);
+    /// `if_flags::loopback`.
+    pub const LOOPBACK: Self = Self::bit(2);
+    /// `if_flags::pointopoint`.
+    pub const POINTOPOINT: Self = Self::bit(3);
+    /// `if_flags::running`.
+    pub const RUNNING: Self = Self::bit(4);
+    /// `if_flags::noarp`.
+    pub const NOARP: Self = Self::bit(5);
+    /// `if_flags::promisc`.
+    pub const PROMISC: Self = Self::bit(6);
+    /// `if_flags::allmulti`.
+    pub const ALLMULTI: Self = Self::bit(7);
+    /// `if_flags::master`.
+    pub const MASTER: Self = Self::bit(8);
+    /// `if_flags::slave`.
+    pub const SLAVE: Self = Self::bit(9);
+    /// `if_flags::multicast`.
+    pub const MULTICAST: Self = Self::bit(10);
+    /// `if_flags::dynamic`.
+    pub const DYNAMIC: Self = Self::bit(11);
+    /// `if_flags::lower_up`.
+    pub const LOWER_UP: Self = Self::bit(12);
+    /// `if_flags::dormant`.
+    pub const DORMANT: Self = Self::bit(13);
+}
+
+/// `if_state` — operational state of an interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IfState {
+    /// `if_state::up`.
+    Up,
+    /// `if_state::dormant`.
+    Dormant,
+    /// `if_state::lowerlayerdown`.
+    LowerLayerDown,
+    /// `if_state::down`.
+    Down,
+    /// `if_state::notpresent`.
+    NotPresent,
+    /// `if_state::testing`.
+    Testing,
+    /// `if_state::unknown`.
+    #[default]
+    Unknown,
+}
+
 /// `ip_interface` — one local interface.
 #[derive(Debug, Clone)]
 pub struct IpInterface {
@@ -21,8 +78,19 @@ pub struct IpInterface {
     pub netmask: IpAddr,
     /// `name` (device name).
     pub name: String,
-    /// `preferred` — interface preferred for outbound connects.
+    /// `friendly_name`.
+    pub friendly_name: String,
+    /// `description`.
+    pub description: String,
+    /// `preferred` — upstream: false iff the address is
+    /// tentative/duplicate/deprecated (DAD state). `if-addrs` doesn't
+    /// surface DAD state, so this stays `true` like upstream's default.
     pub preferred: bool,
+    /// `flags` — `if_addrs` only lets us detect loopback; `UP` is
+    /// assumed like upstream's default.
+    pub flags: InterfaceFlags,
+    /// `state`.
+    pub state: IfState,
 }
 
 /// `ip_route` — one routing-table entry.
@@ -146,8 +214,12 @@ pub fn device_for_address<'a>(addr: &IpAddr, ifs: &'a [IpInterface]) -> Option<&
 
 /// `enum_net_interfaces` — the OS enumeration half. Upstream uses
 /// `GetAdaptersAddresses`/`getifaddrs`; `if-addrs` wraps both and
-/// yields the same (address, netmask, name) tuples.
-/// Loopbacks are dropped (upstream marks them `!preferred` too).
+/// yields the same (address, netmask, name) tuples. Loopbacks are
+/// *kept* and flagged `LOOPBACK` — upstream returns them and the
+/// session's unspecified-address expansion turns them into
+/// local-network listen sockets. `if-addrs` doesn't surface the full
+/// flag set, DAD state or friendly names — `UP`/`preferred`/`Unknown`
+/// are upstream's defaults.
 #[must_use]
 pub fn enum_interfaces() -> Vec<IpInterface> {
     let mut out = Vec::new();
@@ -155,18 +227,24 @@ pub fn enum_interfaces() -> Vec<IpInterface> {
         return out;
     };
     for i in ifs {
-        let (interface_address, netmask) = match i.addr {
+        let (interface_address, netmask) = match &i.addr {
             if_addrs::IfAddr::V4(a) => (IpAddr::V4(a.ip), IpAddr::V4(a.netmask)),
             if_addrs::IfAddr::V6(a) => (IpAddr::V6(a.ip), IpAddr::V6(a.netmask)),
         };
-        if interface_address.is_loopback() {
-            continue;
-        }
+        let flags = if i.is_loopback() {
+            InterfaceFlags::UP | InterfaceFlags::LOOPBACK
+        } else {
+            InterfaceFlags::UP
+        };
         out.push(IpInterface {
             interface_address,
             netmask,
+            friendly_name: i.name.clone(),
             name: i.name,
-            preferred: false,
+            description: String::new(),
+            preferred: true,
+            flags,
+            state: IfState::Unknown,
         });
     }
     out

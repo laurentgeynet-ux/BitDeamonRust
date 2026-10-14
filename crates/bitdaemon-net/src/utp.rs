@@ -160,12 +160,29 @@ impl<'a> Iterator for UtpExtensions<'a> {
 /// `utp_socket_manager` — demux incoming datagrams to uTP sockets by
 /// `connection_id`. `S` is the per-socket sink (upstream
 /// `utp_socket_impl*`), addressed by its receive id.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UtpSocketDemux<S> {
     /// `m_utp_sockets` — recv_id → socket.
     sockets: HashMap<u16, S>,
     /// next send-side connection id.
     next_send_id: u16,
+    /// `m_restrict_mtu` — rolling window of path-MTU failures; the
+    /// cap is the *max* of the last 3 (upstream semantics: a single
+    /// failure doesn't permanently clamp new sockets).
+    restrict_mtu: [i32; 3],
+    /// `m_mtu_idx`.
+    mtu_idx: usize,
+}
+
+impl<S> Default for UtpSocketDemux<S> {
+    fn default() -> Self {
+        Self {
+            sockets: HashMap::new(),
+            next_send_id: 0,
+            restrict_mtu: [65536; 3],
+            mtu_idx: 0,
+        }
+    }
 }
 
 impl<S> UtpSocketDemux<S> {
@@ -209,5 +226,18 @@ impl<S> UtpSocketDemux<S> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.sockets.is_empty()
+    }
+
+    /// `utp_socket_manager::restrict_mtu` — record an MTU that
+    /// killed a connection (rotating slot).
+    pub fn restrict_mtu(&mut self, mtu: i32) {
+        self.restrict_mtu[self.mtu_idx] = mtu;
+        self.mtu_idx = (self.mtu_idx + 1) % self.restrict_mtu.len();
+    }
+
+    /// `restrict_mtu()` — the current cap (`max` of the window).
+    #[must_use]
+    pub fn mtu_cap(&self) -> i32 {
+        self.restrict_mtu.iter().copied().max().unwrap_or(65536)
     }
 }

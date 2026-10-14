@@ -81,6 +81,32 @@ pub fn need_encoding(s: &[u8]) -> bool {
     s.iter().any(|&c| c == 0 || !UNRESERVED_CHARS.contains(&c))
 }
 
+/// `aux::base64encode` — standard `A-Za-z0-9+/` alphabet, `=` padding.
+#[must_use]
+#[allow(clippy::needless_range_loop)]
+pub fn base64encode(s: &[u8]) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut ret = Vec::with_capacity(s.len().div_ceil(3) * 4);
+    let mut i = 0usize;
+    while i < s.len() {
+        let available = (s.len() - i).min(3);
+        let mut inbuf = [0u8; 3];
+        inbuf[..available].copy_from_slice(&s[i..i + available]);
+        i += available;
+        let outbuf = [
+            inbuf[0] >> 2,
+            ((inbuf[0] & 0x03) << 4) | (inbuf[1] >> 4),
+            ((inbuf[1] & 0x0f) << 2) | (inbuf[2] >> 6),
+            inbuf[2] & 0x3f,
+        ];
+        for j in 0..available + 1 {
+            ret.push(TABLE[outbuf[j] as usize]);
+        }
+        ret.extend(std::iter::repeat_n(b'=', 3 - available));
+    }
+    ret
+}
+
 /// `aux::base32decode` — RFC 4648 base32 (upper- or lowercase; `1`→`I`,
 /// `=` padding). Returns the decoded bytes; an invalid character makes
 /// the result empty (upstream `ret.clear()` + bail).
@@ -147,12 +173,21 @@ pub fn split_string(s: &[u8], delim: u8) -> (&[u8], &[u8]) {
     }
 }
 
-/// `aux::parse_decimal` — strict decimal parse, no sign, no trailing junk.
+/// `aux::parse_decimal` — `std::from_chars` semantics: an optional
+/// leading `-`, then a *prefix* of ASCII digits; trailing
+/// non-digit bytes are ignored (upstream quirk), empty digit run or
+/// overflow fails.
 pub fn parse_decimal(s: &[u8]) -> Option<i64> {
-    if s.is_empty() || !s.iter().all(u8::is_ascii_digit) {
+    let (neg, digits) = match s.first() {
+        Some(b'-') => (true, &s[1..]),
+        _ => (false, s),
+    };
+    let len = digits.iter().take_while(|b| b.is_ascii_digit()).count();
+    if len == 0 {
         return None;
     }
-    std::str::from_utf8(s).ok()?.parse().ok()
+    let v: i64 = std::str::from_utf8(&digits[..len]).ok()?.parse().ok()?;
+    Some(if neg { -v } else { v })
 }
 
 /// `aux::string_equal_no_case`.

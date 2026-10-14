@@ -56,6 +56,38 @@ fn parse_request_head(buf: &[u8]) -> Option<(String, Vec<(String, String)>)> {
     Some((method, headers))
 }
 
+/// `std::strtol` — leading whitespace, optional sign, then a digit
+/// *prefix* (trailing junk is ignored, `no digits` → 0 not error).
+fn strtol_prefix(s: &str) -> i64 {
+    let t = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (neg, t) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let n = t.bytes().take_while(|b| b.is_ascii_digit()).count();
+    let v: i64 = t[..n].parse().unwrap_or(0);
+    if neg { -v } else { v }
+}
+
+/// `std::strtoul(…, 16)` — whitespace, sign, optional `0x`, hex
+/// digit prefix; result wraps like `unsigned long`.
+fn strtoul_hex(s: &str) -> u64 {
+    let t = s.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let (neg, t) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let t = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
+    let n = t.bytes().take_while(|b| b.is_ascii_hexdigit()).count();
+    let v = u64::from_str_radix(&t[..n], 16).unwrap_or(0);
+    if neg { v.wrapping_neg() } else { v }
+}
+
 /// `lsd::process_packet` — parse an incoming BT-SEARCH, filtering out
 /// our own cookie.
 ///
@@ -64,17 +96,19 @@ fn parse_request_head(buf: &[u8]) -> Option<(String, Vec<(String, String)>)> {
 /// peer's listen port.
 pub fn process_packet(buf: &[u8], _from: SocketAddr, our_cookie: u32) -> Option<LsdAnnounce> {
     let (method, headers) = parse_request_head(buf)?;
+    // upstream's http_parser already lowercases the method
     if !method.eq_ignore_ascii_case("bt-search") {
         return None;
     }
     let port_str = headers.iter().find(|(k, _)| k == "port")?.1.clone();
-    let port: i64 = port_str.trim().parse().ok()?;
+    // `strtol` upstream — prefix parse, `port >= u16::MAX` rejected
+    let port = strtol_prefix(&port_str);
     if !(1..i64::from(u16::MAX)).contains(&port) {
         return None;
     }
-    // ignore our own announces (cookie match)
+    // ignore our own announces (cookie match — `strtoul` base 16)
     if let Some((_, c)) = headers.iter().find(|(k, _)| k == "cookie") {
-        if u32::from_str_radix(c, 16).ok() == Some(our_cookie) {
+        if strtoul_hex(c) == u64::from(our_cookie) {
             return None;
         }
     }
@@ -83,12 +117,15 @@ pub fn process_packet(buf: &[u8], _from: SocketAddr, our_cookie: u32) -> Option<
         if k != "infohash" {
             continue;
         }
-        // upstream `from_hex` — 40 hex chars (v1) or 64 (v2 →
-        // truncated to 20 bytes like `sha256_hash` truncation)
+        // upstream requires exactly 40 hex chars (v1 hashes) and
+        // skips all-zero hashes
+        if v.len() != 40 {
+            continue;
+        }
         if let Ok(h) = bitdaemon_common::hex::from_hex(v.as_bytes()) {
-            if h.len() == 20 || h.len() == 32 {
+            if h.len() == 20 && h.iter().any(|&b| b != 0) {
                 let mut ih = [0u8; 20];
-                ih.copy_from_slice(&h[..20]);
+                ih.copy_from_slice(&h);
                 info_hashes.push(ih);
             }
         }

@@ -18,7 +18,10 @@ pub enum HttpTrackerError {
     /// `errors::invalid_peers_entry`.
     #[error("invalid peers entry")]
     InvalidPeers,
-    /// `errors::invalid_files_entry` (scrape).
+    /// `errors::invalid_peer_dict` — a `peers` list entry that isn't
+    /// a dict (only fatal when *every* entry is invalid).
+    #[error("invalid peer dict")]
+    InvalidPeerDict,
     #[error("invalid files entry")]
     InvalidFiles,
     /// `errors::invalid_hash_entry` (scrape).
@@ -30,9 +33,12 @@ pub enum HttpTrackerError {
 }
 
 /// `extract_peer_info` input — one entry of a dict-style `peers` list.
+/// Upstream keeps the `ip` field verbatim — it may be a hostname the
+/// session resolves later, not necessarily a numeric IP.
 #[derive(Debug, Clone, Default)]
 pub struct DictPeer {
-    /// `peer id`.
+    /// `peer id` — only copied when exactly 20 bytes (upstream
+    /// zeroes it otherwise).
     pub peer_id: Option<Vec<u8>>,
     /// `ip` — dotted quad or hostname.
     pub ip: String,
@@ -67,23 +73,65 @@ pub struct TrackerResponse {
     pub peer_ids: Vec<Option<Vec<u8>>>,
     /// `resp.external_ip`.
     pub external_ip: Option<IpAddr>,
+    /// i2p destinations (`peers` as 32-byte entries when the request
+    /// was marked `i2p`).
+    pub i2p_peers: Vec<[u8; 32]>,
+    /// dict-style `peers` entries whose `ip` didn't parse as a
+    /// numeric address — upstream keeps them as `peer_entry.hostname`
+    /// for the session to resolve.
+    pub hostname_peers: Vec<DictPeer>,
 }
 
-/// Percent-escape like `aux::escape_string` (unreserved chars only).
+/// `aux::escape_string` — libtorrent's exact unreserved table
+/// (`-_!.~*()` + alnum, lowercase hex escapes).
 fn escape(s: &[u8]) -> String {
-    s.iter()
-        .map(|&b| {
-            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-                (b as char).to_string()
-            } else {
-                format!("%{b:02x}")
-            }
-        })
-        .collect()
+    String::from_utf8_lossy(&bitdaemon_core::escape_string::escape_string(s)).into_owned()
 }
 
-/// Build the announce query string — `tracker_request` → GET params.
-/// `bind_ip`/`trackerid` are optional.
+/// Session settings that gate optional announce params — the
+/// `settings_pack` conditions from `http_tracker_connection::start()`.
+#[derive(Debug, Clone)]
+pub struct AnnounceOptions {
+    /// `in_enc_policy != pe_disabled && announce_crypto_support`
+    /// → `&supportcrypto=1`.
+    pub supportcrypto: bool,
+    /// `report_redundant_bytes` → `&redundant=<bytes>`.
+    pub report_redundant: bool,
+    /// `anonymous_mode` — suppresses `&ip=`/announce-ip reporting.
+    pub anonymous_mode: bool,
+    /// `settings_pack::announce_ip` → `&ip=` (suppressed when
+    /// `anonymous_mode`).
+    pub announce_ip: Option<String>,
+    /// `ssrf_mitigation` — reject announce URLs whose baked-in query
+    /// already contains tracker arguments.
+    pub ssrf_mitigation: bool,
+    /// `min_announce_interval` — floor applied to the response
+    /// `interval` (`tracker_response::interval`).
+    pub min_announce_interval: i32,
+}
+
+impl Default for AnnounceOptions {
+    /// Upstream `settings_pack` defaults: `announce_crypto_support`
+    /// (with `in_enc_policy != pe_disabled`), `report_redundant_bytes`,
+    /// `ssrf_mitigation` are all on; `min_announce_interval` = 5 min.
+    fn default() -> Self {
+        Self {
+            supportcrypto: true,
+            report_redundant: true,
+            anonymous_mode: false,
+            announce_ip: None,
+            ssrf_mitigation: true,
+            min_announce_interval: 300,
+        }
+    }
+}
+
+/// Build the announce query string — the exact parameter order of
+/// `http_tracker_connection::start()`: `info_hash` then the
+/// `snprintf` block (`peer_id`…`no_peer_id`) then the conditional
+/// `supportcrypto`/`redundant`/`trackerid`/`ip`/`ipv4`/`ipv6` tails.
+/// `corrupt`, `numwant`, `compact=1`, `no_peer_id=1` are always
+/// emitted; `key` is `%08X` uppercase-hex.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn announce_query(
@@ -93,42 +141,55 @@ pub fn announce_query(
     uploaded: i64,
     downloaded: i64,
     left: i64,
+    corrupt: i64,
+    redundant: i64,
+    key: u32,
     event: i32,
     num_want: i32,
-    key: i32,
-    compact: bool,
-    no_peer_id: bool,
     tracker_id: Option<&[u8]>,
+    opts: &AnnounceOptions,
+    ipv4: &[Ipv4Addr],
+    ipv6: &[Ipv6Addr],
 ) -> String {
-    // upstream event names: 0 → no param, 1 completed, 2 started,
-    // 3 stopped (paused is client-internal)
-    const EVENTS: [&str; 4] = ["", "completed", "started", "stopped"];
+    // upstream event_t: 1 completed, 2 started, 3 stopped, 4 paused
+    const EVENTS: [&str; 4] = ["completed", "started", "stopped", "paused"];
     let mut q = format!(
-        "info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}",
+        "info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&corrupt={}&key={key:08X}",
         escape(info_hash),
         escape(peer_id),
         listen_port,
         uploaded,
         downloaded,
-        left
+        left,
+        corrupt,
     );
-    if compact {
-        q += "&compact=1";
+    if (1..=4).contains(&event) {
+        q += &format!("&event={}", EVENTS[event as usize - 1]);
     }
-    if no_peer_id {
-        q += "&no_peer_id=1";
+    q += &format!("&numwant={num_want}&compact=1&no_peer_id=1");
+    if opts.supportcrypto {
+        q += "&supportcrypto=1";
     }
-    q += &format!("&key={key:x}");
-    if (1..=3).contains(&event) {
-        q += &format!("&event={}", EVENTS[event as usize]);
-    }
-    if num_want >= 0 {
-        q += &format!("&numwant={num_want}");
+    if opts.report_redundant {
+        q += &format!("&redundant={redundant}");
     }
     if let Some(t) = tracker_id {
         if !t.is_empty() {
             q += &format!("&trackerid={}", escape(t));
         }
+    }
+    if !opts.anonymous_mode {
+        if let Some(ip) = &opts.announce_ip {
+            if !ip.is_empty() {
+                q += &format!("&ip={}", escape(ip.as_bytes()));
+            }
+        }
+    }
+    for v4 in ipv4 {
+        q += &format!("&ipv4={}", escape(v4.to_string().as_bytes()));
+    }
+    for v6 in ipv6 {
+        q += &format!("&ipv6={}", escape(v6.to_string().as_bytes()));
     }
     q
 }
@@ -152,22 +213,31 @@ fn parse_compact_peers(data: &[u8], stride: usize) -> Result<Vec<SocketAddr>, Ht
     Ok(out)
 }
 
-/// `extract_peer_info` — one dict-list peer entry.
-fn extract_peer(node: &BdecodeNode<'_>) -> Option<DictPeer> {
+/// `extract_peer_info` — one dict-list peer entry. `Err` carries the
+/// error upstream would set (`invalid_peer_dict` vs
+/// `invalid_tracker_response`); it's only fatal when *no* entry in
+/// the list parses.
+fn extract_peer(node: &BdecodeNode<'_>) -> Result<DictPeer, HttpTrackerError> {
     if node.node_type() != NodeType::Dict {
-        return None;
+        return Err(HttpTrackerError::InvalidPeerDict);
     }
+    // upstream copies pid only when exactly 20 bytes, else zeroes it
     let pid = node.dict_find_string(b"peer id");
-    let peer_id = (pid.node_type() == NodeType::String).then(|| pid.string_value().to_vec());
+    let peer_id = (pid.node_type() == NodeType::String && pid.string_value().len() == 20)
+        .then(|| pid.string_value().to_vec());
     let ip = node.dict_find_string(b"ip");
-    if ip.node_type() != NodeType::String || ip.string_value().is_empty() {
-        return None;
+    if ip.node_type() != NodeType::String {
+        return Err(HttpTrackerError::InvalidResponse);
     }
-    let port = node.dict_find_int_value(b"port", 0);
+    let port_node = node.dict_find_int(b"port");
+    if port_node.node_type() != NodeType::Int {
+        return Err(HttpTrackerError::InvalidResponse);
+    }
+    let port = port_node.int_value();
     if !(0..=65535).contains(&port) {
-        return None;
+        return Err(HttpTrackerError::InvalidResponse);
     }
-    Some(DictPeer {
+    Ok(DictPeer {
         peer_id,
         ip: String::from_utf8_lossy(ip.string_value()).into_owned(),
         port: port as u16,
@@ -176,11 +246,14 @@ fn extract_peer(node: &BdecodeNode<'_>) -> Option<DictPeer> {
 
 /// `on_response` — parse the bencoded tracker reply.
 ///
-/// `scrape` switches to the `files`/`info_hash` form.
+/// `scrape` switches to the `files`/`info_hash` form; `i2p` makes
+/// `peers` a list of 32-byte destinations instead of compact v4
+/// (`tracker_request_flags_t::i2p`).
 pub fn parse_response(
     body: &[u8],
     scrape: bool,
     scrape_ih: Option<&[u8; 20]>,
+    i2p: bool,
 ) -> Result<TrackerResponse, HttpTrackerError> {
     let e = bdecode(body);
     if e.node_type() != NodeType::Dict {
@@ -233,18 +306,42 @@ pub fn parse_response(
     let peers_ent = e.dict_find(b"peers");
     match peers_ent.node_type() {
         NodeType::String => {
-            resp.peers = parse_compact_peers(peers_ent.string_value(), 6)?;
+            let data = peers_ent.string_value();
+            if i2p {
+                // 32-byte i2p destinations
+                if data.len() % 32 != 0 {
+                    return Err(HttpTrackerError::InvalidPeers);
+                }
+                for c in data.chunks_exact(32) {
+                    let mut d = [0u8; 32];
+                    d.copy_from_slice(c);
+                    resp.i2p_peers.push(d);
+                }
+            } else {
+                resp.peers = parse_compact_peers(data, 6)?;
+            }
         }
         NodeType::List => {
-            // dict-list form: resolve-able addresses aren't — keep ip
-            // strings in peer_ids-compatible shape; only parseable
-            // numeric IPs become SocketAddrs.
+            // dict-list form. `ip` may be a hostname — upstream stores
+            // it verbatim (`peer_entry.hostname`) for later resolve;
+            // only a fully-invalid list fails the response.
+            let mut parse_error = None;
             for i in 0..peers_ent.list_size() {
-                if let Some(p) = extract_peer(&peers_ent.list_at(i)) {
-                    if let Ok(ip) = p.ip.parse::<IpAddr>() {
-                        resp.peer_ids.push(p.peer_id);
-                        resp.peers.push(SocketAddr::new(ip, p.port));
+                match extract_peer(&peers_ent.list_at(i)) {
+                    Ok(p) => {
+                        if let Ok(ip) = p.ip.parse::<IpAddr>() {
+                            resp.peer_ids.push(p.peer_id.clone());
+                            resp.peers.push(SocketAddr::new(ip, p.port));
+                        } else {
+                            resp.hostname_peers.push(p);
+                        }
                     }
+                    Err(e) => parse_error = Some(e),
+                }
+            }
+            if resp.peers.is_empty() && resp.hostname_peers.is_empty() {
+                if let Some(e) = parse_error {
+                    return Err(e);
                 }
             }
         }
@@ -273,11 +370,12 @@ pub fn parse_response(
     Ok(resp)
 }
 
-/// `http_tracker_connection` scrape URL — replace "announce" with
-/// "scrape" (`errors::scrape_not_available` upstream → `None`).
+/// `http_tracker_connection` scrape URL — replace the **first**
+/// "announce" with "scrape" (`str.find` upstream —
+/// `errors::scrape_not_available` → `None`).
 #[must_use]
 pub fn scrape_url(url: &str) -> Option<String> {
-    let pos = url.rfind("announce")?;
+    let pos = url.find("announce")?;
     let mut s = url.to_string();
     s.replace_range(pos..pos + 8, "scrape");
     Some(s)

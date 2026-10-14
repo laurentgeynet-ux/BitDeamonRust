@@ -430,6 +430,7 @@ async fn main() -> anyhow::Result<()> {
             proxy_peer_connections: true,
             proxy_tracker_connections: true,
             proxy_hostnames: true,
+            send_host_in_connect: false,
         };
         if ps.username.is_empty() {
             ps.proxy_type = bitdaemon::net::proxy::ProxyType::Socks5;
@@ -667,7 +668,12 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
             for (ih, t) in &guard.torrents {
-                let st = t.status(&guard.settings, guard.queue_position(ih));
+                let st = t.status(
+                    &guard.settings,
+                    guard.queue_position(ih),
+                    bitdaemon::session::status::StatusFlags::ALL,
+                    &guard.peer_class_pool,
+                );
                 let err = if t.last_error.is_empty() {
                     String::new()
                 } else {
@@ -731,7 +737,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let guard = slock(&eng.session);
         for (ih, t) in &guard.torrents {
-            let buf = t.write_resume_data();
+            let buf = t.write_resume_data(&guard.peer_class_pool);
             if buf.is_empty() {
                 continue;
             }

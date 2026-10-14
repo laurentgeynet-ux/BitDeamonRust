@@ -94,7 +94,7 @@ impl_filter_addr_bytes!([u8; 16], 16);
 
 /// `aux::filter_impl<Addr>` — sorted non-overlapping ranges; each
 /// entry's end is the next entry's start.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct FilterImpl<A: FilterAddr> {
     /// `m_access_list` — start → access flags.
     access_list: BTreeMap<A, u32>,
@@ -197,12 +197,18 @@ impl<A: FilterAddr> FilterImpl<A> {
             Some(jk) => jk.minus_one() != last,
             None => last != A::max_addr(),
         };
+        // upstream reassigns `j` to the inserted tail element, so the
+        // final merge-erase below can only drop the original `j` when
+        // no tail was inserted
+        let mut j_key = j;
         if need_tail && last_access != flags {
-            self.access_list.insert(last.plus_one(), last_access);
+            let tail = last.plus_one();
+            self.access_list.insert(tail, last_access);
+            j_key = Some(tail);
         }
 
         // j got absorbed into the new range when its flags match
-        if let Some(jk) = j {
+        if let Some(jk) = j_key {
             if self.access_list.get(&jk) == Some(&flags) {
                 self.access_list.remove(&jk);
             }
@@ -242,7 +248,7 @@ impl<A: FilterAddr> FilterImpl<A> {
 }
 
 /// `ip_filter` — IPv4 + IPv6 filter.
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct IpFilter {
     f4: FilterImpl<[u8; 4]>,
     f6: FilterImpl<[u8; 16]>,
@@ -305,7 +311,7 @@ impl IpFilter {
 }
 
 /// `port_filter`.
-#[derive(Default, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct PortFilter {
     f: FilterImpl<u16>,
 }

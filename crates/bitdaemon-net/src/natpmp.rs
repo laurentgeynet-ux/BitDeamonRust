@@ -36,6 +36,9 @@ pub enum PortmapAction {
     Delete,
 }
 
+/// `opcode_map` — PCP MAP opcode (RFC 6887 §19.2).
+const PCP_OPCODE_MAP: u8 = 1;
+
 /// Parsed mapping response (`on_reply` result).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NatPmpResponse {
@@ -53,7 +56,15 @@ pub enum NatPmpResponse {
         lifetime: u32,
         /// result code (0 = success).
         result: u16,
+        /// PCP nonce echo (12 bytes) — the caller matches it against
+        /// the outstanding request like upstream's mapping table.
+        nonce: Option<[u8; 12]>,
+        /// PCP-assigned external address (`unspecified` for NAT-PMP).
+        external_address: Option<std::net::IpAddr>,
     },
+    /// `pcp_unsupp_version` — upstream falls back to NAT-PMP when
+    /// the socket isn't v6; the caller should resend as NAT-PMP.
+    UnsupportedVersion,
 }
 
 /// `send_map_request` — NAT-PMP mapping datagram (12 bytes:
@@ -77,47 +88,158 @@ pub fn build_map_request(
     out
 }
 
+/// `send_map_request` PCP variant — 60-byte MAP request
+/// (`[v=2][opcode_map][rsv][ttl][local-v6 16][nonce 12][proto]
+/// [rsv 3][priv][pub][external-v6 16]`). `local_addr`/`external_addr`
+/// select the v4-mapped encoding like upstream; `external_addr` of
+/// `None` follows upstream's `is_local`/same-addr fallbacks.
+#[must_use]
+pub fn build_pcp_map_request(
+    protocol: PortmapProtocol,
+    local_port: u16,
+    external_port: u16,
+    ttl: u32,
+    local_addr: std::net::IpAddr,
+    external_addr: Option<std::net::IpAddr>,
+    nonce: &[u8; 12],
+) -> [u8; 60] {
+    use std::net::IpAddr;
+    let to_v6 = |a: IpAddr| -> std::net::Ipv6Addr {
+        match a {
+            IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+            IpAddr::V6(v6) => v6,
+        }
+    };
+    let mut out = [0u8; 60];
+    out[0] = 2; // version_pcp
+    out[1] = PCP_OPCODE_MAP;
+    out[4..8].copy_from_slice(&ttl.to_be_bytes());
+    out[8..24].copy_from_slice(&to_v6(local_addr).octets());
+    out[24..36].copy_from_slice(nonce);
+    out[36] = match protocol {
+        PortmapProtocol::Tcp => 6,
+        PortmapProtocol::Udp => 17,
+    };
+    out[40..42].copy_from_slice(&local_port.to_be_bytes());
+    out[42..44].copy_from_slice(&external_port.to_be_bytes());
+    // upstream external-address selection
+    let ext = match external_addr {
+        Some(a) if !a.is_unspecified() => to_v6(a),
+        _ if crate::ip_helpers::is_local(&local_addr) => {
+            if local_addr.is_ipv4() {
+                std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped()
+            } else {
+                std::net::Ipv6Addr::UNSPECIFIED
+            }
+        }
+        _ => to_v6(local_addr),
+    };
+    out[44..60].copy_from_slice(&ext.octets());
+    out
+}
+
 /// `send_get_ip_address_request` — `[0][0]` (opcode 0 query).
 #[must_use]
 pub fn build_ip_request() -> [u8; 2] {
     [0, 0]
 }
 
-/// `on_reply` — parse a NAT-PMP response datagram.
+/// `on_reply` — parse a NAT-PMP/PCP response datagram.
 /// `None` on version/opcode/length mismatch (upstream drops).
+///
+/// Layouts (upstream `natpmp::on_reply`):
+/// - NAT-PMP: `[v=0][cmd][result u16][epoch u32][…]` — cmd 0x80 =
+///   public-IP (12 B min); cmd 0x81/0x82 = map reply (16 B exact).
+/// - PCP: `[v=2][cmd|0x80 masked][rsv u8][result u8][lifetime u32]
+///   [epoch u32][rsv 12][nonce 12][proto u8][rsv 3][priv][pub]
+///   [external-v6 16]` (60 B exact).
 #[must_use]
 pub fn parse_response(buf: &[u8]) -> Option<NatPmpResponse> {
-    if buf.len() < 4 || buf[0] != 0 {
+    if buf.len() < 4 {
         return None;
     }
-    let op = buf[1];
-    let result = u16::from_be_bytes([buf[2], buf[3]]);
-    if op == 0 {
-        // public-IP reply: [v][op][result u16][epoch u32][ip u32]
-        if buf.len() < 12 {
-            return None;
-        }
+    let version = buf[0];
+    if version != 0 && version != 2 {
+        return None;
+    }
+    let pcp = version == 2;
+    let op = if pcp { buf[1] & 0x7f } else { buf[1] };
+    // result field: u8 for PCP (after a reserved byte), u16 for NAT-PMP
+    let result = if pcp {
+        u16::from(buf[3])
+    } else {
+        u16::from_be_bytes([buf[2], buf[3]])
+    };
+    // `pcp_unsupp_version` → upstream falls back to NAT-PMP
+    if pcp && result == 1 {
+        return Some(NatPmpResponse::UnsupportedVersion);
+    }
+    if (!pcp && buf.len() < 12) || (pcp && buf.len() < 24) {
+        return None;
+    }
+    // PCP: lifetime precedes epoch; NAT-PMP: epoch at bytes 4..8
+    let pcp_lifetime = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+    if !pcp && op == 0x80 {
+        // public-IP reply — NAT-PMP only (`send_get_ip_address_request`)
         return Some(NatPmpResponse::PublicIp(Ipv4Addr::new(
             buf[8], buf[9], buf[10], buf[11],
         )));
     }
-    if (op == 1 || op == 2) && buf.len() >= 16 {
-        let private_port = u16::from_be_bytes([buf[8], buf[9]]);
-        let public_port = u16::from_be_bytes([buf[10], buf[11]]);
-        let lifetime = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
-        return Some(NatPmpResponse::Map {
-            protocol: if op == 1 {
+
+    // map replies must be the *exact* datagram size upstream requires
+    if buf.len() != if pcp { 60 } else { 16 } {
+        return None;
+    }
+
+    let (nonce, protocol, inx) = if pcp {
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&buf[24..36]);
+        let protocol = if buf[36] == 6 {
+            PortmapProtocol::Tcp
+        } else {
+            PortmapProtocol::Udp
+        };
+        (Some(nonce), protocol, 40)
+    } else {
+        // upstream: `cmd - 0x80 == 1` → udp, anything else → tcp
+        (
+            None,
+            if buf[1] == 0x81 {
                 PortmapProtocol::Udp
             } else {
                 PortmapProtocol::Tcp
             },
-            private_port,
-            public_port,
-            lifetime,
-            result,
-        });
-    }
-    None
+            8,
+        )
+    };
+    let private_port = u16::from_be_bytes([buf[inx], buf[inx + 1]]);
+    let public_port = u16::from_be_bytes([buf[inx + 2], buf[inx + 3]]);
+    let lifetime = if pcp {
+        pcp_lifetime
+    } else {
+        u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]])
+    };
+    let external_address = if pcp {
+        let mut o = [0u8; 16];
+        o.copy_from_slice(&buf[44..60]);
+        let v6 = std::net::Ipv6Addr::from(o);
+        Some(match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(v6),
+        })
+    } else {
+        None
+    };
+    Some(NatPmpResponse::Map {
+        protocol,
+        private_port,
+        public_port,
+        lifetime,
+        result,
+        nonce,
+        external_address,
+    })
 }
 
 /// `from_result_code` — human-readable result.

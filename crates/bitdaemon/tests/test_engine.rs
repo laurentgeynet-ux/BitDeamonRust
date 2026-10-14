@@ -55,7 +55,9 @@ async fn connect_and_receive_bitfield() {
 
     // scripted remote: handshake + bitfield(0,2) — keep the stream
     // alive after writes or the engine sees a disconnect.
-    let remote_pid = lock(&eng.session).peer_id; // any id works; reuse ours
+    // the remote's own pid — reusing the session pid trips the
+    // self-connection disconnect (upstream `is_self_connection`).
+    let remote_pid = bitdaemon_common::peer_id::generate_peer_id(b"-qB4470-");
     let mut boxed: BoxedPeerStream = Box::new(theirs);
     let hs = write_handshake(&ih, &remote_pid, false, false, false, false);
     boxed.write_all(&hs).await.unwrap();
@@ -94,7 +96,7 @@ async fn connect_pump_lists_candidates() {
     t.add_swarm_peer(
         ep(),
         bitdaemon_common::flags::PeerSourceFlags::TRACKER,
-        true,
+        &mut Vec::new(),
     );
     lock(&eng.session).add_torrent(t);
     let st = bitdaemon_net::peer_list::PeerListState::default();
@@ -118,7 +120,9 @@ async fn accept_inbound_handshake() {
         StorageIndex(0),
     ));
 
-    let pid = lock(&eng.session).peer_id;
+    // the remote presents its own pid — reusing ours trips the
+    // self-connection disconnect (upstream `is_self_connection`).
+    let pid = bitdaemon_common::peer_id::generate_peer_id(b"-UT3530-");
     let mut boxed: BoxedPeerStream = Box::new(theirs);
     let hs = write_handshake(&ih, &pid, false, false, false, false);
     let accept = eng.accept_stream(ep(), Box::new(mine));
@@ -162,7 +166,8 @@ async fn http_announce_via_resolver() {
     eng.set_resolver(Arc::new(MapResolver));
     eng.set_listen_port(6881);
     let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
-    t.add_tracker("http://tracker.example:6969/announce".into(), 0);
+    // `announce_entry::tracker_source::source_client`
+    t.add_tracker("http://tracker.example:6969/announce".into(), 0, 2);
     lock(&eng.session).add_torrent(t);
 
     // scripted HTTP tracker: read the GET, answer compact peers.
@@ -276,7 +281,9 @@ async fn dht_ping_round_trip() {
     eng.start_udp_pump();
 
     // a remote node pings our DHT
-    let from = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 51413);
+    // 8.x is routable — 9.x is in upstream's `dht_ignore_dark_internet`
+    // class-A list and would be dropped by `dht_tracker::incoming`.
+    let from = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 51413);
     let ping = b"d1:ad2:id20:aaaaaaaaaaaaaaaaaaaae1:q4:ping1:t2:aa1:y1:qe";
     dg.inbound_tx.send((from, ping.to_vec())).unwrap();
 
@@ -437,11 +444,12 @@ async fn natpmp_map_and_ip_vote() {
 
     // gateway answers the TCP map + public IP
     let mut map = [0u8; 16];
-    map[1] = 2; // tcp op
+    map[1] = 0x82; // tcp map response opcode (cmd 2 + 0x80)
     map[8..10].copy_from_slice(&6881u16.to_be_bytes());
     map[10..12].copy_from_slice(&44123u16.to_be_bytes());
     map[12..16].copy_from_slice(&7200u32.to_be_bytes());
     let mut ipq = [0u8; 12];
+    ipq[1] = 0x80; // public-address response opcode (cmd 0 + 0x80)
     ipq[8..12].copy_from_slice(&[203, 0, 113, 42]);
     eng.start_udp_pump();
     dg.inbound_tx.send((gw, map.to_vec())).unwrap();
@@ -499,6 +507,11 @@ async fn upnp_map_cycle() {
         bitdaemon_net::upnp::RootDevice {
             control_url: "http://192.168.0.1:49152/ctl/IPConn".into(),
             service_namespace: "urn:schemas-upnp-org:service:WANIPConnection:1".into(),
+            // post-`resolve_control_url` fields (upstream fills them
+            // in `on_upnp_xml` before the device goes live)
+            hostname: "192.168.0.1".into(),
+            port: 49152,
+            path: "/ctl/IPConn".into(),
             ..Default::default()
         },
         6881,
@@ -549,10 +562,16 @@ async fn per_torrent_rate_limiters() {
     let ih = Sha1Hash::from_bytes(&[6; 20]).unwrap();
     let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(None)));
     let mut eng = Engine::new(conn, None);
-    let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
-    t.set_upload_limit(10);
-    t.set_download_limit(20);
+    let t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
     lock(&eng.session).add_torrent(t);
+    // torrent limits live on the session's peer-class pool — the
+    // same pool `TorrentHandle::set_upload_limit` reaches.
+    {
+        let s = &mut *lock(&eng.session);
+        let t = s.torrents.get_mut(&ih).unwrap();
+        t.set_upload_limit(10, &mut s.peer_class_pool);
+        t.set_download_limit(20, &mut s.peer_class_pool);
+    }
 
     let _ = eng.tick(std::time::Instant::now()).await;
     let ul = eng.torrent_up_limiters.get(&ih).unwrap().clone();

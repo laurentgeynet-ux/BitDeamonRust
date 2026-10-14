@@ -44,9 +44,22 @@ pub enum I2pError {
     /// `RESULT=DUPLICATED_ID`.
     #[error("duplicated id")]
     DuplicatedId,
+    /// command too long for the 1024-byte `format_command` buffer
+    /// (`asio::error::message_size` upstream).
+    #[error("SAM command too long")]
+    MessageSize,
     /// unknown `RESULT` (`num_errors` upstream).
     #[error("unknown error")]
     Unknown,
+}
+
+/// `format_command` — upstream writes commands into a fixed
+/// 1024-byte buffer and fails with `message_size` on overflow.
+fn format_command(cmd: String) -> Result<Vec<u8>, I2pError> {
+    if cmd.len() >= 1024 {
+        return Err(I2pError::MessageSize);
+    }
+    Ok(cmd.into_bytes())
 }
 
 /// `i2p_session_options` — SESSION CREATE tunnel params.
@@ -131,13 +144,23 @@ async fn read_line(s: &mut BoxedPeerStream) -> Result<String, I2pError> {
     String::from_utf8(line).map_err(|_| I2pError::ParseFailed)
 }
 
+/// `aux::split_string` — first-`sep` split; the separator is
+/// consumed and no trimming happens (a `NAME` preceded by stray
+/// spaces never matches upstream either).
+fn split_at(s: &str, sep: char) -> (&str, &str) {
+    match s.find(sep) {
+        Some(i) => (&s[..i], &s[i + sep.len_utf8()..]),
+        None => (s, ""),
+    }
+}
+
 /// `read_line` tail — token check + `key=value` loop (quoted values
 /// supported, verbatim upstream).
 fn parse_reply(line: &str, expect: Expect) -> Result<SamReply, I2pError> {
     let (t1, t2) = expect.tokens();
-    let mut parts = line.splitn(3, ' ');
-    let first = parts.next().unwrap_or("");
-    let second = parts.next().unwrap_or("");
+    let (first, mut remaining) = split_at(line, ' ');
+    let (second, r2) = split_at(remaining, ' ');
+    remaining = r2;
     if first != t1 || second != t2 {
         return Err(I2pError::ParseFailed);
     }
@@ -145,25 +168,22 @@ fn parse_reply(line: &str, expect: Expect) -> Result<SamReply, I2pError> {
         result: None,
         destination: String::new(),
     };
-    let mut remaining = parts.next().unwrap_or("");
-    while !remaining.is_empty() {
-        let eq = match remaining.find('=') {
-            Some(e) => e,
-            None => break,
-        };
-        let name = &remaining[..eq];
-        remaining = &remaining[eq + 1..];
+    loop {
+        let (name, r) = split_at(remaining, '=');
+        remaining = r;
+        if name.is_empty() {
+            break;
+        }
         let value;
         if let Some(stripped) = remaining.strip_prefix('"') {
-            let end = stripped.find('"').unwrap_or(stripped.len());
-            value = &stripped[..end];
-            remaining = stripped.get(end + 1..).unwrap_or("");
+            let (v, r) = split_at(stripped, '"');
+            value = v;
+            remaining = r;
         } else {
-            let end = remaining.find(' ').unwrap_or(remaining.len());
-            value = &remaining[..end];
-            remaining = &remaining[end.min(remaining.len())..];
+            let (v, r) = split_at(remaining, ' ');
+            value = v;
+            remaining = r;
         }
-        remaining = remaining.trim_start_matches(' ');
         match name {
             "RESULT" => {
                 reply.result = match value {
@@ -203,19 +223,16 @@ pub async fn i2p_session_create(
     opts: &I2pSessionOptions,
 ) -> Result<String, I2pError> {
     sam_hello(s).await?;
-    s.write_all(
-        format!(
-            "SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION=TRANSIENT SIGNATURE_TYPE=7 i2cp.leaseSetEncType=4,0 inbound.quantity={iq} outbound.quantity={oq} inbound.length={il} outbound.length={ol} inbound.lengthVariance={ilv} outbound.lengthVariance={olv}\n",
-            iq = opts.inbound_quantity,
-            oq = opts.outbound_quantity,
-            il = opts.inbound_length,
-            ol = opts.outbound_length,
-            ilv = opts.inbound_length_variance,
-            olv = opts.outbound_length_variance,
-        )
-        .as_bytes(),
-    )
-    .await?;
+    let cmd = format_command(format!(
+        "SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION=TRANSIENT SIGNATURE_TYPE=7 i2cp.leaseSetEncType=4,0 inbound.quantity={iq} outbound.quantity={oq} inbound.length={il} outbound.length={ol} inbound.lengthVariance={ilv} outbound.lengthVariance={olv}\n",
+        iq = opts.inbound_quantity,
+        oq = opts.outbound_quantity,
+        il = opts.inbound_length,
+        ol = opts.outbound_length,
+        ilv = opts.inbound_length_variance,
+        olv = opts.outbound_length_variance,
+    ))?;
+    s.write_all(&cmd).await?;
     let r = parse_reply(&read_line(s).await?, Expect::Session)?;
     match r.result {
         None => Ok(r.destination),
@@ -231,8 +248,10 @@ pub async fn i2p_connect(
     destination: &str,
 ) -> Result<String, I2pError> {
     sam_hello(s).await?;
-    s.write_all(format!("STREAM CONNECT ID={session_id} DESTINATION={destination}\n").as_bytes())
-        .await?;
+    s.write_all(&format_command(format!(
+        "STREAM CONNECT ID={session_id} DESTINATION={destination}\n"
+    ))?)
+    .await?;
     let r = parse_reply(&read_line(s).await?, Expect::Stream)?;
     match r.result {
         None => Ok(r.destination),
@@ -245,7 +264,7 @@ pub async fn i2p_connect(
 /// (`cmd_incoming` upstream).
 pub async fn i2p_accept(s: &mut BoxedPeerStream, session_id: &str) -> Result<String, I2pError> {
     sam_hello(s).await?;
-    s.write_all(format!("STREAM ACCEPT ID={session_id}\n").as_bytes())
+    s.write_all(&format_command(format!("STREAM ACCEPT ID={session_id}\n"))?)
         .await?;
     let r = parse_reply(&read_line(s).await?, Expect::Stream)?;
     if let Some(e) = r.result {
@@ -254,11 +273,11 @@ pub async fn i2p_accept(s: &mut BoxedPeerStream, session_id: &str) -> Result<Str
     read_line(s).await
 }
 
-/// `send_name_lookup` — `NAMING LOOKUP` → the `.b32.i2p`/base64
-/// destination in `VALUE`.
+/// `send_name_lookup` — `NAMING LOOKUP` on an *already established*
+/// SAM socket (upstream reuses the session socket — no new HELLO).
+/// Returns the `.b32.i2p`/base64 destination in `VALUE`.
 pub async fn i2p_name_lookup(s: &mut BoxedPeerStream, name: &str) -> Result<String, I2pError> {
-    sam_hello(s).await?;
-    s.write_all(format!("NAMING LOOKUP NAME={name}\n").as_bytes())
+    s.write_all(&format_command(format!("NAMING LOOKUP NAME={name}\n"))?)
         .await?;
     let r = parse_reply(&read_line(s).await?, Expect::Naming)?;
     match r.result {
@@ -267,16 +286,24 @@ pub async fn i2p_name_lookup(s: &mut BoxedPeerStream, name: &str) -> Result<Stri
     }
 }
 
-/// `i2p_stream` as a `PeerConnector`/`PeerAcceptor`: each
-/// outbound dial is `STREAM CONNECT` on a fresh SAM control socket,
+/// standalone naming lookup on a fresh socket (`HELLO` then
+/// `NAMING LOOKUP`) — upstream only ever looks names up on the
+/// session socket; this exists for callers without a session.
+pub async fn i2p_name_lookup_fresh(
+    s: &mut BoxedPeerStream,
+    name: &str,
+) -> Result<String, I2pError> {
+    sam_hello(s).await?;
+    i2p_name_lookup(s, name).await
+}
+
+/// `i2p_stream`/`i2p_connection` as a `PeerConnector`/`PeerAcceptor`:
+/// each outbound dial is `STREAM CONNECT` on a fresh SAM socket,
 /// each accept `STREAM ACCEPT` likewise (upstream multiplexes per
-/// socket exactly this way). The SAM bridge itself is reached via
-/// `sam_connector` — typically plain TCP to 127.0.0.1:7656.
-///
-/// The session (`SESSION CREATE`) is owned by the caller:
-/// [`I2pConnector::open_session`] runs it once and returns our
-/// destination; the returned connector uses that `session_id` for
-/// every connect/accept.
+/// socket exactly this way). Name lookups go over the **persistent
+/// session socket** like upstream's `i2p_connection` (no new HELLO).
+/// The SAM bridge itself is reached via `sam_connector` — typically
+/// plain TCP to 127.0.0.1:7656.
 #[derive(Debug)]
 pub struct I2pConnector {
     /// connector used to reach the SAM bridge.
@@ -285,13 +312,19 @@ pub struct I2pConnector {
     sam_addr: std::net::SocketAddr,
     /// `ID=` of our STREAM session.
     session_id: String,
+    /// `m_sam_socket` — the persistent session socket, kept open for
+    /// `NAMING LOOKUP` (upstream `i2p_connection` never re-HELLOs).
+    session_socket: std::sync::Arc<tokio::sync::Mutex<Option<BoxedPeerStream>>>,
+    /// `m_i2p_local_endpoint` — our destination (`NAMING LOOKUP ME`).
+    local_endpoint: String,
 }
 
 /// alias — the trait-object connector to the SAM bridge.
 pub(crate) type PeerConnectorDyn = dyn crate::transport::PeerConnector;
 
 impl I2pConnector {
-    /// connector bound to an existing `session_id`.
+    /// connector bound to an existing `session_id` — no persistent
+    /// session socket (name lookups will dial fresh SAM sockets).
     pub fn new(
         sam: std::sync::Arc<PeerConnectorDyn>,
         sam_addr: std::net::SocketAddr,
@@ -301,11 +334,15 @@ impl I2pConnector {
             sam,
             sam_addr,
             session_id,
+            session_socket: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            local_endpoint: String::new(),
         }
     }
 
-    /// `SESSION CREATE` — open our STREAM session on the bridge and
-    /// return `(connector, our_destination)`.
+    /// `i2p_connection::open` + `on_sam_connect` — open the STREAM
+    /// session, keep the SAM socket for naming lookups, and resolve
+    /// our own destination (`NAMING LOOKUP NAME=ME`, upstream's
+    /// `set_local_endpoint`). Returns `(connector, local_endpoint)`.
     pub async fn open_session(
         sam: std::sync::Arc<PeerConnectorDyn>,
         sam_addr: std::net::SocketAddr,
@@ -317,15 +354,42 @@ impl I2pConnector {
             .connect(sam_addr)
             .await
             .map_err(|e| I2pError::Io(std::io::Error::other(e.to_string())))?;
-        let dest = i2p_session_create(&mut s, &session_id, &opts).await?;
+        let _session_dest = i2p_session_create(&mut s, &session_id, &opts).await?;
+        let local = i2p_name_lookup(&mut s, "ME").await?;
         Ok((
             Self {
                 sam,
                 sam_addr,
                 session_id,
+                session_socket: std::sync::Arc::new(tokio::sync::Mutex::new(Some(s))),
+                local_endpoint: local.clone(),
             },
-            dest,
+            local,
         ))
+    }
+
+    /// `async_name_lookup` — resolve `name` to a destination over
+    /// the persistent session socket (fresh socket + HELLO fallback
+    /// when it was closed).
+    pub async fn name_lookup(&self, name: &str) -> Result<String, I2pError> {
+        let mut guard = self.session_socket.lock().await;
+        if let Some(s) = guard.as_mut() {
+            return i2p_name_lookup(s, name).await;
+        }
+        drop(guard);
+        let mut s = self.dial_sam().await?;
+        i2p_name_lookup_fresh(&mut s, name).await
+    }
+
+    /// `is_open` — true while the session socket exists.
+    pub async fn is_open(&self) -> bool {
+        self.session_socket.lock().await.is_some()
+    }
+
+    /// `m_i2p_local_endpoint`.
+    #[must_use]
+    pub fn local_endpoint(&self) -> &str {
+        &self.local_endpoint
     }
 
     /// our session id.
@@ -370,17 +434,15 @@ impl crate::transport::PeerConnector for I2pConnector {
         Box::pin(async move {
             let me = self.clone();
             tokio::spawn(async move {
-                // `NAMING LOOKUP` runs on its own SAM socket — each
-                // command does a fresh HELLO upstream.
-                let destination = if dest.contains('=') || dest.len() > 60 {
-                    dest
-                } else {
-                    let mut ns = me.dial_sam().await.map_err(|e| {
-                        crate::NetError::Transport(std::io::Error::other(e.to_string()))
-                    })?;
-                    i2p_name_lookup(&mut ns, &dest).await.map_err(|e| {
+                // upstream only resolves names ending in `.i2p`
+                // (`torrent::connect_to_peer`); anything else IS the
+                // base64/b32 destination string verbatim.
+                let destination = if dest.ends_with(".i2p") {
+                    me.name_lookup(&dest).await.map_err(|e| {
                         crate::NetError::Transport(std::io::Error::other(e.to_string()))
                     })?
+                } else {
+                    dest
                 };
                 let mut s = me.dial_sam().await.map_err(|e| {
                     crate::NetError::Transport(std::io::Error::other(e.to_string()))

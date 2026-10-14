@@ -16,17 +16,18 @@ bitdaemon_common::bitfield_flag! {
 }
 
 impl IpSourceFlags {
-    /// `source_dht`.
-    pub const SOURCE_DHT: Self = Self::bit(0);
-    /// `source_peer`.
-    pub const SOURCE_PEER: Self = Self::bit(1);
-    /// `source_tracker`.
-    pub const SOURCE_TRACKER: Self = Self::bit(2);
-    /// `source_router`.
-    pub const SOURCE_ROUTER: Self = Self::bit(3);
+    /// `source_dht` — upstream `1_bit`.
+    pub const SOURCE_DHT: Self = Self::bit(1);
+    /// `source_peer` — upstream `2_bit`.
+    pub const SOURCE_PEER: Self = Self::bit(2);
+    /// `source_tracker` — upstream `3_bit`.
+    pub const SOURCE_TRACKER: Self = Self::bit(3);
+    /// `source_router` — upstream `4_bit`.
+    pub const SOURCE_ROUTER: Self = Self::bit(4);
 }
 
-struct ExternalIp {
+/// `external_ip_t` — per-candidate state.
+struct ExternalIpEntry {
     addr: IpAddr,
     /// who voted for this (bloom filter of voter keys)
     voters: BloomFilter<16>,
@@ -35,7 +36,16 @@ struct ExternalIp {
     num_votes: u16,
 }
 
-impl ExternalIp {
+/// Upstream `external_ip_t::operator<` sorts *descending* — more votes
+/// first, ties broken toward the higher `sources` bitmask (more
+/// reliable reporters win).
+fn upstream_order(a: &ExternalIpEntry, b: &ExternalIpEntry) -> std::cmp::Ordering {
+    b.num_votes
+        .cmp(&a.num_votes)
+        .then(b.sources.bits().cmp(&a.sources.bits()))
+}
+
+impl ExternalIpEntry {
     /// `add_vote` — false when this voter already voted.
     fn add_vote(&mut self, k: &bitdaemon_common::hash::Sha1Hash, t: IpSourceFlags) -> bool {
         self.sources |= t;
@@ -50,7 +60,7 @@ impl ExternalIp {
 
 /// `ip_voter` — majority-vote external IP.
 pub struct IpVoter {
-    m_external_addresses: Vec<ExternalIp>,
+    m_external_addresses: Vec<ExternalIpEntry>,
     m_external_address_voters: BloomFilter<32>,
     m_external_address: Option<IpAddr>,
     m_total_votes: i32,
@@ -110,11 +120,13 @@ impl IpVoter {
                     if random(1) != 0 {
                         return self.maybe_rotate();
                     }
-                    // stable sort ascending → evict lowest-vote/oldest
-                    self.m_external_addresses.sort_by_key(|e| e.num_votes);
+                    // upstream stable-sorts with the descending
+                    // comparator and erases the last element — the
+                    // entry with the fewest votes (newest on ties)
+                    self.m_external_addresses.sort_by(upstream_order);
                     self.m_external_addresses.pop();
                 }
-                self.m_external_addresses.push(ExternalIp {
+                self.m_external_addresses.push(ExternalIpEntry {
                     addr: ip,
                     voters: BloomFilter::new(),
                     sources: IpSourceFlags::default(),
@@ -134,14 +146,14 @@ impl IpVoter {
             return self.maybe_rotate();
         }
 
-        let (min_idx, min_votes_addr) = self
+        // upstream `min_element` under the descending comparator —
+        // the leading candidate (most votes, then most reliable
+        // sources; first on full ties)
+        let min_votes_addr = self
             .m_external_addresses
             .iter()
-            .enumerate()
-            .max_by_key(|(_, e)| e.num_votes) // upstream min_element with operator< on num_votes → max here
-            .map(|(i, e)| (i, e.addr))
-            .unwrap_or((idx, ip));
-        let _ = min_idx;
+            .min_by(|a, b| upstream_order(a, b))
+            .map_or(ip, |e| e.addr);
         if Some(min_votes_addr) == self.m_external_address {
             return self.maybe_rotate();
         }
@@ -170,8 +182,10 @@ impl IpVoter {
                 return false;
             }
         } else {
+            // upstream `partial_sort(begin, begin + 2, end)` — the two
+            // leading candidates under the descending comparator
             self.m_external_addresses
-                .select_nth_unstable_by(1, |a, b| b.num_votes.cmp(&a.num_votes));
+                .select_nth_unstable_by(1, upstream_order);
             if self.m_external_addresses[0].num_votes * 2 / 3
                 <= self.m_external_addresses[1].num_votes
             {
@@ -187,5 +201,57 @@ impl IpVoter {
         self.m_last_rotate = now;
         self.m_valid_external = true;
         ret
+    }
+}
+
+/// `external_ip` — one address per (local|global) × (v4|v6) cell, as
+/// observed by a peer at `ip`. `[0][n]` = global, `[1][n]` = local,
+/// `[n][0]` = IPv4, `[n][1]` = IPv6.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalIp {
+    addrs: [[IpAddr; 2]; 2],
+}
+
+impl Default for ExternalIp {
+    fn default() -> Self {
+        Self {
+            addrs: [
+                [
+                    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                ],
+                [
+                    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                ],
+            ],
+        }
+    }
+}
+
+impl ExternalIp {
+    /// `external_ip(local4, global4, local6, global6)` — a v4
+    /// `unspecified` in the v6 slots maps to v6 `unspecified`
+    /// (`ensure_v6`).
+    #[must_use]
+    pub fn new(local4: IpAddr, global4: IpAddr, local6: IpAddr, global6: IpAddr) -> Self {
+        Self {
+            addrs: [
+                [global4, crate::ip_helpers::ensure_v6(global6)],
+                [local4, crate::ip_helpers::ensure_v6(local6)],
+            ],
+        }
+    }
+
+    /// `external_address(ip)` — the external IP as observed from `ip`.
+    /// A v6 query answered by an unspecified v4 maps to unspecified v6.
+    #[must_use]
+    pub fn external_address(&self, ip: &IpAddr) -> IpAddr {
+        let ext =
+            self.addrs[usize::from(crate::ip_helpers::is_local(ip))][usize::from(ip.is_ipv6())];
+        if ip.is_ipv6() && ext == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) {
+            return IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+        }
+        ext
     }
 }

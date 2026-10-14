@@ -254,20 +254,21 @@ pub fn parse_comma_separated_string_port(input: &str) -> Vec<(String, i32)> {
             let colon = start + colon;
             if colon > start {
                 let port_part = strip_string(&bytes[colon + 1..end]);
-                if let Ok(port_str) = std::str::from_utf8(port_part) {
-                    if let Ok(port) = port_str.parse::<i32>() {
-                        let mut soft_end = colon;
-                        while soft_end > start && is_space(bytes[soft_end - 1]) {
-                            soft_end -= 1;
-                        }
-                        if bytes[start] == b'[' {
-                            start += 1;
-                        }
-                        if soft_end > start && bytes[soft_end - 1] == b']' {
-                            soft_end -= 1;
-                        }
-                        out.push((input[start..soft_end].to_string(), port));
+                // upstream `parse_decimal` accepts a digit prefix
+                if let Some(port) = bitdaemon_core::escape_string::parse_decimal(port_part)
+                    .and_then(|p| i32::try_from(p).ok())
+                {
+                    let mut soft_end = colon;
+                    while soft_end > start && is_space(bytes[soft_end - 1]) {
+                        soft_end -= 1;
                     }
+                    if bytes[start] == b'[' {
+                        start += 1;
+                    }
+                    if soft_end > start && bytes[soft_end - 1] == b']' {
+                        soft_end -= 1;
+                    }
+                    out.push((input[start..soft_end].to_string(), port));
                 }
             }
         }
@@ -294,9 +295,8 @@ pub fn parse_comma_separated_string(input: &str) -> Vec<String> {
         while soft_end > start && is_space(bytes[soft_end - 1]) {
             soft_end -= 1;
         }
-        if start < soft_end {
-            out.push(input[start..soft_end].to_string());
-        }
+        // upstream pushes unconditionally — empty elements are kept
+        out.push(input[start..soft_end].to_string());
         start = end + 1;
     }
     out

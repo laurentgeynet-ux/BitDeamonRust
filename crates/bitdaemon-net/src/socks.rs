@@ -33,9 +33,18 @@ pub enum SocksError {
     /// `general_failure` / mapped response codes.
     #[error("SOCKS proxy failure: {0}")]
     ProxyFailure(#[source] std::io::Error),
-    /// `no_identd` / `identd_error` (SOCKS4).
-    #[error("SOCKS4 identd failure: {0}")]
-    Identd(u8),
+    /// `command_not_supported` (SOCKS5 reply 7).
+    #[error("SOCKS command not supported")]
+    CommandNotSupported,
+    /// `general_failure` — upstream's catch-all reply error.
+    #[error("SOCKS general failure")]
+    GeneralFailure,
+    /// `no_identd` (SOCKS4 reply 92).
+    #[error("SOCKS4 no identd running")]
+    NoIdentd,
+    /// `identd_error` (SOCKS4 reply 93).
+    #[error("SOCKS4 identd error")]
+    IdentdError,
     /// transport I/O.
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
@@ -184,19 +193,35 @@ async fn socks5<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(SocksError::UnsupportedVersion);
     }
     if hdr[1] != 0 {
-        let e = match hdr[1] {
-            2 => std::io::ErrorKind::PermissionDenied,
-            3 => std::io::ErrorKind::AddrNotAvailable,
-            4 => std::io::ErrorKind::HostUnreachable,
-            5 => std::io::ErrorKind::ConnectionRefused,
-            6 => std::io::ErrorKind::TimedOut,
-            8 => std::io::ErrorKind::InvalidInput,
-            _ => std::io::ErrorKind::Other,
-        };
-        return Err(SocksError::ProxyFailure(std::io::Error::new(
-            e,
-            format!("SOCKS5 reply {}", hdr[1]),
-        )));
+        // upstream `connect2` reply-code mapping
+        return Err(match hdr[1] {
+            2 => SocksError::ProxyFailure(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "SOCKS5 no permission",
+            )),
+            3 => SocksError::ProxyFailure(std::io::Error::new(
+                std::io::ErrorKind::NetworkUnreachable,
+                "SOCKS5 network unreachable",
+            )),
+            4 => SocksError::ProxyFailure(std::io::Error::new(
+                std::io::ErrorKind::HostUnreachable,
+                "SOCKS5 host unreachable",
+            )),
+            5 => SocksError::ProxyFailure(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "SOCKS5 connection refused",
+            )),
+            6 => SocksError::ProxyFailure(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "SOCKS5 timed out",
+            )),
+            7 => SocksError::CommandNotSupported,
+            8 => SocksError::ProxyFailure(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "SOCKS5 address family not supported",
+            )),
+            _ => SocksError::GeneralFailure,
+        });
     }
     // read the bound address (BND.ADDR/BND.PORT)
     let bound = match hdr[3] {
@@ -221,6 +246,11 @@ async fn socks5<S: AsyncRead + AsyncWrite + Unpin>(
         3 => {
             let mut l = [0u8; 1];
             stream.read_exact(&mut l).await?;
+            // upstream rejects a domain BND shorter than 3 chars
+            // (`host_len < 3` → general_failure)
+            if l[0] < 3 {
+                return Err(SocksError::GeneralFailure);
+            }
             let mut a = vec![0u8; usize::from(l[0]) + 2];
             stream.read_exact(&mut a).await?;
             // a domain BND isn't a numeric endpoint — leave the
@@ -260,8 +290,9 @@ async fn socks4<S: AsyncRead + AsyncWrite + Unpin>(
 
     let mut resp = [0u8; 8];
     stream.read_exact(&mut resp).await?;
+    // upstream `connect2`: a nonzero first byte is general_failure
     if resp[0] != 0 {
-        return Err(SocksError::UnsupportedVersion);
+        return Err(SocksError::GeneralFailure);
     }
     match resp[1] {
         90 => Ok(()),
@@ -269,10 +300,9 @@ async fn socks4<S: AsyncRead + AsyncWrite + Unpin>(
             std::io::ErrorKind::ConnectionRefused,
             "SOCKS4 request rejected",
         ))),
-        r @ (92 | 93) => Err(SocksError::Identd(r)),
-        _ => Err(SocksError::ProxyFailure(std::io::Error::other(
-            "SOCKS4 general failure",
-        ))),
+        92 => Err(SocksError::NoIdentd),
+        93 => Err(SocksError::IdentdError),
+        _ => Err(SocksError::GeneralFailure),
     }
 }
 

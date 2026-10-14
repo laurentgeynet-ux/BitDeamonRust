@@ -148,12 +148,15 @@ fn round_trip_all() {
             data: bytes::Bytes::from_static(b"li42e"),
         },
         PeerMessage::HashRequest(hr()),
+        // upstream `on_hashes` requires exactly `count +
+        // max(0, proof_layers - (merkle_num_layers(leafs(count))-1))`
+        // hashes: count=3 → leafs 4 → 2 layers → base depth 1;
+        // proof_layers=4 → 3 proofs → 3+3 = 6 hashes.
         PeerMessage::Hashes {
             req: hr(),
-            hashes: vec![
-                Sha256Hash::from_bytes(&[1u8; 32]).unwrap_or_default(),
-                Sha256Hash::from_bytes(&[2u8; 32]).unwrap_or_default(),
-            ],
+            hashes: (1u8..=6)
+                .map(|b| Sha256Hash::from_bytes(&[b; 32]).unwrap_or_default())
+                .collect(),
         },
         PeerMessage::HashReject(hr()),
     ];

@@ -7,6 +7,97 @@
 /// `flags_t::dont_parse_chunks`.
 pub const DONT_PARSE_CHUNKS: i32 = 1;
 
+/// `is_ok_status` — 200, 206 and any 3xx.
+#[must_use]
+pub fn is_ok_status(http_status: i32) -> bool {
+    http_status == 206 || http_status == 200 || (300..400).contains(&http_status)
+}
+
+/// `is_redirect`.
+#[must_use]
+pub fn is_redirect(http_status: i32) -> bool {
+    (300..400).contains(&http_status)
+}
+
+/// `read_until` — take bytes up to `delim`, then skip the whole
+/// delimiter run (upstream collapses consecutive separators).
+fn read_until<'a>(line: &'a [u8], pos: &mut usize, delim: u8) -> &'a [u8] {
+    let start = *pos;
+    while *pos < line.len() && line[*pos] != delim {
+        *pos += 1;
+    }
+    let end = *pos;
+    while *pos < line.len() && line[*pos] == delim {
+        *pos += 1;
+    }
+    &line[start..end]
+}
+
+/// `resolve_redirect_location` — resolve `location` against the
+/// `referrer` URL. Handles absolute URLs, network-path (`//h/p`),
+/// absolute paths, `?query`, `#fragment` and bare relative paths.
+#[must_use]
+pub fn resolve_redirect_location(referrer: &str, location: &str) -> String {
+    if location.is_empty() {
+        return referrer.to_string();
+    }
+
+    let network_path = location.len() > 1 && location.starts_with("//");
+    // a full URL is returned as-is
+    if !location.starts_with('/') && crate::parse_url::parse_url_components(location).is_ok() {
+        return location.to_string();
+    }
+
+    let mut url = referrer.to_string();
+    let Some(scheme_end) = url.find("://") else {
+        // the referrer is not a valid full URL
+        return location.to_string();
+    };
+
+    let authority_start = scheme_end + 3;
+    let path_end = url[authority_start..]
+        .find(['?', '#'])
+        .map_or(url.len(), |i| authority_start + i);
+
+    if network_path {
+        // keep only the referrer's scheme
+        url.truncate(scheme_end + 1);
+        url.push_str(location);
+    } else if location.starts_with('/') {
+        // absolute path — replace the path component of referrer
+        let path_start = url[authority_start..]
+            .find('/')
+            .map_or(usize::MAX, |i| authority_start + i);
+        url.truncate(path_start.min(path_end));
+        url.push_str(location);
+    } else if location.starts_with('?') {
+        // a query reference replaces query + fragment
+        url.truncate(path_end);
+        url.push_str(location);
+    } else if location.starts_with('#') {
+        // a fragment preserves path and query
+        if let Some(fragment) = url[authority_start..].find('#') {
+            url.truncate(authority_start + fragment);
+        }
+        url.push_str(location);
+    } else {
+        // relative path — strip query/fragment, cut the leaf and join
+        url.truncate(path_end);
+        let end = url.rfind('/');
+        // a '/' belonging to the scheme means there is none in the path
+        let end = end.filter(|&e| e > scheme_end + 2);
+        if let Some(e) = end {
+            url.truncate(e);
+        }
+        // neither side may carry the joining '/'
+        if !url.ends_with('/') {
+            url.push('/');
+        }
+        url.push_str(location);
+    }
+    url
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     ReadStatus,
@@ -221,15 +312,22 @@ impl HttpParser {
                 ret.1 += (newline + 1) - start_pos.min(newline + 1);
                 pos = newline + 1;
 
-                // split on spaces
-                let mut it = line.split(|&b| b == b' ');
-                let first = String::from_utf8_lossy(it.next().unwrap_or(b"")).to_string();
-                if first.starts_with("HTTP/") {
-                    self.m_protocol = first;
-                    let code_str = it.next().unwrap_or(b"");
-                    let code_s = String::from_utf8_lossy(code_str).to_string();
-                    match code_s.parse::<i32>() {
-                        Ok(c) if c >= 0 && !code_s.is_empty() => self.m_status_code = c,
+                // upstream `read_until` skips delimiter runs — repeated
+                // spaces collapse; the reason phrase is the rest of the
+                // line (read_until '\r' past the already-stripped end).
+                let mut p = 0usize;
+                let first = read_until(line, &mut p, b' ');
+                if first.starts_with(b"HTTP/") {
+                    self.m_protocol = String::from_utf8_lossy(first).to_string();
+                    let code_str = read_until(line, &mut p, b' ');
+                    // `from_chars` — optional '-', digits only, the
+                    // whole token consumed, result must be ≥ 0
+                    let digits = code_str.strip_prefix(b"-").unwrap_or(code_str);
+                    let code = (!digits.is_empty() && digits.iter().all(|b| b.is_ascii_digit()))
+                        .then(|| std::str::from_utf8(code_str).ok()?.parse::<i32>().ok())
+                        .flatten();
+                    match code {
+                        Some(c) if c >= 0 => self.m_status_code = c,
                         _ => {
                             self.state = State::Error;
                             *error = true;
@@ -237,16 +335,18 @@ impl HttpParser {
                         }
                     }
                     self.m_server_message =
-                        String::from_utf8_lossy(it.next().unwrap_or(b"")).to_string();
+                        String::from_utf8_lossy(read_until(line, &mut p, b'\r')).to_string();
                     if self.m_protocol == "HTTP/1.0" {
                         self.m_connection_close = true;
                     }
                 } else {
-                    self.m_method = first.to_ascii_lowercase();
+                    self.m_method = String::from_utf8_lossy(first).to_ascii_lowercase();
                     self.m_content_length = 0;
                     self.m_protocol.clear();
-                    self.m_path = String::from_utf8_lossy(it.next().unwrap_or(b"")).to_string();
-                    self.m_protocol = String::from_utf8_lossy(it.next().unwrap_or(b"")).to_string();
+                    self.m_path =
+                        String::from_utf8_lossy(read_until(line, &mut p, b' ')).to_string();
+                    self.m_protocol =
+                        String::from_utf8_lossy(read_until(line, &mut p, b' ')).to_string();
                     self.m_status_code = 0;
                 }
                 self.state = State::ReadHeader;
@@ -287,14 +387,15 @@ impl HttpParser {
                     self.m_header.push((name.clone(), value.clone()));
 
                     if name == "content-length" {
-                        match value.trim().parse::<i64>() {
-                            Ok(v) if (0..i64::MAX).contains(&v) => self.m_content_length = v,
-                            _ => {
-                                self.state = State::Error;
-                                *error = true;
-                                return ret;
-                            }
+                        // upstream `strtoll` — decimal prefix, garbage
+                        // parses as 0; only <0 or INT64_MAX is an error
+                        let v = strtoll(value.as_bytes()).map_or(0, |(v, _)| v);
+                        if v < 0 || v == i64::MAX {
+                            self.state = State::Error;
+                            *error = true;
+                            return ret;
                         }
+                        self.m_content_length = v;
                     } else if name == "connection" {
                         self.m_connection_close =
                             value.len() >= 5 && value[..5].eq_ignore_ascii_case("close");
@@ -446,8 +547,9 @@ impl HttpParser {
             return Some((size, header_size));
         }
 
-        // terminator chunk — read tail headers
-        let mut tail: Vec<(String, String)> = Vec::new();
+        // terminator chunk — read tail headers. Upstream collects them
+        // in a std::map: sorted by name, first occurrence wins.
+        let mut tail: std::collections::BTreeMap<String, String> = Default::default();
         let mut p = newline;
         loop {
             let nl = buf[p..].iter().position(|&b| b == b'\n').map(|i| p + i)?;
@@ -472,39 +574,59 @@ impl HttpParser {
             while vs < line.len() && (line[vs] == b' ' || line[vs] == b'\t') {
                 vs += 1;
             }
-            tail.push((name, String::from_utf8_lossy(&line[vs..]).to_string()));
+            tail.entry(name)
+                .or_insert_with(|| String::from_utf8_lossy(&line[vs..]).to_string());
         }
     }
 }
 
-/// Parse `start-end` for `content-range` (`strtoll` semantics:
-/// unparseable tail is an error).
-/// `strtoll` semantics — parse the leading decimal prefix.
-fn strtoll(s: &str) -> Option<(i64, usize)> {
-    let s = s.trim_start();
-    let mut end = 0;
-    for (i, c) in s.char_indices() {
-        if c.is_ascii_digit() || (i == 0 && (c == '+' || c == '-')) {
-            end = i + c.len_utf8();
-        } else {
-            break;
-        }
-    }
-    if end == 0 {
+/// `http_parser::header_duration` — `atol` ≥ 1 → seconds.
+#[must_use]
+pub fn header_duration(parser: &HttpParser, key: &str) -> Option<std::time::Duration> {
+    let v = parser.header(key)?;
+    let (secs, _) = strtoll(v.as_bytes())?;
+    if secs <= 0 {
         return None;
     }
-    s[..end].parse::<i64>().ok().map(|v| (v, end))
+    Some(std::time::Duration::from_secs(secs as u64))
 }
 
-/// Parse `start-end` for `content-range`.
+/// `strtoll` semantics — skip whitespace, optional `+`/`-` sign,
+/// leading decimal digits. `None` when no digits were consumed
+/// (upstream `end == ptr`), `Some((value, bytes_consumed))` otherwise.
+fn strtoll(s: &[u8]) -> Option<(i64, usize)> {
+    let mut i = 0;
+    while i < s.len() && crate::string_util::is_space(s[i]) {
+        i += 1;
+    }
+    let start = i;
+    if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
+        i += 1;
+    }
+    let dstart = i;
+    while i < s.len() && s[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == dstart {
+        return None;
+    }
+    std::str::from_utf8(&s[start..i])
+        .ok()?
+        .parse::<i64>()
+        .ok()
+        .map(|v| (v, i))
+}
+
+/// Parse `start-end` for `content-range` (`strtoll` prefix semantics:
+/// a bare `-` with no digits is `success = false` upstream).
 fn parse_range(v: &str) -> (bool, i64, i64) {
-    let v = v.trim();
+    let v = v.as_bytes();
     let (s, used) = match strtoll(v) {
         Some((s, u)) if (0..i64::MAX).contains(&s) => (s, u),
         _ => return (false, -1, -1),
     };
     let rest = &v[used..];
-    if !rest.starts_with('-') {
+    if !rest.starts_with(b"-") {
         return (false, -1, -1);
     }
     let (e, _) = match strtoll(&rest[1..]) {

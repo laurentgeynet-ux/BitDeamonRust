@@ -29,7 +29,7 @@ fn natpmp_parse_map_reply() {
             public_port,
             lifetime,
             result,
-            protocol: _,
+            ..
         }) => {
             assert_eq!(private_port, 1111);
             assert_eq!(public_port, 2222);
@@ -42,7 +42,8 @@ fn natpmp_parse_map_reply() {
 
 #[test]
 fn natpmp_parse_public_ip() {
-    let reply = [0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8];
+    // upstream requires cmd == 0x80 for a public-address reply
+    let reply = [0, 0x80, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8];
     assert_eq!(
         parse_response(&reply),
         Some(NatPmpResponse::PublicIp("8.8.8.8".parse().unwrap()))
@@ -94,6 +95,7 @@ async fn fetch_block_over_duplex() {
     });
 
     let req = WebSeedRequest {
+        base: "http://s.example".to_string(),
         request: "GET /file.bin HTTP/1.1\r\nHost: s.example\r\nRange: bytes=16-31\r\n\r\n"
             .to_string(),
         files: vec![FileRequest {

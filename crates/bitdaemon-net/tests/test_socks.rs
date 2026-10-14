@@ -205,7 +205,7 @@ async fn http_connect_rejected() {
 // ---------- bep10 (extended handshake) ----------
 
 use bitdaemon_net::bep10::ExtendedHandshake;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[test]
 fn bep10_roundtrip() {
@@ -426,27 +426,37 @@ fn announce_query_format() {
         0,
         500,
         1_000_000,
-        2, // started
+        3,      // corrupt
+        7,      // redundant
+        0x1234, // key — rendered %08X upstream
+        2,      // started
         50,
-        0x1234,
-        true,
-        true,
         Some(b"tid42"),
+        &AnnounceOptions::default(),
+        &[Ipv4Addr::new(1, 2, 3, 4)],
+        &[Ipv6Addr::LOCALHOST],
     );
     assert!(q.contains("port=6881"));
     assert!(q.contains("downloaded=500"));
     assert!(q.contains("left=1000000"));
+    assert!(q.contains("corrupt=3"));
     assert!(q.contains("event=started"));
     assert!(q.contains("numwant=50"));
-    assert!(q.contains("key=1234"));
+    // upstream `%08X` — uppercase, zero-padded
+    assert!(q.contains("key=00001234"));
     assert!(q.contains("compact=1"));
     assert!(q.contains("no_peer_id=1"));
+    // default opts: crypto + redundant reporting on
+    assert!(q.contains("supportcrypto=1"));
+    assert!(q.contains("redundant=7"));
     assert!(q.contains("trackerid=tid42"));
+    assert!(q.contains("ipv4=1.2.3.4"));
+    assert!(q.contains("ipv6=%3a%3a1"));
     assert!(q.contains("info_hash=%aa%aa%aa"));
 }
 
 fn dict_resp(body: &[u8]) -> TrackerResponse {
-    parse_response(body, false, None).unwrap()
+    parse_response(body, false, None, false).unwrap()
 }
 
 #[test]
@@ -475,7 +485,7 @@ fn response_dict_peers() {
 #[test]
 fn response_failure() {
     let body = b"d14:failure reason23:not authorized to announcee";
-    let err = parse_response(body, false, None).unwrap_err();
+    let err = parse_response(body, false, None, false).unwrap_err();
     assert!(matches!(err, HttpTrackerError::Failure(_)));
 }
 
@@ -484,7 +494,7 @@ fn response_scrape() {
     let mut body = b"d5:filesd20:".to_vec();
     body.extend([0xaa; 20]);
     body.extend(b"d8:completei9e10:downloadedi4e10:incompletei2eeee");
-    let r = parse_response(&body, true, Some(&[0xaa; 20])).unwrap();
+    let r = parse_response(&body, true, Some(&[0xaa; 20]), false).unwrap();
     assert_eq!(r.complete, 9);
     assert_eq!(r.downloaded, 4);
     assert_eq!(r.incomplete, 2);

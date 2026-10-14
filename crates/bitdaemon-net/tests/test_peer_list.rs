@@ -4,7 +4,7 @@
 
 //! `peer_list` — add/candidates/weeding/ban (`test_peer_list`-style).
 
-use bitdaemon_common::PeerSourceFlags;
+use bitdaemon_common::{PeerSourceFlags, PexFlags};
 use bitdaemon_net::peer_list::{PeerList, PeerListState, primary_source, source_rank};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -12,13 +12,21 @@ fn ep(a: u8, port: u16) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, a)), port)
 }
 
+fn add(l: &mut PeerList, e: SocketAddr, src: PeerSourceFlags) -> Option<(usize, bool)> {
+    l.add_peer(e, src, PexFlags::NONE, &PeerListState::default())
+}
+
 #[test]
 fn add_and_source() {
     let st = PeerListState::default();
     let mut l = PeerList::new(&st);
-    let (i, new) = l.add_peer(ep(1, 6881), PeerSourceFlags::TRACKER, true);
+    let (i, new) = l
+        .add_peer(ep(1, 6881), PeerSourceFlags::TRACKER, PexFlags::NONE, &st)
+        .unwrap();
     assert!(new);
-    let (j, new2) = l.add_peer(ep(1, 6881), PeerSourceFlags::PEX, true);
+    let (j, new2) = l
+        .add_peer(ep(1, 6881), PeerSourceFlags::PEX, PexFlags::NONE, &st)
+        .unwrap();
     assert!(!new2);
     assert_eq!(i, j);
     assert_eq!(
@@ -34,11 +42,114 @@ fn add_and_source() {
 }
 
 #[test]
+fn add_peer_rejects_invalid_endpoints() {
+    // upstream `add_peer`: unspecified addr, port 0 and port 1 are
+    // dropped before insertion; v6 link-locals likewise.
+    let st = PeerListState::default();
+    let mut l = PeerList::new(&st);
+    assert!(
+        l.add_peer(ep(1, 0), PeerSourceFlags::TRACKER, PexFlags::NONE, &st)
+            .is_none()
+    );
+    assert!(
+        l.add_peer(ep(1, 1), PeerSourceFlags::TRACKER, PexFlags::NONE, &st)
+            .is_none()
+    );
+    assert!(
+        l.add_peer(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 6881),
+            PeerSourceFlags::TRACKER,
+            PexFlags::NONE,
+            &st,
+        )
+        .is_none()
+    );
+    assert!(
+        l.add_peer(
+            SocketAddr::new("fe80::1".parse().unwrap(), 6881),
+            PeerSourceFlags::TRACKER,
+            PexFlags::NONE,
+            &st,
+        )
+        .is_none()
+    );
+    assert_eq!(l.num_peers(), 0);
+}
+
+#[test]
+fn add_peer_sorted_insert_and_multi_ip() {
+    // upstream keeps `m_peers` sorted by address (`peer_address_compare`)
+    // and dedups by (addr, port) when multiple connections per IP are
+    // allowed.
+    let st = PeerListState::default();
+    let mut l = PeerList::new(&st);
+    add(&mut l, ep(9, 6881), PeerSourceFlags::TRACKER);
+    add(&mut l, ep(1, 6881), PeerSourceFlags::TRACKER);
+    // indices shift on sorted insert — assert on slot order instead
+    assert_eq!(l.peers()[0].addr.address(), Some(ep(1, 0).ip()));
+    assert_eq!(l.peers()[1].addr.address(), Some(ep(9, 0).ip()));
+
+    let st_multi = PeerListState {
+        allow_multiple_connections_per_ip: true,
+        ..Default::default()
+    };
+    let mut m = PeerList::new(&st_multi);
+    let (_a, new_a) = m
+        .add_peer(
+            ep(1, 6881),
+            PeerSourceFlags::TRACKER,
+            PexFlags::NONE,
+            &st_multi,
+        )
+        .unwrap();
+    // same addr, different port → a second entry upstream (indices
+    // aren't stable under sorted insert — count the group instead)
+    let (_b, new_b) = m
+        .add_peer(
+            ep(1, 6882),
+            PeerSourceFlags::TRACKER,
+            PexFlags::NONE,
+            &st_multi,
+        )
+        .unwrap();
+    assert!(new_a && new_b);
+    assert_eq!(m.num_peers(), 2);
+    // same endpoint again → dedup onto the existing entry
+    let (_c, new_c) = m
+        .add_peer(ep(1, 6881), PeerSourceFlags::PEX, PexFlags::NONE, &st_multi)
+        .unwrap();
+    assert!(!new_c);
+    assert_eq!(m.num_peers(), 2);
+}
+
+#[test]
+fn update_peer_tracker_decrements_failcount() {
+    // upstream `update_peer`: a tracker re-announce gives one
+    // failure credit back.
+    let st = PeerListState::default();
+    let mut l = PeerList::new(&st);
+    let (i, _) = add(&mut l, ep(1, 6881), PeerSourceFlags::TRACKER).unwrap();
+    l.inc_failcount(i);
+    l.inc_failcount(i);
+    assert_eq!(l.peers()[i].failcount, 2);
+    let (j, new) = l
+        .add_peer(ep(1, 6881), PeerSourceFlags::TRACKER, PexFlags::NONE, &st)
+        .unwrap();
+    assert!(!new && j == i);
+    assert_eq!(l.peers()[i].failcount, 1);
+    // …but a non-tracker source does not refund failures
+    let _ = l
+        .add_peer(ep(1, 6881), PeerSourceFlags::PEX, PexFlags::NONE, &st)
+        .unwrap();
+    assert_eq!(l.peers()[i].failcount, 1);
+}
+
+#[test]
 fn candidates_and_failcount() {
     let st = PeerListState::default();
     let mut l = PeerList::new(&st);
     for n in 1..=5 {
-        l.add_peer(ep(n, 6881), PeerSourceFlags::TRACKER, true);
+        add(&mut l, ep(n, 6881), PeerSourceFlags::TRACKER);
     }
     assert_eq!(l.num_connect_candidates(), 5);
     // three strikes → no longer a candidate
@@ -51,14 +162,64 @@ fn candidates_and_failcount() {
     assert_eq!(cands.len(), 4);
     assert!(!cands.contains(&i));
     // connected peer isn't a candidate
-    l.set_connected(l.find_peer(ep(2, 6881).ip()).unwrap());
+    l.set_connected(l.find_peer(ep(2, 6881).ip()).unwrap(), 900, false);
     assert_eq!(l.num_connect_candidates(), 3);
-    l.connection_closed(l.find_peer(ep(2, 6881).ip()).unwrap(), 1000);
-    // just connected → still skipped by min_reconnect_time
+    l.connection_closed(
+        l.find_peer(ep(2, 6881).ip()).unwrap(),
+        1000,
+        false,
+        false,
+        &st,
+    );
+    // just disconnected → still skipped by min_reconnect_time
     assert!(
         !l.find_connect_candidates(1000, &st)
             .contains(&l.find_peer(ep(2, 6881).ip()).unwrap())
     );
+}
+
+#[test]
+fn connection_closed_fast_reconnect_keeps_stamp() {
+    // upstream: `fast_reconnect` connections keep `last_connected`
+    // at the initiate-time value.
+    let st = PeerListState::default();
+    let mut l = PeerList::new(&st);
+    let (i, _) = add(&mut l, ep(1, 6881), PeerSourceFlags::TRACKER).unwrap();
+    l.set_connected(i, 100, true);
+    assert_eq!(l.peers()[i].last_connected, 0);
+    l.connection_closed(i, 500, true, false, &st);
+    assert_eq!(l.peers()[i].last_connected, 0);
+    l.set_connected(i, 600, false);
+    assert_eq!(l.peers()[i].last_connected, 600);
+}
+
+#[test]
+fn connection_closed_multi_conn_evicts_anonymous() {
+    // upstream `connection_closed`: allow_multiple_connections_per_ip
+    // + never-connectable incoming entry → erased on disconnect.
+    let st = PeerListState {
+        allow_multiple_connections_per_ip: true,
+        ..Default::default()
+    };
+    let mut l = PeerList::new(&st);
+    let i = l.add_incoming(ep(1, 40000), &st).unwrap();
+    assert!(!l.peers()[i].connectable);
+    l.set_connected(i, 10, false);
+    l.connection_closed(i, 20, false, false, &st);
+    assert_eq!(l.num_peers(), 0);
+}
+
+#[test]
+fn set_connected_clears_maybe_upload_only() {
+    // upstream `set_connection`: a live conn supersedes the pex_seed hint.
+    let st = PeerListState::default();
+    let mut l = PeerList::new(&st);
+    let (i, _) = l
+        .add_peer(ep(1, 6881), PeerSourceFlags::PEX, PexFlags::SEED, &st)
+        .unwrap();
+    assert!(l.peers()[i].maybe_upload_only);
+    l.set_connected(i, 0, false);
+    assert!(!l.peers()[i].maybe_upload_only);
 }
 
 #[test]
@@ -69,16 +230,16 @@ fn ranking_prefers_low_failcount_local() {
     };
     let mut l = PeerList::new(&st);
     // local peer + a failed remote + a good remote
-    l.add_peer(ep(9, 6881), PeerSourceFlags::TRACKER, true); // 10.0.0.9 → "local" per is_local
-    l.add_peer(
+    add(&mut l, ep(9, 6881), PeerSourceFlags::TRACKER); // 10.0.0.9 → "local" per is_local
+    add(
+        &mut l,
         SocketAddr::new("8.8.8.8".parse().unwrap(), 6881),
         PeerSourceFlags::TRACKER,
-        true,
     );
-    l.add_peer(
+    add(
+        &mut l,
         SocketAddr::new("1.1.1.1".parse().unwrap(), 6881),
         PeerSourceFlags::TRACKER,
-        true,
     );
     let bad = l.find_peer("8.8.8.8".parse().unwrap()).unwrap();
     l.inc_failcount(bad);
@@ -97,6 +258,27 @@ fn ranking_prefers_low_failcount_local() {
 }
 
 #[test]
+fn ranking_uses_primary_source() {
+    // upstream `compare_peer` ranks `peer_source()` (the *primary*
+    // source bit), not the OR-combined set: a PEX-primary peer that
+    // also came from a tracker must NOT outrank a tracker-primary one.
+    let st = PeerListState {
+        min_reconnect_time: 0,
+        ..Default::default()
+    };
+    let mut l = PeerList::new(&st);
+    // tracker-primary (later also seen on PEX)
+    let (t, _) = add(&mut l, ep(1, 6881), PeerSourceFlags::TRACKER).unwrap();
+    add(&mut l, ep(1, 6881), PeerSourceFlags::PEX);
+    // pex-primary
+    let (p, _) = add(&mut l, ep(2, 6881), PeerSourceFlags::PEX).unwrap();
+    assert_eq!(primary_source(l.peers()[p].source), PeerSourceFlags::PEX);
+    let cands = l.find_connect_candidates(0, &st);
+    let pos = |i| cands.iter().position(|&c| c == i).unwrap();
+    assert!(pos(t) < pos(p), "tracker-primary must rank before pex-only");
+}
+
+#[test]
 fn weeding_over_capacity() {
     let st = PeerListState {
         max_peerlist_size: 10,
@@ -104,9 +286,9 @@ fn weeding_over_capacity() {
     };
     let mut l = PeerList::new(&st);
     for n in 1..=12 {
-        l.add_peer(ep(n, 6881), PeerSourceFlags::TRACKER, true);
+        l.add_peer(ep(n, 6881), PeerSourceFlags::TRACKER, PexFlags::NONE, &st);
     }
-    // fail one out — over 95% cap it becomes an erase candidate
+    // fail one out — over the cap it becomes an erase candidate
     let i = l.find_peer(ep(1, 6881).ip()).unwrap();
     l.inc_failcount(i);
     l.inc_failcount(i);
@@ -117,27 +299,163 @@ fn weeding_over_capacity() {
 }
 
 #[test]
+fn erase_prefers_worse_peers() {
+    // `compare_peer_erase` upstream order: higher failcount first,
+    // then resume-data-only, then non-connectable, then low trust.
+    // A sweep only runs above the 95% low watermark.
+    let st = PeerListState {
+        max_peerlist_size: 5,
+        ..Default::default()
+    };
+    let mut m = PeerList::new(&st);
+    // five failed peers (past max_failcount → not connect candidates
+    // → erase candidates); `a` has the lowest trust_points and must
+    // be picked regardless of scan order.
+    let mut idxs = Vec::new();
+    for n in 1..=5 {
+        let (i, _) = m
+            .add_peer(ep(n, 6881), PeerSourceFlags::TRACKER, PexFlags::NONE, &st)
+            .unwrap();
+        m.set_failcount(i, 5);
+        idxs.push(i);
+    }
+    let a = l_find(&m, 1);
+    let _ = a;
+    let ia = idxs[0];
+    m.peers_mut()[ia].trust_points = -5;
+    m.peers_mut()[idxs[1]].trust_points = 3;
+    m.erase_peers(&st, false);
+    // `a` (lower trust) is the better erase candidate → gone first
+    assert!(m.find_peer(ep(1, 6881).ip()).is_none());
+    assert_eq!(m.num_peers(), 4);
+
+    // failcount ordering beats trust ordering upstream
+    let mut m2 = PeerList::new(&st);
+    let mut i2 = Vec::new();
+    for n in 1..=5 {
+        let (i, _) = m2
+            .add_peer(ep(n, 6881), PeerSourceFlags::TRACKER, PexFlags::NONE, &st)
+            .unwrap();
+        i2.push(i);
+    }
+    // trusted but high-failcount vs untrusted low-failcount: the
+    // higher failcount is still the better erase candidate. Both
+    // are past max_failcount → both non-candidates → both erasable.
+    m2.set_failcount(i2[0], 3);
+    m2.peers_mut()[i2[0]].trust_points = -5;
+    m2.set_failcount(i2[1], 10);
+    m2.peers_mut()[i2[1]].trust_points = 5;
+    m2.erase_peers(&st, false);
+    assert!(m2.find_peer(ep(2, 6881).ip()).is_none());
+    assert!(m2.find_peer(ep(1, 6881).ip()).is_some());
+}
+
+fn l_find(l: &PeerList, a: u8) -> usize {
+    l.find_peer(ep(a, 0).ip()).unwrap()
+}
+
+#[test]
+fn resume_data_peers_weeded_immediately() {
+    // upstream `should_erase_immediately`: resume-data-only entries
+    // are dropped inside the sweep, not deferred to the end.
+    let st = PeerListState {
+        max_peerlist_size: 6,
+        ..Default::default()
+    };
+    let mut l = PeerList::new(&st);
+    for n in 1..=6 {
+        l.add_peer(ep(n, 6881), PeerSourceFlags::TRACKER, PexFlags::NONE, &st);
+    }
+    // refill one slot with a resume-data peer after a failure made
+    // room for it
+    let gone = l.find_peer(ep(1, 6881).ip()).unwrap();
+    l.set_failcount(gone, 5);
+    l.erase_peers(&st, false);
+    let added = l.add_peer(
+        ep(9, 6881),
+        PeerSourceFlags::RESUME_DATA,
+        PexFlags::NONE,
+        &st,
+    );
+    assert!(added.is_some());
+    // a *connectable* resume peer is still a connect candidate —
+    // upstream only weeds it once it's no longer dialable
+    let (ri, _) = added.unwrap();
+    l.set_failcount(ri, 3);
+    // next insert past the cap erases the resume-only entry inline
+    l.add_peer(ep(8, 6881), PeerSourceFlags::TRACKER, PexFlags::NONE, &st);
+    assert!(l.find_peer(ep(9, 6881).ip()).is_none());
+    // and a fresh resume_data add when the list is full is refused
+    let st2 = PeerListState {
+        max_peerlist_size: 2,
+        ..Default::default()
+    };
+    let mut l2 = PeerList::new(&st2);
+    l2.add_peer(ep(1, 6881), PeerSourceFlags::TRACKER, PexFlags::NONE, &st2);
+    l2.add_peer(ep(2, 6881), PeerSourceFlags::TRACKER, PexFlags::NONE, &st2);
+    assert!(
+        l2.add_peer(
+            ep(3, 6881),
+            PeerSourceFlags::RESUME_DATA,
+            PexFlags::NONE,
+            &st2
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn ban_and_filter() {
     let st = PeerListState::default();
     let mut l = PeerList::new(&st);
-    l.add_peer(ep(1, 6881), PeerSourceFlags::TRACKER, true);
-    l.add_peer(ep(2, 6881), PeerSourceFlags::TRACKER, true);
+    add(&mut l, ep(1, 6881), PeerSourceFlags::TRACKER);
+    add(&mut l, ep(2, 6881), PeerSourceFlags::TRACKER);
     let i = l.find_peer(ep(1, 6881).ip()).unwrap();
     l.ban_peer(i);
     assert_eq!(l.num_connect_candidates(), 1);
+    // upstream `apply_ip_filter` erases filtered entries; only
+    // *connected* ones are reported in `banned`.
     let banned = l.apply_ip_filter(|a| a == ep(2, 6881).ip());
-    assert_eq!(banned, vec![ep(2, 6881).ip()]);
+    assert!(banned.is_empty());
     assert_eq!(l.num_peers(), 1);
+
+    // a connected filtered peer is reported *and* its entry erased
+    let (j, _) = add(&mut l, ep(3, 6881), PeerSourceFlags::TRACKER).unwrap();
+    l.set_connected(j, 0, false);
+    let banned = l.apply_ip_filter(|a| a == ep(3, 6881).ip());
+    assert_eq!(banned, vec![ep(3, 6881).ip()]);
+    assert!(l.find_peer(ep(3, 6881).ip()).is_none());
 }
 
 #[test]
 fn update_port() {
     let st = PeerListState::default();
     let mut l = PeerList::new(&st);
-    let (i, _) = l.add_peer(ep(1, 0), PeerSourceFlags::DHT, false);
+    // an incoming conn is stored connectable=false — a DHT port
+    // message then flips it (upstream `update_peer_port`).
+    let i = l.add_incoming(ep(1, 40000), &st).unwrap();
     assert_eq!(l.num_connect_candidates(), 0);
     assert!(l.update_peer_port(6881, i, PeerSourceFlags::DHT, &st));
     assert_eq!(l.peers()[i].port, 6881);
     assert!(l.peers()[i].connectable);
     assert_eq!(l.num_connect_candidates(), 1);
+}
+
+#[test]
+fn set_seed_and_upload_only() {
+    let st = PeerListState::default();
+    let mut l = PeerList::new(&st);
+    let (i, _) = add(&mut l, ep(1, 6881), PeerSourceFlags::TRACKER).unwrap();
+    l.set_seed(i, true);
+    assert_eq!(l.num_seeds(), 1);
+    // finished torrents don't dial seeds → candidate count drops
+    let st_f = PeerListState {
+        is_finished: true,
+        ..Default::default()
+    };
+    l.recalculate_connect_candidates(&st_f);
+    assert_eq!(l.num_connect_candidates(), 0);
+    // BEP-21 upload_only is not a full seed — num_seeds untouched
+    l.set_upload_only(i, true);
+    assert_eq!(l.num_seeds(), 1);
 }

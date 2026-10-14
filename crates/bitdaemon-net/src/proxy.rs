@@ -38,8 +38,9 @@ pub enum ProxyType {
 }
 
 /// `settings_pack::proxy_*` — one proxy configuration shared by
-/// peer connections and tracker announces.
-#[derive(Debug, Clone, Default)]
+/// peer connections and tracker announces. Defaults mirror
+/// `aux::proxy_settings`' member initializers.
+#[derive(Debug, Clone)]
 pub struct ProxySettings {
     /// `proxy_hostname`.
     pub hostname: String,
@@ -51,13 +52,35 @@ pub struct ProxySettings {
     pub password: String,
     /// `proxy_type`.
     pub proxy_type: ProxyType,
-    /// `proxy_peer_connections`.
+    /// `proxy_peer_connections` (default true upstream).
     pub proxy_peer_connections: bool,
-    /// `proxy_tracker_connections`.
+    /// `proxy_tracker_connections` (default true upstream).
     pub proxy_tracker_connections: bool,
-    /// `proxy_hostnames` — let the proxy resolve hostnames
-    /// (`SocksTarget::Name` / CONNECT by name instead of IP).
+    /// `proxy_hostnames` (default true upstream) — let the proxy
+    /// resolve hostnames (`SocksTarget::Name` / CONNECT by name
+    /// instead of IP).
     pub proxy_hostnames: bool,
+    /// `send_host_in_connect` (default false) — when proxying
+    /// non-plain-HTTP over an HTTP proxy, send the hostname in the
+    /// CONNECT request (also implied by `proxy_hostnames` +
+    /// HTTP proxy + SSL — `proxy_hostname_via_http_connect`).
+    pub send_host_in_connect: bool,
+}
+
+impl Default for ProxySettings {
+    fn default() -> Self {
+        Self {
+            hostname: String::new(),
+            port: 0,
+            username: String::new(),
+            password: String::new(),
+            proxy_type: ProxyType::None,
+            proxy_peer_connections: true,
+            proxy_tracker_connections: true,
+            proxy_hostnames: true,
+            send_host_in_connect: false,
+        }
+    }
 }
 
 /// `socks5_stream` as a connector — TCP to the proxy via `inner`,

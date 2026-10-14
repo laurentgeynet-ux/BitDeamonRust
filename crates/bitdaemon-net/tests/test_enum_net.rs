@@ -5,8 +5,8 @@
 //! `enum_net` — pure helpers (netmask/match/gateway/routes).
 
 use bitdaemon_net::enum_net::{
-    IpInterface, IpRoute, build_netmask, device_for_address, get_gateway, has_any_internet_route,
-    has_internet_route, match_addr_mask,
+    IfState, InterfaceFlags, IpInterface, IpRoute, build_netmask, device_for_address, get_gateway,
+    has_any_internet_route, has_internet_route, match_addr_mask,
 };
 use bitdaemon_net::ip_helpers::is_global;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -51,7 +51,11 @@ fn gateway_and_routes() {
         interface_address: v4(192, 168, 1, 5),
         netmask: v4(255, 255, 255, 0),
         name: "eth0".into(),
+        friendly_name: "eth0".into(),
+        description: String::new(),
         preferred: true,
+        flags: InterfaceFlags::UP,
+        state: IfState::Up,
     };
     let routes = vec![
         IpRoute {

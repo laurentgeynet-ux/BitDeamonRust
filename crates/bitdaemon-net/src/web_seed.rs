@@ -71,12 +71,35 @@ pub struct FileRequest {
 /// `web_connection_base` request context.
 #[derive(Clone, Debug)]
 pub struct WebSeedRequest {
+    /// conn-grouping key — upstream issues every GET of a
+    /// `web_peer_connection` request batch on its own connection;
+    /// redirected files route through their own (ephemeral) seed.
+    /// `split_url(url).0` of the base the GETs target.
+    pub base: String,
     /// HTTP bytes for all gets (concatenated, `m_file_requests`
     /// order preserved).
     pub request: String,
     /// `m_file_requests` — files the request covers (pad files
     /// included — their bytes are zeroed client-side).
     pub files: Vec<FileRequest>,
+}
+
+/// `web_seed_t::redirects` entry — a per-file redirect target
+/// learned from a 3xx `Location` (`resolve_redirect_location` +
+/// `maybe_url_encode` applied before storing).
+#[derive(Clone, Debug)]
+pub struct RedirectTarget {
+    /// `redirect_base` — absolute URL up to (not incl.) the path;
+    /// proxy GETs send this + `path`, direct GETs send `path`.
+    pub url: String,
+    /// `redirect_path` — request path verbatim.
+    pub path: String,
+    /// conn-grouping key — `split_url(url).0`.
+    pub base: String,
+    /// `Authorization` for this target — upstream forwards
+    /// `web_seed_entry::auth` only when the redirect is
+    /// `same_origin`; empty otherwise.
+    pub authorization: String,
 }
 
 /// `WebSeedHeaders` — `add_headers` knobs (User-Agent, auth,
@@ -86,9 +109,12 @@ pub struct WebSeedRequest {
 pub struct WebSeedHeaders {
     /// `settings_pack::user_agent` (empty = anonymous).
     pub user_agent: String,
-    /// `always_send_user_agent` or first request.
-    pub send_user_agent: bool,
-    /// `Authorization:` header (external auth verbatim).
+    /// `settings_pack::always_send_user_agent`.
+    pub always_send_user_agent: bool,
+    /// `settings_pack::anonymous_mode` — suppresses `User-Agent`.
+    pub anonymous_mode: bool,
+    /// `Authorization:` header value (`m_external_auth` verbatim,
+    /// or `Basic ` + base64 of the URL-embedded credentials).
     pub authorization: String,
     /// `Proxy-Authorization: Basic …` (pre-encoded).
     pub proxy_authorization: String,
@@ -98,16 +124,24 @@ pub struct WebSeedHeaders {
     pub host: String,
 }
 
-fn add_headers(req: &mut String, h: &WebSeedHeaders) {
+fn add_headers(
+    req: &mut String,
+    h: &WebSeedHeaders,
+    using_proxy: bool,
+    auth: Option<&str>,
+    first_request: bool,
+) {
     req.push_str("Host: ");
     req.push_str(&h.host);
-    if h.send_user_agent && !h.user_agent.is_empty() {
+    if (first_request || h.always_send_user_agent) && !h.anonymous_mode && !h.user_agent.is_empty()
+    {
         req.push_str("\r\nUser-Agent: ");
         req.push_str(&h.user_agent);
     }
-    if !h.authorization.is_empty() {
+    let auth = auth.unwrap_or(&h.authorization);
+    if !auth.is_empty() {
         req.push_str("\r\nAuthorization: ");
-        req.push_str(&h.authorization);
+        req.push_str(auth);
     }
     if !h.proxy_authorization.is_empty() {
         req.push_str("\r\nProxy-Authorization: ");
@@ -119,18 +153,50 @@ fn add_headers(req: &mut String, h: &WebSeedHeaders) {
         req.push_str(": ");
         req.push_str(v);
     }
+    if using_proxy {
+        req.push_str("\r\nProxy-Connection: keep-alive");
+    }
+    if first_request || using_proxy {
+        req.push_str("\r\nConnection: keep-alive");
+    }
 }
 
-/// `web_peer_connection::write_request` — build the GET(s) for a
-/// block request. `single_file` = BEP-19 url-seed over the whole
-/// payload (the path is used verbatim — single-file paths are
-/// assumed already encoded, like upstream).
+/// One per-connection slice of a block request — the plan half of
+/// `write_request` (upstream builds the request string when the
+/// connection sends it, so headers/`first_request` resolve at
+/// `render` time).
+#[derive(Clone, Debug)]
+pub struct WebSeedPlan {
+    /// conn-grouping key — `split_url(url).0` of the base these
+    /// GETs target (the seed's own base or a redirect's).
+    pub base: String,
+    /// absolute-URL base for proxy GETs (`m_url`).
+    pub url: String,
+    /// request-path base for direct GETs (`m_path`).
+    pub path: String,
+    /// `m_file_requests` covered on this base (pads included).
+    pub files: Vec<FileRequest>,
+    /// per-file `redirects[file_index]` (aligned with `files`).
+    pub redirs: Vec<Option<RedirectTarget>>,
+    /// BEP-19 whole-payload seed (single-file torrent).
+    pub single_file: bool,
+}
+
+/// Grouping half of `write_request` — map a block request to file
+/// slices (`map_block`), apply `redirects`, group consecutive
+/// slices by target base. Pure data; `render_web_request` emits
+/// the HTTP bytes when the connection sends.
 ///
-/// `url`/`path` mirror `m_url`/`m_path`: `url` when a proxy
-/// request needs the absolute form, `path` otherwise.
+/// `length` is the torrent-contiguous span the request covers —
+/// upstream's `map_length`: for v2 torrents, where `req.length`
+/// is pad-excluded (`piece_size2`), the caller must pass the span
+/// from `(piece, offset)` to the end of the merged request
+/// (`pr.piece*piece_length + pr.start + pr.length - piece*
+/// piece_length - offset`); our session requests already carry
+/// contiguous (pad-inclusive) lengths.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub fn build_piece_request(
+pub fn plan_piece_request(
     fs: &FileStorage,
     piece_length: i64,
     piece: PieceIndex,
@@ -139,60 +205,156 @@ pub fn build_piece_request(
     url: &str,
     path: &str,
     single_file: bool,
-    using_proxy: bool,
-    headers: &WebSeedHeaders,
-) -> WebSeedRequest {
-    let mut request = String::new();
-    let mut files = Vec::new();
+    redirects: &std::collections::HashMap<usize, RedirectTarget>,
+) -> Vec<WebSeedPlan> {
+    let default_base = crate::parse_url::split_url(url)
+        .map(|(b, _)| b)
+        .unwrap_or_else(|_| url.to_string());
 
+    let mut slices: Vec<FileRequest> = Vec::new();
     if single_file {
-        let fr = FileRequest {
+        slices.push(FileRequest {
             file_index: 0,
             start: i64::from(piece.0) * piece_length + offset,
             length,
             got_get: true,
-        };
+        });
+    } else {
+        for sl in fs.map_block(piece, offset, length) {
+            slices.push(FileRequest {
+                file_index: sl.file_index.get(),
+                start: sl.offset,
+                length: sl.size,
+                got_get: !fs.pad_file_at(sl.file_index),
+            });
+        }
+    }
+
+    let mut plans: Vec<WebSeedPlan> = Vec::new();
+    // pads arriving before any GET attach to the next group
+    let mut pending_pads: Vec<(FileRequest, Option<RedirectTarget>)> = Vec::new();
+    for fr in slices {
+        let red = redirects.get(&fr.file_index).cloned();
+        if !fr.got_get {
+            pending_pads.push((fr, red));
+            continue;
+        }
+        let base = red
+            .as_ref()
+            .map_or_else(|| default_base.clone(), |r| r.base.clone());
+        if plans.last().is_none_or(|p| p.base != base) {
+            plans.push(WebSeedPlan {
+                base,
+                url: url.to_string(),
+                path: path.to_string(),
+                files: Vec::new(),
+                redirs: Vec::new(),
+                single_file,
+            });
+        }
+        let i = plans.len() - 1;
+        for (p, pr) in pending_pads.drain(..) {
+            plans[i].files.push(p);
+            plans[i].redirs.push(pr);
+        }
+        plans[i].files.push(fr);
+        plans[i].redirs.push(red);
+    }
+    // trailing pads (or a pure-pad block): attach to the last group,
+    // or stand alone on the default base — no GET either way
+    if !pending_pads.is_empty() {
+        if plans.is_empty() {
+            plans.push(WebSeedPlan {
+                base: default_base,
+                url: url.to_string(),
+                path: path.to_string(),
+                files: Vec::new(),
+                redirs: Vec::new(),
+                single_file,
+            });
+        }
+        let i = plans.len() - 1;
+        for (p, pr) in pending_pads.drain(..) {
+            plans[i].files.push(p);
+            plans[i].redirs.push(pr);
+        }
+    }
+    plans
+}
+
+/// `write_request`'s emission — the HTTP/1.1 GET(s) for one
+/// `WebSeedPlan`, headers evaluated at send time
+/// (`m_first_request` is per-connection upstream).
+#[must_use]
+pub fn render_web_request(
+    fs: &FileStorage,
+    plan: &WebSeedPlan,
+    headers: &WebSeedHeaders,
+    using_proxy: bool,
+    first_request: bool,
+) -> WebSeedRequest {
+    let mut request = String::new();
+    // upstream clears `m_first_request` after the first GET of the
+    // batch — later GETs in the same request omit UA/keep-alive
+    let mut first = first_request;
+    for (fr, red) in plan
+        .files
+        .iter()
+        .zip(plan.redirs.iter())
+        .filter(|(f, _)| f.got_get)
+    {
         request.push_str("GET ");
-        request.push_str(if using_proxy { url } else { path });
+        if plan.single_file {
+            // whole-payload seed: `m_url`/`m_path` verbatim — a
+            // redirect replaces them entirely.
+            match red {
+                Some(r) => request.push_str(if using_proxy { &r.url } else { &r.path }),
+                None => request.push_str(if using_proxy { &plan.url } else { &plan.path }),
+            }
+        } else if let Some(r) = red {
+            if using_proxy {
+                request.push_str(&r.url);
+                // `m_url` ends in '/' — skip a dup slash on the
+                // redirect path (upstream appends from index 1)
+                let skip = usize::from(r.path.starts_with('/'));
+                if !r.url.ends_with('/') && skip == 0 {
+                    request.push('/');
+                }
+                request.push_str(&r.path[skip..]);
+            } else {
+                request.push_str(&r.path);
+            }
+        } else {
+            let base = if using_proxy { &plan.url } else { &plan.path };
+            request.push_str(base);
+            if !base.ends_with('/') {
+                request.push('/');
+            }
+            request.push_str(&escape_file_path(&fs.file_path(
+                bitdaemon_common::types::FileIndex(fr.file_index as i32),
+                b"",
+            )));
+        }
         request.push_str(" HTTP/1.1\r\n");
-        add_headers(&mut request, headers);
+        add_headers(
+            &mut request,
+            headers,
+            using_proxy,
+            red.as_ref().map(|r| r.authorization.as_str()),
+            first,
+        );
+        first = false;
         request.push_str("\r\nRange: bytes=");
         request.push_str(&fr.start.to_string());
         request.push('-');
         request.push_str(&(fr.start + fr.length - 1).to_string());
         request.push_str("\r\n\r\n");
-        files.push(fr);
-    } else {
-        for sl in fs.map_block(piece, offset, length) {
-            let mut fr = FileRequest {
-                file_index: sl.file_index.get(),
-                start: sl.offset,
-                length: sl.size,
-                got_get: true,
-            };
-            if fs.pad_file_at(sl.file_index) {
-                fr.got_get = false;
-                files.push(fr);
-                continue;
-            }
-            request.push_str("GET ");
-            let base = if using_proxy { url } else { path };
-            request.push_str(base);
-            if !base.ends_with('/') {
-                request.push('/');
-            }
-            request.push_str(&escape_file_path(&fs.file_path(sl.file_index, b"")));
-            request.push_str(" HTTP/1.1\r\n");
-            add_headers(&mut request, headers);
-            request.push_str("\r\nRange: bytes=");
-            request.push_str(&fr.start.to_string());
-            request.push('-');
-            request.push_str(&(fr.start + fr.length - 1).to_string());
-            request.push_str("\r\n\r\n");
-            files.push(fr);
-        }
     }
-    WebSeedRequest { request, files }
+    WebSeedRequest {
+        base: plan.base.clone(),
+        request,
+        files: plan.files.clone(),
+    }
 }
 
 /// `on_received` bookkeeping — `m_file_requests` consumption.
@@ -222,6 +384,17 @@ pub enum WebSeedError {
     /// non-2xx status with the server's message.
     #[error("http {0}: {1}")]
     Http(i32, String),
+    /// 3xx — upstream `handle_redirect` stores a per-file redirect
+    /// (`web_seed_t::redirects`) and reconnects; the caller can
+    /// re-request `file_index` at `location` (resolve it with
+    /// `resolve_redirect_location` + `maybe_url_encode`).
+    #[error("redirect file {file_index} -> {location}")]
+    Redirect {
+        /// `m_file_requests.front().file_index`.
+        file_index: usize,
+        /// raw `Location` header value.
+        location: String,
+    },
     /// response shorter than the requested range.
     #[error("short body: got {got}, want {want}")]
     ShortBody {
@@ -255,7 +428,15 @@ pub async fn fetch_block(
     let mut close = false;
     for f in req.files.iter().filter(|f| f.got_get) {
         let r = crate::http_conn::recv_response(s, max_response).await?;
-        if !(200..300).contains(&r.status()) {
+        // upstream: `!is_ok_status` aborts; `is_redirect` is handled
+        // first (redirects pass `is_ok_status` but carry no body).
+        if crate::http_parser::is_redirect(r.status()) {
+            return Err(WebSeedError::Redirect {
+                file_index: f.file_index,
+                location: r.header("location").unwrap_or("").to_string(),
+            });
+        }
+        if !crate::http_parser::is_ok_status(r.status()) {
             return Err(WebSeedError::Http(
                 r.status(),
                 r.header("server").unwrap_or("").to_string(),
@@ -277,6 +458,179 @@ pub async fn fetch_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitdaemon_common::types::PieceIndex;
+    use bitdaemon_core::{FileFlags, FileStorage, calc_num_pieces};
+
+    fn multi_fs() -> FileStorage {
+        let mut fs = FileStorage::new();
+        // a(2000) + pad(96) + b(2000) — piece 0 (4096) spans all
+        // three so one block request exercises pad-skip + grouping
+        fs.add_file(None, b"torrent/a.bin", 2000, FileFlags::NONE, 0, b"", None)
+            .ok();
+        fs.add_file(
+            None,
+            b"torrent/pad-file",
+            96,
+            FileFlags::PAD_FILE,
+            0,
+            b"",
+            None,
+        )
+        .ok();
+        fs.add_file(None, b"torrent/b.bin", 2000, FileFlags::NONE, 0, b"", None)
+            .ok();
+        fs.set_piece_length(4096);
+        fs.set_num_pieces(calc_num_pieces(&fs));
+        fs
+    }
+
+    fn headers() -> WebSeedHeaders {
+        WebSeedHeaders {
+            host: "s.example".to_string(),
+            user_agent: "test/1.0".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn render_first_request_emits_keepalive() {
+        let fs = multi_fs();
+        let plan = plan_piece_request(
+            &fs,
+            4096,
+            PieceIndex(0),
+            0,
+            1000,
+            "http://s.example/torrent/",
+            "/torrent/",
+            false,
+            &Default::default(),
+        );
+        let r1 = render_web_request(&fs, &plan[0], &headers(), false, true);
+        let r2 = render_web_request(&fs, &plan[0], &headers(), false, false);
+        assert!(r1.request.contains("\r\nConnection: keep-alive"));
+        assert!(r1.request.contains("User-Agent: test/1.0"));
+        assert!(!r2.request.contains("Connection:"));
+        assert!(!r2.request.contains("User-Agent:"));
+    }
+
+    #[test]
+    fn render_proxy_emits_absolute_form_and_proxy_keepalive() {
+        let fs = multi_fs();
+        let plan = plan_piece_request(
+            &fs,
+            4096,
+            PieceIndex(0),
+            0,
+            100,
+            "http://s.example/torrent/",
+            "/torrent/",
+            false,
+            &Default::default(),
+        );
+        let r = render_web_request(&fs, &plan[0], &headers(), true, false);
+        assert!(
+            r.request
+                .starts_with("GET http://s.example/torrent/torrent/a.bin")
+        );
+        assert!(r.request.contains("\r\nProxy-Connection: keep-alive"));
+        assert!(r.request.contains("\r\nConnection: keep-alive"));
+    }
+
+    #[test]
+    fn render_anonymous_suppresses_user_agent() {
+        let fs = multi_fs();
+        let plan = plan_piece_request(
+            &fs,
+            4096,
+            PieceIndex(0),
+            0,
+            100,
+            "http://s.example/torrent/",
+            "/torrent/",
+            false,
+            &Default::default(),
+        );
+        let h = WebSeedHeaders {
+            anonymous_mode: true,
+            ..headers()
+        };
+        let r = render_web_request(&fs, &plan[0], &h, false, true);
+        assert!(!r.request.contains("User-Agent:"));
+        assert!(r.request.contains("Connection: keep-alive"));
+    }
+
+    #[test]
+    fn plan_skips_pad_and_groups_redirects() {
+        let fs = multi_fs();
+        let mut redirects = std::collections::HashMap::new();
+        redirects.insert(
+            2usize,
+            RedirectTarget {
+                url: "http://cdn.example".to_string(),
+                path: "/moved/b.bin".to_string(),
+                base: "http://cdn.example".to_string(),
+                authorization: String::new(),
+            },
+        );
+        // a[0..2000] + pad[96] + b[0..2000] = piece 0 (4096)
+        let plans = plan_piece_request(
+            &fs,
+            4096,
+            PieceIndex(0),
+            0,
+            4096,
+            "http://s.example/torrent/",
+            "/torrent/",
+            false,
+            &redirects,
+        );
+        // file 0 on the seed base, file 2 on the redirect base —
+        // the pad rides with the group of the file that follows it
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].base, "http://s.example");
+        assert_eq!(plans[1].base, "http://cdn.example");
+        assert_eq!(
+            plans[0].files.iter().map(|f| f.got_get).collect::<Vec<_>>(),
+            vec![true]
+        );
+        assert_eq!(
+            plans[1].files.iter().map(|f| f.got_get).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        // the redirected file's GET uses the redirect path verbatim
+        let r = render_web_request(&fs, &plans[1], &headers(), false, true);
+        assert!(r.request.starts_with("GET /moved/b.bin HTTP/1.1"));
+        assert!(r.request.contains("Range: bytes=0-1999"));
+        let r0 = render_web_request(&fs, &plans[0], &headers(), false, true);
+        assert!(r0.request.starts_with("GET /torrent/torrent/a.bin"));
+        assert_eq!(r0.request.matches("Range:").count(), 1);
+    }
+
+    #[test]
+    fn single_file_request_is_range_only() {
+        let mut fs = FileStorage::new();
+        fs.add_file(None, b"movie.mkv", 8000, FileFlags::NONE, 0, b"", None)
+            .ok();
+        fs.set_piece_length(4096);
+        fs.set_num_pieces(calc_num_pieces(&fs));
+        let plans = plan_piece_request(
+            &fs,
+            4096,
+            PieceIndex(1),
+            128,
+            256,
+            "http://s.example/dl/movie.mkv",
+            "/dl/movie.mkv",
+            true,
+            &Default::default(),
+        );
+        assert_eq!(plans.len(), 1);
+        let r = render_web_request(&fs, &plans[0], &headers(), false, true);
+        // start = piece*piece_length + offset = 4096+128
+        assert!(r.request.contains("Range: bytes=4224-4479"));
+        assert!(r.request.starts_with("GET /dl/movie.mkv HTTP/1.1"));
+    }
 
     #[test]
     fn normalize_multi_file() {

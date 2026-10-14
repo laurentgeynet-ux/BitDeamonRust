@@ -188,12 +188,79 @@ pub fn read_endpoint_list(n: &BdecodeNode<'_>) -> Vec<SocketAddr> {
     ret
 }
 
+/// `parse_endpoint` failure — variants name the upstream
+/// `errors::` codes they replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseEndpointError {
+    /// `errors::invalid_port` — missing/empty/non-decimal port,
+    /// port 0 or > 65535, or empty input.
+    InvalidPort,
+    /// `errors::expected_close_bracket_in_address`.
+    ExpectedCloseBracket,
+    /// `errors::invalid_address` — the address part doesn't parse
+    /// (unbracketed input is parsed as IPv4 only, like upstream).
+    InvalidAddress,
+}
+
+impl std::fmt::Display for ParseEndpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidPort => "invalid port",
+            Self::ExpectedCloseBracket => "expected close bracket in address",
+            Self::InvalidAddress => "invalid address",
+        })
+    }
+}
+
+impl std::error::Error for ParseEndpointError {}
+
+impl From<ParseEndpointError> for io::Error {
+    fn from(e: ParseEndpointError) -> Self {
+        io::Error::new(io::ErrorKind::InvalidInput, e)
+    }
+}
+
+/// `aux::parse_decimal` — `std::from_chars` semantics (digit prefix,
+/// optional `-`, trailing junk ignored). Shared impl lives in
+/// `core::escape_string`.
+fn parse_decimal(s: &str) -> Option<i64> {
+    bitdaemon_core::escape_string::parse_decimal(s.as_bytes())
+}
+
 /// `aux::parse_endpoint` — `"ip:port"` / `"[v6]:port"` text form.
-pub fn parse_endpoint(s: &str) -> io::Result<SocketAddr> {
-    s.parse::<SocketAddr>().map_err(|_| {
-        // upstream trims brackets/spaces; SocketAddr already handles
-        // "[::1]:6881". Try host:port split for unbracketed v6? Upstream
-        // only accepts bracketed v6 too — report invalid.
-        io::Error::new(io::ErrorKind::InvalidInput, "invalid endpoint")
-    })
+/// Input is trimmed; unbracketed addresses are parsed as IPv4 only;
+/// the port must be a decimal in `1..=65535`.
+pub fn parse_endpoint(s: &str) -> Result<SocketAddr, ParseEndpointError> {
+    let str = s.trim();
+    if str.is_empty() {
+        return Err(ParseEndpointError::InvalidPort);
+    }
+
+    let (addr, port): (IpAddr, &str) = if let Some(rest) = str.strip_prefix('[') {
+        // IPv6: `[addr]:port`
+        let Some(close) = rest.find(']') else {
+            return Err(ParseEndpointError::ExpectedCloseBracket);
+        };
+        let ip: Ipv6Addr = rest[..close]
+            .parse()
+            .map_err(|_| ParseEndpointError::InvalidAddress)?;
+        let port = &rest[close + 1..];
+        if !port.starts_with(':') {
+            return Err(ParseEndpointError::InvalidPort);
+        }
+        (IpAddr::V6(ip), &port[1..])
+    } else {
+        let Some(colon) = str.find(':') else {
+            return Err(ParseEndpointError::InvalidPort);
+        };
+        let ip: Ipv4Addr = str[..colon]
+            .parse()
+            .map_err(|_| ParseEndpointError::InvalidAddress)?;
+        (IpAddr::V4(ip), &str[colon + 1..])
+    };
+
+    match parse_decimal(port) {
+        Some(p) if p > 0 && p <= i64::from(u16::MAX) => Ok(SocketAddr::new(addr, p as u16)),
+        _ => Err(ParseEndpointError::InvalidPort),
+    }
 }

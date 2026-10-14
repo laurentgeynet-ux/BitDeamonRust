@@ -36,11 +36,23 @@ pub enum HttpError {
     /// too many redirects (`errors::http_redirection_depleted`).
     #[error("too many redirects")]
     TooManyRedirects,
+    /// 3xx without a `Location` header
+    /// (`errors::http_missing_location`).
+    #[error("redirect without location")]
+    MissingLocation,
+    /// redirect to a different origin — upstream `http_connection`
+    /// reconnects; our stream is fixed, so the resolved URL is handed
+    /// back to the caller (same policy as upstream: auth headers must
+    /// not be forwarded cross-origin).
+    #[error("redirect to {0}")]
+    CrossOriginRedirect(String),
 }
 
-/// `send_request` — verbatim request format upstream writes
-/// (`send_hostname`/`user_agent` included by the caller in
-/// `headers`). `body` is appended after the blank line (for POST).
+/// `send_request` — verbatim request format upstream writes in
+/// `http_connection::sendrequest` (`Host` via `format_host_header`,
+/// `User-Agent`/`Authorization` come from `headers`, gzip always
+/// advertised, one-shot → `Connection: close`). `body` is appended
+/// after the blank line (for POST).
 pub async fn send_request(
     s: &mut BoxedPeerStream,
     method: &str,
@@ -56,20 +68,19 @@ pub async fn send_request(
     req.push_str(" HTTP/1.1\r\nHost: ");
     req.push_str(host);
     req.push_str("\r\n");
-    // upstream always advertises gzip (http_connection.cpp:191)
-    req.push_str("Accept-Encoding: gzip\r\n");
     for (k, v) in headers {
         req.push_str(k);
         req.push_str(": ");
         req.push_str(v);
         req.push_str("\r\n");
     }
+    req.push_str("Accept-Encoding: gzip\r\n");
     if !body.is_empty() {
         req.push_str("Content-Length: ");
         req.push_str(&body.len().to_string());
         req.push_str("\r\n");
     }
-    req.push_str("\r\n");
+    req.push_str("Connection: close\r\n\r\n");
     s.write_all(req.as_bytes()).await?;
     if !body.is_empty() {
         s.write_all(body).await?;
@@ -163,53 +174,49 @@ pub async fn recv_response(
     Ok(HttpResponse { parser, raw: buf })
 }
 
-/// full GET — the common tracker/web-seed shape.
+/// full GET — the common tracker/web-seed shape. `url` is the full
+/// request URL (like upstream `http_connection::get`) — the path and
+/// `Host` header are derived from it.
 ///
-/// Follows `301/302/303/307` `Location` redirects on the **same
-/// stream** like `http_connection::on_redirect` does (absolute URLs
-/// keep host/scheme — a cross-host redirect keeps the authority
-/// path only if the hostname matches `host`, mirroring upstream's
-/// reconnect requirement; cross-host locations are treated as
-/// next-request paths when they parse to a path). Up to 5 hops.
-/// Non-2xx/3xx statuses surface as [`HttpError::Status`].
+/// Redirects follow `http_connection::on_redirect`: `location` is
+/// resolved against the referrer with `resolve_redirect_location` and
+/// retried on the same stream. A redirect to a different origin needs
+/// a new connection upstream — surfaced as
+/// [`HttpError::CrossOriginRedirect`] carrying the resolved URL. Up to
+/// 5 hops (`m_redirects`). Non-redirect statuses return the response
+/// — callers apply `is_ok_status` like upstream.
 pub async fn http_get(
     s: &mut BoxedPeerStream,
-    path: &str,
-    host: &str,
+    url: &str,
     headers: &[(String, String)],
     max_response: usize,
 ) -> Result<HttpResponse, HttpError> {
-    let mut path = path.to_string();
-    for _ in 0..5 {
-        send_request(s, "GET", &path, host, headers, &[]).await?;
+    let mut url = url.to_string();
+    for _ in 0..=5 {
+        let c = crate::parse_url::parse_url_components(&url).map_err(|_| HttpError::Malformed)?;
+        let default_port = if c.protocol.eq_ignore_ascii_case("https") {
+            443
+        } else {
+            80
+        };
+        let host = crate::string_util::format_host_header(c.hostname, c.port, default_port);
+        send_request(s, "GET", &c.path, &host, headers, &[]).await?;
         let resp = recv_response(s, max_response).await?;
-        let status = resp.status();
-        match status {
-            301 | 302 | 303 | 307 | 308 => {
-                let loc = resp
-                    .header("location")
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty());
-                let Some(loc) = loc else {
-                    return Err(HttpError::Status(status));
-                };
-                // absolute http(s) URL → extract path+query; relative
-                // redirect already is the path.
-                path = if let Some(rest) = loc
-                    .strip_prefix("http://")
-                    .or_else(|| loc.strip_prefix("https://"))
-                {
-                    match rest.find('/') {
-                        Some(i) => rest[i..].to_string(),
-                        None => "/".to_string(),
-                    }
-                } else {
-                    loc.to_string()
-                };
-            }
-            200..=299 => return Ok(resp),
-            _ => return Err(HttpError::Status(status)),
+        if !crate::http_parser::is_redirect(resp.status()) {
+            return Ok(resp);
         }
+        let loc = resp
+            .header("location")
+            .map(str::trim)
+            .filter(|l| !l.is_empty());
+        let Some(loc) = loc else {
+            return Err(HttpError::MissingLocation);
+        };
+        let next = crate::http_parser::resolve_redirect_location(&url, loc);
+        if !crate::parse_url::same_origin(&url, &next) {
+            return Err(HttpError::CrossOriginRedirect(next));
+        }
+        url = next;
     }
     Err(HttpError::TooManyRedirects)
 }

@@ -94,6 +94,8 @@ pub struct UtpConfig {
     pub loss_multiplier: i64,
     /// `utp_cwnd_reduce_timer` (ms).
     pub cwnd_reduce_timer: i64,
+    /// `proxy_type == socks5 || socks5_pw` — affects `mtu_for_dest`.
+    pub proxy_socks5: bool,
 }
 
 impl Default for UtpConfig {
@@ -108,6 +110,7 @@ impl Default for UtpConfig {
             connect_timeout: 3000,
             loss_multiplier: 50,
             cwnd_reduce_timer: 100,
+            proxy_socks5: false,
         }
     }
 }
@@ -217,6 +220,11 @@ pub struct UtpSocket {
     m_num_timeouts: u8,
     m_delay_sample_idx: usize,
 
+    /// `m_sm.restrict_mtu(m_mtu)` — set when a give-up packet was
+    /// larger than the floor (MTU probe likely killed the conn);
+    /// the caller feeds it to `UtpSocketDemux::restrict_mtu`.
+    failed_mtu: Option<u16>,
+
     /// close reason received from the peer (`on_close_reason`).
     pub their_close_reason: u16,
 
@@ -285,6 +293,7 @@ impl UtpSocket {
             m_duplicate_acks: 0,
             m_num_timeouts: 0,
             m_delay_sample_idx: 0,
+            failed_mtu: None,
             their_close_reason: 0,
             m_in_eof: false,
             m_out_eof: false,
@@ -798,10 +807,16 @@ impl UtpSocket {
         self.m_write_buffer_size > 0 && !self.m_cwnd_full && !self.m_stalled
     }
 
-    /// `insert_packet`.
+    /// `insert_packet` — a replaced packet marked `need_resend` must
+    /// be unlinked from the resend queue, else its (already replaced)
+    /// seq would spuriously resend the *new* packet.
     fn insert_packet(&mut self, p: Packet) {
         if let Some(old) = self.outbuf.insert(u32::from(self.m_seq_nr), p) {
-            if !old.need_resend {
+            if old.need_resend {
+                if let Some(pos) = self.needs_resend.iter().position(|&s| s == old.seq_nr()) {
+                    self.needs_resend.remove(pos);
+                }
+            } else {
                 self.m_bytes_in_flight -= i32::from(old.size - old.header_size);
             }
         }
@@ -1415,13 +1430,15 @@ impl UtpSocket {
             }
             match extension {
                 x if x == UtpExtension::Sack as u8 => {
+                    // upstream assigns (`std::tie(rtt, acked_bytes) =
+                    // parse_sack`) — a second SACK overwrites
                     let (rtt, ab) = self.parse_sack(
                         ph.ack_nr,
                         &buf[header_size..header_size + len],
                         receive_time,
                     );
                     min_rtt = min_rtt.min(rtt);
-                    acked_bytes += ab;
+                    acked_bytes = ab;
                 }
                 x if x == UtpExtension::CloseReason as u8 => {
                     self.parse_close_reason(&buf[header_size..header_size + len]);
@@ -1439,13 +1456,16 @@ impl UtpSocket {
         if self.m_duplicate_acks >= DUP_ACK_LIMIT
             && (self.m_acked_seq_nr.wrapping_add(1) & ACK_MASK) == self.m_fast_resend_seq_nr
         {
-            // fast resend
+            // fast resend — upstream increments
+            // `m_fast_resend_seq_nr` *before* calling
+            // `experienced_loss`/`resend_packet`, passing the
+            // already-incremented value to the loss-rate guard
             let seq = self.m_fast_resend_seq_nr;
             self.m_fast_resend_seq_nr = self.m_fast_resend_seq_nr.wrapping_add(1) & ACK_MASK;
-            if self.outbuf.at(u32::from(seq)).is_some() {
-                let is_probe = self.outbuf.at(u32::from(seq)).is_some_and(|p| p.mtu_probe);
+            if let Some(p) = self.outbuf.at(u32::from(seq)) {
+                let is_probe = p.mtu_probe;
                 if !is_probe {
-                    self.experienced_loss(seq, receive_time);
+                    self.experienced_loss(self.m_fast_resend_seq_nr, receive_time);
                 }
                 self.resend_packet_seq(seq, true);
             }
@@ -1576,6 +1596,50 @@ impl UtpSocket {
         true
     }
 
+    /// `init_mtu` — called with `mtu_for_dest(remote)` when the
+    /// socket is created (outgoing or accepted).
+    pub fn init_mtu(&mut self, mtu: u16) {
+        self.m_mtu_ceiling = mtu;
+        // start in the middle of the PMTU search space
+        self.m_mtu = ((u32::from(self.m_mtu_ceiling) + u32::from(self.m_mtu_floor)) / 2) as u16;
+        if self.m_mtu > self.m_mtu_ceiling {
+            self.m_mtu = self.m_mtu_ceiling;
+        }
+        if self.m_mtu_floor > mtu {
+            self.m_mtu_floor = mtu;
+        }
+        if (self.m_cwnd >> 16) < i64::from(self.m_mtu) {
+            self.m_cwnd = i64::from(self.m_mtu) << 16;
+        }
+    }
+
+    /// `m_sm.restrict_mtu(m_mtu)` hook — `Some(mtu)` once a packet
+    /// larger than the floor caused a give-up (upstream pushes it
+    /// into the manager's rolling `m_restrict_mtu` window).
+    pub fn take_failed_mtu(&mut self) -> Option<u16> {
+        self.failed_mtu.take()
+    }
+
+    /// `utp_socket_manager::mtu_for_dest` — path-MTU guess for a
+    /// destination (Teredo/SOCKS5/v6 adjustments), clamped to the
+    /// manager's rolling restrict cap.
+    #[must_use]
+    pub fn mtu_for_dest(addr: &std::net::IpAddr, socks5: bool, restrict_cap: i32) -> i32 {
+        let mut mtu = if crate::ip_helpers::is_teredo(addr) {
+            1280
+        } else {
+            i32::try_from(ETHERNET_MTU).unwrap_or(1500)
+        };
+        mtu -= UDP_HEADER as i32;
+        if socks5 {
+            // IP layer (assume the proxy runs over IPv4) + SOCKS layer
+            mtu -= IPV4_HEADER as i32 + 6 + if addr.is_ipv4() { 4 } else { 16 };
+        } else {
+            mtu -= if addr.is_ipv4() { IPV4_HEADER } else { 40 } as i32;
+        }
+        mtu.min(restrict_cap)
+    }
+
     /// `send_deferred_ack` — flush a queued pure-ACK.
     pub fn send_deferred_ack(&mut self) {
         if !self.m_deferred_ack {
@@ -1659,6 +1723,12 @@ impl UtpSocket {
                 || (self.state == UtpState::SynSent && n >= self.cfg.syn_resends)
                 || (self.state == UtpState::FinSent && n >= self.cfg.fin_resends)
             {
+                // the packet that killed the conn was bigger than the
+                // floor — probably a dead MTU probe; tell the manager
+                // to be more conservative (`m_sm.restrict_mtu`)
+                if i32::from(p.size) > i32::from(self.m_mtu_floor) {
+                    self.failed_mtu = Some(self.m_mtu);
+                }
                 self.m_error = Some(UtpError::TimedOut);
                 self.set_state(UtpState::ErrorWait);
                 self.test_socket_state();
@@ -1682,19 +1752,23 @@ const PKT_ACK: u8 = 1;
 const PKT_FIN: u8 = 2;
 
 /// `remove_sack_header` — drop a stale SACK extension in place.
+/// The SACK's `next` byte becomes the header extension id upstream
+/// (`h->extension = ptr[0]`): a chained close-reason survives.
 fn remove_sack_header(p: &mut Packet) {
+    let next_ext = p.buf[UTP_HEADER_LEN];
     let sack_size = usize::from(p.buf[UTP_HEADER_LEN + 1]) + 2;
     let hdr = usize::from(p.header_size);
     p.buf.copy_within(hdr..usize::from(p.size), UTP_HEADER_LEN);
     p.size -= sack_size as u16;
     p.header_size -= sack_size as u16;
-    p.buf[1] = UtpExtension::None as u8;
+    p.buf[1] = next_ext;
 }
 
 fn micros_now() -> u32 {
-    (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
-        & 0xffff_ffff) as u32
+    // upstream uses `clock_type` (a monotonic clock) for the
+    // timestamp fields; a wall clock would corrupt the delay
+    // samples when NTP steps it.
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(Instant::now);
+    (start.elapsed().as_micros() as u64 & 0xffff_ffff) as u32
 }

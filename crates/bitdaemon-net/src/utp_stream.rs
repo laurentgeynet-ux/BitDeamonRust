@@ -41,7 +41,7 @@ pub struct UtpManager {
     inner: Arc<Mutex<ManagerInner>>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ManagerInner {
     /// `(remote, conn_id)` → socket's inbound channel.
     sockets: HashMap<(SocketAddr, u16), mpsc::Sender<Inbound>>,
@@ -50,6 +50,34 @@ struct ManagerInner {
     listener: Option<mpsc::Sender<Inbound>>,
     /// tasks we spawned (kept alive; aborted with the manager).
     tasks: Vec<JoinHandle<()>>,
+    /// `connections_limit` — unmatched SYNs are dropped once
+    /// `sockets.len() > limit * 2` (upstream SYN-flood guard).
+    conn_limit: usize,
+    /// `m_restrict_mtu`/`m_mtu_idx` — rolling window of failed
+    /// path-MTU probes; the cap is the max of the last 3.
+    restrict_mtu: [i32; 3],
+    mtu_idx: usize,
+}
+
+impl Default for ManagerInner {
+    fn default() -> Self {
+        Self {
+            sockets: HashMap::new(),
+            listener: None,
+            tasks: Vec::new(),
+            // upstream `settings_pack::connections_limit` default
+            conn_limit: 200,
+            restrict_mtu: [65536; 3],
+            mtu_idx: 0,
+        }
+    }
+}
+
+impl ManagerInner {
+    /// `restrict_mtu()` — `max` of the rolling window.
+    fn mtu_cap(&self) -> i32 {
+        self.restrict_mtu.iter().copied().max().unwrap_or(65536)
+    }
 }
 
 impl UtpManager {
@@ -84,12 +112,34 @@ impl UtpManager {
                 return;
             }
         }
-        // unmatched ST_SYN (type nibble 4) → the listen queue
-        if buf[0] >> 4 == 4 {
+        // unmatched ST_SYN (type nibble 4) → the listen queue,
+        // unless we're over the upstream SYN-flood cap
+        // (`connections_limit * 2` sockets)
+        if buf[0] >> 4 == 4 && inner.sockets.len() <= inner.conn_limit * 2 {
             if let Some(tx) = &inner.listener {
                 let _ = tx.send((buf.to_vec(), from)).await;
             }
         }
+    }
+
+    /// `settings_pack::connections_limit` for the SYN-flood guard.
+    pub async fn set_connection_limit(&self, limit: usize) {
+        self.inner.lock().await.conn_limit = limit;
+    }
+
+    /// `utp_socket_manager::restrict_mtu` — record a failed MTU.
+    pub async fn restrict_mtu(&self, mtu: i32) {
+        let mut inner = self.inner.lock().await;
+        let idx = inner.mtu_idx;
+        inner.restrict_mtu[idx] = mtu;
+        inner.mtu_idx = (idx + 1) % inner.restrict_mtu.len();
+    }
+
+    /// `mtu_for_dest` — path-MTU guess for `remote` clamped to the
+    /// rolling restrict cap.
+    async fn mtu_for(&self, remote: SocketAddr, socks5: bool) -> i32 {
+        let cap = self.inner.lock().await.mtu_cap();
+        UtpSocket::mtu_for_dest(&remote.ip(), socks5, cap)
     }
 
     /// register the SYN listener — returns the acceptor's queue
@@ -116,7 +166,8 @@ impl UtpManager {
         let id = u16::from_be_bytes([syn[2], syn[3]]);
         // upstream `utp_socket_manager::incoming_packet`: responder
         // send_id = the SYN's connection id, recv_id = send_id + 1
-        let mut sock = UtpSocket::new(id.wrapping_add(1), id, cfg);
+        let mut sock = UtpSocket::new(id.wrapping_add(1), id, cfg.clone());
+        sock.init_mtu(self.mtu_for(from, cfg.proxy_socks5).await as u16);
         // Feed the SYN *synchronously* — upstream constructs the
         // socket impl already-Connected (the SYN is what creates it).
         // Routing it through the pump's inbound channel let
@@ -191,7 +242,8 @@ impl UtpManager {
         // upstream `new_utp_socket`: send_id = random,
         // recv_id = send_id - 1 (the SYN carries recv_id)
         let send_id = rand::random::<u16>();
-        let mut sock = UtpSocket::new(send_id.wrapping_sub(1), send_id, cfg);
+        let mut sock = UtpSocket::new(send_id.wrapping_sub(1), send_id, cfg.clone());
+        sock.init_mtu(self.mtu_for(remote, cfg.proxy_socks5).await as u16);
         sock.connect(remote);
         let recv_id = sock.recv_id();
         let rx = self.register((remote, recv_id)).await;
@@ -285,6 +337,9 @@ async fn socket_pump(
             }
             _ = tick.tick() => {
                 sock.tick(Instant::now());
+                if let Some(mtu) = sock.take_failed_mtu() {
+                    mgr.restrict_mtu(i32::from(mtu)).await;
+                }
             }
             else => break,
         }

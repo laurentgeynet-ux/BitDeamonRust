@@ -91,56 +91,92 @@ impl UdpTrackerDemux {
 }
 
 /// Attend la reponse `tid` via le demux (remplace le `recv_from`
-/// direct qui se faisait voler les paquets par la pompe UDP).
-struct UdpWaiter {
+/// direct qui se faisait voler les paquets par la pompe UDP). La
+/// registration est retiree au `Drop` — la boucle de retry peut
+/// reutiliser le meme waiter sans fuite dans le demux.
+struct UdpWaiter<'a> {
     tid: u32,
     rx: mpsc::UnboundedReceiver<UdpReply>,
+    demux: &'a UdpTrackerDemux,
+}
+
+impl Drop for UdpWaiter<'_> {
+    fn drop(&mut self) {
+        self.demux.unregister(self.tid);
+    }
 }
 
 /// Enregistre l'attente **avant** l'envoi du datagramme — sinon une
 /// reponse tres rapide arrive avant le `register` et est perdue.
-fn udp_waiter(demux: &UdpTrackerDemux, tid: u32) -> UdpWaiter {
+fn udp_waiter(demux: &UdpTrackerDemux, tid: u32) -> UdpWaiter<'_> {
     UdpWaiter {
         tid,
         rx: demux.register(tid),
+        demux,
     }
 }
 
 async fn wait_reply(
-    demux: &UdpTrackerDemux,
-    waiter: UdpWaiter,
+    waiter: &mut UdpWaiter<'_>,
     timeout: Duration,
 ) -> Result<Vec<u8>, UdpTrackerError> {
-    let mut waiter = waiter;
-    let res = tokio::time::timeout(timeout, waiter.rx.recv()).await;
-    drop(waiter.rx);
-    demux.unregister(waiter.tid);
-    res.map_err(|_| UdpTrackerError::Timeout)?
+    tokio::time::timeout(timeout, waiter.rx.recv())
+        .await
+        .map_err(|_| UdpTrackerError::Timeout)?
         .map(|(_from, buf)| buf)
         .ok_or(UdpTrackerError::Timeout)
 }
 
-/// announce parameters shared by both protocols.
+/// announce parameters shared by both protocols — the fields of
+/// upstream `tracker_request` (`tracker_manager.hpp`).
 #[derive(Debug, Clone)]
 pub struct AnnounceParams {
-    /// v1 info hash.
+    /// `req.url` — the tracker announce URL (also feeds the UDP
+    /// `request_string` trailer).
+    pub url: String,
+    /// `req.info_hash` — v1 info hash.
     pub info_hash: [u8; 20],
-    /// our peer id.
+    /// `req.pid` — our peer id.
     pub peer_id: [u8; 20],
-    /// listen port announced.
+    /// `req.listen_port`.
     pub port: u16,
-    /// uploaded bytes.
+    /// `req.uploaded`.
     pub uploaded: i64,
-    /// downloaded bytes.
+    /// `req.downloaded`.
     pub downloaded: i64,
-    /// bytes left.
+    /// `req.left`.
     pub left: i64,
-    /// `event` — 0 none, 1 completed, 2 started, 3 stopped.
+    /// `req.corrupt` — downloaded bytes that failed the hash check
+    /// (always sent on HTTP announces).
+    pub corrupt: i64,
+    /// `req.redundant` — received bytes we already had (sent when
+    /// `report_redundant_bytes` is on).
+    pub redundant: i64,
+    /// `req.event` — `event_t`: 0 none, 1 completed, 2 started,
+    /// 3 stopped, 4 paused.
     pub event: i32,
-    /// `numwant` (-1 = omit).
+    /// `req.num_want`.
     pub num_want: i32,
-    /// `key` — our random announce key.
-    pub key: i32,
+    /// `req.key` — our random announce key (`std::uint32_t`
+    /// upstream, rendered `%08X` on HTTP).
+    pub key: u32,
+    /// `req.trackerid` — echoed `tracker id` from a previous
+    /// response (empty = none).
+    pub tracker_id: Vec<u8>,
+    /// `req.ipv4` — per-listen-socket external v4 addresses →
+    /// repeated `&ipv4=` params.
+    pub ipv4: Vec<std::net::Ipv4Addr>,
+    /// `req.ipv6` — repeated `&ipv6=` params.
+    pub ipv6: Vec<std::net::Ipv6Addr>,
+    /// `tracker_request_flags_t::i2p` — interpret `peers` as
+    /// 32-byte destinations in HTTP responses.
+    pub i2p: bool,
+    /// `req.filter` — shared `ip_filter` attached when
+    /// `apply_ip_filter_to_trackers` + the torrent's
+    /// `apply_ip_filter` flag are both set; resolved tracker
+    /// endpoints are dropped through it (`on_filter` upstream:
+    /// all-blocked → `banned_by_ip_filter` failure).
+    pub filter: Option<std::sync::Arc<crate::ip_filter::IpFilter>>,
 }
 
 /// announce errors (protocol or transport).
@@ -161,20 +197,31 @@ pub enum AnnounceError {
     /// tracker refused (`failure_reason`).
     #[error("failure: {0}")]
     Failure(String),
+    /// `errors::ssrf_mitigation` — the tracker URL already carried
+    /// tracker query args while `ssrf_mitigation` is enabled.
+    #[error("ssrf mitigation: tracker url contains announce arguments")]
+    Ssrf,
 }
 
 /// `http_tracker_connection` — announce over an established stream
-/// (proxy/tunnel handshake already done by the caller). `path` is
-/// the URL path+query minus our params (announce params appended).
+/// (proxy/tunnel handshake already done by the caller). `p.url` is
+/// the full announce URL; our params are appended like upstream
+/// (`?`/`&` depending on a baked-in query string, with the
+/// `ssrf_mitigation` check).
 pub async fn announce_http(
     s: &mut BoxedPeerStream,
-    host: &str,
-    base_path: &str,
     p: &AnnounceParams,
-    tracker_id: Option<&[u8]>,
+    opts: &crate::http_tracker::AnnounceOptions,
     extra_headers: &[(String, String)],
     max_response: usize,
 ) -> Result<TrackerResponse, AnnounceError> {
+    // upstream start(): a pre-baked `?` query means `&` join, and is
+    // rejected under ssrf_mitigation when it holds announce args.
+    if let Some(i) = p.url.find('?') {
+        if opts.ssrf_mitigation && crate::parse_url::has_tracker_query_string(&p.url[i + 1..]) {
+            return Err(AnnounceError::Ssrf);
+        }
+    }
     let q = announce_query(
         &p.info_hash,
         &p.peer_id,
@@ -182,78 +229,115 @@ pub async fn announce_http(
         p.uploaded,
         p.downloaded,
         p.left,
+        p.corrupt,
+        p.redundant,
+        p.key,
         p.event,
         p.num_want,
-        p.key,
-        true,
-        false,
-        tracker_id,
+        (!p.tracker_id.is_empty()).then_some(p.tracker_id.as_slice()),
+        opts,
+        &p.ipv4,
+        &p.ipv6,
     );
-    let sep = if base_path.contains('?') { "&" } else { "?" };
-    let path = format!("{base_path}{sep}{q}");
-    let resp = http_get(s, &path, host, extra_headers, max_response).await?;
-    let r = parse_response(&resp.body(), false, None).map_err(|e| match e {
+    let sep = if p.url.contains('?') { "&" } else { "?" };
+    let url = format!("{}{sep}{q}", p.url);
+    let resp = http_get(s, &url, extra_headers, max_response).await?;
+    // upstream on_response(): anything but 200 fails with
+    // http_category(status_code) + the reason phrase.
+    if resp.status() != 200 {
+        return Err(HttpError::Status(resp.status()).into());
+    }
+    let mut r = parse_response(&resp.body(), false, None, p.i2p).map_err(|e| match e {
         HttpTrackerError::Failure(m) => AnnounceError::Failure(m),
         other => AnnounceError::HttpTracker(other),
     })?;
+    r.interval = r.interval.max(opts.min_announce_interval);
     Ok(r)
 }
 
-/// `udp_tracker_connection` — the full BEP-15 exchange: connect
-/// (fresh transaction ids each attempt), retry `max_tries` times
-/// with `timeout` per datagram round-trip.
+/// `update_transaction_id` — upstream draws `random(0xfffffffe) + 1`
+/// (never 0, never 0xffffffff).
+fn new_tid() -> u32 {
+    rand::random::<u32>() % 0xffff_fffe + 1
+}
+
+/// `udp_tracker_connection` — the BEP-15 exchange: connect then
+/// announce, one datagram each (upstream sends once — a receive
+/// timeout fails the announce; `m_attempts` is just a counter).
+/// Stray packets failing the tid/length checks are ignored and
+/// rearm the `timeout` receive deadline like upstream's
+/// `restart_read_timeout`. `opts` carries
+/// `anonymous_mode`/`announce_ip`/`min_announce_interval` like the
+/// session settings upstream reads.
 pub async fn announce_udp(
     dgram: &dyn DatagramSocket,
     demux: &UdpTrackerDemux,
     tracker: SocketAddr,
     p: &AnnounceParams,
+    opts: &crate::http_tracker::AnnounceOptions,
     timeout: Duration,
-    max_tries: u32,
 ) -> Result<TrackerResponse, AnnounceError> {
-    // connect exchange (one retry inside upstream too)
-    let mut conn_id = None;
-    for _ in 0..max_tries.max(1) {
-        let tid = rand::random::<u32>();
-        let w = udp_waiter(demux, tid);
+    // connect exchange
+    let conn_id = {
+        let tid = new_tid();
+        let mut w = udp_waiter(demux, tid);
         let _ = dgram.send_to(&build_connect(tid), tracker).await?;
-        let buf = wait_reply(demux, w, timeout).await?;
-        match parse_connect_response(&buf, tid) {
-            Ok(id) => {
-                conn_id = Some(id);
-                break;
+        loop {
+            let buf = wait_reply(&mut w, timeout).await?;
+            match parse_connect_response(&buf, tid) {
+                Ok(id) => break id,
+                Err(UdpTrackerError::Tracker(m)) => return Err(AnnounceError::Failure(m)),
+                Err(UdpTrackerError::UnexpectedReply | UdpTrackerError::Truncated) => continue,
+                Err(e) => return Err(e.into()),
             }
-            Err(UdpTrackerError::Tracker(m)) => return Err(AnnounceError::Failure(m)),
-            Err(UdpTrackerError::UnexpectedReply) => continue, // stale packet
-            Err(e) => return Err(e.into()),
         }
-    }
-    let conn_id = conn_id.ok_or(UdpTrackerError::Timeout)?;
+    };
 
-    // announce exchange
-    for _ in 0..max_tries.max(1) {
-        let tid = rand::random::<u32>();
-        let req = AnnounceRequest {
-            info_hash: p.info_hash,
-            peer_id: p.peer_id,
-            downloaded: p.downloaded,
-            left: p.left,
-            uploaded: p.uploaded,
-            event: p.event,
-            announce_ip: std::net::Ipv4Addr::UNSPECIFIED,
-            key: p.key,
-            num_want: p.num_want,
-            listen_port: p.port,
-            request_string: String::new(),
-        };
-        let w = udp_waiter(demux, tid);
-        let _ = dgram
-            .send_to(&build_announce(conn_id, tid, &req), tracker)
-            .await?;
-        let buf = wait_reply(demux, w, timeout).await?;
+    // the ip field: settings announce_ip when !anonymous_mode and it
+    // parses as v4, else 0 (upstream udp_tracker_connection).
+    let announce_ip = if !opts.anonymous_mode {
+        opts.announce_ip
+            .as_deref()
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            .and_then(|ip| match ip {
+                std::net::IpAddr::V4(v4) => Some(v4),
+                std::net::IpAddr::V6(_) => None,
+            })
+            .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED)
+    } else {
+        std::net::Ipv4Addr::UNSPECIFIED
+    };
+    // `request_string` trailer: the announce URL's path+query.
+    let request_string = crate::parse_url::parse_url_components(&p.url)
+        .map(|c| c.path)
+        .unwrap_or_default();
+
+    // announce exchange — one datagram; strays rearm the deadline
+    let tid = new_tid();
+    let req = AnnounceRequest {
+        info_hash: p.info_hash,
+        peer_id: p.peer_id,
+        downloaded: p.downloaded,
+        left: p.left,
+        uploaded: p.uploaded,
+        event: p.event,
+        announce_ip,
+        key: p.key,
+        num_want: p.num_want,
+        listen_port: p.port,
+        request_string: request_string.clone(),
+    };
+    let mut w = udp_waiter(demux, tid);
+    let _ = dgram
+        .send_to(&build_announce(conn_id, tid, &req), tracker)
+        .await?;
+    loop {
+        let buf = wait_reply(&mut w, timeout).await?;
         match parse_announce_response(&buf, 1, tid, tracker.is_ipv6()) {
             Ok(r) => {
                 return Ok(TrackerResponse {
-                    interval: r.interval,
+                    interval: r.interval.max(opts.min_announce_interval),
+                    min_interval: 60,
                     complete: i64::from(r.complete),
                     incomplete: i64::from(r.incomplete),
                     tracker_id: r.tracker_id,
@@ -262,79 +346,78 @@ pub async fn announce_udp(
                 });
             }
             Err(UdpTrackerError::Tracker(m)) => return Err(AnnounceError::Failure(m)),
-            Err(UdpTrackerError::UnexpectedReply) => continue,
+            Err(UdpTrackerError::UnexpectedReply | UdpTrackerError::Truncated) => continue,
             Err(e) => return Err(e.into()),
         }
     }
-    Err(UdpTrackerError::Timeout.into())
 }
 
 /// `scrape_udp` — connect then a single scrape datagram (BEP-15
-/// action 2); `max_tries` round-trip retries like `announce_udp`.
+/// action 2); one send each, like `announce_udp` upstream.
 pub async fn scrape_udp(
     dgram: &dyn DatagramSocket,
     demux: &UdpTrackerDemux,
     tracker: SocketAddr,
     info_hash: &[u8; 20],
     timeout: Duration,
-    max_tries: u32,
 ) -> Result<crate::udp_tracker::ScrapeResponse, AnnounceError> {
     use crate::udp_tracker::{
         build_connect, build_scrape, parse_connect_response, parse_scrape_response,
     };
-    let mut conn_id = None;
-    for _ in 0..max_tries.max(1) {
-        let tid = rand::random::<u32>();
-        let w = udp_waiter(demux, tid);
+    let conn_id = {
+        let tid = new_tid();
+        let mut w = udp_waiter(demux, tid);
         let _ = dgram.send_to(&build_connect(tid), tracker).await?;
-        let buf = wait_reply(demux, w, timeout).await?;
-        match parse_connect_response(&buf, tid) {
-            Ok(id) => {
-                conn_id = Some(id);
-                break;
+        loop {
+            let buf = wait_reply(&mut w, timeout).await?;
+            match parse_connect_response(&buf, tid) {
+                Ok(id) => break id,
+                Err(UdpTrackerError::Tracker(m)) => return Err(AnnounceError::Failure(m)),
+                Err(UdpTrackerError::UnexpectedReply | UdpTrackerError::Truncated) => continue,
+                Err(e) => return Err(e.into()),
             }
-            Err(UdpTrackerError::Tracker(m)) => return Err(AnnounceError::Failure(m)),
-            Err(UdpTrackerError::UnexpectedReply) => continue,
-            Err(e) => return Err(e.into()),
         }
-    }
-    let conn_id = conn_id.ok_or(UdpTrackerError::Timeout)?;
-    for _ in 0..max_tries.max(1) {
-        let tid = rand::random::<u32>();
-        let pkt = build_scrape(conn_id, tid, &[*info_hash]);
-        let w = udp_waiter(demux, tid);
-        let _ = dgram.send_to(&pkt, tracker).await?;
-        let buf = wait_reply(demux, w, timeout).await?;
+    };
+    let tid = new_tid();
+    let pkt = build_scrape(conn_id, tid, &[*info_hash]);
+    let mut w = udp_waiter(demux, tid);
+    let _ = dgram.send_to(&pkt, tracker).await?;
+    loop {
+        let buf = wait_reply(&mut w, timeout).await?;
         match parse_scrape_response(&buf, tid) {
-            Ok(mut v) => {
+            Ok(v) => {
                 return v
-                    .pop()
+                    .into_iter()
+                    .next()
                     .ok_or(AnnounceError::Udp(UdpTrackerError::BadLength));
             }
             Err(UdpTrackerError::Tracker(m)) => return Err(AnnounceError::Failure(m)),
-            Err(UdpTrackerError::UnexpectedReply) => continue,
+            Err(UdpTrackerError::UnexpectedReply | UdpTrackerError::Truncated) => continue,
             Err(e) => return Err(e.into()),
         }
     }
-    Err(UdpTrackerError::Timeout.into())
 }
 
 /// `scrape_http` — GET the scrape url with `info_hash`, parse the
 /// `files`/`info_hash` dict (upstream maps it onto the same
-/// `tracker_response` fields).
+/// `tracker_response` fields). `url` is the full scrape URL (from
+/// [`crate::http_tracker::scrape_url`]); scrape requests carry only
+/// `info_hash` upstream.
 pub async fn scrape_http(
     s: &mut BoxedPeerStream,
-    host: &str,
-    base_path: &str,
+    url: &str,
     info_hash: &[u8; 20],
     extra_headers: &[(String, String)],
     max_response: usize,
 ) -> Result<TrackerResponse, AnnounceError> {
     let q = crate::http_tracker::scrape_query(info_hash);
-    let sep = if base_path.contains('?') { "&" } else { "?" };
-    let path = format!("{base_path}{sep}{q}");
-    let resp = http_get(s, &path, host, extra_headers, max_response).await?;
-    parse_response(&resp.body(), true, Some(info_hash)).map_err(|e| match e {
+    let sep = if url.contains('?') { "&" } else { "?" };
+    let url = format!("{url}{sep}{q}");
+    let resp = http_get(s, &url, extra_headers, max_response).await?;
+    if resp.status() != 200 {
+        return Err(HttpError::Status(resp.status()).into());
+    }
+    parse_response(&resp.body(), true, Some(info_hash), false).map_err(|e| match e {
         HttpTrackerError::Failure(m) => AnnounceError::Failure(m),
         other => AnnounceError::HttpTracker(other),
     })

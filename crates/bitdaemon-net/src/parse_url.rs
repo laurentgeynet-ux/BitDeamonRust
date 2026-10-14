@@ -181,6 +181,36 @@ pub fn split_url(url: &str) -> Result<(String, String), UrlError> {
     }
 }
 
+/// `maybe_url_encode` — work-around for servers returning unencoded
+/// redirect URLs: `escape_path` the path iff it needs it, rebuilt
+/// over the original scheme/auth/host/port. Unparseable URLs pass
+/// through unchanged.
+#[must_use]
+pub fn maybe_url_encode(url: &str) -> String {
+    let Ok(c) = parse_url_components(url) else {
+        return url.to_string();
+    };
+    if !bitdaemon_core::escape_string::need_encoding(c.path.as_bytes()) {
+        return url.to_string();
+    }
+    let mut msg = String::with_capacity(url.len() + 8);
+    msg.push_str(&c.protocol);
+    msg.push_str("://");
+    if !c.auth.is_empty() {
+        msg.push_str(&c.auth);
+        msg.push('@');
+    }
+    msg.push_str(&c.hostname);
+    if c.port != -1 {
+        msg.push(':');
+        msg.push_str(&c.port.to_string());
+    }
+    msg.push_str(&String::from_utf8_lossy(
+        &bitdaemon_core::escape_string::escape_path(c.path.as_bytes()),
+    ));
+    msg
+}
+
 /// `is_idna` — an `xn--`-prefixed label.
 #[must_use]
 pub fn is_idna(hostname: &str) -> bool {

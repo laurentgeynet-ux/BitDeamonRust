@@ -30,8 +30,13 @@ pub const CRYPTO_PLAINTEXT: u32 = 0x01;
 /// see above.
 pub const CRYPTO_RC4: u32 = 0x02;
 
-/// Max pad length upstream emits (`random(512)`).
+/// Pad bound upstream uses (`random(512)` → 0..=511 emitted) and the
+/// sync-scan limit (`m_sync_bytes_read >= 512` → disconnect).
 pub const MAX_PAD: usize = 512;
+
+/// `handshake_len` cap upstream applies to `len_ia`
+/// (`errors::invalid_pad_size` past 68 — the BT handshake length).
+pub const MAX_IA: usize = 68;
 
 /// MSE handshake errors.
 #[derive(Debug, thiserror::Error)]
@@ -54,6 +59,9 @@ pub enum MseError {
     /// no torrent matches the skey hash.
     #[error("unknown info_hash")]
     UnknownInfoHash,
+    /// `errors::invalid_pad_size` — `len_ia` > `MAX_IA`.
+    #[error("invalid pad size")]
+    InvalidPadSize,
 }
 
 /// `random_bytes` for pads — injectable for tests.
@@ -89,14 +97,16 @@ pub fn skey_candidate(secret: &[u8], field: &Sha1Hash) -> Sha1Hash {
 }
 
 /// `write_pe_vc_cryptofield` — `[VC 8][crypto 4][len_pad 2][pad][len_ia 2?]`.
-fn vc_cryptofield(crypto: u32, pad: &[u8], outgoing: bool) -> Vec<u8> {
+/// `len_ia` is written only on the initiating side — its value is the
+/// IA length (`handshake_len` upstream), not 0.
+fn vc_cryptofield(crypto: u32, pad: &[u8], ia_len: Option<u16>) -> Vec<u8> {
     let mut v = Vec::with_capacity(8 + 4 + 2 + pad.len() + 2);
     v.extend([0u8; 8]); // VC
     v.extend(crypto.to_be_bytes());
     v.extend((pad.len() as u16).to_be_bytes());
     v.extend(pad);
-    if outgoing {
-        v.extend(0u16.to_be_bytes()); // len(IA) = 0
+    if let Some(ia) = ia_len {
+        v.extend(ia.to_be_bytes());
     }
     v
 }
@@ -116,17 +126,21 @@ pub struct MseResult {
 
 /// PE1+PE3 — the **initiator** side: send our DH key, read theirs,
 /// compute S, send sync/skey + RC4 cryptofield, read PE4.
-/// `pad_len` ∈ 0..=512 (upstream `random(512)`).
+/// `ia` is the initial payload — upstream piggybacks the 68-byte BT
+/// handshake (`len_ia = handshake_len`), sent RC4-encrypted right
+/// after the cryptofield. `pad_len` clamps at upstream's emit bound
+/// (511 = `random(512)` max).
 pub async fn mse_initiator(
     s: &mut BoxedPeerStream,
     info_hash: &Sha1Hash,
     crypto_provide: u32,
+    ia: &[u8],
     pad_len: usize,
 ) -> Result<MseResult, MseError> {
     // PE1 — send pub + pad
     let mut dh = DhKeyExchange::new();
     s.write_all(dh.local_key()).await?;
-    s.write_all(&random_pad(pad_len.min(MAX_PAD))).await?;
+    s.write_all(&random_pad(pad_len.min(MAX_PAD - 1))).await?;
 
     // PE2 — read remote pub
     let mut remote = [0u8; DH_KEY_LEN];
@@ -141,10 +155,17 @@ pub async fn mse_initiator(
     s.write_all(skey_field(&secret, info_hash).as_bytes())
         .await?;
     let mut rc4 = init_pe_rc4_handler(&secret, info_hash, true);
-    let pad = random_pad(pad_len.min(MAX_PAD));
-    let mut cf = vc_cryptofield(crypto_provide, &pad, true);
+    let pad = random_pad(pad_len.min(MAX_PAD - 1));
+    let ia_len = u16::try_from(ia.len()).unwrap_or(MAX_IA as u16);
+    let mut cf = vc_cryptofield(crypto_provide, &pad, Some(ia_len));
     rc4.encrypt(&mut cf);
     s.write_all(&cf).await?;
+    // len(IA) announces the BT handshake; it follows RC4'd.
+    if ia_len > 0 {
+        let mut enc_ia = ia[..usize::from(ia_len)].to_vec();
+        rc4.encrypt(&mut enc_ia);
+        s.write_all(&enc_ia).await?;
+    }
 
     // PE4 — padB (plaintext, ≤512) precedes the RC4'd cryptofield.
     // upstream `read_pe_syncvc`: scan the raw stream for the 8
@@ -229,7 +250,7 @@ pub async fn mse_responder_prefix(
     s.read_exact(&mut remote[dh_prefix.len()..]).await?;
     let mut dh = DhKeyExchange::new();
     s.write_all(dh.local_key()).await?;
-    s.write_all(&random_pad(pad_len.min(MAX_PAD))).await?;
+    s.write_all(&random_pad(pad_len.min(MAX_PAD - 1))).await?;
     if !dh.compute_secret(&remote) {
         return Err(MseError::DhFailed);
     }
@@ -275,6 +296,11 @@ pub async fn mse_responder_prefix(
     s.read_exact(&mut tail).await?;
     rc4.decrypt(&mut tail);
     let ia_len = u16::from_be_bytes([tail[len_pad], tail[len_pad + 1]]) as usize;
+    // upstream disconnects on len_ia > 68 (`invalid_pad_size`) — the
+    // IA is a BT handshake, nothing larger is legitimate.
+    if ia_len > MAX_IA {
+        return Err(MseError::InvalidPadSize);
+    }
     let mut initial_payload = vec![0u8; ia_len];
     if ia_len > 0 {
         s.read_exact(&mut initial_payload).await?;
@@ -286,8 +312,8 @@ pub async fn mse_responder_prefix(
     if crypto_select & 0x03 == 0 {
         return Err(MseError::NoCrypto);
     }
-    let pad = random_pad(pad_len.min(MAX_PAD));
-    let mut cf = vc_cryptofield(crypto_select, &pad, false);
+    let pad = random_pad(pad_len.min(MAX_PAD - 1));
+    let mut cf = vc_cryptofield(crypto_select, &pad, None);
     rc4.encrypt(&mut cf);
     s.write_all(&cf).await?;
     Ok(MseResult {

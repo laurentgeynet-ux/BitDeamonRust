@@ -31,9 +31,11 @@ async fn mse_full_handshake_rc4() {
     };
     let want = ih();
     let skh = stream_key_hash(&want);
+    // IA rides in PE3 like upstream (len_ia = handshake_len)
+    let ia: [u8; 68] = [0xcc; 68];
 
     let (ra, rb) = tokio::join!(
-        mse_initiator(&mut a, &want, CRYPTO_RC4, 100),
+        mse_initiator(&mut a, &want, CRYPTO_RC4, &ia, 100),
         mse_responder(
             &mut b,
             50,
@@ -44,6 +46,9 @@ async fn mse_full_handshake_rc4() {
     let ra = ra.unwrap();
     let rb = rb.unwrap();
     assert!(ra.rc4_encrypted && rb.rc4_encrypted);
+    // upstream `len(ia)` path — the responder recovered the
+    // piggybacked initial payload.
+    assert_eq!(rb.initial_payload, ia);
 
     // keystream agreement: encrypt on A → decrypt on B
     let mut buf = *b"hello peer world!!!!";
@@ -66,7 +71,7 @@ async fn bad_skey_rejected() {
         (Box::new(a), Box::new(b))
     };
     let want = ih();
-    let ra = tokio::spawn(async move { mse_initiator(&mut a, &want, CRYPTO_RC4, 0).await });
+    let ra = tokio::spawn(async move { mse_initiator(&mut a, &want, CRYPTO_RC4, &[], 0).await });
     let rb = mse_responder(&mut b, 0, |_| None, |p| p).await;
     assert!(matches!(rb, Err(MseError::UnknownInfoHash)));
     // initiator never gets PE4 — abort it (upstream disconnects)
@@ -136,7 +141,7 @@ async fn mse_plaintext_selected() {
     let want = ih();
     let skh = stream_key_hash(&want);
     let (ra, rb) = tokio::join!(
-        mse_initiator(&mut a, &want, CRYPTO_RC4 | CRYPTO_PLAINTEXT, 0),
+        mse_initiator(&mut a, &want, CRYPTO_RC4 | CRYPTO_PLAINTEXT, &[], 0),
         mse_responder(
             &mut b,
             0,

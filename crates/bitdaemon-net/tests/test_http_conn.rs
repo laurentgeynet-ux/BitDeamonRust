@@ -27,8 +27,7 @@ async fn get_round_trip() {
     });
     let r = http_get(
         &mut cli,
-        "/announce?info_hash=x",
-        "tracker.example",
+        "http://tracker.example/announce?info_hash=x",
         &[("User-Agent".into(), "bitdaemon".into())],
         MAX_RESPONSE,
     )
@@ -86,7 +85,7 @@ async fn gzip_body_inflated() {
         srv.write_all(resp.as_bytes()).await.unwrap();
         srv.write_all(&gz).await.unwrap();
     });
-    let r = http_get(&mut cli, "/announce", "t.example", &[], MAX_RESPONSE)
+    let r = http_get(&mut cli, "http://t.example/announce", &[], MAX_RESPONSE)
         .await
         .unwrap();
     assert_eq!(r.status(), 200);

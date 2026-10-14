@@ -55,11 +55,13 @@ async fn frame_round_trip_masked() {
             .await
             .unwrap();
     });
-    let (op, payload) = ws_read_frame(&mut b).await.unwrap();
+    let (op, payload, fin) = ws_read_frame(&mut b).await.unwrap();
     assert!(matches!(op, WsOpcode::Binary));
+    assert!(fin);
     assert_eq!(payload, b"announce-reply");
-    let (op, payload) = ws_read_frame(&mut b).await.unwrap();
+    let (op, payload, fin) = ws_read_frame(&mut b).await.unwrap();
     assert!(matches!(op, WsOpcode::Text));
+    assert!(fin);
     assert_eq!(payload.len(), 300); // 16-bit length path
     writer.await.unwrap();
 }
@@ -101,17 +103,25 @@ async fn ws_announce_round_trip() {
 
     let ih = [7u8; 20];
     let p = AnnounceParams {
+        url: "ws://tracker.example/announce".into(),
         info_hash: ih,
         peer_id: *b"-OB0001-123456789012",
         port: 6881,
         uploaded: 5,
         downloaded: 9,
         left: 100,
+        corrupt: 0,
+        redundant: 0,
         event: 2, // started
         num_want: 50,
         key: 0x0BADCAFE,
+        tracker_id: Vec::new(),
+        ipv4: Vec::new(),
+        ipv6: Vec::new(),
+        i2p: false,
+        filter: None,
     };
-    let payload = build_announce(&p, &[], 0);
+    let payload = build_announce(&p, &[]);
     assert!(payload.contains("\"action\":\"announce\""));
     assert!(payload.contains("\"event\":\"started\""));
     assert!(payload.contains("\"key\":\"0BADCAFE\""));
@@ -144,9 +154,10 @@ async fn ws_announce_round_trip() {
         )
         .await
         .unwrap();
-        // read the announce frame
-        let (op, data) = ws_read_frame(&mut srv).await.unwrap();
-        assert_eq!(op, WsOpcode::Text);
+        // read the announce frame — beast sends binary upstream
+        let (op, data, fin) = ws_read_frame(&mut srv).await.unwrap();
+        assert_eq!(op, WsOpcode::Binary);
+        assert!(fin);
         assert!(String::from_utf8_lossy(&data).contains("\"action\":\"announce\""));
         // reply — unmasked server frame
         let resp = serde_json::to_string(&serde_json::json!({

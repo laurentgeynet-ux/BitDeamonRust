@@ -77,11 +77,10 @@ async fn connect_and_accept_and_lookup() {
     bridge.await.unwrap();
     assert_eq!(peer, "peer-destination-b64");
 
-    // name lookup → VALUE
+    // name lookup on an established session socket → NAMING LOOKUP
+    // goes out *without* a new HELLO (upstream reuses m_sam_socket)
     let (mut cli, mut srv) = pair();
     let bridge = tokio::spawn(async move {
-        let _ = read_line(&mut srv).await;
-        srv.write_all(b"HELLO REPLY RESULT=OK\n").await.unwrap();
         assert_eq!(read_line(&mut srv).await, "NAMING LOOKUP NAME=forum.i2p");
         srv.write_all(b"NAMING REPLY RESULT=OK NAME=forum.i2p VALUE=b64dest\n")
             .await
@@ -90,6 +89,65 @@ async fn connect_and_accept_and_lookup() {
     let v = i2p_name_lookup(&mut cli, "forum.i2p").await.unwrap();
     bridge.await.unwrap();
     assert_eq!(v, "b64dest");
+}
+
+#[tokio::test]
+async fn name_lookup_fresh_socket() {
+    use bitdaemon_net::i2p::i2p_name_lookup_fresh;
+    let (mut cli, mut srv) = pair();
+    let bridge = tokio::spawn(async move {
+        let _ = read_line(&mut srv).await; // HELLO
+        srv.write_all(b"HELLO REPLY RESULT=OK\n").await.unwrap();
+        assert_eq!(read_line(&mut srv).await, "NAMING LOOKUP NAME=forum.i2p");
+        srv.write_all(b"NAMING REPLY RESULT=OK NAME=forum.i2p VALUE=b64dest\n")
+            .await
+            .unwrap();
+    });
+    let v = i2p_name_lookup_fresh(&mut cli, "forum.i2p").await.unwrap();
+    bridge.await.unwrap();
+    assert_eq!(v, "b64dest");
+}
+
+#[tokio::test]
+async fn open_session_keeps_socket_and_lookups_up_me() {
+    use bitdaemon_net::i2p::I2pConnector;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+
+    let (mine, theirs) = tokio::io::duplex(64 * 1024);
+    let factory = Arc::new(SamFactory(tokio::sync::Mutex::new(vec![mine])));
+    tokio::spawn(async move {
+        let mut srv: BoxedPeerStream = Box::new(theirs);
+        let _ = read_line(&mut srv).await; // HELLO
+        srv.write_all(b"HELLO REPLY RESULT=OK\n").await.unwrap();
+        let line = read_line(&mut srv).await; // SESSION CREATE
+        assert!(line.starts_with("SESSION CREATE STYLE=STREAM ID=sess"));
+        srv.write_all(b"SESSION STATUS RESULT=OK DESTINATION=BASE64DEST\n")
+            .await
+            .unwrap();
+        // upstream: NAMING LOOKUP ME on the same socket, no HELLO
+        assert_eq!(read_line(&mut srv).await, "NAMING LOOKUP NAME=ME");
+        srv.write_all(b"NAMING REPLY RESULT=OK NAME=ME VALUE=my-dest\n")
+            .await
+            .unwrap();
+        // a later name_lookup reuses the same socket, still no HELLO
+        assert_eq!(read_line(&mut srv).await, "NAMING LOOKUP NAME=x.i2p");
+        srv.write_all(b"NAMING REPLY RESULT=OK VALUE=x-dest\n")
+            .await
+            .unwrap();
+    });
+    let (conn, local) = I2pConnector::open_session(
+        factory,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7656),
+        "sess".into(),
+        I2pSessionOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(local, "my-dest");
+    assert_eq!(conn.local_endpoint(), "my-dest");
+    let got = conn.name_lookup("x.i2p").await.unwrap();
+    assert_eq!(got, "x-dest");
 }
 
 #[tokio::test]
@@ -147,7 +205,9 @@ impl PeerConnector for SamFactory {
 async fn i2p_connector_connect_dest() {
     use bitdaemon_net::i2p::I2pConnector;
 
-    // two scripted SAM sockets: NAMING then CONNECT (each gets HELLO)
+    // two scripted SAM sockets: NAMING then CONNECT (each gets HELLO —
+    // `I2pConnector::new` has no session socket so the lookup dials
+    // a fresh SAM connection, like upstream's fallback).
     let (m1, t1) = tokio::io::duplex(64 * 1024);
     let (m2, t2) = tokio::io::duplex(64 * 1024);
     let factory = Arc::new(SamFactory(tokio::sync::Mutex::new(vec![m2, m1]))); // pop order
@@ -160,7 +220,7 @@ async fn i2p_connector_connect_dest() {
             .unwrap();
         line.clear();
         r.read_line(&mut line).await.unwrap(); // NAMING LOOKUP
-        assert!(line.contains("NAMING LOOKUP NAME=peerdest"));
+        assert!(line.contains("NAMING LOOKUP NAME=peerdest.i2p"));
         r.write_all(b"NAMING REPLY RESULT=OK NAME=peerdest VALUE=resolveddest\n")
             .await
             .unwrap();
@@ -187,6 +247,6 @@ async fn i2p_connector_connect_dest() {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7656),
         "sess".into(),
     ));
-    let mut s = conn.connect_dest("peerdest").await.unwrap();
+    let mut s = conn.connect_dest("peerdest.i2p").await.unwrap();
     s.write_all(b"x").await.unwrap();
 }
