@@ -212,8 +212,8 @@ fn force_announce_emits_effects() {
         min_interval: 0,
         ..TrackerResponse::default()
     };
-    s.on_announce_response(&ih, "http://a/announce", Ok(reply.clone()));
-    s.on_announce_response(&ih, "http://b/announce", Ok(reply));
+    s.on_announce_response(&ih, "http://a/announce", Ok(reply.clone()), &mut out);
+    s.on_announce_response(&ih, "http://b/announce", Ok(reply), &mut out);
     s.settings.announce_to_all_tiers = true;
     out.clear();
     s.force_announce(

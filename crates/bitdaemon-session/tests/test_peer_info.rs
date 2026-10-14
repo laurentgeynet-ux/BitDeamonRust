@@ -9,6 +9,7 @@ use bitdaemon_common::{Bitfield, Sha1Hash};
 use bitdaemon_session::peer_conn::PeerConn;
 use bitdaemon_session::peer_info::PeerFlags;
 use bitdaemon_session::peer_pipeline::PeerPipeline;
+use bitdaemon_session::settings::SessionSettings;
 use bitdaemon_session::torrent::Torrent;
 
 #[test]
@@ -26,7 +27,8 @@ fn snapshot_flags_and_queues() {
     c.bitfield_received = true;
     c.num_pieces = 4;
     t.add_peer(1, c);
-    let pi = t.peer_info(1, None).expect("peer 1");
+    let s = SessionSettings::default();
+    let pi = t.peer_info(1, None, &s).expect("peer 1");
     assert!(pi.flags.has(PeerFlags::INTERESTING));
     assert!(pi.flags.has(PeerFlags::CHOKED));
     assert!(pi.flags.has(PeerFlags::SEED));
@@ -34,5 +36,5 @@ fn snapshot_flags_and_queues() {
     assert_eq!(pi.progress_ppm, 1_000_000);
     assert_eq!(pi.num_pieces, 4);
     assert_eq!(pi.request_timeout, -1);
-    assert!(t.peer_info(99, None).is_none());
+    assert!(t.peer_info(99, None, &s).is_none());
 }

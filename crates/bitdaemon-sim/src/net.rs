@@ -1,3 +1,6 @@
+//! Port of `test/simulation/` + `deps/libsimulator` (delivery queue,
+//! per-link filters).
+//!
 //! `sim::simulation` core — registered endpoints + queued deliveries
 //! ordered by virtual send/recv times. Upstream models per-link
 //! latency/jitter/loss via `sim::filter`; we attach a `Link` config to

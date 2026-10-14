@@ -70,7 +70,7 @@ fn announce_cycle() {
         external_ip: None,
         ..Default::default()
     };
-    s.on_announce_response(&ih, "udp://tr/announce", Ok(resp));
+    s.on_announce_response(&ih, "udp://tr/announce", Ok(resp), &mut Vec::new());
     let t = s.torrents.get(&ih).unwrap();
     assert_eq!(t.peer_list.num_peers(), 2);
     // upstream: announce `complete` is scrape population data —
@@ -122,7 +122,7 @@ fn announce_failure_backs_off() {
     );
     let mut s = Session::new();
     s.add_torrent(t);
-    s.on_announce_response(&ih, "http://tr", Err("timeout".into()));
+    s.on_announce_response(&ih, "http://tr", Err("timeout".into()), &mut Vec::new());
     // just failed → not due
     let mut out = Vec::new();
     s.tracker_announce_due(Instant::now(), 0, &mut out);

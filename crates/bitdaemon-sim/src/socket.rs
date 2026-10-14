@@ -1,3 +1,6 @@
+//! Port of `test/simulation/simulator`-side sockets (libsimulator
+//! `sim::asio::udp::socket` equivalent) on our `DatagramSocket` seam.
+//!
 //! `SimSocket` — `DatagramSocket` over a [`SimNet`] mailbox.
 
 use std::fmt::Debug;

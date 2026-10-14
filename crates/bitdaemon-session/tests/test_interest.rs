@@ -46,7 +46,7 @@ fn bitfield_sends_interested() {
         remote: "127.0.0.1:6881".parse().unwrap(),
         msg: PeerMessage::Bitfield(bytes::Bytes::from(vec![0b0010_0000u8])),
     };
-    s.on_peer_message(&p, &mut out);
+    s.on_peer_message(&p, 0, &mut out);
     assert!(
         out.iter().any(|e| matches!(
             e,
@@ -71,7 +71,7 @@ fn piece_verified_sends_not_interested() {
         remote: "127.0.0.1:6881".parse().unwrap(),
         msg: PeerMessage::Bitfield(bytes::Bytes::from(vec![0b1000_0000u8])),
     };
-    s.on_peer_message(&p, &mut out);
+    s.on_peer_message(&p, 0, &mut out);
     out.clear();
     // upstream `on_piece_verified` ignores pieces the picker doesn't
     // consider finished — simulate the download completing first.

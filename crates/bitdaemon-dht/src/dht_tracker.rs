@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `kademlia/dht_tracker.cpp`/`dht_tracker.hpp`.
+//!
 //! `dht_tracker` — owns the per-address-family [`DhtNode`]s and
 //! drives their periodic work. Upstream binds real sockets and
 //! posts through `io_context`; here transports are injected, so

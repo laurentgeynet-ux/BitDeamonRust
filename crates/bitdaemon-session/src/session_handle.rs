@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `session_handle.cpp`/`session_handle.hpp` +
+//! `torrent_handle.cpp`/`torrent_handle.hpp`.
+//!
 //! `session_handle` + `torrent_handle` — the thread-safe public
 //! API. Upstream posts every call through `session_call` to the io
 //! thread; our `Session` core is `Send`, so the handle wraps it in
@@ -277,7 +280,7 @@ impl SessionHandle {
 
     /// `session::on_peer_message` — feed a decoded wire message.
     pub fn on_peer_message(&self, p: &PeerPacket, out: &mut Vec<SessionOut>) {
-        lock(&self.inner).on_peer_message(p, out);
+        lock(&self.inner).on_peer_message(p, 0, out);
     }
 
     /// `session_tick` — drive the periodic pump; returns wait.
@@ -1200,10 +1203,10 @@ impl TorrentHandle {
         peer: u64,
         remote: Option<std::net::SocketAddr>,
     ) -> Option<crate::peer_info::PeerInfo> {
-        lock(&self.session)
-            .torrents
+        let s = lock(&self.session);
+        s.torrents
             .get(&self.info_hash)
-            .and_then(|t| t.peer_info(peer, remote))
+            .and_then(|t| t.peer_info(peer, remote, &s.settings))
     }
 
     /// `piece_availability` — swarm availability per piece.
@@ -2033,7 +2036,7 @@ impl TorrentHandle {
                 .peers
                 .keys()
                 .copied()
-                .filter_map(|id| t.peer_info(id, None))
+                .filter_map(|id| t.peer_info(id, None, &s.settings))
                 .collect();
             s.alerts.post(Alert::PeerInfo {
                 ih: self.info_hash,

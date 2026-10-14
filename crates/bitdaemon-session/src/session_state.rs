@@ -2,8 +2,10 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! BitDaemon `.session` container — **extension, not an upstream
-//! format**. Upstream persists the session as `session_params`
+//! Port of the `session_params.cpp`/`session_state` *role* — the
+//! container itself is **a BitDaemon extension, not an upstream
+//! format** (see PORTING.md deviation log). Upstream persists the
+//! session as `session_params`
 //! (`write_session_params`: settings/dht/dht-state/extensions/
 //! ip-filter) and each torrent separately via `save_resume_data`;
 //! there is no upstream single-file "session + torrents" blob.

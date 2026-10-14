@@ -46,7 +46,7 @@ fn add_peer_and_dispatch() {
         remote: "127.0.0.1:6881".parse().unwrap(),
         msg: PeerMessage::Have(PieceIndex(0)),
     };
-    s.on_peer_message(&p, &mut out);
+    s.on_peer_message(&p, 0, &mut out);
     assert_eq!(
         s.torrents[&ih]
             .picker
@@ -80,7 +80,7 @@ fn disconnect_cleans_up() {
         msg: PeerMessage::Have(PieceIndex(2)),
     };
     let mut out = Vec::new();
-    s.on_peer_message(&p, &mut out);
+    s.on_peer_message(&p, 0, &mut out);
     s.peer_disconnected(&ih, 9, false, &mut out);
     assert_eq!(s.num_peers(), 0);
 }
@@ -223,6 +223,20 @@ fn connect_candidates_backoff_on_failure() {
         &mut Vec::new(),
     );
     s.add_torrent(t);
+    // ctor boost: `p.peers` non-empty → `do_connect_boost` dials the
+    // peer immediately — the effect sits in `pending_out` until the
+    // engine dispatch drains it.
+    let dials: Vec<_> = s
+        .pending_out
+        .iter()
+        .filter(|o| {
+            matches!(
+                o,
+                bitdaemon_session::session::SessionOut::ConnectPeer { .. }
+            )
+        })
+        .collect();
+    assert_eq!(dials.len(), 1);
     let mut _o = Vec::new();
     s.tick(&mut _o); // session_time = 1 (0 means "never connected" upstream)
 
@@ -236,40 +250,32 @@ fn connect_candidates_backoff_on_failure() {
         allow_multiple_connections_per_ip: false,
     };
     let pol = bitdaemon_net::pe_crypto::EncPolicy::Enabled;
-    let c = s
-        .torrents
-        .get_mut(&ih)
-        .unwrap()
-        .connect_candidates(0, &st, pol);
-    // first dial: peer unknown for encryption → plaintext, but
-    // `pe_support` is tentatively armed (upstream toggle — a failed
-    // plaintext attempt retries with MSE).
-    assert_eq!(c, vec![(ep, false)]);
-    // already marked connecting — no candidate next round
+    // the boost already handed the peer out (plaintext — `pe_support`
+    // tentatively armed per upstream's toggle); nothing left to dial.
     assert!(
         s.torrents
             .get_mut(&ih)
             .unwrap()
-            .connect_candidates(0, &st, pol)
-            .is_empty()
+            .try_connect_peer(0, &st, pol)
+            .is_none()
     );
     // dial fails → backoff window blocks re-dial at t=1
-    s.peer_connect_failed(&ih, ep);
+    s.peer_connect_failed(&ih, ep, false);
     assert!(
         s.torrents
             .get_mut(&ih)
             .unwrap()
-            .connect_candidates(1, &st, pol)
-            .is_empty()
+            .try_connect_peer(1, &st, pol)
+            .is_none()
     );
     // after min_reconnect_time*(failcount+1)=120s it's a candidate again
     let c = s
         .torrents
         .get_mut(&ih)
         .unwrap()
-        .connect_candidates(200, &st, pol);
+        .try_connect_peer(200, &st, pol);
     // the failed plaintext dial left pe_support armed → MSE retry.
-    assert_eq!(c, vec![(ep, true)]);
+    assert_eq!(c, Some((ep, true)));
 }
 
 #[test]

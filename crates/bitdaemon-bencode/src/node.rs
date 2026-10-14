@@ -1,3 +1,5 @@
+//! Port of `bdecode.cpp`/`bdecode.hpp` (`bdecode_node`).
+//!
 //! `BdecodeNode` — port of `libtorrent::bdecode_node`.
 //!
 //! A node is a lightweight view into a flat token stream plus the source

@@ -1,4 +1,5 @@
-//! Crate-level error umbrella.
+//! Crate-level error umbrella. Port of the `error_code.cpp`/`error.hpp`
+//! *role* (the concrete `lt::errors` enum lives in [`crate::lt_error`]).
 //!
 //! `libtorrent::error_code` maps to `boost::system::error_code`; in Rust each
 //! module exposes a typed error (`HexError`, bencode errors, `NetError`, …)

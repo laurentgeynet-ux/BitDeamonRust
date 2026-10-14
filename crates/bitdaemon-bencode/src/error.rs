@@ -1,3 +1,6 @@
+//! Port of `bdecode.cpp`'s `bdecode_errors::error_code_enum` +
+//! `error_code.cpp`'s `bdecode_error_category`.
+//!
 //! Decode error kinds — port of `bdecode_errors::error_code_enum` and the
 //! `bdecode_error_category::message()` strings.
 

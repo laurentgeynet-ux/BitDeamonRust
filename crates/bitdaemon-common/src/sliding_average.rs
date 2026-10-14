@@ -1,3 +1,6 @@
+//! Port of `include/libtorrent/aux_/sliding_average.hpp`
+//! (header-only upstream — `stat.cpp` is its only client).
+//!
 //! `aux::sliding_average<int, inverted_gain>` — exponential moving average
 //! with fixed-point accumulation and an average-deviation estimator.
 //!

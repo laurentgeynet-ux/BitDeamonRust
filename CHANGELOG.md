@@ -9,6 +9,23 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- Session `on_tick` leg parity: `try_connect_more_peers` verbatim
+  (`m_prio_torrents` ticket queue, `connect_seed_every_n_download`
+  downloading/finished round-robin split, `smooth_connects`,
+  half-open-aware `connections_limit` gating, live `want_peers`
+  rechecks), `do_connect_boost`/`m_connect_boost_counter`/
+  `inc_boost_connections`/`prioritize_connections` wiring (ctor
+  arming, resume re-arm, `start_announcing`/`tracker_response`
+  dispatch), the u16 session-time wrap step-back (`peer_list::
+  step_session_time`), auto-scrape for paused auto-managed
+  torrents, `peer_turnover` disconnect sweep, outbound
+  `handshake_timeout`, `outgoing_port` bind rotation +
+  `too_few_outgoing_ports`, accept-loop EMFILE/ENFILE/WSAEMFILE
+  retry with `too_few_file_descriptors`, and uTP dial-failure →
+  `supports_utp` clear + TCP fallback (`confirmed_supports_utp` on
+  success). Per-conn `m_stat` channel split lands in `peer_info`
+  (`total_*` payload-only, `*_speed` all-channel) and
+  `torrent_status` totals (payload+protocol).
 - `torrent::second_tick` ordering parity: `want_tick` tests the raw
   `m_paused` bit (session-paused torrents keep ticking stats), a
   paused non-graceful torrent now early-returns after its stat tick

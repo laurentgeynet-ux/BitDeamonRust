@@ -98,9 +98,17 @@ async fn connect_pump_lists_candidates() {
         bitdaemon_common::flags::PeerSourceFlags::TRACKER,
         &mut Vec::new(),
     );
-    lock(&eng.session).add_torrent(t);
-    let st = bitdaemon_net::peer_list::PeerListState::default();
-    let dialing = eng.connect_pump(0, &st, 10);
+    {
+        let mut ses = lock(&eng.session);
+        // boost would dial the candidate at `add_torrent` — disable
+        // it so the tick pump is what hands it out.
+        ses.apply_settings(bitdaemon_session::settings::SessionSettings {
+            torrent_connect_boost: 0,
+            ..Default::default()
+        });
+        ses.add_torrent(t);
+    }
+    let dialing = eng.connect_pump(0, 10);
     // pe_enabled + pe_support=false → first dial is plaintext
     // (the self-toggling flag retries encrypted on failure).
     assert_eq!(dialing, vec![(ih, ep(), false)]);

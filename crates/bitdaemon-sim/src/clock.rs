@@ -1,3 +1,6 @@
+//! Port of the `test/simulation/` harness clock (`sim::chrono` /
+//! libsimulator timer queue).
+//!
 //! Virtual time — `sim::timer_queue` equivalent (upstream runs the
 //! whole sim on a single io_context clock; we keep a bare counter
 //! the harness advances).

@@ -5,8 +5,10 @@
 //
 //! `alert` + `alert_manager` — the event bus (ADR-0023).
 //!
-//! Upstream `alert_types.hpp` declares ~105 structs; this ports the
-//! full concrete set behind one `Alert` enum (class hierarchy →
+//! Upstream `alert_types.hpp` defines 102 `alert_type` ids (3–107
+//! with gaps; `mmap_cache_alert` 69 is `TORRENT_ABI_VERSION == 1`-only
+//! → skipped); this ports the 101 concrete ABI-2 types behind one
+//! `Alert` enum (class hierarchy →
 //! variants), with `category()`/`alert_type()`/`priority()` tables
 //! verbatim from `test_alert_types.cpp` — the conformance spec.
 //! `AlertCategory` uses upstream `alert_category_t` bit positions

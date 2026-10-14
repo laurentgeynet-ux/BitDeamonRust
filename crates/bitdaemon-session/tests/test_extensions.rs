@@ -191,6 +191,7 @@ fn new_peer_connection_and_message_fanout() {
     t.on_peer_message(
         9,
         &PeerMessage::Have(PieceIndex(0)),
+        0,
         &bitdaemon_session::settings::SessionSettings::default(),
         &bitdaemon_session::counters::Counters::default(),
         &mut out,

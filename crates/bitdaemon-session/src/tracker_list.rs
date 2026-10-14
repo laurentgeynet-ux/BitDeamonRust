@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `announce_entry.cpp`/`announce_entry.hpp` +
+//! `tracker_list.cpp`/`tracker_list.hpp`.
+//!
 //! `announce_entry` + `tracker_list` — tracker retry/failover.
 //! Ports `announce_infohash::failed`'s quadratic backoff
 //! (`fail² × 5s × backoff/100`, capped 60 min) and the

@@ -32,7 +32,12 @@ fn tracker_feed_gives_candidates() {
         t.add_swarm_peer(ep(n), PeerSourceFlags::TRACKER, &mut Vec::new());
     }
     let st = PeerListState::default();
-    let cands = t.connect_candidates(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled);
+    // `connect_one_peer` pops one candidate per dial — drain the
+    // cache like upstream's boost loop.
+    let mut cands = Vec::new();
+    while let Some(c) = t.try_connect_peer(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled) {
+        cands.push(c);
+    }
     assert_eq!(cands.len(), 4);
     assert!(cands.contains(&(ep(1), false)));
 }
@@ -67,14 +72,13 @@ fn seed_skips_seed_candidates() {
     t.peer_list.set_seed(i, true);
     let st = PeerListState::default();
     assert!(
-        t.connect_candidates(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled)
-            .is_empty()
+        t.try_connect_peer(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled)
+            .is_none()
     );
     // back to downloading → candidate again
     t.finished = false;
-    assert_eq!(
-        t.connect_candidates(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled)
-            .len(),
-        1
+    assert!(
+        t.try_connect_peer(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled)
+            .is_some()
     );
 }

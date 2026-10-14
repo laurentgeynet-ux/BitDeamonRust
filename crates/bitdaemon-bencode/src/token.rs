@@ -1,3 +1,5 @@
+//! Port of `aux_/bdecode.hpp`'s `bdecode_token`.
+//!
 //! Packed bdecode token — port of `aux::bdecode_token`.
 //!
 //! Upstream packs each token into 8 bytes: `offset:29 | type:3` in the first

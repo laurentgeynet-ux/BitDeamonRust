@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `session_impl.cpp`/`session.cpp` (synchronous core) +
+//! `session_call.cpp`/`session_interface.hpp`.
+//!
 //! `session` — the synchronous core of `session_impl`. One owner
 //! for all torrents, the disk backend and the DHT tracker; a thin
 //! async actor (mpsc commands) wraps this in the daemon.
@@ -120,6 +123,18 @@ pub enum SessionOut {
     /// driver re-runs listen setup (upstream `on_ip_change` →
     /// `reopen_listen_sockets`).
     InterfacesChanged,
+    /// `session_impl::connect_to_peer` — a session-initiated dial
+    /// (connect-pump hand-out, torrent connect-boost, tracker
+    /// response). The engine spawns the async connect and reports
+    /// the outcome via `peer_connected`/`peer_connect_failed`.
+    ConnectPeer {
+        /// torrent.
+        ih: Sha1Hash,
+        /// remote endpoint.
+        ep: SocketAddr,
+        /// dial MSE-encrypted (`bt_peer_connection` policy pick).
+        encrypted: bool,
+    },
     /// `scrape_tracker` — user-triggered scrape of one tracker
     /// entry; the driver runs the scrape exchange and reports via
     /// `Session::on_scrape_response`.
@@ -450,16 +465,22 @@ pub struct Session {
     /// (upstream `torrent::m_sequence_number`) orders the
     /// auto-managed queues.
     pub next_queue_seq: i64,
-    /// last LSD broadcast.
-    last_lsd: Option<Instant>,
+    /// `m_lsd_torrents` — `prioritize_lsd` queue; drained ahead of
+    /// the round-robin in `lsd_tick` (upstream caps their wait at
+    /// 4 s; our 1 s tick is inside that bound).
+    lsd_queue: std::collections::VecDeque<Sha1Hash>,
+    /// `m_next_lsd_torrent` — round-robin cursor into the sorted
+    /// torrent set for LSD announces.
+    lsd_rr_cursor: usize,
+    /// millisecond budget pacing for `lsd_tick` — the announce
+    /// timer upstream fires every `local_service_announce_interval/
+    /// N` ms; our 1 s tick accrues 1000 ms and spends it in
+    /// `cost`-sized slots.
+    lsd_budget_ms: i64,
     /// last disk-pool idle reaping — upstream gives every
     /// `disk_io_thread_pool` a 60 s `deadline_timer`
     /// (`reap_idle_threads`); the session tick drives ours.
     last_disk_reap: Option<Instant>,
-    /// torrents that already fired their prioritized first LSD
-    /// announce (upstream `torrent::start_announcing` emits one
-    /// immediately, the 5-min timer only re-sends).
-    lsd_announced: std::collections::BTreeSet<Sha1Hash>,
     /// `m_session_time` — seconds since session start, bumped once
     /// per `tick` (peer_list reconnect backoff epoch).
     pub session_time: i32,
@@ -556,6 +577,33 @@ pub struct Session {
     /// `torrent::m_prev_state` — last emitted `state_changed_alert`
     /// state per torrent (the subscription diff, by state name).
     torrent_prev_states: std::collections::BTreeMap<Sha1Hash, String>,
+    /// `m_boost_connections` — dials handed out by torrent
+    /// connect-boosts (tracker responses) since the last connect
+    /// pump; deducted from `connection_speed` per
+    /// `try_connect_more_peers`.
+    boost_connections: i32,
+    /// `m_prio_torrents` — `(torrent, remaining connect tickets)`
+    /// queue from `prioritize_connections`; drained ahead of the
+    /// round-robin each pump pass.
+    prio_torrents: std::collections::VecDeque<(Sha1Hash, i32)>,
+    /// `m_next_downloading_connect_torrent` — round-robin cursor
+    /// into the per-tick `want_peers_download` partition.
+    next_downloading_connect_torrent: usize,
+    /// `m_next_finished_connect_torrent` — same for
+    /// `want_peers_finished`.
+    next_finished_connect_torrent: usize,
+    /// `m_disconnect_time_scaler` — seconds until the next
+    /// `peer_turnover` disconnect sweep (init 90 upstream).
+    disconnect_time_scaler: i32,
+    /// `m_auto_scrape_time_scaler` — seconds until the next
+    /// auto-scrape of a paused auto-managed torrent (init 180).
+    auto_scrape_time_scaler: i32,
+    /// `m_next_scrape_torrent` — round-robin cursor into the
+    /// per-tick `want_scrape` partition.
+    next_scrape_torrent: usize,
+    /// `m_download_connect_attempts` — enforces the
+    /// `connect_seed_every_n_download` finished:download ratio.
+    download_connect_attempts: i32,
     /// last tick's disk back-pressure state — `performance_alert`
     /// fires on the rising edge only.
     prev_disk_bp: bool,
@@ -565,6 +613,14 @@ pub struct Session {
     /// `m_auto_manage_time_scaler` — ticks until the next
     /// auto-manage pass; `add_torrent` forces 0 (immediate).
     auto_manage_scaler: i32,
+    /// `m_next_port` — the `outgoing_port`/`num_outgoing_ports`
+    /// round-robin cursor for `bind_outgoing_socket`.
+    next_outgoing_port: i32,
+    /// last tick's session-wide IP-overhead counters — the
+    /// `download_ip_overhead() >= down_limit` alert compares the
+    /// *per-tick* amount (upstream `stat_channel::counter()` resets
+    /// each `second_tick`).
+    prev_ip_overhead: [i64; 2],
     /// `m_dht_nodes` — `add_dht_node` calls that arrive while no
     /// DHT node is bound queue here (cap 200, random replace) and
     /// drain into `add_node` on the next `start_dht`.
@@ -851,9 +907,10 @@ impl Default for Session {
                 rand::rng().random::<i32>()
             },
             lsd_cookie: rand::random::<u32>(),
-            lsd_announced: std::collections::BTreeSet::new(),
+            lsd_queue: std::collections::VecDeque::new(),
+            lsd_rr_cursor: 0,
+            lsd_budget_ms: 0,
             next_queue_seq: 0,
-            last_lsd: None,
             last_disk_reap: None,
             session_time: 0,
             ip_filter: std::sync::Arc::new(bitdaemon_net::ip_filter::IpFilter::new()),
@@ -870,6 +927,14 @@ impl Default for Session {
             pending_out: Vec::new(),
             stats_header_posted: false,
             torrent_prev_states: std::collections::BTreeMap::new(),
+            boost_connections: 0,
+            prio_torrents: std::collections::VecDeque::new(),
+            next_downloading_connect_torrent: 0,
+            next_finished_connect_torrent: 0,
+            disconnect_time_scaler: 90,
+            auto_scrape_time_scaler: 180,
+            next_scrape_torrent: 0,
+            download_connect_attempts: 0,
             prev_disk_bp: false,
             prev_flush_errors: 0,
             dht_port: None,
@@ -878,6 +943,8 @@ impl Default for Session {
             dht_rr_cursor: 0,
             dht_announce_budget_ms: 0,
             auto_manage_scaler: 0,
+            next_outgoing_port: -1,
+            prev_ip_overhead: [0; 2],
             dht_nodes: Vec::new(),
             dht_router_nodes: Vec::new(),
             dht_state_seed: bitdaemon_dht::dht_state::DhtState::default(),
@@ -1025,6 +1092,261 @@ impl Session {
                 .value(crate::counters::Counter::NumPeersHalfOpen)
     }
 
+    /// `session_impl::update_peer_connections`'s `torrent_state`
+    /// snapshot — settings + the `external_ip` aggregate (elected
+    /// WAN address by family) + listen port.
+    #[must_use]
+    pub fn peer_list_state(&self) -> bitdaemon_net::peer_list::PeerListState {
+        let s = &self.settings;
+        let mut ext = bitdaemon_net::ip_voter::ExternalIp::default();
+        if let Some(ip) = self.ip_voter.external_address() {
+            ext = match ip {
+                std::net::IpAddr::V4(v4) => bitdaemon_net::ip_voter::ExternalIp::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    std::net::IpAddr::V4(v4),
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                ),
+                std::net::IpAddr::V6(v6) => bitdaemon_net::ip_voter::ExternalIp::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    std::net::IpAddr::V6(v6),
+                ),
+            };
+        }
+        bitdaemon_net::peer_list::PeerListState {
+            is_finished: false,
+            external_ip: ext,
+            external_port: self.listen_port,
+            min_reconnect_time: s.min_reconnect_time,
+            max_peerlist_size: s.max_peerlist_size,
+            max_failcount: s.max_failcount,
+            allow_multiple_connections_per_ip: s.allow_multiple_connections_per_ip,
+        }
+    }
+
+    /// `session_impl::prioritize_connections` — push a torrent to
+    /// the front of the connect pump with 10 dial tickets.
+    pub fn prioritize_connections(&mut self, ih: Sha1Hash) {
+        self.prio_torrents.push_back((ih, 10));
+    }
+
+    /// `session_impl::inc_boost_connections` — one boost dial took
+    /// a connect slot outside the per-tick budget; deducted next
+    /// pump pass.
+    pub fn inc_boost_connections(&mut self) {
+        self.boost_connections += 1;
+    }
+
+    /// `session_impl::try_connect_more_peers` — hand out up to
+    /// `connection_speed` dials this pass: boost deductions first,
+    /// `smooth_connects` cap, then prioritized torrents ahead of the
+    /// downloading/finished round-robin at the
+    /// `connect_seed_every_n_download` ratio. `speed_override`
+    /// replaces `connection_speed` (harness knob — upstream has no
+    /// equivalent). Returns `(ih, endpoint, encrypted)` dial
+    /// requests.
+    pub fn try_connect_more_peers(
+        &mut self,
+        session_time: i32,
+        out_policy: bitdaemon_net::pe_crypto::EncPolicy,
+        speed_override: Option<i32>,
+    ) -> Vec<(Sha1Hash, SocketAddr, bool)> {
+        let mut dials = Vec::new();
+        let connections_limit = i64::from(self.settings.connections_limit);
+        let live = self.num_connections();
+        if live >= connections_limit {
+            return dials;
+        }
+
+        let mut max_connections = speed_override.unwrap_or(self.settings.connection_speed);
+        if self.boost_connections > 0 {
+            if self.boost_connections > max_connections {
+                self.boost_connections -= max_connections;
+                max_connections = 0;
+            } else {
+                max_connections -= self.boost_connections;
+                self.boost_connections = 0;
+            }
+        }
+        if max_connections <= 0 {
+            return dials;
+        }
+
+        // `smooth_connects` — cap the batch at half the free slots
+        // so attempts spread over ticks instead of bursting.
+        let limit = (connections_limit - live).min(i64::from(i32::MAX) - 1);
+        if self.settings.smooth_connects && i64::from(max_connections) > (limit + 1) / 2 {
+            max_connections = ((limit + 1) / 2) as i32;
+        }
+
+        // upstream keeps intrusive `want_peers_*` lists; ours is a
+        // per-tick partition of the torrents map (order stable
+        // enough for the round-robin cursors).
+        let st = self.peer_list_state();
+        let mut want_download: Vec<Sha1Hash> = Vec::new();
+        let mut want_finished: Vec<Sha1Hash> = Vec::new();
+        for (ih, t) in &self.torrents {
+            if t.want_peers_download(&self.settings) {
+                want_download.push(*ih);
+            } else if t.want_peers_finished(&self.settings) {
+                want_finished.push(*ih);
+            }
+        }
+        if want_download.is_empty() && want_finished.is_empty() {
+            return dials;
+        }
+
+        let num_torrents = (want_download.len() + want_finished.len()) as i32;
+        let mut steps_since_last_connect = 0i32;
+        loop {
+            if self.next_downloading_connect_torrent >= want_download.len() {
+                self.next_downloading_connect_torrent = 0;
+            }
+            if self.next_finished_connect_torrent >= want_finished.len() {
+                self.next_finished_connect_torrent = 0;
+            }
+
+            // prioritized torrents hand out first — verbatim
+            // `--tickets; tickets > 0 && want_peers → use else pop`.
+            let mut picked: Option<Sha1Hash> = None;
+            while let Some((ih, tk)) = self.prio_torrents.front_mut() {
+                let ih = *ih;
+                *tk -= 1;
+                if *tk > 0
+                    && self
+                        .torrents
+                        .get(&ih)
+                        .is_some_and(|t| t.want_peers(&self.settings))
+                {
+                    picked = Some(ih);
+                    break;
+                }
+                self.prio_torrents.pop_front();
+            }
+            let ih = match picked {
+                Some(ih) => ih,
+                None => {
+                    if (self.download_connect_attempts
+                        >= self.settings.connect_seed_every_n_download
+                        && !want_finished.is_empty())
+                        || want_download.is_empty()
+                    {
+                        let ih = want_finished[self.next_finished_connect_torrent];
+                        self.download_connect_attempts = 0;
+                        self.next_finished_connect_torrent += 1;
+                        ih
+                    } else {
+                        let ih = want_download[self.next_downloading_connect_torrent];
+                        self.download_connect_attempts += 1;
+                        self.next_downloading_connect_torrent += 1;
+                        ih
+                    }
+                }
+            };
+
+            steps_since_last_connect += 1;
+            if max_connections == 0 {
+                break;
+            }
+            if want_download.is_empty() && want_finished.is_empty() {
+                break;
+            }
+            if steps_since_last_connect > num_torrents + 1 {
+                break;
+            }
+            // upstream re-reads `num_connections()` per hand-out —
+            // the `peer_connection` ctor registers half-open dials.
+            // Ours bumps `num_connecting` at `try_connect_peer`, so
+            // the live count grows by each dial this pass returns.
+            if live + dials.len() as i64 >= connections_limit {
+                break;
+            }
+
+            // a torrent picked from the want lists may have been
+            // drained by an earlier hand-out — upstream's intrusive
+            // lists drop it via `update_want_peers`; ours is a
+            // snapshot, so re-check live and drop when stale.
+            let Some(t) = self.torrents.get_mut(&ih) else {
+                want_download.retain(|k| *k != ih);
+                want_finished.retain(|k| *k != ih);
+                continue;
+            };
+            if !t.want_peers(&self.settings) {
+                want_download.retain(|k| *k != ih);
+                want_finished.retain(|k| *k != ih);
+                if want_download.is_empty() && want_finished.is_empty() {
+                    break;
+                }
+                continue;
+            }
+            match t.try_connect_peer(session_time, &st, out_policy) {
+                Some((ep, enc)) => {
+                    self.counters
+                        .inc(crate::counters::Counter::ConnectionAttempts);
+                    dials.push((ih, ep, enc));
+                    max_connections -= 1;
+                    steps_since_last_connect = 0;
+                }
+                None => {
+                    // `no_peer_connection_attempts` when the cache
+                    // was empty, `missed_connection_attempts` when
+                    // `connect_to_peer` failed — both collapse into
+                    // the want-list drop + `update_want_peers`.
+                    self.counters
+                        .inc(crate::counters::Counter::NoPeerConnectionAttempts);
+                    t.update_want_peers();
+                    if !t.want_peers(&self.settings) {
+                        want_download.retain(|k| *k != ih);
+                        want_finished.retain(|k| *k != ih);
+                        if want_download.is_empty() && want_finished.is_empty() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        dials
+    }
+
+    /// `torrent::do_connect_boost` + the session bookkeeping around
+    /// it — each returned dial counts as `inc_boost_connections`
+    /// (deducted from the next pump's `connection_speed`), emitted
+    /// as `ConnectPeer`; `want_peers` still true →
+    /// `prioritize_connections`.
+    fn do_connect_boost(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
+        let st = self.peer_list_state();
+        let policy = self.settings.out_enc_policy;
+        let nconn = self.num_connections();
+        let Some(t) = self.torrents.get_mut(ih) else {
+            return;
+        };
+        // upstream: `do_connect_boost` early-returns before the
+        // `prioritize_connections` tail when the counter is spent.
+        if t.connect_boost_counter == 0 {
+            return;
+        }
+        let dials = t.do_connect_boost(self.session_time, &st, policy, nconn, &self.settings);
+        for _ in &dials {
+            self.inc_boost_connections();
+        }
+        for (ep, enc) in dials {
+            out.push(SessionOut::ConnectPeer {
+                ih: *ih,
+                ep,
+                encrypted: enc,
+            });
+        }
+        if self
+            .torrents
+            .get(ih)
+            .is_some_and(|t| t.want_peers(&self.settings))
+        {
+            self.prioritize_connections(*ih);
+        }
+    }
+
     /// `find_disconnect_candidate_torrent` — the torrent to steal a
     /// conn slot from: must have peers, finished torrents first, then
     /// the largest swarm.
@@ -1034,6 +1356,60 @@ impl Session {
             .filter(|(_, t)| !t.peers.is_empty())
             .max_by_key(|(_, t)| (t.is_finished(), t.peers.len()))
             .map(|(ih, _)| *ih)
+    }
+
+    /// `bind_outgoing_socket`'s bind endpoint for an outgoing conn —
+    /// `None` when `outgoing_port == 0` (the OS picks the port, the
+    /// common case). Otherwise the `m_next_port` round-robin over
+    /// `[outgoing_port, outgoing_port + num_outgoing_ports]`; the
+    /// family follows the remote (upstream `address_v6::any()` for a
+    /// v6 target).
+    pub fn outgoing_bind_addr(
+        &mut self,
+        remote: std::net::SocketAddr,
+    ) -> Option<std::net::SocketAddr> {
+        if self.settings.outgoing_port <= 0 {
+            return None;
+        }
+        let start = self.settings.outgoing_port;
+        let end = start.saturating_add(self.settings.num_outgoing_ports);
+        if self.next_outgoing_port < start || self.next_outgoing_port > end {
+            self.next_outgoing_port = start;
+        }
+        let port = self.next_outgoing_port;
+        self.next_outgoing_port += 1;
+        if self.next_outgoing_port > end {
+            self.next_outgoing_port = start;
+        }
+        let ip = if remote.is_ipv6() {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        } else {
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        };
+        Some(std::net::SocketAddr::new(ip, port as u16))
+    }
+
+    /// accept-side `too_many_files_open` handling — upstream posts
+    /// `performance_alert::too_few_file_descriptors`, disconnects one
+    /// conn of the largest torrent (plain `num_peers` max — the
+    /// in-torrent ladder ranks which), and clamps
+    /// `connections_limit` to the live count (floor 10).
+    pub fn on_accept_fd_exhausted(&mut self, out: &mut Vec<SessionOut>) {
+        if self.settings.connections_limit <= 10 {
+            return;
+        }
+        self.alerts.post(Alert::Performance {
+            warning: "too_few_file_descriptors".into(),
+        });
+        if let Some(t) = self.torrents.values_mut().max_by_key(|t| t.peers.len()) {
+            let mut eff = Vec::new();
+            t.disconnect_peers(1, "too_many_files_open", &mut eff);
+            for e in eff {
+                out.push(SessionOut::Torrent(e));
+            }
+        }
+        self.settings.connections_limit =
+            i32::try_from(self.num_connections()).unwrap_or(10).max(10);
     }
 
     /// the sender disk-job callbacks clone to report completions.
@@ -1880,12 +2256,28 @@ impl Session {
         // `add_peer`/`connect_to_peer` consult them from then on.
         t.ip_filter = Some(std::sync::Arc::clone(&self.ip_filter));
         t.port_filter = Some(std::sync::Arc::clone(&self.port_filter));
+        // upstream ctor arms `m_connect_boost_counter` from
+        // `torrent_connect_boost`; `do_connect_boost` runs when the
+        // params brought peers (`!p.peers.empty()` — ours: peers
+        // already in the list, e.g. from resume data).
+        t.connect_boost_counter =
+            self.settings.torrent_connect_boost.clamp(0, u8::MAX as i32) as u8;
+        let has_peers = t.peer_list.num_peers() > 0;
         // `torrent::init` → `start_announcing` — a peer-starved
-        // torrent on a live DHT jumps the announce queue.
+        // torrent on a live DHT jumps the announce queue; `has_lsd`
+        // also pushes a prioritized LSD announce.
         if !t.is_paused() && t.peer_list.num_peers() < 50 {
             self.dht_queue.push_back(ih);
         }
+        if self.services.lsd && !t.is_paused() {
+            self.lsd_queue.push_back(ih);
+        }
         self.torrents.insert(ih, t);
+        if has_peers {
+            let mut tmp = std::mem::take(&mut self.pending_out);
+            self.do_connect_boost(&ih, &mut tmp);
+            self.pending_out = tmp;
+        }
         // `add_torrent_alert`
         self.alerts.post(Alert::TorrentAdded(ih));
         ih
@@ -2193,7 +2585,7 @@ impl Session {
             );
         }
         self.post_tracker_announces(sent);
-        self.lsd_announced.remove(ih);
+        self.lsd_queue.retain(|k| k != ih);
         let mut removed = self.torrents.remove(ih);
         if let Some(t) = &mut removed {
             // `~torrent`/`abort` — release the torrent's peer class
@@ -2452,6 +2844,10 @@ impl Session {
             t.announce_dht = true;
             t.announce_trackers = true;
             t.announce_lsd = true;
+            // upstream `unpause`: the connect boost re-arms so the
+            // next tracker response dials a burst immediately.
+            t.connect_boost_counter =
+                self.settings.torrent_connect_boost.clamp(0, u8::MAX as i32) as u8;
             t.last_error.clear();
             t.state_updated();
             t.update_want_peers();
@@ -2505,8 +2901,17 @@ impl Session {
                 );
             }
         }
+        // `start_announcing` tail — `do_connect_boost` dials any
+        // pre-known peers (resume data, params) without waiting a
+        // full tick.
+        self.do_connect_boost(ih, out);
         if prioritize {
             self.prioritize_dht(*ih);
+        }
+        // `start_announcing` tail — `has_lsd()` → `prioritize_lsd`:
+        // the torrent jumps the LSD broadcast queue.
+        if self.services.lsd && self.torrents.contains_key(ih) {
+            self.lsd_queue.push_back(*ih);
         }
         self.post_tracker_announces(sent);
     }
@@ -2843,7 +3248,19 @@ impl Session {
     }
 
     /// feed one decoded peer message → effects.
-    pub fn on_peer_message(&mut self, p: &PeerPacket, out: &mut Vec<SessionOut>) {
+    pub fn on_peer_message(
+        &mut self,
+        p: &PeerPacket,
+        wire_bytes: usize,
+        out: &mut Vec<SessionOut>,
+    ) {
+        // `counters::recv_bytes` — raw socket bytes (`peer_connection::
+        // account_received_bytes`' accounting leg; IP/TCP overhead is
+        // tracked separately via `trancieve_ip_packet`).
+        if wire_bytes > 0 {
+            self.counters
+                .add(crate::counters::Counter::RecvBytes, wire_bytes as i64);
+        }
         // `inc_stats_counter` per incoming message class
         match p.msg {
             PeerMessage::Bitfield(_) => self.counters.inc(Counter::NumIncomingBitfield),
@@ -2862,7 +3279,14 @@ impl Session {
             // `incoming_request_alert`/`invalid_request_alert` are
             // posted by `Torrent`'s ReadRequest handler — upstream
             // only posts the former for *accepted* requests.
-            t.on_peer_message(p.peer, &p.msg, &self.settings, &self.counters, &mut eff);
+            t.on_peer_message(
+                p.peer,
+                &p.msg,
+                wire_bytes,
+                &self.settings,
+                &self.counters,
+                &mut eff,
+            );
         }
         self.route(p.info_hash, eff, out);
     }
@@ -2985,6 +3409,22 @@ impl Session {
             }
         }
         if let Some(t) = self.torrents.get_mut(ih) {
+            // `sent_syn` (at `connect()`) + `received_synack` (at
+            // `on_connection_complete`) — outgoing TCP conns carry
+            // the handshake IP overhead on their stat channels and
+            // the session's `*_ip_overhead_bytes` counters. Incoming
+            // accepts aren't charged upstream (the OS did the
+            // handshake).
+            if conn.outgoing && !conn.is_utp {
+                let oh = i64::from(if remote.is_ipv6() { 60 } else { 40 });
+                conn.stat_up_ip += oh; // sent_syn
+                conn.stat_up_ip += oh; // received_synack's ACK
+                conn.stat_down_ip += oh; // the SYN-ACK itself
+                self.counters
+                    .add(crate::counters::Counter::SentIpOverheadBytes, oh * 2);
+                self.counters
+                    .add(crate::counters::Counter::RecvIpOverheadBytes, oh);
+            }
             if let Some(rpid) = conn.peer_id {
                 // `find_peer` + `allow_multiple_connections_per_pid` —
                 // a second conn carrying a peer-id we already serve is
@@ -3179,7 +3619,11 @@ impl Session {
                 }
             }
             // `new_connection` — a full peer list refuses the insert.
-            if !t.peer_connected_addr(remote, conn.supports_encryption, self.session_time) {
+            // `conn.sock_type` 3|9 = uTP → the connect confirmed
+            // uTP support upstream (`confirmed_supports_utp`).
+            let was_utp = matches!(conn.sock_type, 3 | 9);
+            if !t.peer_connected_addr(remote, conn.supports_encryption, self.session_time, was_utp)
+            {
                 self.alerts.post(Alert::PeerDisconnected {
                     ih: *ih,
                     reason: format!("peer {peer}: too_many_connections"),
@@ -3501,9 +3945,12 @@ impl Session {
 
     /// `peer_connect_failed` — an outbound dial never completed the
     /// handshake; report it so the swarm entry backs off.
-    pub fn peer_connect_failed(&mut self, ih: &Sha1Hash, remote: SocketAddr) {
+    /// `peer_connect_failed` — an outbound dial never completed the
+    /// handshake. `was_utp` marks uTP sockets (upstream clears
+    /// `supports_utp` + fast-reconnects → immediate TCP retry).
+    pub fn peer_connect_failed(&mut self, ih: &Sha1Hash, remote: SocketAddr, was_utp: bool) {
         if let Some(t) = self.torrents.get_mut(ih) {
-            t.peer_connect_failed(remote, self.session_time);
+            t.peer_connect_failed(remote, self.session_time, was_utp);
         }
     }
 
@@ -4768,13 +5215,13 @@ impl Session {
     /// every eligible conn when the limit is `INT_MAX`/unlimited.
     fn update_unchoke_limit(&mut self) {
         let limit = self.settings.unchoke_slots_limit;
-        self.counters.set(
-            crate::counters::Counter::NumUnchokeSlots,
-            i64::from(limit.max(0)),
-        );
-        if i64::from(self.settings.num_optimistic_unchoke_slots) >= i64::from(limit) / 2
-            && limit > 0
-        {
+        // upstream stores the raw value — `-1` (unlimited) shows
+        // as-is on the gauge.
+        self.counters
+            .set(crate::counters::Counter::NumUnchokeSlots, i64::from(limit));
+        // upstream has no `limit > 0` guard — an unlimited (-1)
+        // setting still fires when `num_optimistic >= -1/2`.
+        if i64::from(self.settings.num_optimistic_unchoke_slots) >= i64::from(limit) / 2 {
             self.alerts.post(Alert::Performance {
                 warning: "too_many_optimistic_unchoke_slots".into(),
             });
@@ -4942,61 +5389,90 @@ impl Session {
 
     /// `lsd::announce` cadence — every 5 min per non-private
     /// torrent, one datagram per multicast group.
-    pub fn lsd_tick(&mut self, now: Instant, out: &mut Vec<SessionOut>) {
+    /// `session_impl::on_lsd_announce` — upstream's dedicated
+    /// announce timer fires one broadcast per
+    /// `local_service_announce_interval / num_torrents` ms (≥1 ms),
+    /// prioritized torrents (`m_lsd_torrents`, from
+    /// `prioritize_lsd` at `start_announcing`) first, else
+    /// round-robin `m_next_lsd_torrent`. Our 1 s tick models the
+    /// timer with a millisecond budget.
+    pub fn lsd_tick(&mut self, _now: Instant, out: &mut Vec<SessionOut>) {
         // anonymous sessions must not broadcast info-hashes to the LAN
         if self.settings.anonymous_mode || !self.services.lsd {
+            self.lsd_queue.clear();
             return;
         }
-        const LSD_INTERVAL: Duration = Duration::from_secs(300);
-        let resend = self
-            .last_lsd
-            .is_none_or(|t| now.duration_since(t) >= LSD_INTERVAL);
-        for t in self.torrents.values_mut() {
-            // upstream `torrent::lsd_announce`: per-torrent
-            // `m_enable_lsd`, unchecked-but-valid metadata, private
-            // and i2p-unless-mixed all suppress the broadcast.
-            let i2p = t.ti.as_ref().is_some_and(|ti| ti.is_i2p());
-            if t.private
-                || !t.announce_lsd
-                || !t.enable_lsd
-                || t.is_paused()
-                || (!t.files_checked && t.ti.is_some())
-                || (i2p && !self.settings.allow_i2p_mixed)
-            {
-                continue;
-            }
-            // upstream `torrent::start_announcing` emits a
-            // prioritized announce per torrent immediately; the
-            // broadcast timer only re-sends.
-            let first = self.lsd_announced.insert(t.info_hash);
-            if !first && !resend {
-                continue;
-            }
-            t.lsd_announcing = true;
-            let hex = bitdaemon_common::hex::to_hex(t.info_hash.as_bytes());
-            for v6 in [false, true] {
-                let pkt = bitdaemon_net::lsd::render_lsd_packet(
-                    self.listen_port,
-                    &hex,
-                    self.lsd_cookie,
-                    v6,
-                );
-                let to = if v6 {
-                    SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR6.into(), 6771)
-                } else {
-                    SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR4.into(), 6771)
-                };
-                out.push(SessionOut::UdpPacket(pkt, to));
-            }
+        // prioritized announces drain first.
+        while let Some(ih) = self.lsd_queue.pop_front() {
+            self.lsd_announce_one(ih, out);
         }
-        if resend {
-            self.last_lsd = Some(now);
+        let n_torrents = self.torrents.len().max(1) as i64;
+        let cost =
+            (self.settings.local_service_announce_interval.as_millis() as i64 / n_torrents).max(1);
+        self.lsd_budget_ms += 1000;
+        if self.lsd_budget_ms < cost || self.torrents.is_empty() {
+            return;
+        }
+        let mut ihs: Vec<Sha1Hash> = self.torrents.keys().copied().collect();
+        ihs.sort_unstable_by_key(|h| *h.as_bytes());
+        let len = ihs.len();
+        let mut steps = 0;
+        while self.lsd_budget_ms >= cost && steps < len {
+            self.lsd_budget_ms -= cost;
+            let ih = ihs[self.lsd_rr_cursor % len];
+            self.lsd_rr_cursor = (self.lsd_rr_cursor + 1) % len;
+            steps += 1;
+            self.lsd_announce_one(ih, out);
+        }
+        self.lsd_rr_cursor %= len;
+    }
+
+    /// `torrent::lsd_announce` — eligibility + one broadcast per
+    /// address family. Ineligible torrents still consume their
+    /// pacing slot upstream (the round-robin cursor advances past
+    /// them).
+    fn lsd_announce_one(&mut self, ih: Sha1Hash, out: &mut Vec<SessionOut>) {
+        let Some(t) = self.torrents.get_mut(&ih) else {
+            return;
+        };
+        let i2p = t.ti.as_ref().is_some_and(|ti| ti.is_i2p());
+        if t.private
+            || !t.announce_lsd
+            || !t.enable_lsd
+            || t.is_paused()
+            || (!t.files_checked && t.ti.is_some())
+            || (i2p && !self.settings.allow_i2p_mixed)
+        {
+            return;
+        }
+        t.lsd_announcing = true;
+        let hex = bitdaemon_common::hex::to_hex(ih.as_bytes());
+        for v6 in [false, true] {
+            let pkt =
+                bitdaemon_net::lsd::render_lsd_packet(self.listen_port, &hex, self.lsd_cookie, v6);
+            let to = if v6 {
+                SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR6.into(), 6771)
+            } else {
+                SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR4.into(), 6771)
+            };
+            out.push(SessionOut::UdpPacket(pkt, to));
         }
     }
 
     /// `tick` — drive every torrent's peers + dht timeouts.
     pub fn tick(&mut self, out: &mut Vec<SessionOut>) -> std::time::Duration {
         self.session_time += 1;
+        // upstream `session_time()` is a u16-seconds epoch — near
+        // the 65536 s wrap (18.2 h) `m_created` steps forward 4 h
+        // and every peer's `last_connected`/`last_optimistically_
+        // unchoked` clamps back the same amount; stepping our
+        // counter is the identical transform.
+        if self.session_time > 65000 {
+            self.session_time -= 4 * 60 * 60;
+            for t in self.torrents.values_mut() {
+                t.peer_list.step_session_time(4 * 60 * 60);
+            }
+        }
         // upstream `on_tick`'s top block — `mixed_mode_algorithm`
         // rebalances the `tcp` class throttle against live uTP share.
         self.update_mixed_mode();
@@ -5247,7 +5723,147 @@ impl Session {
             }
             self.route(ih, eff, out);
         }
+        // `session_impl::on_tick` — session-wide IP-overhead check:
+        // the per-tick `stat_channel::counter()` (delta since last
+        // tick) meeting the *global class* limit posts
+        // `download`/`upload_limit_too_low`. The per-conn/torrent
+        // legs run inside `check_request_timeouts`; this one is the
+        // global channel the class channels can't see per-conn.
+        if self.settings.rate_limit_ip_overhead {
+            // indexed by `UPLOAD_CHANNEL`/`DOWNLOAD_CHANNEL` (0/1).
+            let down_now = self
+                .counters
+                .value(crate::counters::Counter::RecvIpOverheadBytes);
+            let up_now = self
+                .counters
+                .value(crate::counters::Counter::SentIpOverheadBytes);
+            let down_oh = down_now - self.prev_ip_overhead[crate::peer_conn::DOWNLOAD_CHANNEL];
+            let up_oh = up_now - self.prev_ip_overhead[crate::peer_conn::UPLOAD_CHANNEL];
+            self.prev_ip_overhead[crate::peer_conn::UPLOAD_CHANNEL] = up_now;
+            self.prev_ip_overhead[crate::peer_conn::DOWNLOAD_CHANNEL] = down_now;
+            if self.alerts.should_post(AlertCategory::PERFORMANCE)
+                && let Some(pc) = self.peer_class_pool.at(self.global_peer_class)
+            {
+                let down_limit = pc.channel[crate::peer_conn::DOWNLOAD_CHANNEL].throttle_value();
+                let up_limit = pc.channel[crate::peer_conn::UPLOAD_CHANNEL].throttle_value();
+                if down_limit > 0 && down_oh >= down_limit {
+                    self.alerts.post(Alert::Performance {
+                        warning: "download_limit_too_low".into(),
+                    });
+                }
+                if up_limit > 0 && up_oh >= up_limit {
+                    self.alerts.post(Alert::Performance {
+                        warning: "upload_limit_too_low".into(),
+                    });
+                }
+            }
+        }
+        // `session_impl::on_tick` — auto-scrape paused auto-managed
+        // torrents (skipped while the session is paused): the scaler
+        // re-arms to `auto_scrape_interval / want_scrape.len()` with
+        // a floor of `auto_scrape_min_interval`, then scrapes the
+        // next round-robin member.
+        if !self.paused {
+            self.auto_scrape_time_scaler -= 1;
+            if self.auto_scrape_time_scaler <= 0 {
+                let want_scrape: Vec<Sha1Hash> = self
+                    .torrents
+                    .iter()
+                    .filter(|(_, t)| t.is_paused() && t.auto_managed && !t.aborted)
+                    .map(|(ih, _)| *ih)
+                    .collect();
+                self.auto_scrape_time_scaler = (self.settings.auto_scrape_interval.as_secs()
+                    as i32)
+                    / want_scrape.len().max(1) as i32;
+                let min = self.settings.auto_scrape_min_interval.as_secs() as i32;
+                if self.auto_scrape_time_scaler < min {
+                    self.auto_scrape_time_scaler = min;
+                }
+                if !want_scrape.is_empty() {
+                    if self.next_scrape_torrent >= want_scrape.len() {
+                        self.next_scrape_torrent = 0;
+                    }
+                    let ih = want_scrape[self.next_scrape_torrent];
+                    // `scrape_tracker(-1, false)` — automatic, not
+                    // user-triggered.
+                    self.scrape_tracker(&ih, -1, out);
+                    self.next_scrape_torrent = (self.next_scrape_torrent + 1) % want_scrape.len();
+                }
+            }
+        }
+        // `session_impl::on_tick` — `try_connect_more_peers` sits
+        // here in upstream order (after scrape, before the unchoke
+        // scalers); `ConnectPeer` effects ride `out` and the engine
+        // dispatches the dials.
+        let policy = self.settings.out_enc_policy;
+        let stime = self.session_time;
+        for (ih, ep, enc) in self.try_connect_more_peers(stime, policy, None) {
+            out.push(SessionOut::ConnectPeer {
+                ih,
+                ep,
+                encrypted: enc,
+            });
+        }
         self.unchoke_tick(out);
+        // `m_disconnect_time_scaler` → `peer_turnover`: at
+        // `connections_limit > 5`, either the swarm is at
+        // `peer_turnover_cutoff`% of the global limit (disconnect
+        // `peer_turnover`% of the largest torrent's peers) or any
+        // torrent sits above its own `max_connections` cutoff.
+        self.disconnect_time_scaler -= 1;
+        if self.disconnect_time_scaler <= 0 {
+            self.disconnect_time_scaler =
+                self.settings.peer_turnover_interval.as_secs().max(1) as i32;
+            if self.settings.connections_limit > 5 {
+                let limit = i64::from(self.settings.connections_limit.min(i32::MAX / 100));
+                let cutoff = i64::from(self.settings.peer_turnover_cutoff.min(100));
+                if self.num_connections() >= limit * cutoff / 100 && !self.torrents.is_empty() {
+                    // disconnect the worst peers of the largest
+                    // swarm every `peer_turnover_interval` —
+                    // `num_peers()` is the *peer-list* size upstream,
+                    // not the live-conn count.
+                    if let Some(t) = self
+                        .torrents
+                        .values_mut()
+                        .max_by_key(|t| t.peer_list.num_peers())
+                    {
+                        let n = (t.peer_list.num_peers() as i64
+                            * i64::from(self.settings.peer_turnover)
+                            / 100)
+                            .max(1)
+                            .min(t.peer_list.num_connect_candidates() as i64)
+                            as usize;
+                        let mut eff = Vec::new();
+                        t.disconnect_peers(n, "optimistic_disconnect", &mut eff);
+                        let ih = t.info_hash;
+                        self.route(ih, eff, out);
+                    }
+                } else {
+                    // below the global cap — enforce per-torrent
+                    // `max_connections` cutoffs instead (same
+                    // peer-list sizing as the global leg).
+                    let ihs: Vec<Sha1Hash> = self.torrents.keys().copied().collect();
+                    for ih in ihs {
+                        let Some(t) = self.torrents.get_mut(&ih) else {
+                            continue;
+                        };
+                        let max = i64::from(t.max_connections.min(i32::MAX / 100));
+                        if (t.peer_list.num_peers() as i64) < max * cutoff / 100 || max < 6 {
+                            continue;
+                        }
+                        let n = (t.peer_list.num_peers() as i64
+                            * i64::from(self.settings.peer_turnover)
+                            / 100)
+                            .max(1)
+                            .min(t.peer_list.num_connect_candidates() as i64)
+                            as usize;
+                        let mut eff = Vec::new();
+                        t.disconnect_peers(n, "optimistic_disconnect", &mut eff);
+                        self.route(ih, eff, out);
+                    }
+                }
+            }
+        }
         self.resume_save_tick(now);
         // `SessionOut` produced outside the actor loop (portmap
         // registrations) is emitted here — `effects` already went
@@ -6642,6 +7258,7 @@ impl Session {
         ih: &Sha1Hash,
         peer: u64,
         bytes: usize,
+        payload: usize,
         out: &mut Vec<SessionOut>,
     ) {
         let mut eff = Vec::new();
@@ -6656,6 +7273,20 @@ impl Session {
                 // `send_buffer_offset`s down by the drained bytes
                 // (`requests_in_buffer` tracks what's still queued).
                 c.pipeline.on_send_data(bytes);
+                // `sent_bytes(payload, protocol)` — accounted when
+                // the bytes leave the socket, like upstream
+                // `on_sent`/`m_payloads` range accounting.
+                let payload = i64::try_from(payload).unwrap_or(i64::MAX);
+                c.stat_up_total += payload;
+                c.stat_up_round += payload;
+                c.stat_up_protocol += bytes as i64 - payload;
+                if payload > 0 {
+                    c.last_sent_payload_ms = c.now_ms;
+                    t.last_payload_up = Some(std::time::Instant::now());
+                    // `stat::sent_payload` → session counter.
+                    self.counters
+                        .add(crate::counters::Counter::SentPayloadBytes, payload);
+                }
             }
             t.fill_send_buffer(peer, &self.settings, &self.counters, &mut eff);
         }
@@ -6673,24 +7304,14 @@ impl Session {
         for e in effects {
             match e {
                 TorrentEffect::SendTo { peer, msg } => {
-                    // `m_stat` upload accounting — payload bytes
-                    // feed the choker's round counters. `m_last_sent`
-                    // / `m_last_sent_payload` stamp on every write
-                    // (upstream `send_buffer`/`sent_payload`).
+                    // `m_last_sent` stamps at `send_packet` enqueue
+                    // upstream; `sent_bytes`/`sent_payload` stat
+                    // accounting happens at write completion in
+                    // `on_peer_sent`.
                     if let Some(t) = self.torrents.get_mut(&ih)
                         && let Some(c) = t.peers.get_mut(&peer)
                     {
                         c.last_sent_ms = t.now_ms;
-                        if let PeerMessage::Piece { data, .. } = &msg {
-                            let n = data.len() as i64;
-                            c.stat_up_total += n;
-                            c.stat_up_round += n;
-                            c.last_sent_payload_ms = t.now_ms;
-                            t.last_payload_up = Some(std::time::Instant::now());
-                            // `stat::sent_payload` → session counter.
-                            self.counters
-                                .add(crate::counters::Counter::SentPayloadBytes, n);
-                        }
                     }
                     self.push_to_peer(&ih, peer, msg, out);
                 }
@@ -7200,6 +7821,7 @@ impl Session {
         ih: &Sha1Hash,
         url: &str,
         resp: Result<bitdaemon_net::http_tracker::TrackerResponse, String>,
+        out: &mut Vec<SessionOut>,
     ) {
         let Some(t) = self.torrents.get_mut(ih) else {
             return;
@@ -7213,6 +7835,10 @@ impl Session {
             .find(url)
             .is_some_and(|i| t.trackers.trackers[i].endpoints[0].v1.sent_manual);
         let mut ext_ip = None;
+        // `do_connect_boost` fires once the response is fully
+        // folded in (upstream calls it inside `tracker_response`
+        // after the peers + endpoint bookkeeping).
+        let mut need_boost = false;
         match resp {
             Ok(r) => {
                 ext_ip = r.external_ip;
@@ -7241,6 +7867,7 @@ impl Session {
                 // `tracker_response` tail — new dial candidates
                 // refresh `want_peers` so the connect pump fires.
                 t.update_want_peers();
+                need_boost = true;
                 let mut trackerid = None;
                 let mut completed_acked = false;
                 if let Some(i) = t.trackers.find(url) {
@@ -7362,6 +7989,12 @@ impl Session {
                 bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_TRACKER,
                 &ip,
             );
+        }
+        // `do_connect_boost` — the first tracker response hands out
+        // `torrent_connect_boost` dials now instead of waiting a
+        // whole tick for the connect pump.
+        if need_boost {
+            self.do_connect_boost(ih, out);
         }
     }
 

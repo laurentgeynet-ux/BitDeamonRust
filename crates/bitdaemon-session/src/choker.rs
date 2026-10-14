@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `choker.cpp`/`choker.hpp`.
+//!
 //! `choker` — the unchoke sort. `unchoke_sort` upstream returns
 //! the number of upload slots after reordering `peers` so the top
 //! `slots` should be unchoked. Peers are described by

@@ -186,6 +186,7 @@ fn pex_feeds_swarm_and_broadcasts() {
             id: 0,
             data: bitdaemon_bencode::bencode(&hs.build()).into(),
         },
+        0,
         &bitdaemon_session::settings::SessionSettings::default(),
         &bitdaemon_session::counters::Counters::default(),
         &mut out,
@@ -206,6 +207,7 @@ fn pex_feeds_swarm_and_broadcasts() {
             id: 1, // our local pex id (`PeerConn::local_ut_pex` — upstream fixed id 1)
             data: body.into(),
         },
+        0,
         &bitdaemon_session::settings::SessionSettings::default(),
         &bitdaemon_session::counters::Counters::default(),
         &mut out,
@@ -267,6 +269,7 @@ fn pex_advertises_only_completed_dialable_peers() {
             id: 0,
             data: bitdaemon_bencode::bencode(&hs.build()).into(),
         },
+        0,
         &bitdaemon_session::settings::SessionSettings::default(),
         &bitdaemon_session::counters::Counters::default(),
         &mut scratch,
@@ -416,6 +419,7 @@ fn magnet_metadata_creates_storage() {
             remote,
             msg: PeerMessage::Bitfield(vec![0x80].into()),
         },
+        0,
         &mut out,
     );
 
@@ -431,6 +435,7 @@ fn magnet_metadata_creates_storage() {
                 data: packet.into(),
             },
         },
+        0,
         &mut out,
     );
 

@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `performance_counters.cpp`/`session_stats.cpp` +
+//! `session_stats.hpp`/`performance_counters.hpp`.
+//!
 //! `performance_counters`/`session_stats` — session metrics.
 //! Upstream keeps one `std::array<std::atomic<int64>>` indexed by
 //! `stats_counter_t`; we port the counter enum subset the ported

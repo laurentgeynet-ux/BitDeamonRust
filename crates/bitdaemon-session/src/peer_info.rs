@@ -109,7 +109,8 @@ pub struct PeerInfo {
     pub flags: PeerFlags,
     /// `source` — where the peer came from.
     pub source: PeerSourceFlags,
-    /// `up_speed`/`down_speed` (B/s) — not tracked yet.
+    /// `up_speed`/`down_speed` (B/s) — all-channel rates (payload +
+    /// protocol + IP overhead), upstream `stat::*_rate()`.
     pub up_speed: i32,
     /// download speed.
     pub down_speed: i32,
@@ -117,6 +118,19 @@ pub struct PeerInfo {
     pub payload_up_speed: i32,
     /// payload-only download speed.
     pub payload_down_speed: i32,
+    /// `total_upload`/`total_download` — payload bytes on this conn
+    /// (upstream exposes the payload totals here).
+    pub total_upload: i64,
+    /// total payload downloaded.
+    pub total_download: i64,
+    /// `last_request` — time since the last block request went out.
+    pub last_request: std::time::Duration,
+    /// `last_active` — time since the last message either way.
+    pub last_active: std::time::Duration,
+    /// `download_queue_time` — estimated time to drain the request
+    /// queue at the current rate (upstream `peer_connection::
+    /// download_queue_time`).
+    pub download_queue_time: std::time::Duration,
     /// `pid` — remote peer id (all-zero until handshake).
     pub pid: PeerId,
     /// `pieces` — the peer's have-bitfield.

@@ -382,11 +382,16 @@ pub struct Torrent {
     /// per-piece `checking_files` pass. Cleared on `files_checked`
     /// and when a full recheck arms.
     pub checking_resume: bool,
-    /// payload rate samples for `torrent_status`
-    /// (`stat().download_payload_rate()` — sampled per tick).
+    /// all-channel download rate (`m_stat.download_rate()` — payload
+    /// + protocol + ip-overhead EMA; `st.download_rate`).
     pub down_rate: i64,
-    /// upload payload B/s.
+    /// `m_stat.upload_rate()`.
     pub up_rate: i64,
+    /// `m_stat.download_payload_rate()` — payload-channel EMA only
+    /// (`st.download_payload_rate`).
+    pub down_payload_rate: i64,
+    /// `m_stat.upload_payload_rate()`.
+    pub up_payload_rate: i64,
     /// last sample instant.
     pub stat_sample: Option<std::time::Instant>,
     /// `m_inactive` — debounced verdict of `is_inactive_internal`;
@@ -572,6 +577,18 @@ pub struct Torrent {
     pub payload_uploaded: i64,
     /// ditto download.
     pub payload_downloaded: i64,
+    /// `m_stat[upload_protocol]` accumulator — same fold-at-
+    /// `remove_peer` semantics as `payload_uploaded`; upstream
+    /// `st->total_upload` = payload + protocol (not ip-overhead).
+    pub protocol_uploaded: i64,
+    /// `m_stat[download_protocol]` accumulator.
+    pub protocol_downloaded: i64,
+    /// `m_stat::*_ip_protocol` accumulators — kept for per-torrent
+    /// wire-traffic visibility (`session_stats`-equivalent totals);
+    /// not folded into `status.total_*` upstream-style.
+    pub ip_overhead_uploaded: i64,
+    /// download-side ip overhead accumulator.
+    pub ip_overhead_downloaded: i64,
     /// last tick a payload byte was received (`st.last_download`).
     pub last_payload_down: Option<Instant>,
     /// last tick a payload byte was sent (`st.last_upload`).
@@ -602,6 +619,11 @@ pub struct Torrent {
     pub aborted: bool,
     /// `m_num_connecting` — in-flight dials (connect cap accounting).
     pub num_connecting: i32,
+    /// `m_connect_boost_counter` — dials to hand out immediately on
+    /// the next tracker response / `do_connect_boost` call. Armed to
+    /// `settings.torrent_connect_boost` at add + resume (upstream
+    /// ctor + `do_resume`).
+    pub connect_boost_counter: u8,
     /// `settings_pack::close_redundant_connections` — session
     /// settings live on `Session`; this copy is what
     /// `disconnect_if_redundant` consults (upstream conns read
@@ -820,6 +842,8 @@ impl Torrent {
             checking_resume: false,
             down_rate: 0,
             up_rate: 0,
+            down_payload_rate: 0,
+            up_payload_rate: 0,
             stat_sample: None,
             inactive: false,
             pending_active_change: false,
@@ -875,6 +899,10 @@ impl Torrent {
             all_time_download: 0,
             payload_uploaded: 0,
             payload_downloaded: 0,
+            protocol_uploaded: 0,
+            protocol_downloaded: 0,
+            ip_overhead_uploaded: 0,
+            ip_overhead_downloaded: 0,
             last_payload_down: None,
             last_payload_up: None,
             started: Instant::now(),
@@ -889,6 +917,9 @@ impl Torrent {
             lsd_announcing: false,
             aborted: false,
             num_connecting: 0,
+            // armed by `Session::add_torrent` — `Torrent::new` is a
+            // harness ctor without settings access.
+            connect_boost_counter: 0,
 
             // upstream `settings_pack::close_redundant_connections`
             // default — `add_torrent`/`apply_settings` sync it.
@@ -1853,8 +1884,9 @@ impl Torrent {
         match c.i2p_pex.on_message(now, body, body.len()) {
             crate::i2p_pex::I2pPexVerdict::Added(hashes) => {
                 if crate::i2p_pex::apply_added(self, &hashes) {
-                    // `do_connect_boost` — new peers → want to dial.
-                    self.want_peers = true;
+                    // upstream `on_i2p_resolve` → `update_want_peers`
+                    // — new candidates make the torrent dialable.
+                    self.update_want_peers();
                 }
             }
             crate::i2p_pex::I2pPexVerdict::Disconnect(reason) => {
@@ -2244,6 +2276,7 @@ impl Torrent {
         &self,
         id: u64,
         remote: Option<std::net::SocketAddr>,
+        s: &crate::settings::SessionSettings,
     ) -> Option<crate::peer_info::PeerInfo> {
         use crate::peer_info::{BandwidthState, ConnectionType, PeerFlags, PeerInfo};
         let c = self.peers.get(&id)?;
@@ -2278,13 +2311,38 @@ impl Torrent {
         if c.num_pieces >= self.num_pieces {
             flags = flags.with(PeerFlags::SEED);
         }
+        // `p.source` = the torrent_peer's source flags (`{}` when the
+        // conn isn't tracked in the peer list).
+        let tp = c.remote.or(remote).and_then(|ep| self.peer_index(ep));
         Some(PeerInfo {
             flags,
-            source: bitdaemon_common::flags::PeerSourceFlags::INCOMING,
+            source: tp.map_or_else(Default::default, |i| self.peer_list.peers()[i].source),
+            // `up_speed`/`down_speed` = `stat::*_rate()` — all
+            // channels; `payload_*_speed` = `*_payload_rate()`.
             up_speed: c.rate_up_speed,
             down_speed: c.rate_down_speed,
-            payload_up_speed: c.rate_up_speed,
-            payload_down_speed: c.rate_down_speed,
+            payload_up_speed: c.rate_up_payload,
+            payload_down_speed: c.rate_down_payload,
+            // `p.total_*` upstream = `total_payload_*` — payload only.
+            total_upload: c.stat_up_total,
+            total_download: c.stat_down_total,
+            // `p.last_request`/`p.last_active` — conn-clock stamps.
+            last_request: std::time::Duration::from_millis(
+                (c.now_ms - c.pipeline.last_request_ms).max(0) as u64,
+            ),
+            last_active: std::time::Duration::from_millis(
+                (c.now_ms - c.last_sent_ms.max(c.last_receive_ms)).max(0) as u64,
+            ),
+            // `p.download_queue_time` — `download_queue_time(0)`.
+            download_queue_time: std::time::Duration::from_millis(
+                c.download_queue_time(
+                    0,
+                    self.down_payload_rate,
+                    self.down_request_peers,
+                    i64::from(self.block_size()),
+                )
+                .max(0) as u64,
+            ),
             pid: c.peer_id.unwrap_or_default(),
             pieces: c.peer_pieces.clone(),
             queue_bytes: c.pipeline.outstanding_bytes.min(i64::from(i32::MAX)) as i32,
@@ -2293,16 +2351,27 @@ impl Torrent {
             } else {
                 c.pipeline.request_timeout_setting
             },
-            send_buffer_size: 0,
-            used_send_buffer: 0,
-            receive_buffer_size: 0,
-            used_receive_buffer: 0,
-            receive_buffer_watermark: 0,
-            num_hashfails: c
-                .remote
-                .or(remote)
-                .and_then(|ep| self.peer_index(ep))
-                .map_or(0, |i| i32::from(self.peer_list.peers()[i].hashfails)),
+            // `send_buffer_size` = `m_send_buffer.capacity()` — our
+            // effective cap is the configured watermark.
+            send_buffer_size: s.send_buffer_watermark.min(i32::MAX as usize) as i32,
+            // `used_send_buffer` — payload staged for write.
+            used_send_buffer: c.send_buffer.min(i32::MAX as usize) as i32,
+            // `m_recv_buffer.capacity()`/`pos()` — live via the conn's
+            // shared bandwidth state (the pump updates per iteration).
+            receive_buffer_size: c
+                .bw
+                .recv_capacity
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(i64::from(i32::MAX)) as i32,
+            used_receive_buffer: c
+                .bw
+                .recv_pos
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(i64::from(i32::MAX)) as i32,
+            // `m_recv_buffer.watermark()` — the configured cap.
+            receive_buffer_watermark: s.max_peer_recv_buffer_size.clamp(0, i64::from(i32::MAX))
+                as i32,
+            num_hashfails: tp.map_or(0, |i| i32::from(self.peer_list.peers()[i].hashfails)),
             // upstream: `download_queue().size() + m_request_queue
             // .size()` — sent *and* unsent requests.
             download_queue_length: (c.pipeline.download_queue.len()
@@ -2340,14 +2409,18 @@ impl Torrent {
             downloading_progress: 0,
             downloading_total: 0,
             connection_type: ConnectionType::STANDARD_BITTORRENT,
-            pending_disk_bytes: 0,
-            pending_disk_read_bytes: 0,
+            // `pending_disk_bytes` = `m_outstanding_writing_bytes` —
+            // block payload staged for this conn awaiting the wire.
+            pending_disk_bytes: c.outstanding_writing_bytes.min(i64::from(i32::MAX)) as i32,
+            // `pending_disk_read_bytes` = `m_reading_bytes`.
+            pending_disk_read_bytes: c.reading_bytes.min(i32::MAX as usize) as i32,
             // `p.send_quota`/`p.receive_quota` — live per-conn quota.
             send_quota: c.bw.quota[crate::peer_conn::UPLOAD_CHANNEL]
                 .load(std::sync::atomic::Ordering::Relaxed) as i32,
             receive_quota: c.bw.quota[crate::peer_conn::DOWNLOAD_CHANNEL]
                 .load(std::sync::atomic::Ordering::Relaxed) as i32,
-            rtt: 0,
+            // `p.rtt` = `m_request_time.mean()` — ms.
+            rtt: c.pipeline.request_time.mean().min(i64::from(i32::MAX)) as i32,
             num_pieces: c.num_pieces,
             download_rate_peak: c.download_rate_peak,
             upload_rate_peak: c.upload_rate_peak,
@@ -2678,15 +2751,40 @@ impl Torrent {
         )
     }
 
-    /// `find_connect_candidates` — the session's connect pump asks
-    /// for the next endpoints to dial (`torrent::connect_to_peer`).
+    /// `torrent::want_peers_download` — `want_peers` gated to the
+    /// downloading states (upstream `m_state` membership).
     #[must_use]
-    pub fn connect_candidates(
+    pub fn want_peers_download(&self, s: &crate::settings::SessionSettings) -> bool {
+        matches!(
+            self.state(),
+            crate::status::TorrentState::Downloading
+                | crate::status::TorrentState::DownloadingMetadata
+        ) && self.want_peers(s)
+    }
+
+    /// `torrent::want_peers_finished` — `want_peers` gated to
+    /// `finished`/`seeding` (a seed keeps dialing to serve upload
+    /// and feed PEX).
+    #[must_use]
+    pub fn want_peers_finished(&self, s: &crate::settings::SessionSettings) -> bool {
+        matches!(
+            self.state(),
+            crate::status::TorrentState::Finished | crate::status::TorrentState::Seeding
+        ) && self.want_peers(s)
+    }
+
+    /// `torrent::try_connect_peer` — `connect_one_peer` + the dial
+    /// bookkeeping; the session hands out one dial per call. The
+    /// returned `(endpoint, encrypted)` is what the engine dials;
+    /// `None` = no usable candidate (`p->ip()` unresolvable — i2p
+    /// — counts as a missed attempt, like upstream's failed
+    /// `connect_to_peer`).
+    pub fn try_connect_peer(
         &mut self,
         session_time: i32,
         state: &bitdaemon_net::peer_list::PeerListState,
         out_policy: bitdaemon_net::pe_crypto::EncPolicy,
-    ) -> Vec<(std::net::SocketAddr, bool)> {
+    ) -> Option<(std::net::SocketAddr, bool)> {
         // keep `finished` in sync so finished torrents skip
         // seed/upload-only candidates — upstream feeds
         // `torrent_state::is_finished` (`is_finished()`, which is
@@ -2696,63 +2794,128 @@ impl Torrent {
         // `torrent_state` snapshot for the other peer-list entry
         // points (upstream rebuilds it from settings each call).
         self.peer_list_state = st.clone();
-        let idxs = self.peer_list.find_connect_candidates(session_time, &st);
+        // upstream `connect_to_peer`: `m_abort` → refuse the dial.
+        if self.aborted {
+            return None;
+        }
+        let i = self.peer_list.connect_one_peer(session_time, &st)?;
+        let dial = {
+            let p = self.peer_list.peers_mut().get_mut(i)?;
+            // upstream stamps `last_connected` at `connect_to_peer`
+            // entry — a failed instantiate still counts as an
+            // attempt for the reconnect cooldown.
+            p.last_connected = session_time.max(0) as u16;
+            let Some(ep) = p.ip() else {
+                // i2p or unresolvable — upstream's `connect_to_peer`
+                // fails → `inc_failcount` + `update_want_peers` (the
+                // peer was never marked connecting).
+                self.peer_list.inc_failcount(i);
+                self.update_want_peers();
+                return None;
+            };
+            // upstream `bt_peer_connection::start`: pe_forced →
+            // MSE always; pe_enabled → MSE iff `pi->pe_support`,
+            // with the self-toggling flag: a plain dial pre-sets
+            // it (a failure retries encrypted), an MSE dial
+            // clears it (success re-arms via peer_connected).
+            let encrypted = match out_policy {
+                bitdaemon_net::pe_crypto::EncPolicy::Forced => true,
+                bitdaemon_net::pe_crypto::EncPolicy::Disabled => false,
+                bitdaemon_net::pe_crypto::EncPolicy::Enabled => {
+                    if p.pe_support {
+                        p.pe_support = false;
+                        true
+                    } else {
+                        p.pe_support = true;
+                        false
+                    }
+                }
+            };
+            (ep, encrypted)
+        };
         // `set_connection` at dial start (upstream's peer_connection
         // ctor) — the entry stops being a candidate until
         // `peer_connect_failed`/`peer_disconnected` reports back.
-        for i in &idxs {
-            self.peer_list.set_connected(*i, session_time, false);
-            // `inc_num_connecting` — dial bookkeeping; a
-            // seed-flagged candidate counts toward
-            // `num_connecting_seeds` too (upstream counts them out
-            // of `num_downloaders`).
-            self.num_connecting += 1;
-            if self.peer_list.peers()[*i].seed {
-                self.num_connecting_seeds += 1;
-            }
+        self.peer_list.set_connected(i, session_time, false);
+        // `inc_num_connecting` — dial bookkeeping; a
+        // seed-flagged candidate counts toward
+        // `num_connecting_seeds` too (upstream counts them out
+        // of `num_downloaders`).
+        self.num_connecting += 1;
+        if self.peer_list.peers()[i].seed {
+            self.num_connecting_seeds += 1;
         }
-        idxs.into_iter()
-            .filter_map(|i| {
-                let p = self.peer_list.peers_mut().get_mut(i)?;
-                let ep = p.ip()?;
-                // upstream `bt_peer_connection::start`: pe_forced →
-                // MSE always; pe_enabled → MSE iff `pi->pe_support`,
-                // with the self-toggling flag: a plain dial pre-sets
-                // it (a failure retries encrypted), an MSE dial
-                // clears it (success re-arms via peer_connected).
-                let encrypted = match out_policy {
-                    bitdaemon_net::pe_crypto::EncPolicy::Forced => true,
-                    bitdaemon_net::pe_crypto::EncPolicy::Disabled => false,
-                    bitdaemon_net::pe_crypto::EncPolicy::Enabled => {
-                        if p.pe_support {
-                            p.pe_support = false;
-                            true
-                        } else {
-                            p.pe_support = true;
-                            false
-                        }
-                    }
-                };
-                Some((ep, encrypted))
-            })
-            .collect()
+        self.update_want_peers();
+        Some(dial)
+    }
+
+    /// `torrent::do_connect_boost` — the first tracker response
+    /// dials `m_connect_boost_counter` peers immediately instead of
+    /// waiting for the next session tick. `num_connections` is the
+    /// session's live count (incl. half-open). Returns the dial
+    /// requests — one `inc_boost_connections` each, deducted from
+    /// the next tick's `connection_speed` budget.
+    #[must_use]
+    pub fn do_connect_boost(
+        &mut self,
+        session_time: i32,
+        state: &bitdaemon_net::peer_list::PeerListState,
+        out_policy: bitdaemon_net::pe_crypto::EncPolicy,
+        num_connections: i64,
+        s: &crate::settings::SessionSettings,
+    ) -> Vec<(std::net::SocketAddr, bool)> {
+        if self.connect_boost_counter == 0 {
+            return Vec::new();
+        }
+        let mut conns = i64::from(self.connect_boost_counter)
+            .min(i64::from(s.connections_limit) - num_connections);
+        if conns <= 0 {
+            return Vec::new();
+        }
+        let mut dials = Vec::new();
+        while self.want_peers(s) && conns > 0 {
+            conns -= 1;
+            self.connect_boost_counter = self.connect_boost_counter.saturating_sub(1);
+            if let Some(d) = self.try_connect_peer(session_time, state, out_policy) {
+                dials.push(d);
+            }
+            self.update_want_peers();
+        }
+        dials
     }
 
     /// `connection_closed` for a dial that never completed —
     /// bumps `last_connected` and `failcount` so the peer isn't
     /// retried immediately (`inc_failcount` + timestamp upstream).
-    pub fn peer_connect_failed(&mut self, remote: std::net::SocketAddr, session_time: i32) {
+    /// `was_utp` mirrors upstream's uTP-failure leg: clear
+    /// `supports_utp` (next dial picks TCP) and fast-reconnect
+    /// (don't restamp `last_connected` — the TCP retry isn't
+    /// throttled by the cooldown).
+    pub fn peer_connect_failed(
+        &mut self,
+        remote: std::net::SocketAddr,
+        session_time: i32,
+        was_utp: bool,
+    ) {
         if let Some(i) = self.peer_index(remote) {
             // `dec_num_connecting` — the dial is over.
             self.num_connecting = self.num_connecting.saturating_sub(1);
             if self.peer_list.peers()[i].seed {
                 self.num_connecting_seeds = self.num_connecting_seeds.saturating_sub(1);
             }
+            // upstream clears `supports_utp` on a failed uTP connect
+            // (`!m_holepunch_mode` conn flag — our outbound dials
+            // never run holepunch mode).
+            if was_utp {
+                self.peer_list.peers_mut()[i].supports_utp = false;
+            }
             // `connection_closed` with `c.failed()` — upstream bumps
-            // `failcount` inside.
+            // `failcount` inside. `was_utp` fast-reconnects: the old
+            // `last_connected` stands so the TCP retry isn't cooled
+            // out.
             let st = self.peer_list_state.clone();
             self.peer_list
-                .connection_closed(i, session_time, false, true, &st);
+                .connection_closed(i, session_time, was_utp, true, &st);
         }
     }
 
@@ -2771,6 +2934,7 @@ impl Torrent {
         remote: std::net::SocketAddr,
         encrypted: bool,
         session_time: i32,
+        was_utp: bool,
     ) -> bool {
         // upstream `peer_list::new_connection` — an unseen incoming
         // endpoint inserts `connectable = false` (no listen port is
@@ -2795,6 +2959,12 @@ impl Torrent {
         self.peer_list.set_connected(i, session_time, false);
         if let Some(p) = self.peer_list.peers_mut().get_mut(i) {
             p.pe_support = encrypted;
+            // a successful uTP dial confirms the transport —
+            // upstream `peer_connection` on socket-connect.
+            if was_utp {
+                p.confirmed_supports_utp = true;
+                p.supports_utp = false;
+            }
             // upstream `++m_num_seeds` on attach when the peer was
             // already seed-flagged (e.g. a re-dial to a known seed).
             if p.seed {
@@ -3032,6 +3202,10 @@ impl Torrent {
         // the conn is gone.
         self.payload_downloaded += c.stat_down_total;
         self.payload_uploaded += c.stat_up_total;
+        self.protocol_downloaded += c.stat_down_protocol;
+        self.protocol_uploaded += c.stat_up_protocol;
+        self.ip_overhead_downloaded += c.stat_down_ip;
+        self.ip_overhead_uploaded += c.stat_up_ip;
         self.update_want_peers();
         // `update_want_tick` — our `want_tick` is a computed
         // predicate, so removing the conn is the update.
@@ -3243,9 +3417,8 @@ impl Torrent {
     /// whose send buffer is drained while disk reads are still in
     /// flight counts as disk-stalled (`num_peers_up_disk`); a stall
     /// at a full watermark with queued requests posts
-    /// `send_buffer_watermark_too_low` once per crossing. Our
-    /// bandwidth model is global rather than per-conn, so
-    /// `m_quota[upload] > 0` is treated as satisfied.
+    /// `send_buffer_watermark_too_low` once per crossing. The whole
+    /// leg is gated on upload quota being available, like upstream.
     pub fn update_up_disk_gate(
         &mut self,
         peer_id: u64,
@@ -3256,7 +3429,11 @@ impl Torrent {
         let Some(c) = self.peers.get_mut(&peer_id) else {
             return;
         };
-        let stalled = c.send_buffer == 0 && c.reading_bytes > 0;
+        // `setup_send` gates the whole leg on `m_quota[upload] > 0`
+        // — a quota-starved conn isn't disk-stalled, it's throttled.
+        let quota_up =
+            c.bw.quota[crate::peer_conn::UPLOAD_CHANNEL].load(std::sync::atomic::Ordering::Relaxed);
+        let stalled = c.send_buffer == 0 && c.reading_bytes > 0 && quota_up > 0;
         if stalled && !c.up_disk_blocked {
             c.up_disk_blocked = true;
             counters.inc(crate::counters::Counter::NumPeersUpDisk);
@@ -3554,11 +3731,14 @@ impl Torrent {
                         {
                             let d = p.get_downloaders(b.piece_index);
                             if d.len() == 1 {
+                                // upstream: `statistics()
+                                // .download_payload_rate()` — the
+                                // payload channel only.
                                 let rate = d[0]
                                     .and_then(|k| {
                                         self.peers.values().find(|c| c.peer_key() == Some(k))
                                     })
-                                    .map_or(0, |c| c.rate_down_speed);
+                                    .map_or(0, |c| c.rate_down_payload);
                                 let bytes_left =
                                     i64::from(st.requested) * i64::from(self.block_size());
                                 let eta_ms = if rate > 0 {
@@ -3836,15 +4016,29 @@ impl Torrent {
     }
 
     /// feed one decoded message from `peer` — `dispatch` + effects.
-    /// `s` feeds the send-buffer watermark (`m_settings` upstream).
+    /// `s` feeds the send-buffer watermark (`m_settings` upstream);
+    /// `wire_bytes` is the frame's exact wire length (len-prefix
+    /// included) for `stat.received_bytes` protocol accounting.
     pub fn on_peer_message(
         &mut self,
         peer_id: u64,
         msg: &PeerMessage,
+        wire_bytes: usize,
         s: &crate::settings::SessionSettings,
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
+        // `stat.received_bytes(payload, protocol)` — only `on_piece`
+        // counts payload upstream; every other message is protocol.
+        // `stat_down_total` itself is bumped at the piece dispatch.
+        if let Some(c) = self.peers.get_mut(&peer_id) {
+            let payload = if let PeerMessage::Piece { data, .. } = msg {
+                data.len() as i64
+            } else {
+                0
+            };
+            c.stat_down_protocol += (wire_bytes as i64 - payload).max(0);
+        }
         match msg {
             // `on_hash_request`/`on_hashes`/`on_hash_reject` upstream:
             // hash messages are only legal on a `protocol_v2`
@@ -4480,7 +4674,9 @@ impl Torrent {
             // A *choked* peer is still driven: `request_a_block`
             // itself restricts the mask to `allowed_fast` (BEP-6).
             Some(c) if c.peer_pieces.size() > 0 => {
-                (c.send_buffer, c.now_ms, i64::from(c.rate_down_speed))
+                // `request_a_block` takes the payload-channel rate
+                // upstream (`download_payload_rate()`).
+                (c.send_buffer, c.now_ms, i64::from(c.rate_down_payload))
             }
             _ => return false,
         };
@@ -6461,32 +6657,41 @@ impl Torrent {
         // set AND the torrent's) runs before the disconnecting
         // early-out upstream.
         let rate_limit_overhead = s.rate_limit_ip_overhead;
+        // `m_stat.download_ip_overhead()` at torrent scope — the
+        // per-tick sum feeding `torrent::second_tick`'s
+        // `overhead >= download_limit()` alert check.
+        let mut tick_oh_down = 0i64;
+        let mut tick_oh_up = 0i64;
         for (peer_id, c) in self.peers.iter_mut() {
             let _ = peer_id;
+            // `trancieve_ip_packet` hits `m_stat` *unconditionally*
+            // upstream — only the `use_quota_overhead` channel debit
+            // and its alert are `rate_limit_ip_overhead`-gated.
+            use std::sync::atomic::Ordering::Relaxed;
+            let amount_down = c.bw.ip_overhead[crate::peer_conn::DOWNLOAD_CHANNEL].swap(0, Relaxed);
+            let amount_up = c.bw.ip_overhead[crate::peer_conn::UPLOAD_CHANNEL].swap(0, Relaxed);
+            if amount_down != 0 || amount_up != 0 {
+                c.stat_down_ip += amount_down;
+                c.stat_up_ip += amount_up;
+                tick_oh_down += amount_down;
+                tick_oh_up += amount_up;
+                counters.add(crate::counters::Counter::RecvIpOverheadBytes, amount_down);
+                counters.add(crate::counters::Counter::SentIpOverheadBytes, amount_up);
+            }
             let mut warning = 0u8;
-            if rate_limit_overhead {
-                use std::sync::atomic::Ordering::Relaxed;
-                let amount_down =
-                    c.bw.ip_overhead[crate::peer_conn::DOWNLOAD_CHANNEL].swap(0, Relaxed);
-                let amount_up = c.bw.ip_overhead[crate::peer_conn::UPLOAD_CHANNEL].swap(0, Relaxed);
-                if amount_down != 0 || amount_up != 0 {
-                    warning |= crate::session::Session::quota_overhead(
-                        pool,
-                        &c.peer_classes,
-                        amount_down,
-                        amount_up,
-                    );
-                    warning |= crate::session::Session::quota_overhead(
-                        pool,
-                        &self.peer_classes,
-                        amount_down,
-                        amount_up,
-                    );
-                    // `stat::{download,upload}_ip_protocol` → the
-                    // session's overhead counters.
-                    counters.add(crate::counters::Counter::RecvIpOverheadBytes, amount_down);
-                    counters.add(crate::counters::Counter::SentIpOverheadBytes, amount_up);
-                }
+            if rate_limit_overhead && (amount_down != 0 || amount_up != 0) {
+                warning |= crate::session::Session::quota_overhead(
+                    pool,
+                    &c.peer_classes,
+                    amount_down,
+                    amount_up,
+                );
+                warning |= crate::session::Session::quota_overhead(
+                    pool,
+                    &self.peer_classes,
+                    amount_down,
+                    amount_up,
+                );
             }
             // upstream posts `performance_alert::{download,
             // upload}_limit_too_low` when a class throttle is lower
@@ -6589,12 +6794,15 @@ impl Torrent {
                 });
                 continue;
             }
-            // `setup_send_buffer`'s upload `bw_disk` transition —
-            // evaluated per tick so a conn that drains its buffer or
-            // gets its reads back while idle still leaves/joins the
-            // gauge (the alert leg only fires inside
-            // `fill_send_buffer`, matching upstream's eval site).
-            let stalled = c.send_buffer == 0 && c.reading_bytes > 0;
+            // `setup_send`'s upload `bw_disk` transition — evaluated
+            // per tick so a conn that drains its buffer or gets its
+            // reads back while idle still leaves/joins the gauge (the
+            // alert leg only fires inside `fill_send_buffer`,
+            // matching upstream's eval site). Upstream gates on
+            // `m_quota[upload] > 0` too — throttled ≠ disk-stalled.
+            let quota_up = c.bw.quota[crate::peer_conn::UPLOAD_CHANNEL]
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let stalled = c.send_buffer == 0 && c.reading_bytes > 0 && quota_up > 0;
             if stalled && !c.up_disk_blocked {
                 c.up_disk_blocked = true;
                 counters.inc(crate::counters::Counter::NumPeersUpDisk);
@@ -6630,7 +6838,7 @@ impl Torrent {
             {
                 c.pipeline.last_request_ms = now_ms;
                 if let Some(p) = self.picker.as_mut() {
-                    let (send_buffer, rate) = (c.send_buffer, i64::from(c.rate_down_speed));
+                    let (send_buffer, rate) = (c.send_buffer, i64::from(c.rate_down_payload));
                     let mut pc_stats = crate::piece_picker::NullPickerStats;
                     let (invoked, _eg, reqs, _queued) = c.drive_requests(
                         p,
@@ -6730,7 +6938,7 @@ impl Torrent {
                     let key = c.peer_key();
                     let outstanding = c.outstanding();
                     let disconnecting = c.disconnecting;
-                    let rate = i64::from(c.rate_down_speed);
+                    let rate = i64::from(c.rate_down_payload);
                     let mut ctx = c.request_ctx(false, disconnecting, rate);
                     ctx.outstanding = &outstanding;
                     ctx.picker_options = opts;
@@ -6787,6 +6995,24 @@ impl Torrent {
                     peer: *peer_id,
                     msg: PeerMessage::Request(req),
                 });
+            }
+        }
+        // `torrent::second_tick` — the *torrent-level* overhead check
+        // (distinct from the per-conn class debit above): this tick's
+        // torrent stat overhead vs the torrent's own rate limits.
+        if rate_limit_overhead && (alert_mask.0 & crate::alerts::AlertCategory::PERFORMANCE.0) != 0
+        {
+            let down_limit = self.download_limit(pool);
+            let up_limit = self.upload_limit(pool);
+            if down_limit > 0 && tick_oh_down >= down_limit {
+                out.push(TorrentEffect::Alert(crate::alerts::Alert::Performance {
+                    warning: "download_limit_too_low".into(),
+                }));
+            }
+            if up_limit > 0 && tick_oh_up >= up_limit {
+                out.push(TorrentEffect::Alert(crate::alerts::Alert::Performance {
+                    warning: "upload_limit_too_low".into(),
+                }));
             }
         }
     }
@@ -6999,9 +7225,8 @@ impl Torrent {
     /// session payload totals — `m_stat.total_payload_download()`:
     /// live conns plus the folded totals of conns already gone
     /// (monotonic across disconnects, unlike a live-only sum).
-    /// Upstream's `total_download` status field adds protocol
-    /// overhead on top — per-conn protocol channels aren't
-    /// tracked yet (see PORTING `peer_class`/`bandwidth` notes).
+    /// `st->total_download` adds the protocol channel on top —
+    /// `status()` folds `protocol_downloaded` separately.
     pub fn total_download(&self) -> i64 {
         self.payload_downloaded + self.peers.values().map(|c| c.stat_down_total).sum::<i64>()
     }
@@ -7127,6 +7352,16 @@ impl Torrent {
             .unwrap_or(0);
         let total_download = self.total_download();
         let total_upload = self.total_upload();
+        // `st->total_*` = payload + *protocol* channels only (upstream
+        // does not fold ip-overhead into the totals).
+        let proto_down: i64 = self.protocol_downloaded
+            + self
+                .peers
+                .values()
+                .map(|c| c.stat_down_protocol)
+                .sum::<i64>();
+        let proto_up: i64 =
+            self.protocol_uploaded + self.peers.values().map(|c| c.stat_up_protocol).sum::<i64>();
         // `torrent::status` progress rules: the checking pass
         // reports pieces-checked progress (upstream `m_progress_ppm`
         // = num_checked/num_pieces — the fastresume-verify window
@@ -7243,8 +7478,8 @@ impl Torrent {
             downloaded,
             total_done,
             total_wanted,
-            total_upload,
-            total_download,
+            total_upload: total_upload + proto_up,
+            total_download: total_download + proto_down,
             total_payload_download: total_download,
             total_payload_upload: total_upload,
             total_failed_bytes: self.failed_bytes,
@@ -7269,8 +7504,8 @@ impl Torrent {
                 .map_or(-1, |t| now.duration_since(t).as_secs() as i64),
             download_rate: self.down_rate,
             upload_rate: self.up_rate,
-            download_payload_rate: self.down_rate,
-            upload_payload_rate: self.up_rate,
+            download_payload_rate: self.down_payload_rate,
+            upload_payload_rate: self.up_payload_rate,
             list_seeds: self.peer_list.num_seeds(),
             list_peers: self.peer_list.num_peers() as i32 - self.peer_list.num_seeds(),
             connect_candidates: self.peer_list.num_connect_candidates(),
@@ -7407,6 +7642,19 @@ impl Torrent {
             .values()
             .map(|c| c.stat_up_total - c.last_up_total)
             .sum();
+        // `m_stat` all-channel deltas — payload + protocol +
+        // ip-overhead (upstream `m_stat.download_rate()` feeds
+        // `st.download_rate`, `want_tick`'s rate leg, `is_inactive`).
+        let down_wire: i64 = self
+            .peers
+            .values()
+            .map(|c| c.stat_down_total + c.stat_down_protocol + c.stat_down_ip - c.last_down_wire)
+            .sum();
+        let up_wire: i64 = self
+            .peers
+            .values()
+            .map(|c| c.stat_up_total + c.stat_up_protocol + c.stat_up_ip - c.last_up_wire)
+            .sum();
         // `set_need_save_resume(if_counters_changed)` — upstream
         // marks the resume dirty each tick the stat counters moved
         // (`total_uploaded`/`total_downloaded` are resume fields).
@@ -7416,8 +7664,10 @@ impl Torrent {
         if let Some(prev_t) = self.stat_sample {
             let dt = (now - prev_t).as_secs_f64();
             if dt > 0.0 {
-                let current_torrent_down = (down as f64 / dt) as i64;
-                let current_torrent_up = (up as f64 / dt) as i64;
+                let current_torrent_down = (down_wire as f64 / dt) as i64;
+                let current_torrent_up = (up_wire as f64 / dt) as i64;
+                let current_torrent_down_p = (down as f64 / dt) as i64;
+                let current_torrent_up_p = (up as f64 / dt) as i64;
                 self.down_rate = if self.down_rate == 0 {
                     current_torrent_down
                 } else {
@@ -7428,6 +7678,16 @@ impl Torrent {
                 } else {
                     (self.up_rate * 4 + current_torrent_up) / 5
                 };
+                self.down_payload_rate = if self.down_payload_rate == 0 {
+                    current_torrent_down_p
+                } else {
+                    (self.down_payload_rate * 4 + current_torrent_down_p) / 5
+                };
+                self.up_payload_rate = if self.up_payload_rate == 0 {
+                    current_torrent_up_p
+                } else {
+                    (self.up_payload_rate * 4 + current_torrent_up_p) / 5
+                };
                 // per-peer `stat::rate()` — 5-second exponential moving average
                 // matching upstream `stat_channel::second_tick` (`m_5_sec_average = m_5_sec_average * 4 / 5 + sample / 5`).
                 for c in self.peers.values_mut() {
@@ -7437,15 +7697,36 @@ impl Torrent {
                     let current_up = ((c.stat_up_total - c.last_up_total) as f64 / dt)
                         .clamp(0.0, f64::from(i32::MAX))
                         as i32;
+                    // all-channel rate (`stat::download_rate()` —
+                    // upstream's `up_speed`/`m_download_rate`).
+                    let wire_down_delta = c.stat_down_total + c.stat_down_protocol + c.stat_down_ip
+                        - c.last_down_wire;
+                    let wire_up_delta =
+                        c.stat_up_total + c.stat_up_protocol + c.stat_up_ip - c.last_up_wire;
+                    let current_down_w =
+                        (wire_down_delta as f64 / dt).clamp(0.0, f64::from(i32::MAX)) as i32;
+                    let current_up_w =
+                        (wire_up_delta as f64 / dt).clamp(0.0, f64::from(i32::MAX)) as i32;
                     c.rate_down_speed = if c.rate_down_speed == 0 {
-                        current_down
+                        current_down_w
                     } else {
-                        ((i64::from(c.rate_down_speed) * 4 + i64::from(current_down)) / 5) as i32
+                        ((i64::from(c.rate_down_speed) * 4 + i64::from(current_down_w)) / 5) as i32
                     };
                     c.rate_up_speed = if c.rate_up_speed == 0 {
+                        current_up_w
+                    } else {
+                        ((i64::from(c.rate_up_speed) * 4 + i64::from(current_up_w)) / 5) as i32
+                    };
+                    // payload-channel rate (`stat::*_payload_rate()`).
+                    c.rate_down_payload = if c.rate_down_payload == 0 {
+                        current_down
+                    } else {
+                        ((i64::from(c.rate_down_payload) * 4 + i64::from(current_down)) / 5) as i32
+                    };
+                    c.rate_up_payload = if c.rate_up_payload == 0 {
                         current_up
                     } else {
-                        ((i64::from(c.rate_up_speed) * 4 + i64::from(current_up)) / 5) as i32
+                        ((i64::from(c.rate_up_payload) * 4 + i64::from(current_up)) / 5) as i32
                     };
                     // upstream `second_tick` slow-start exit: the
                     // rate stopped growing (prev + 5 KiB slack >=
@@ -7462,15 +7743,16 @@ impl Torrent {
                     // `m_upload_rate_peak`/`m_download_rate_peak` —
                     // second_tick records the best payload rate seen
                     // (`peer_info` reads these).
-                    if c.rate_up_speed > c.upload_rate_peak {
-                        c.upload_rate_peak = c.rate_up_speed;
+                    if c.rate_up_payload > c.upload_rate_peak {
+                        c.upload_rate_peak = c.rate_up_payload;
                     }
-                    if c.rate_down_speed > c.download_rate_peak {
-                        c.download_rate_peak = c.rate_down_speed;
+                    if c.rate_down_payload > c.download_rate_peak {
+                        c.download_rate_peak = c.rate_down_payload;
                     }
                     // `peer_connection::second_tick` — AIMD: the
                     // request queue target follows the measured
                     // download rate (queue_time × rate / block).
+                    // Upstream's `m_download_rate` = all-channel rate.
                     c.pipeline
                         .update_desired_queue_size(i64::from(c.rate_down_speed), block_size);
                     // `performance_alert::
@@ -7490,6 +7772,8 @@ impl Torrent {
         for c in self.peers.values_mut() {
             c.last_down_total = c.stat_down_total;
             c.last_up_total = c.stat_up_total;
+            c.last_down_wire = c.stat_down_total + c.stat_down_protocol + c.stat_down_ip;
+            c.last_up_wire = c.stat_up_total + c.stat_up_protocol + c.stat_up_ip;
         }
         self.stat_sample = Some(now);
     }

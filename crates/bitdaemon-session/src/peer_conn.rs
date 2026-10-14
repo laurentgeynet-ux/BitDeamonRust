@@ -1,3 +1,7 @@
+//! Port of `peer_connection.cpp`/`peer_connection.hpp` (state machine
+//! half — the wire codec is `net::peer_wire`, the async driver
+//! `net::bt_peer_conn`).
+//!
 //! `peer_connection` assembled as a Rust state machine: the remote's
 //! bitfield, choke/interest flags both directions, the request
 //! pipeline (`PeerPipeline`), BEP-10 extension ids, suggest pieces,
@@ -53,6 +57,12 @@ pub struct PeerQuota {
     /// dropped and their assigned quota returned on the next
     /// `update_quotas` pass.
     pub disconnecting: std::sync::atomic::AtomicBool,
+    /// `m_recv_buffer.pos()` — staged-but-undecoded bytes, for
+    /// `peer_info::used_receive_buffer`. Written by the socket task.
+    pub recv_pos: std::sync::atomic::AtomicI64,
+    /// `m_recv_buffer.capacity()` — the staging buffer's size, for
+    /// `peer_info::receive_buffer_size`.
+    pub recv_capacity: std::sync::atomic::AtomicI64,
 }
 
 impl PeerQuota {
@@ -74,6 +84,8 @@ impl PeerQuota {
             ],
             grant: [tokio::sync::Notify::new(), tokio::sync::Notify::new()],
             disconnecting: std::sync::atomic::AtomicBool::new(false),
+            recv_pos: std::sync::atomic::AtomicI64::new(0),
+            recv_capacity: std::sync::atomic::AtomicI64::new(0),
         })
     }
 
@@ -245,6 +257,9 @@ pub struct PeerConn {
     /// `m_last_unchoke` (ms) — conn-clock of our last unchoke of
     /// this peer; part of the `timed_out_no_request` max.
     pub last_unchoke_ms: i64,
+    /// `m_last_unchoked` (ms) — conn-clock of the last time the peer
+    /// unchoked *us* (`download_queue_time` rate leg).
+    pub last_unchoked_ms: i64,
     /// `m_last_choke` (ms) — conn-clock of the last `Choke` we
     /// sent. Requests from a still-choked peer stop being tolerated
     /// 2 s after this stamp (upstream disconnects them).
@@ -308,15 +323,26 @@ pub struct PeerConn {
     /// BEP-21 `complete_ago` (0 = never/didn't say). Feeds
     /// `torrent`'s `m_swarm_last_seen_complete`.
     pub last_seen_complete: i64,
-    /// `stat` rate sampling — last totals at the previous tick and
-    /// the resulting bytes/sec the `peer_info` snapshot reports.
+    /// `stat::upload_rate()` — all-channel EMA B/s (payload +
+    /// protocol + ip-overhead); `peer_info.up_speed`.
     pub rate_up_speed: i32,
-    /// `stat` rate sampling — payload download bytes/sec.
+    /// `stat::download_rate()`.
     pub rate_down_speed: i32,
-    /// last sampled `stat_up_total` for rate computation.
+    /// `stat::upload_payload_rate()` — payload-channel EMA only;
+    /// `peer_info.payload_up_speed`, the choker's sort key and the
+    /// rate peaks.
+    pub rate_up_payload: i32,
+    /// `stat::download_payload_rate()`.
+    pub rate_down_payload: i32,
+    /// last sampled `stat_up_total` for payload-rate computation.
     pub last_up_total: i64,
     /// last sampled `stat_down_total` for rate computation.
     pub last_down_total: i64,
+    /// last sampled all-channel totals (`stat_*_total +
+    /// stat_*_protocol + stat_*_ip`) driving `rate_*_speed`.
+    pub last_up_wire: i64,
+    /// last sampled all-channel download total.
+    pub last_down_wire: i64,
     /// `m_download_rate_peak` — best payload download rate ever
     /// measured on this conn (`peer_info` exposes it).
     pub download_rate_peak: i32,
@@ -381,6 +407,17 @@ pub struct PeerConn {
     pub stat_up_total: i64,
     /// download payload lifetime bytes.
     pub stat_down_total: i64,
+    /// `m_stat[upload_protocol]` — lifetime BT message bytes sent
+    /// that aren't piece payload (headers, bitfield, ext msgs…).
+    pub stat_up_protocol: i64,
+    /// `m_stat[download_protocol]`.
+    pub stat_down_protocol: i64,
+    /// `m_stat[upload_ip_protocol]` — estimated IP+TCP overhead
+    /// (`trancieve_ip_packet`: a packet's header *and* its ACK —
+    /// every event lands on both directions' channels).
+    pub stat_up_ip: i64,
+    /// `m_stat[download_ip_protocol]`.
+    pub stat_down_ip: i64,
     /// upload payload bytes since the last unchoke round.
     pub stat_up_round: i64,
     /// download payload bytes since the last unchoke round.
@@ -449,6 +486,7 @@ impl PeerConn {
             last_incoming_request_ms: now_ms,
             last_sent_payload_ms: now_ms,
             last_unchoke_ms: now_ms,
+            last_unchoked_ms: now_ms,
             last_choke_ms: now_ms,
             last_receive_ms: now_ms,
             remote_upload_only: false,
@@ -480,12 +518,20 @@ impl PeerConn {
             exceeded_limit: false,
             stat_up_total: 0,
             stat_down_total: 0,
+            stat_up_protocol: 0,
+            stat_down_protocol: 0,
+            stat_up_ip: 0,
+            stat_down_ip: 0,
             rate_up_speed: 0,
             rate_down_speed: 0,
+            rate_up_payload: 0,
+            rate_down_payload: 0,
             download_rate_peak: 0,
             upload_rate_peak: 0,
             last_up_total: 0,
             last_down_total: 0,
+            last_up_wire: 0,
+            last_down_wire: 0,
             stat_up_round: 0,
             stat_down_round: 0,
             down_delta_prev: -1,
@@ -601,6 +647,9 @@ impl PeerConn {
     /// unchoke.
     pub fn on_unchoke(&mut self) {
         self.peer_choked = false;
+        // `m_last_unchoked` — the peer unchoked *us*; feeds
+        // `download_queue_time`'s short-unchoke rate leg.
+        self.last_unchoked_ms = self.now_ms;
     }
     /// `incoming_interested` / `incoming_not_interested`.
     pub fn on_interested(&mut self) {
@@ -1692,6 +1741,52 @@ impl PeerConn {
         // non-negative operands is `(a + b - 1) / b` (0 for a=0, which
         // the floor covers).
         ((bytes + packet_size - 1) / packet_size).max(1) * header
+    }
+
+    /// `stat::total_upload()` — payload + protocol + ip-overhead.
+    #[must_use]
+    pub fn total_upload(&self) -> i64 {
+        self.stat_up_total + self.stat_up_protocol + self.stat_up_ip
+    }
+
+    /// `stat::total_download()`.
+    #[must_use]
+    pub fn total_download(&self) -> i64 {
+        self.stat_down_total + self.stat_down_protocol + self.stat_down_ip
+    }
+
+    /// `peer_connection::download_queue_time` — estimated ms to
+    /// drain the request queue. `torrent_payload_rate` is the
+    /// torrent's payload download rate and `peers_with_requests` the
+    /// session's `num_peers_down_requests` gauge (upstream's global
+    /// download-rate leg approximates a fair share).
+    #[must_use]
+    pub fn download_queue_time(
+        &self,
+        extra_bytes: i64,
+        torrent_payload_rate: i64,
+        peers_with_requests: i64,
+        block_size: i64,
+    ) -> i64 {
+        let mut rate: i64 = if self.now_ms - self.pipeline.last_piece_ms > 30_000
+            && self.download_rate_peak > 0
+        {
+            i64::from(self.download_rate_peak)
+        } else if self.now_ms - self.last_unchoked_ms < 5_000 && self.stat_up_total < 2 * 0x4000 {
+            // freshly unchoked — no measured rate yet, assume a
+            // fair share of the torrent's payload download rate.
+            torrent_payload_rate / peers_with_requests.max(1)
+        } else {
+            i64::from(self.rate_down_payload)
+        };
+        if rate < 50 {
+            rate = 50;
+        }
+        (self.pipeline.outstanding_bytes
+            + extra_bytes
+            + i64::from(self.pipeline.queued_time_critical) * block_size)
+            * 1000
+            / rate
     }
 }
 
