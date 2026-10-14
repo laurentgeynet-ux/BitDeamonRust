@@ -49,6 +49,8 @@ docs/
   PORTING.md          C++→Rust file mapping + status — ALWAYS up to date
   architecture.md     crate graph, threading/concurrency model
   adr/                architecture decision records
+  upstream/           « sync libtorrent » workflow + delta fiches —
+                      local only (.git/info/exclude, never pushed; §5)
 ```
 
 Dependency direction is strictly downward:
@@ -150,6 +152,18 @@ CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and an MSRV
    test against C++ or a live swarm).
 7. **Commit** with a message `port(<crate>): <module>` and update the
    changelog.
+
+### Upstream sync (« sync libtorrent »)
+
+Tracking new upstream commits on `RC_2_1` is a separate, repeatable
+workflow living in `docs/upstream/` — **local only**: the directory is
+excluded via `.git/info/exclude` and must never be committed or pushed
+(add the same rule on a fresh clone before recreating it). Inside,
+`WORKFLOW.md` is the protocol, `sync-state.toml` the machine-readable
+state (baseline commit + per-commit verdicts), and each sync writes a
+`deltas/<date>_<range>/` folder (index + per-commit fiches + action
+list). Git operations run in the working checkout named by
+`sync-state.toml`, never in the read-only reference.
 
 ## 6. C++ → Rust translation cheatsheet
 
