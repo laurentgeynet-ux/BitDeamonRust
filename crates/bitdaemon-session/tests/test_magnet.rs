@@ -139,13 +139,23 @@ fn smart_ban_disconnects_corrupt_peer() {
     let mut out = Vec::new();
     t.piece_verified_ban(
         PieceIndex(0),
-        16384,
         false,
+        &[],
         &bitdaemon_session::settings::SessionSettings::default(),
         &bitdaemon_session::counters::Counters::default(),
         &mut out,
         addr,
         digest,
+    );
+    // `PieceFailed` (`hash_failed` alert) posts after the
+    // `clear_piece` fence drains — drain it inline like the session
+    // would.
+    t.on_piece_sync(
+        PieceIndex(0),
+        &[],
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out,
     );
     assert!(
         out.iter()

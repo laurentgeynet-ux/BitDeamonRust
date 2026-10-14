@@ -106,6 +106,7 @@ fn piece_verified_broadcasts_have() {
     t.piece_verified(
         PieceIndex(0),
         true,
+        &[],
         &bitdaemon_session::settings::SessionSettings::default(),
         &bitdaemon_session::counters::Counters::default(),
         &mut out,
@@ -140,6 +141,7 @@ fn all_pieces_makes_seed() {
     t.piece_verified(
         PieceIndex(0),
         true,
+        &[],
         &bitdaemon_session::settings::SessionSettings::default(),
         &bitdaemon_session::counters::Counters::default(),
         &mut out,
@@ -148,6 +150,7 @@ fn all_pieces_makes_seed() {
     t.piece_verified(
         PieceIndex(1),
         true,
+        &[],
         &bitdaemon_session::settings::SessionSettings::default(),
         &bitdaemon_session::counters::Counters::default(),
         &mut out,
@@ -226,6 +229,18 @@ fn failed_piece_restores() {
     t.piece_verified(
         PieceIndex(1),
         false,
+        &[],
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out,
+    );
+    // `piece_failed` fences `clear_piece`; `PieceFailed` (the
+    // `hash_failed` alert) only posts once the drain lands in
+    // `on_piece_sync` — the session routes ClearPiece there, the
+    // test drains it inline.
+    t.on_piece_sync(
+        PieceIndex(1),
+        &[],
         &bitdaemon_session::settings::SessionSettings::default(),
         &bitdaemon_session::counters::Counters::default(),
         &mut out,
@@ -358,4 +373,129 @@ fn fill_send_buffer_gates_reads_on_watermark() {
             .count(),
         3
     );
+}
+
+/// `piece_failed` fences `clear_piece` (upstream `piece_failed` →
+/// `async_clear_piece` → `on_piece_sync`): the lock lands now, the
+/// restore + `hash_failed` alert only arrive when the fence drains.
+#[test]
+fn hash_fail_fences_restore_until_piece_sync() {
+    use bitdaemon_session::counters::{Counter, Counters};
+    use bitdaemon_session::settings::SessionSettings;
+    let s = SessionSettings::default();
+    let counters = Counters::default();
+    let mut t = torrent(3);
+    t.init_picker(true);
+    finish_piece(&mut t, PieceIndex(1));
+
+    let mut out = Vec::new();
+    t.piece_verified(PieceIndex(1), false, &[], &s, &counters, &mut out);
+    assert_eq!(counters.value(Counter::NumPieceFailed), 1);
+    // fenced — ClearPiece emitted, restore/alert still pending
+    assert!(
+        out.iter().any(
+            |e| matches!(e, TorrentEffect::ClearPiece { piece, .. } if *piece == PieceIndex(1))
+        )
+    );
+    assert!(
+        !out.iter()
+            .any(|e| matches!(e, TorrentEffect::PieceFailed(_)))
+    );
+
+    // the `clear_piece` job drained → `on_piece_sync` restores and
+    // posts the deferred `hash_failed` alert.
+    t.on_piece_sync(PieceIndex(1), &[], &s, &counters, &mut out);
+    assert!(
+        out.iter()
+            .any(|e| matches!(e, TorrentEffect::PieceFailed(i) if *i == PieceIndex(1)))
+    );
+    assert!(!t.picker.as_ref().unwrap().is_piece_finished(PieceIndex(1)));
+}
+
+/// v2 `hash_failed` pinpointing bad blocks: the restore only drops
+/// those blocks (upstream `on_piece_sync` block filtering) — good
+/// blocks from honest peers stay finished.
+#[test]
+fn v2_bad_blocks_restore_only_bad() {
+    use bitdaemon_common::types::PieceBlock;
+    use bitdaemon_session::settings::SessionSettings;
+    let s = SessionSettings::default();
+    let mut t = torrent(3);
+    t.init_picker(true);
+    finish_piece(&mut t, PieceIndex(1));
+
+    let mut out = Vec::new();
+    t.piece_verified(
+        PieceIndex(1),
+        false,
+        &[3],
+        &s,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out,
+    );
+    // the bad-block list is carried on the fence
+    assert!(
+        out.iter()
+            .any(|e| matches!(e, TorrentEffect::ClearPiece { piece, blocks }
+            if *piece == PieceIndex(1) && blocks.as_slice() == [3]))
+    );
+    t.on_piece_sync(
+        PieceIndex(1),
+        &[3],
+        &s,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out,
+    );
+    let p = t.picker.as_ref().unwrap();
+    assert!(!p.is_piece_finished(PieceIndex(1)));
+    assert!(!p.is_finished_block(PieceBlock {
+        piece_index: PieceIndex(1),
+        block_index: 3,
+    }));
+    // neighbours survived the restore
+    assert!(p.is_finished_block(PieceBlock {
+        piece_index: PieceIndex(1),
+        block_index: 0,
+    }));
+}
+
+/// `found_on_disk` — every block arrived without a downloader (only
+/// `None` entries): upstream still fences+restores, but skips
+/// `add_failed_bytes`, plugin `on_piece_failed` and peer penalties.
+#[test]
+fn found_on_disk_skips_blame_but_restores() {
+    use bitdaemon_session::settings::SessionSettings;
+    let s = SessionSettings::default();
+    let mut t = torrent(3);
+    t.init_picker(true);
+    finish_piece(&mut t, PieceIndex(1));
+
+    let mut out = Vec::new();
+    t.piece_verified(
+        PieceIndex(1),
+        false,
+        &[],
+        &s,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out,
+    );
+    assert_eq!(t.failed_bytes, 0);
+    // still fenced → restore path identical to a swarm-blamed fail
+    assert!(
+        out.iter().any(
+            |e| matches!(e, TorrentEffect::ClearPiece { piece, .. } if *piece == PieceIndex(1))
+        )
+    );
+}
+
+/// `force_recheck` bumps `picker_generation` (upstream
+/// `++m_picker_generation`) — that's what makes in-flight
+/// write/hash completions stale for the session gates.
+#[test]
+fn recheck_bumps_picker_generation() {
+    let mut t = torrent(4);
+    t.init_picker(true);
+    let g0 = t.picker_generation;
+    assert!(t.arm_full_recheck() > 0);
+    assert_ne!(t.picker_generation, g0);
 }

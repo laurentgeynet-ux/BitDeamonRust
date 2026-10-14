@@ -452,6 +452,7 @@ fn piece_deadline_and_read_piece() {
     t.piece_verified(
         PieceIndex(2),
         true,
+        &[],
         &bitdaemon_session::settings::SessionSettings::default(),
         &bitdaemon_session::counters::Counters::default(),
         &mut eff,

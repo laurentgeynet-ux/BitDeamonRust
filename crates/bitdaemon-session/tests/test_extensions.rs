@@ -114,8 +114,12 @@ fn add_extension_instantiates_and_sees_lifecycle() {
 
     // `piece_verified` pass/fail → on_piece_pass/on_piece_failed.
     // upstream `on_piece_verified` ignores pieces the picker doesn't
-    // consider finished — mark the blocks downloaded first.
+    // consider finished — mark the blocks downloaded first. Piece 1's
+    // blocks carry a downloader key: without one the piece counts as
+    // `found_on_disk` and upstream skips the `on_piece_failed` plugin
+    // call (nothing to blame on the swarm).
     for i in [0, 1] {
+        let dl = if i == 1 { Some(7) } else { None };
         if let Some(p) = t.picker.as_mut() {
             for b in 0..p.blocks_in_piece(PieceIndex(i)) {
                 p.mark_as_finished(
@@ -123,7 +127,7 @@ fn add_extension_instantiates_and_sees_lifecycle() {
                         piece_index: PieceIndex(i),
                         block_index: b,
                     },
-                    None,
+                    dl,
                 );
             }
         }
@@ -131,6 +135,7 @@ fn add_extension_instantiates_and_sees_lifecycle() {
     t.piece_verified(
         PieceIndex(0),
         true,
+        &[],
         &bitdaemon_session::settings::SessionSettings::default(),
         &bitdaemon_session::counters::Counters::default(),
         &mut out,
@@ -138,6 +143,7 @@ fn add_extension_instantiates_and_sees_lifecycle() {
     t.piece_verified(
         PieceIndex(1),
         false,
+        &[],
         &bitdaemon_session::settings::SessionSettings::default(),
         &bitdaemon_session::counters::Counters::default(),
         &mut out,

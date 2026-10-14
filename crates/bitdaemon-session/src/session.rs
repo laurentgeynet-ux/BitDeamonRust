@@ -745,6 +745,10 @@ pub enum DiskCompleted {
         peer: u64,
         /// block written.
         req: PeerRequest,
+        /// `picker_gen` — picker generation at dispatch; upstream
+        /// drops the completion entirely (success or failure) when
+        /// a `force_recheck` reset the picker in between.
+        picker_gen: u8,
         /// job result.
         err: StorageError,
     },
@@ -816,6 +820,18 @@ pub enum DiskCompleted {
         ih: Sha1Hash,
         /// the piece whose writes were fenced.
         piece: PieceIndex,
+    },
+    /// `async_clear_piece` fence drained after a *hash* failure —
+    /// upstream's `on_piece_sync`: restore only the bad `blocks`
+    /// (whole piece when empty), post `hash_failed_alert`, re-mark
+    /// in-flight duplicate blocks.
+    PieceSync {
+        /// torrent.
+        ih: Sha1Hash,
+        /// the piece whose writes were fenced.
+        piece: PieceIndex,
+        /// v2 known-bad block indices (empty = whole piece failed).
+        blocks: Vec<i32>,
     },
     /// `async_delete_files` verdict.
     DeleteFiles {
@@ -1620,7 +1636,13 @@ impl Session {
                         });
                     }
                 }
-                DiskCompleted::Write { ih, peer, req, err } => {
+                DiskCompleted::Write {
+                    ih,
+                    peer,
+                    req,
+                    picker_gen,
+                    err,
+                } => {
                     // `on_disk_write_complete` — `queued_write_bytes`
                     // and `m_outstanding_writing_bytes` drain (the
                     // `bw_disk` read gate + `num_peers_down_disk`
@@ -1646,6 +1668,17 @@ impl Session {
                                 gates.clear_blocked((ih, peer));
                             }
                         }
+                    }
+                    // `picker_gen` gate — a `force_recheck` reset the
+                    // picker after this write was issued; upstream
+                    // drops the completion (success *and* failure)
+                    // rather than touching freshly-reset state.
+                    if self
+                        .torrents
+                        .get(&ih)
+                        .is_none_or(|t| t.picker_generation != picker_gen)
+                    {
+                        continue;
                     }
                     if err.is_err() {
                         // `peer_connection::on_disk_write_complete`
@@ -1713,7 +1746,11 @@ impl Session {
                     // redundant` (a seed↔seed conn drops here too).
                     let mut eff = Vec::new();
                     if let Some(t) = self.torrents.get_mut(&ih) {
-                        t.mark_block_finished(req.piece, req.start);
+                        // upstream `mark_as_finished(block,
+                        // peer_info_struct())` — the completing
+                        // conn's key attributes the downloader.
+                        let key = t.peers.get(&peer).and_then(|c| c.peer_key());
+                        t.mark_block_finished(req.piece, req.start, key);
                         // `on_disk_write_complete` tail —
                         // `check_graceful_pause`: under graceful pause
                         // a conn disconnects once its own outstanding
@@ -1984,6 +2021,11 @@ impl Session {
                         let Some(t) = self.torrents.get_mut(&ih) else {
                             continue;
                         };
+                        // `m_picker->completed_hash_job` runs after
+                        // the generation gate, before the verdicts —
+                        // `verify_v2_blocks` must see the hashing flag
+                        // already cleared.
+                        t.hashing_done(piece);
                         let v1 = if self.settings.disable_hash_checks {
                             Some(true)
                         } else if err.is_ok() && t.wants_v1_hash() {
@@ -2083,6 +2125,16 @@ impl Session {
                     let mut eff = Vec::new();
                     if let Some(t) = self.torrents.get_mut(&ih) {
                         t.on_piece_fail_sync(piece, &self.settings, &self.counters, &mut eff);
+                    }
+                    self.route(ih, eff, out);
+                }
+                DiskCompleted::PieceSync { ih, piece, blocks } => {
+                    // hash-fail fence drained → `on_piece_sync`:
+                    // restore the (blocks-scoped) piece, post
+                    // `hash_failed_alert`, re-mark in-flight dupes.
+                    let mut eff = Vec::new();
+                    if let Some(t) = self.torrents.get_mut(&ih) {
+                        t.on_piece_sync(piece, &blocks, &self.settings, &self.counters, &mut eff);
                     }
                     self.route(ih, eff, out);
                 }
@@ -2189,6 +2241,10 @@ impl Session {
                     };
                     let storage = t.storage;
                     let (peer, req) = (*peer, *req);
+                    // `picker_gen` stamp — `on_disk_write_complete`
+                    // drops completions issued before a
+                    // `force_recheck` reset the picker.
+                    let picker_gen = t.picker_generation;
                     let tx = self.disk_tx.clone();
                     // `async_write`'s `o` — upstream passes the conn
                     // itself (`self()`); the observer lives on the
@@ -2221,7 +2277,13 @@ impl Session {
                         holder,
                         observer,
                         Box::new(move |err| {
-                            let _ = tx.send(DiskCompleted::Write { ih, peer, req, err });
+                            let _ = tx.send(DiskCompleted::Write {
+                                ih,
+                                peer,
+                                req,
+                                picker_gen,
+                                err,
+                            });
                         }),
                         // upstream `torrent::add_piece`: writes get
                         // `flush_piece | volatile_read` only under
@@ -4146,10 +4208,6 @@ impl Session {
             // async here, so we pass `None` (upstream treats a failed
             // re-read identically: the suspicious peer goes unbanned
             // until a later piece exposes it).
-            let piece_size = t
-                .files
-                .as_ref()
-                .map_or(t.piece_length, |f| i64::from(f.piece_size(piece)));
             // downloader keys are `peer_key()` values (first 8 bytes
             // of the remote peer-id), not conn ids — resolve through
             // the conn's key, not its slot in `peers`.
@@ -4160,8 +4218,8 @@ impl Session {
                 .collect();
             t.piece_verified_ban(
                 piece,
-                piece_size,
                 passed,
+                &[],
                 &self.settings,
                 &self.counters,
                 &mut eff,
@@ -7581,6 +7639,40 @@ impl Session {
                 TorrentEffect::PieceFailed(piece) => {
                     self.alerts.post(Alert::HashFailed { ih, piece });
                     out.push(SessionOut::Torrent(TorrentEffect::PieceFailed(piece)));
+                }
+                TorrentEffect::ClearPiece { piece, blocks } => {
+                    // `piece_failed` tail — the picker already
+                    // `lock_piece`d; fence a `clear_piece` job so the
+                    // restore happens only after every in-flight write
+                    // to the piece has drained (`has_storage` leg).
+                    let storage = self.torrents.get(&ih).map(|t| t.storage);
+                    match (self.disk.clone(), storage) {
+                        (Some(disk), Some(storage)) if storage.is_valid() => {
+                            let tx = self.disk_tx.clone();
+                            disk.async_clear_piece(
+                                storage,
+                                piece,
+                                Box::new(move |piece| {
+                                    let _ = tx.send(DiskCompleted::PieceSync { ih, piece, blocks });
+                                }),
+                            );
+                        }
+                        // `!has_storage()` — upstream runs
+                        // `on_piece_sync` inline; nothing to fence.
+                        _ => {
+                            let mut eff = Vec::new();
+                            if let Some(t) = self.torrents.get_mut(&ih) {
+                                t.on_piece_sync(
+                                    piece,
+                                    &blocks,
+                                    &self.settings,
+                                    &self.counters,
+                                    &mut eff,
+                                );
+                            }
+                            self.route(ih, eff, out);
+                        }
+                    }
                 }
                 TorrentEffect::FileCompleted(index) => {
                     self.alerts

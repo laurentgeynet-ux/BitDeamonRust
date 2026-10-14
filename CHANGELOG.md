@@ -9,6 +9,32 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- **Piece-lifecycle parity (write/hash verification)**: in-flight
+  disk write/hash completions now carry `picker_generation` and are
+  dropped when a `force_recheck`/`handle_inconsistent_hashes`
+  invalidated the picker (upstream `++m_picker_generation` gate).
+  `piece_failed` no longer restores inline: it runs `lock_piece` +
+  a `clear_piece` disk fence, then `on_piece_sync` restores — only
+  the v2 bad-block list when the `hashes` message pinpointed them —
+  posts `hash_failed_alert` after restoration, and re-marks
+  in-flight duplicate requests for the restored blocks. Write
+  failures keep the separate `on_piece_fail_sync` continuation
+  (whole-piece restore + re-drive of newly interesting peers,
+  `hash_fail_piece_picks`).
+- **Piece-failure blame**: `found_on_disk` pieces (no swarm
+  downloader) skip `add_failed_bytes`, plugin `on_piece_failed` and
+  peer penalties; `penalize_peers` applies parole, trust −2
+  (floor −7), `banned_for_hash_failure`, `update_want_peers` and a
+  `failed`-flagged disconnect (`too_many_corrupt_pieces` is a
+  peer error upstream).
+- **Piece counters**: `num_piece_passed`, `num_piece_failed`,
+  `num_have_pieces` are now incremented at the upstream sites;
+  `we_have` is split from `piece_passed` so pad-only, checking and
+  accepted-fastresume pieces get `Have` broadcast without download
+  rewards/counters; per-file completion edges fire
+  `file_completed_alert` (re-armed when a piece is lost or the
+  picker rebuilds); `m_last_download`/`last_payload_down` stamps on
+  the verification edge, not block arrival.
 - **Wire-compat fix (upload path)**: `PeerMessage::DontHave` now
   carries the peer's negotiated `lt_donthave` extension id and
   encodes as BEP-10 `msg_extended` (10-byte frame). It was
