@@ -2339,6 +2339,12 @@ impl Session {
     /// attach the disk backend (`session_params` wiring).
     pub fn set_disk(&mut self, io: Arc<dyn DiskIo>) {
         io.set_max_queued_bytes(self.settings.max_queued_disk_bytes);
+        // `settings_updated` — upstream's hook also resizes
+        // `m_file_pool` and both thread pools; push the same set so a
+        // backend handed in cold picks up the live configuration.
+        io.set_file_pool_size(self.settings.file_pool_size);
+        io.set_max_threads(self.settings.aio_threads);
+        io.set_hash_threads(self.settings.hashing_threads);
         io.set_write_no_cache(self.settings.disk_io_write_mode.bypasses_os_cache());
         io.set_write_through(
             self.settings.disk_io_write_mode == crate::settings::DiskIoMode::WriteThrough,
@@ -4845,6 +4851,9 @@ impl Session {
         // the rest is read lazily through `self.settings`.
         if let Some(d) = &self.disk {
             d.set_max_queued_bytes(s.max_queued_disk_bytes);
+            // `settings_updated` — `m_file_pool.resize` lands here
+            // upstream, next to the cache-size and thread pushes.
+            d.set_file_pool_size(s.file_pool_size);
             d.set_write_no_cache(s.disk_io_write_mode.bypasses_os_cache());
             d.set_write_through(s.disk_io_write_mode == crate::settings::DiskIoMode::WriteThrough);
             d.set_cache_expiry(s.cache_expiry.as_secs());
@@ -8262,6 +8271,68 @@ impl Session {
             crate::counters::Counter::LimiterDownBytes,
             self.download_rate.queued_bytes(),
         );
+        // `update_stats_counters` — the backend's live disk gauges
+        // land in the stats bank on each snapshot (upstream calls
+        // `m_disk_thread.update_stats_counters(m_stats_counters)`
+        // from `update_stats_counters` on the same cadence).
+        if let Some(d) = &self.disk {
+            let q = d.queue_stats();
+            self.counters.set(
+                crate::counters::Counter::QueuedDiskJobs,
+                q.queued_disk_jobs as i64,
+            );
+            self.counters.set(
+                crate::counters::Counter::BlockedDiskJobs,
+                q.blocked_disk_jobs as i64,
+            );
+            self.counters.set(
+                crate::counters::Counter::DiskBlocksInUse,
+                q.disk_blocks_in_use,
+            );
+            self.counters
+                .set(crate::counters::Counter::CachedBlocks, q.cached_blocks);
+            self.counters
+                .set(crate::counters::Counter::NumUnhashed, q.num_unhashed);
+            self.counters
+                .set(crate::counters::Counter::FilePoolSize, q.file_pool_size);
+            self.counters
+                .set(crate::counters::Counter::FilePoolHits, q.file_pool_hits);
+            self.counters
+                .set(crate::counters::Counter::FilePoolMisses, q.file_pool_misses);
+            self.counters.set(
+                crate::counters::Counter::FilePoolThreadStall,
+                q.file_pool_thread_stall,
+            );
+            self.counters
+                .set(crate::counters::Counter::FilePoolRace, q.file_pool_race);
+            self.counters.set(
+                crate::counters::Counter::NumBlocksWritten,
+                q.num_blocks_written,
+            );
+            self.counters
+                .set(crate::counters::Counter::NumBlocksRead, q.num_blocks_read);
+            self.counters.set(
+                crate::counters::Counter::NumBlocksHashed,
+                q.num_blocks_hashed,
+            );
+            self.counters
+                .set(crate::counters::Counter::NumWriteOps, q.num_write_ops);
+            self.counters
+                .set(crate::counters::Counter::NumReadOps, q.num_read_ops);
+            // `num_fenced_read + get_type()` — verbatim upstream
+            // arithmetic: the name table predates `hash2` (type 3),
+            // so every kind ≥ hash2 reports under the next-shifted
+            // metric name upstream; we replicate the same indexing
+            // (stale names included). `RemoveTorrent` (type 13) is a
+            // Rust-only job kind — it lands on the
+            // `num_fenced_file_priority` slot by raw index; upstream
+            // never produces a type-13 job so no real counter is
+            // displaced.
+            for (i, &n) in q.fenced_jobs.iter().enumerate() {
+                self.counters
+                    .set_idx(crate::counters::Counter::NumFencedRead as usize + i, n);
+            }
+        }
         crate::counters::SessionStats::snapshot(&self.counters)
     }
     /// `save_state` — the `.session` blob: resume data per torrent

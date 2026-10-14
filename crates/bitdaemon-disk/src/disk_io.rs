@@ -533,6 +533,12 @@ impl PreadDiskIo {
     /// low watermark (upstream `disk_cache::check_buffer_level` on
     /// every erase).
     fn job_done(&self, j: &mut DiskJob) {
+        // upstream `add_completed_jobs_impl`: a `fence`-flagged job
+        // leaves its `num_fenced_read + get_type()` slot here — the
+        // matching increment ran at `add_fence_job` submit.
+        if j.flags & job_flags::FENCE != 0 {
+            self.fence_counters.dec_fenced(j.get_type());
+        }
         match &mut j.action {
             // a write that errored *before reaching the cache*
             // (aborted while parked behind a fence) releases its
@@ -568,6 +574,9 @@ impl PreadDiskIo {
                         }
                         self.num_blocks_written
                             .fetch_add(f.bufs.len() as i64, Ordering::Relaxed);
+                        // upstream counts the op only when the iovec
+                        // group didn't fail (`if (!failed)`).
+                        self.num_write_ops.fetch_add(1, Ordering::Relaxed);
                     } else {
                         // upstream `flush_cache_blocks`: a failed
                         // writev completes every writer of the visited
@@ -593,7 +602,6 @@ impl PreadDiskIo {
                         }
                     }
                 }
-                self.num_write_ops.fetch_add(1, Ordering::Relaxed);
                 let level = self
                     .write_blocks
                     .fetch_sub(f.bufs.len() as i64, Ordering::Relaxed)
@@ -727,6 +735,13 @@ impl PreadDiskIo {
                 }
                 let mut j = j;
                 j.storage = idx;
+                // upstream `add_fence_job` counts the job under
+                // `num_fenced_read + get_type()` before `raise_fence`
+                // — the gauge covers the job's whole life in the
+                // system (blocked or running); the matching decrement
+                // fires in `job_done` when the `FENCE`-flagged job
+                // reaches the completed queue.
+                self.fence_counters.inc_fenced(j.get_type());
                 let (ret, job) = entry.fence.raise_fence(j, &self.fence_counters);
                 if ret == FENCE_POST_FENCE {
                     if let Some(j) = job {
@@ -874,13 +889,16 @@ impl PreadDiskIo {
     ) -> crate::disk_cache::PieceLocation {
         let JobKind::Write(w) = &mut j.action else {
             // upstream `TORRENT_ASSERT(j->action == write)` — only
-            // write jobs reach `insert_write`. Abort explicitly: a
-            // silent drop would skip completion and leak the
-            // `write_blocks` back-pressure slot.
+            // write jobs reach `insert_write`. Abort explicitly and
+            // run the normal completion path: a silent `completed`
+            // push would skip `job_done` (the `write_blocks`
+            // back-pressure slot stays charged forever) and
+            // `job_complete` (the fence's `outstanding` count never
+            // drains — a pending fence would wait on it).
             debug_assert!(matches!(j.action, JobKind::Write(_)));
             let storage = j.storage;
             crate::disk_completed::abort(&mut j);
-            self.completed.push(j);
+            self.add_completed_job(j, Some(entry));
             return (storage, PieceIndex(-1));
         };
         let (piece_size, piece_size2) = {
@@ -967,12 +985,15 @@ impl PreadDiskIo {
                 if cache.num_cached_blocks <= low {
                     break;
                 }
-                // upstream `flush_to_disk` order: complete/hashed
-                // pieces first (large contiguous writes), then the
-                // piece with the most contiguous dirty blocks, then
-                // the oldest partial run — `coalesce_writes` extends
-                // each run across piece boundaries so write-through
-                // writes stay large.
+                // upstream `flush_to_disk` order under a whole-piece
+                // hasher: force-flush/ready pieces first (pass 1),
+                // then ascending `(storage, piece)` — upstream's
+                // pass-4 `get<0>` order. Its pass 2 (largest
+                // `hasher_cursor - flushed_cursor` run) is empty here
+                // because `hasher_cursor` only moves when the hash
+                // job runs. `coalesce_writes` extends each run across
+                // piece boundaries so write-through writes stay
+                // large.
                 let Some(run) = cache.take_coalesced(128) else {
                     break;
                 };
@@ -1248,7 +1269,7 @@ impl PreadDiskIo {
                 let mut repost_pool: Vec<Box<DiskJob>> = Vec::new();
                 let mut repost_locs: Vec<crate::disk_cache::PieceLocation> = Vec::new();
                 let mut repost_done: Vec<Box<DiskJob>> = Vec::new();
-                e.fence.job_complete(&mut j, &mut |bj, fence_up| match self
+                let reposted = e.fence.job_complete(&mut j, &mut |bj, fence_up| match self
                     .gate_consult(e, bj, fence_up)
                 {
                     PostGate::Done(j) => repost_done.push(j),
@@ -1259,6 +1280,13 @@ impl PreadDiskIo {
                     PostGate::Pool(j) => repost_pool.push(j),
                     PostGate::Parked => {}
                 });
+                // upstream `add_completed_jobs_impl`:
+                // `inc_stats_counter(blocked_disk_jobs, -ret)` — every
+                // job `job_complete` popped out of the blocked queue
+                // leaves the gauge.
+                for _ in 0..reposted {
+                    self.fence_counters.dec_blocked();
+                }
                 // deferred, in upstream order: `schedule_flush` for
                 // the inserted blocks, the inline completions re-enter
                 // the completion path (they can lower further fences),
@@ -2612,6 +2640,12 @@ impl DiskIo for PreadDiskIo {
         PreadDiskIo::set_max_queued_bytes(self, bytes);
     }
 
+    /// `settings_pack::file_pool_size` — `m_file_pool.resize` inside
+    /// upstream `settings_updated`; shrinking evicts LRU handles.
+    fn set_file_pool_size(&self, n: i32) {
+        self.file_pool.resize(n.max(1));
+    }
+
     fn set_write_no_cache(&self, v: bool) {
         self.write_no_cache.store(v, Ordering::Relaxed);
         self.fan_out_storages(|st| st.set_write_no_cache(v));
@@ -2716,6 +2750,11 @@ impl DiskIo for PreadDiskIo {
         s.file_pool_thread_stall = stalls;
         s.file_pool_race = races;
         s.file_pool_size = num_files;
+        // `num_fenced_read + get_type()` per-kind gauges — fence jobs
+        // still inside the fence lifetime (submit → completion).
+        for (i, n) in s.fenced_jobs.iter_mut().enumerate() {
+            *n = self.fence_counters.fenced_jobs[i].load(Ordering::Relaxed);
+        }
         // per-kind counts maintained on push/pop — walking the queue
         // here held the worker lock for O(queue) every stats tick and
         // stalled all disk threads mid-burst.

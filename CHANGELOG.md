@@ -136,6 +136,22 @@ Until `1.0.0`, breaking changes may occur in any release.
   `m_quota[download_channel] > 0` gate on the timeout detectors
   (per-conn quota since the `BandwidthManager` wiring) in
   `check_request_timeouts`.
+- `update_stats_counters` port: the disk backend's live gauges now
+  land in `session_stats` on each snapshot — `queued_disk_jobs`,
+  `blocked_disk_jobs`, `disk_blocks_in_use`, `cached_blocks`,
+  `num_unhashed`, the `file_pool_*` set, `num_blocks_*`, `num_*_ops`,
+  and the `num_fenced_*` range via upstream's
+  `num_fenced_read + get_type()` raw-index arithmetic (stale counter
+  names for kinds ≥ `hash2` replicated verbatim).
+- `DiskIo::set_file_pool_size` — `settings_pack::file_pool_size`
+  hot-resizes the `FilePool` (upstream `m_file_pool.resize` inside
+  `settings_updated`); `set_disk` and `apply_settings` now push it
+  alongside `aio_threads`/`hashing_threads` so a backend attached
+  cold or reconfigured live picks up the full disk knob set.
+- `DiskQueueStats::fenced_jobs` — per-`job_action_t` gauge of fence
+  jobs currently in the system (incremented at `add_fence_job`,
+  decremented when a `fence`-flagged job completes), exposed through
+  `queue_stats` for the session-counters sync above.
 
 ### Changed
 
@@ -148,6 +164,35 @@ Until `1.0.0`, breaking changes may occur in any release.
   write cache block, which owns its data.
 
 ### Fixed
+
+- **`blocked_disk_jobs` gauge leak on fence repost**: `job_complete`
+  returns the number of jobs popped out of a storage's blocked queue,
+  and upstream turns it into `inc_stats_counter(blocked_disk_jobs,
+  -ret)` — the return was dropped, so every reposted job left the
+  gauge charged forever. `PreadDiskIo` now decrements per reposted
+  job, matching `update_stats_counters` semantics.
+- **`num_write_ops` counted failed flushes**: the per-iovec counter
+  incremented unconditionally after `writev`; upstream only counts
+  `if (!failed)` — the same condition that governs
+  `num_blocks_written`. Failed spans still retire `flushed` and
+  error their writers (upstream `flush_cache_blocks` behavior), only
+  the stat was wrong.
+- **Non-write abort in `insert_write` skipped the completion path**:
+  a defensive `debug_assert!` leg pushed the job straight to the
+  completed queue, bypassing `job_done` (leaked `write_blocks`
+  back-pressure slot) and `job_complete` (the fence's outstanding
+  count never drained, wedging a pending fence). It now runs the
+  normal `add_completed_job` path.
+- **Flush pick order documented/pinned to upstream semantics**:
+  `take_coalesced` picks ready pieces first, then the ascending
+  `(storage, piece)` sweep. That matches `flush_to_disk`'s reachable
+  passes under our whole-piece hasher — upstream's pass 2
+  (`cheap_to_flush = hasher_cursor - flushed_cursor`) is
+  structurally empty when `hasher_cursor` only advances at hash-job
+  time. A regression test pins the order (a longer dirty run must
+  not jump ahead of a lower piece index).
+- **Duplicate `compute_flushed_cursor`** call in the flush-complete
+  path removed.
 
 - **Engine tick starvation under sustained load** (the "runs fine,
   collapses for ~1 min, resumes" report): `Engine::run` created a

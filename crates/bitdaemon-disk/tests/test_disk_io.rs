@@ -94,6 +94,94 @@ fn write_job(piece: i32, fill: u8, io: &PreadDiskIo, done: Arc<AtomicUsize>) -> 
     })
 }
 
+/// `write` blocks on a barrier so in-flight work holds
+/// deterministically until the test releases the worker.
+struct GatedStorage {
+    inner: PreadStorage,
+    gate: Arc<std::sync::Barrier>,
+}
+impl bitdaemon_disk::storage::DiskStorage for GatedStorage {
+    fn set_storage_index(&self, idx: StorageIndex) {
+        self.inner.set_storage_index(idx);
+    }
+    fn files(&self) -> &FileStorage {
+        self.inner.files()
+    }
+    fn file_priorities(&self) -> &[DownloadPriority] {
+        self.inner.file_priorities()
+    }
+    fn read(
+        &self,
+        buf: &mut [u8],
+        piece: PieceIndex,
+        offset: i64,
+        mode: bitdaemon_disk::open_mode::OpenMode,
+        volatile: bool,
+    ) -> bitdaemon_disk::storage_error::StorageResult<i64> {
+        self.inner.read(buf, piece, offset, mode, volatile)
+    }
+    fn write(
+        &self,
+        buf: &[u8],
+        piece: PieceIndex,
+        offset: i64,
+        mode: bitdaemon_disk::open_mode::OpenMode,
+    ) -> bitdaemon_disk::storage_error::StorageResult<i64> {
+        self.gate.wait();
+        self.inner.write(buf, piece, offset, mode)
+    }
+    fn hash_with(
+        &self,
+        feed: &mut dyn FnMut(&[u8]),
+        len: i64,
+        piece: PieceIndex,
+        offset: i64,
+        mode: bitdaemon_disk::open_mode::OpenMode,
+        volatile: bool,
+    ) -> bitdaemon_disk::storage_error::StorageResult<i64> {
+        self.inner
+            .hash_with(feed, len, piece, offset, mode, volatile)
+    }
+    fn release_files(&self) -> bitdaemon_disk::storage_error::StorageResult<()> {
+        self.inner.release_files()
+    }
+    fn move_storage(
+        &self,
+        _p: PathBuf,
+        _f: bitdaemon_disk::storage::MoveFlags,
+    ) -> (
+        u8,
+        PathBuf,
+        Option<bitdaemon_disk::storage_error::StorageError>,
+    ) {
+        unimplemented!()
+    }
+    fn delete_files(&self, _o: u8) -> bitdaemon_disk::storage_error::StorageResult<()> {
+        unimplemented!()
+    }
+    fn rename_file(
+        &mut self,
+        _i: FileIndex,
+        _n: &[u8],
+    ) -> bitdaemon_disk::storage_error::StorageResult<()> {
+        unimplemented!()
+    }
+    fn set_file_priority(
+        &mut self,
+        _p: &[DownloadPriority],
+    ) -> bitdaemon_disk::storage_error::StorageResult<()> {
+        unimplemented!()
+    }
+    fn verify_resume_data(
+        &self,
+        _h: &bitdaemon_common::bitfield::Bitfield,
+        _s: bool,
+        _l: &[PathBuf],
+    ) -> (bool, Option<bitdaemon_disk::storage_error::StorageError>) {
+        unimplemented!()
+    }
+}
+
 fn read_job(piece: i32, got: Arc<Mutex<Vec<u8>>>, done: Arc<AtomicUsize>) -> Box<DiskJob> {
     Box::new(DiskJob {
         storage: StorageIndex(u32::MAX),
@@ -339,83 +427,6 @@ fn hash_job_computes_piece_sha1() {
 #[test]
 fn hash_parked_behind_inflight_write_is_released() {
     use std::sync::Barrier;
-
-    use bitdaemon_disk::open_mode::OpenMode;
-    use bitdaemon_disk::storage::{DiskStorage, MoveFlags};
-    use bitdaemon_disk::storage_error::{StorageError, StorageResult};
-
-    // `write` blocks on a barrier so the piece_gate holds the hash job
-    // deterministically until the test releases the worker.
-    struct GatedStorage {
-        inner: PreadStorage,
-        gate: Arc<Barrier>,
-    }
-    impl DiskStorage for GatedStorage {
-        fn set_storage_index(&self, idx: StorageIndex) {
-            self.inner.set_storage_index(idx);
-        }
-        fn files(&self) -> &FileStorage {
-            self.inner.files()
-        }
-        fn file_priorities(&self) -> &[DownloadPriority] {
-            self.inner.file_priorities()
-        }
-        fn read(
-            &self,
-            buf: &mut [u8],
-            piece: PieceIndex,
-            offset: i64,
-            mode: OpenMode,
-            volatile: bool,
-        ) -> StorageResult<i64> {
-            self.inner.read(buf, piece, offset, mode, volatile)
-        }
-        fn write(
-            &self,
-            buf: &[u8],
-            piece: PieceIndex,
-            offset: i64,
-            mode: OpenMode,
-        ) -> StorageResult<i64> {
-            self.gate.wait();
-            self.inner.write(buf, piece, offset, mode)
-        }
-        fn hash_with(
-            &self,
-            feed: &mut dyn FnMut(&[u8]),
-            len: i64,
-            piece: PieceIndex,
-            offset: i64,
-            mode: OpenMode,
-            volatile: bool,
-        ) -> StorageResult<i64> {
-            self.inner
-                .hash_with(feed, len, piece, offset, mode, volatile)
-        }
-        fn release_files(&self) -> StorageResult<()> {
-            self.inner.release_files()
-        }
-        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> (u8, PathBuf, Option<StorageError>) {
-            unimplemented!()
-        }
-        fn delete_files(&self, _o: u8) -> StorageResult<()> {
-            unimplemented!()
-        }
-        fn rename_file(&mut self, _i: FileIndex, _n: &[u8]) -> StorageResult<()> {
-            unimplemented!()
-        }
-        fn set_file_priority(&mut self, _p: &[DownloadPriority]) -> StorageResult<()> {
-            unimplemented!()
-        }
-        fn verify_resume_data(
-            &self,
-            _h: &bitdaemon_common::bitfield::Bitfield,
-            _s: bool,
-            _l: &[PathBuf],
-        ) -> (bool, Option<StorageError>) {
-            unimplemented!()
-        }
-    }
 
     let d = dir("gate");
     let (io, _drained) = make_io(1);
@@ -1804,6 +1815,181 @@ fn stop_torrent_aborts_queued_volatile_hash() {
         1,
         "aborted hash must never reach the storage"
     );
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// `num_fenced_*`/`blocked_disk_jobs` gauges + `disk_observer` wiring
+// ---------------------------------------------------------------------------
+
+/// A fence job counts in at `add_fence_job` (`num_fenced_read +
+/// get_type()`) and out when its `FENCE`-flagged completion lands;
+/// jobs parked behind the raised fence lift `blocked_disk_jobs`
+/// until `job_complete` reposts them (upstream
+/// `add_completed_jobs_impl`'s `inc_stats_counter(…, -ret)`).
+#[test]
+fn fenced_and_blocked_counters_balance() {
+    use std::sync::Barrier;
+
+    use bitdaemon_disk::disk_interface::DiskIo;
+    use bitdaemon_disk::disk_job::JobAction;
+
+    let d = dir("fence_ctrs");
+    let (io, _drained) = make_io(1);
+    let gate = Arc::new(Barrier::new(2));
+    io.insert_storage(
+        StorageIndex(0),
+        Box::new(GatedStorage {
+            inner: storage(&make_fs(), &d),
+            gate: Arc::clone(&gate),
+        }),
+    );
+
+    let done = Arc::new(AtomicUsize::new(0));
+    // piece 0 completes on insert → the eager Flush job's
+    // storage.write() parks the single worker on the barrier;
+    // `outstanding` stays > 0 so the fence below queues instead of
+    // posting immediately.
+    io.add_job(StorageIndex(0), write_job(0, 0x5A, &io, Arc::clone(&done)));
+
+    io.async_release_files(
+        StorageIndex(0),
+        Box::new({
+            let d2 = Arc::clone(&done);
+            move || {
+                d2.fetch_add(1, Ordering::Relaxed);
+            }
+        }),
+    );
+    let q = io.queue_stats();
+    assert_eq!(
+        q.fenced_jobs[JobAction::ReleaseFiles.index()],
+        1,
+        "fence job counts in at submit"
+    );
+    assert_eq!(
+        q.blocked_disk_jobs, 1,
+        "fence job parked behind the in-flight write"
+    );
+
+    // a normal read queues behind the raised fence
+    let got = Arc::new(Mutex::new(Vec::new()));
+    io.add_job(
+        StorageIndex(0),
+        read_job(0, Arc::clone(&got), Arc::clone(&done)),
+    );
+    assert_eq!(io.queue_stats().blocked_disk_jobs, 2);
+
+    // release the worker: the write lands, the fence drains and runs,
+    // then the parked read reposts — every gauge settles at 0.
+    gate.wait();
+    wait_done(&io, &done, 3);
+
+    let q = io.queue_stats();
+    assert!(q.fenced_jobs.iter().all(|&n| n == 0));
+    assert_eq!(
+        q.blocked_disk_jobs, 0,
+        "reposted jobs leave the blocked gauge"
+    );
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// `disk_observer` wiring — `async_write`'s `o` registers with
+/// `has_back_pressure` when the queue level reaches the max; once the
+/// queue drains below the low watermark the observer's `on_disk`
+/// fires (upstream posts it to the network thread — the default
+/// poster runs it inline on the disk path).
+#[test]
+fn back_pressure_observer_fires_below_low_watermark() {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::back_pressure::DiskObserver;
+    use bitdaemon_disk::disk_interface::DiskIo;
+
+    struct Obs(AtomicUsize);
+    impl DiskObserver for Obs {
+        fn on_disk(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let d = dir("bp_obs");
+    let (io, _drained) = make_io(0);
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs(), &d)));
+    // max = 1 block — the first write pushes the queue to the limit;
+    // low watermark = 0, so the drain fires the observer at once.
+    io.set_max_queued_bytes(0x4000);
+
+    let obs = Arc::new(Obs(AtomicUsize::new(0)));
+    let o: Arc<dyn DiskObserver> = obs.clone();
+    let done = Arc::new(AtomicUsize::new(0));
+    let exceeded = io.async_write(
+        StorageIndex(0),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start: 0,
+            length: 1024,
+        },
+        DiskBufferHolder::from_owned(vec![0x33; 1024]),
+        Some(o),
+        Box::new({
+            let d2 = Arc::clone(&done);
+            move |_| {
+                d2.fetch_add(1, Ordering::Relaxed);
+            }
+        }),
+        0,
+    );
+    assert!(exceeded, "level 1 >= max_size 1 → back-pressure signalled");
+    // the 0-thread io flushed the piece inline — `write_blocks` is
+    // back to 0, below the low watermark → the observer already fired.
+    assert_eq!(obs.0.load(Ordering::Relaxed), 1);
+    io.completed().call_job_handlers();
+    assert_eq!(done.load(Ordering::Relaxed), 1);
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// `settings_pack::file_pool_size` hot-resize — `set_file_pool_size`
+/// reaches the backend's live `FilePool` (upstream
+/// `settings_updated` → `m_file_pool.resize`): shrinking evicts the
+/// LRU handles immediately.
+#[test]
+fn set_file_pool_size_resizes_live_pool() {
+    use bitdaemon_disk::disk_interface::DiskIo;
+
+    let d = dir("fpsize");
+    let (io, _drained) = make_io(0);
+    let fs = make_fs();
+    // `new_torrent` is the production path — the factory-built
+    // storage shares the io's `file_pool` (unlike `insert_storage`).
+    let idx = io.new_torrent(&StorageParams {
+        files: &fs,
+        renamed: &RenamedFiles::default(),
+        path: d.clone(),
+        part_file_dir: PathBuf::new(),
+        mode: StorageMode::Sparse,
+        priorities: &[DownloadPriority::DEFAULT; 2],
+        info_hash: [7u8; 20],
+        v1: true,
+        v2: false,
+    });
+    // a write spanning a.bin's tail into b.bin's head opens both
+    // files (piece 0 = a[0..1000] + b[0..24]).
+    let done = Arc::new(AtomicUsize::new(0));
+    io.add_job(idx, write_job(0, 0x77, &io, Arc::clone(&done)));
+    io.completed().call_job_handlers();
+    assert_eq!(
+        io.get_status(idx).len(),
+        2,
+        "both files pooled after the write"
+    );
+
+    io.set_file_pool_size(1);
+    assert_eq!(io.get_status(idx).len(), 1, "shrink evicts the LRU handle");
+
+    io.set_file_pool_size(40);
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();
 }

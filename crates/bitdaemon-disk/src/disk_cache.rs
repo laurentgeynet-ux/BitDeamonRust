@@ -597,15 +597,17 @@ impl DiskCache {
         None
     }
 
-    /// Elevator/SCAN pick: the lowest dirty piece location whose index
-    /// is `>= scan_head`, wrapping to the overall lowest once past the
-    /// end — a monotonic sweep instead of the LRU/largest-run order's
-    /// essentially random jumps. Not upstream (libtorrent doesn't
-    /// distinguish disk media), but a standard disk-scheduling
-    /// technique and the dominant lever for seek-bound rotating
-    /// disks: on an HDD, `fkb`-sized (tens of KiB) concurrent writes
-    /// from several threads at scattered offsets cost one seek each —
-    /// sweeping ascending keeps consecutive flushes close together.
+    /// Ascending-piece pick — upstream `flush_to_disk`'s last pass
+    /// iterates `m_pieces`' `get<0>` index (ordered by
+    /// `(storage, piece)`), flushing every dirty run of each piece it
+    /// visits; the sweep is a monotonic `(storage, piece)` walk, so
+    /// consecutive flushes stay close together on disk. We resume at
+    /// `scan_head` instead of restarting from 0 each call, and a
+    /// piece left dirty behind a gap is found again on wrap. Under
+    /// the whole-piece hasher, pass 2 (`cheap_to_flush`) never has a
+    /// positive score, so this ascending pass is the routine drain
+    /// order — same as upstream once its hasher has nothing cheap
+    /// left.
     /// Stale/emptied entries are dropped lazily like the other
     /// indices.
     pub fn take_elevator_run(&mut self) -> Option<LocatedRun> {
@@ -634,16 +636,31 @@ impl DiskCache {
         }
     }
 
-    /// `coalesce_writes` — take one run (ready → elevator sweep →
-    /// largest → oldest) then extend it across piece boundaries: a
-    /// run ending at a piece's last block followed by the next
-    /// piece's dirty blocks starting at 0 is one contiguous file
-    /// region, flushed as a single writev like upstream builds its
-    /// iovec over the ordered dirty-block set. Stops at `max_blocks`
-    /// buffers or the first gap. Returns `(job_loc, first_block,
-    /// spans, bufs, writers)` where `spans` splits `bufs` into
-    /// per-piece `(piece, first_block, n_bufs)` runs for
+    /// `coalesce_writes` — take one run then extend it across piece
+    /// boundaries: a run ending at a piece's last block followed by
+    /// the next piece's dirty blocks starting at 0 is one contiguous
+    /// file region, flushed as a single writev like upstream builds
+    /// its iovec over the ordered dirty-block set. Stops at
+    /// `max_blocks` buffers or the first gap. Returns `(job_loc,
+    /// first_block, spans, bufs, writers)` where `spans` splits `bufs`
+    /// into per-piece `(piece, first_block, n_bufs)` runs for
     /// `run_flushed`/`restore_run` bookkeeping.
+    ///
+    /// Pick order mirrors the passes upstream's `flush_to_disk`
+    /// actually reaches under a whole-piece hasher: ready pieces
+    /// first (pass 1 — `force_flush_flag`, plus complete un-hashed
+    /// pieces which upstream's incremental hasher promotes to
+    /// force-flush as blocks land; ours must flush before the hash
+    /// job can even be issued, since write completions drive it),
+    /// then the ascending `(storage, piece)` sweep — upstream's
+    /// pass-4 `get<0>` iteration order. Upstream's pass 2
+    /// (`cheap_to_flush = hasher_cursor - flushed_cursor`, largest
+    /// first) is structurally empty here: `hasher_cursor` only
+    /// advances when the whole-piece hash job runs, so an unhashed
+    /// piece's score is `0 - flushed_cursor ≤ 0` — upstream skips
+    /// those in pass 2 and flushes them in pass 4. `largest` and
+    /// `oldest` stay as unreachable-in-practice fallbacks for stale
+    /// index entries (the run index covers every dirty piece).
     pub fn take_coalesced(&mut self, max_blocks: usize) -> Option<CoalescedFlush> {
         let (job_loc, job_first, mut bufs, mut writers) = self
             .take_ready_run()
@@ -835,7 +852,6 @@ impl DiskCache {
                 retired += 1;
             }
             self.num_cached_blocks -= retired;
-            p.flushed_cursor = compute_flushed_cursor(&p.blocks);
             p.flushed_cursor = compute_flushed_cursor(&p.blocks);
             // the entry leaves the cache once every block is on disk —
             // except v2 pieces keep their (tiny) entry for the stored
@@ -1099,5 +1115,42 @@ mod tests {
         assert_eq!(c.num_unhashed, 1);
         c.free_piece(loc2);
         assert_eq!(c.num_unhashed, 0);
+    }
+
+    /// `flush_to_disk` pass order under the whole-piece hasher:
+    /// ready pieces first, then the ascending `(storage, piece)`
+    /// sweep — upstream's pass-4 `get<0>` order. A longer dirty run
+    /// must NOT jump ahead of a lower piece index: upstream's
+    /// pass-2 `cheap_to_flush` score is `hasher_cursor -
+    /// flushed_cursor`, and `hasher_cursor` only advances when the
+    /// whole-piece hash job runs — unhashed pieces always score
+    /// `≤ 0` upstream and are left for the ascending pass.
+    #[test]
+    fn flush_pick_prefers_ready_then_ascending() {
+        let mut c = DiskCache::default();
+        let s = StorageIndex(0);
+        let at = |p: i32| (s, PieceIndex(p));
+        // piece 5 carries the *longest* partial run (2 blocks);
+        // pieces 2 and 9 have one dirty block each.
+        c.insert(at(5), 0, Some(vec![5; 4]), None, false, params());
+        c.insert(at(5), 1, Some(vec![5; 4]), None, false, params());
+        c.insert(at(9), 0, Some(vec![9; 4]), None, false, params());
+        c.insert(at(2), 0, Some(vec![2; 4]), None, false, params());
+        // piece 0 lands complete → ready queue (upstream pass 1:
+        // its incremental hasher promotes complete pieces to
+        // force-flush; our `ready` covers both).
+        for b in 0..3 {
+            c.insert(at(0), b, Some(vec![0; 4]), None, false, params());
+        }
+
+        let (loc, ..) = c.take_coalesced(16).unwrap();
+        assert_eq!(loc, at(0), "complete piece flushes first");
+        let (loc, ..) = c.take_coalesced(16).unwrap();
+        assert_eq!(loc, at(2), "ascending piece order — not the largest run");
+        let (loc, ..) = c.take_coalesced(16).unwrap();
+        assert_eq!(loc, at(5));
+        let (loc, ..) = c.take_coalesced(16).unwrap();
+        assert_eq!(loc, at(9));
+        assert!(c.take_coalesced(16).is_none());
     }
 }

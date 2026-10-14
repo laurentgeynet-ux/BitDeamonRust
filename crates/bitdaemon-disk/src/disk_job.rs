@@ -50,6 +50,19 @@ pub enum JobAction {
     RemoveTorrent,
 }
 
+impl JobAction {
+    /// `num_job_ids` — counter array slots for the `num_fenced_*`
+    /// gauges (`num_fenced_read + get_type()`).
+    pub const COUNT: usize = 14;
+
+    /// `static_cast<int>(get_type())` — index into the
+    /// `num_fenced_read + …` counter range.
+    #[must_use]
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// `disk_job` flag bits (`fence`, `in_progress`, `aborted`).
 pub mod job_flags {
     /// `disk_job::fence` — exclusive-storage job that raised the fence.

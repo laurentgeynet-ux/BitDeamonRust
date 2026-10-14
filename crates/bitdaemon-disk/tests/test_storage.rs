@@ -547,3 +547,27 @@ fn delete_files_error_ordering() {
     assert!(d2.join("t/c.bin").is_dir());
     stdfs::remove_dir_all(&d2).unwrap();
 }
+
+/// `disk_io_write_mode == write_through` — `sync_file` runs after
+/// each landed write and its errors are swallowed (upstream
+/// `pread_storage.cpp` calls it without an `ec` out-param). The
+/// write must succeed and the data must read back.
+#[test]
+fn write_through_syncs_and_lands() {
+    use bitdaemon_disk::storage::DiskStorage;
+
+    let d = dir("wt");
+    let fs = make_fs();
+    let prio = vec![DownloadPriority::DEFAULT; 2];
+    let st = storage(&fs, &d, &prio);
+    st.set_storage_index(StorageIndex(0));
+    st.set_write_through(true);
+
+    let data = vec![0x41u8; 1024];
+    st.write(&data, PieceIndex(0), 0, OpenMode::WRITE).unwrap();
+    let mut out = vec![0u8; 1024];
+    st.read(&mut out, PieceIndex(0), 0, OpenMode::READ_ONLY, false)
+        .unwrap();
+    assert_eq!(out, data);
+    stdfs::remove_dir_all(&d).unwrap();
+}

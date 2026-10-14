@@ -39,12 +39,18 @@ struct HasFence {
     blocked: VecDeque<Box<DiskJob>>,
 }
 
-/// `counters::blocked_disk_jobs` — minimal performance counter so the
-/// TOCTOU-safe increment under the fence mutex is preserved.
+/// `counters::blocked_disk_jobs` + the `num_fenced_*` per-kind
+/// gauges — live counters so the TOCTOU-safe increments under the
+/// fence mutex are preserved.
 #[derive(Default)]
 pub struct FenceCounters {
     /// `blocked_disk_jobs`.
     pub blocked_disk_jobs: AtomicUsize,
+    /// `num_fenced_read + get_type()` — fence jobs currently in the
+    /// system per `job_action_t` (incremented at `add_fence_job`,
+    /// decremented when a `fence`-flagged job completes — upstream
+    /// `add_completed_jobs_impl`).
+    pub fenced_jobs: [AtomicI64; crate::disk_job::JobAction::COUNT],
 }
 
 impl FenceCounters {
@@ -55,6 +61,17 @@ impl FenceCounters {
     /// of the blocked queue (wired by disk_io on repost).
     pub fn dec_blocked(&self) {
         self.blocked_disk_jobs.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// `inc_stats_counter(num_fenced_read + get_type())` — called at
+    /// `add_fence_job` submit time, before `raise_fence`.
+    pub fn inc_fenced(&self, kind: crate::disk_job::JobAction) {
+        self.fenced_jobs[kind.index()].fetch_add(1, Ordering::Relaxed);
+    }
+    /// `inc_stats_counter(num_fenced_read + get_type(), -1)` — called
+    /// when a `fence`-flagged job lands on the completed queue.
+    pub fn dec_fenced(&self, kind: crate::disk_job::JobAction) {
+        self.fenced_jobs[kind.index()].fetch_sub(1, Ordering::Relaxed);
     }
 }
 

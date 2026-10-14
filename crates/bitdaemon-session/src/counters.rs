@@ -1009,6 +1009,14 @@ impl Counters {
     pub fn set(&self, c: Counter, n: i64) {
         self.v[c as usize].store(n, Ordering::Relaxed);
     }
+    /// `set_value` by raw index — for upstream's
+    /// `num_fenced_read + get_type()` counter arithmetic where the
+    /// base plus a `job_action_t` ordinal selects the slot.
+    pub fn set_idx(&self, idx: usize, n: i64) {
+        if let Some(c) = self.v.get(idx) {
+            c.store(n, Ordering::Relaxed);
+        }
+    }
     /// `counters[c]`.
     #[must_use]
     pub fn value(&self, c: Counter) -> i64 {

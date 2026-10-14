@@ -173,6 +173,12 @@ pub trait DiskIo: Send + Sync {
     /// on backends without a buffer limit.
     fn set_max_queued_bytes(&self, _bytes: i64) {}
 
+    /// `settings_pack::file_pool_size` — resize the pooled-handle
+    /// limit (upstream `m_file_pool.resize` inside
+    /// `settings_updated`). Shrinking evicts LRU entries eagerly.
+    /// No-op on backends without a pooled resource.
+    fn set_file_pool_size(&self, _n: i32) {}
+
     /// `settings_pack::disk_io_write_mode ∈ {disable_os_cache,
     /// write_through}` — every file open gets `open_mode::no_cache`
     /// (`pread_storage.cpp:780` / `mmap_storage.cpp:956`), so dirty
@@ -266,7 +272,12 @@ pub trait DiskIo: Send + Sync {
         0
     }
 
-    /// `settings_updated`.
+    /// `settings_updated` — upstream re-reads `m_settings` live in
+    /// this hook (`m_cache.set_max_size`, `m_file_pool.resize`,
+    /// `m_generic_threads`/`m_hash_threads.set_max_threads`). Ours
+    /// pushes each knob through its own setter — `set_disk` and
+    /// `apply_settings` cover the same set — so the hook itself stays
+    /// a no-op placeholder for backends that prefer pull-style config.
     fn settings_updated(&self);
 }
 
@@ -319,6 +330,10 @@ pub struct DiskQueueStats {
     pub file_pool_thread_stall: i64,
     /// `counters::file_pool_race`.
     pub file_pool_race: i64,
+    /// `counters::num_fenced_*` — fence jobs currently in the system,
+    /// indexed by `JobAction::index` (upstream
+    /// `num_fenced_read + get_type()`).
+    pub fenced_jobs: [i64; crate::disk_job::JobAction::COUNT],
 }
 
 /// `storage_holder` — RAII ownership of a torrent's storage index;
