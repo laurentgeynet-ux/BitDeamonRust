@@ -159,7 +159,11 @@ Until `1.0.0`, breaking changes may occur in any release.
   is why the failure never showed on Windows. Also dropped a stray
   `unsafe` wrapper around `format!` in the same probe. CI matrices
   gained `fail-fast: false` so a Linux failure no longer cancels the
-  Windows leg mid-run.
+  Windows leg mid-run. `ViewEntry::mode` (`bitdaemon-mmap`) is only
+  read by the Windows sparse-clear `Drop` path — it is now
+  `cfg_attr`-`allow(dead_code)` off Windows so `RUSTFLAGS=-D warnings`
+  stops failing the Linux legs (upstream stores `m_open_mode` on every
+  platform, so the field stays).
 - Upstream-sync fixes (libtorrent `RC_2_1` up to `v2.1.2-62-ge7381c7bc`):
   `file_piece_range_exclusive` no longer emits an inverted range when a
   mid-piece-start file owns no whole piece — `end` is clamped to `begin`

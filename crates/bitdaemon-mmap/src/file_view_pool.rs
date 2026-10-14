@@ -46,6 +46,9 @@ struct ViewEntry {
     map_len: usize,
     /// `m_open_mode` — Windows `Drop` clears the sparse attribute on
     /// write+sparse files that never grew regions (file.cpp:730-749).
+    /// Only read by the Windows close path — upstream stores it on
+    /// every platform.
+    #[cfg_attr(not(windows), allow(dead_code))]
     mode: OpenMode,
     /// `m_open_unmap_lock` — serializes `CreateFileMapping` vs
     /// `UnmapViewOfFile` on the same file across pool generations
