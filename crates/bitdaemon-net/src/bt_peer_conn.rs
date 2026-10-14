@@ -2,6 +2,10 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `bt_peer_connection.cpp`/`bt_peer_connection.hpp` (async
+//! driver half — the packet codec is `net::peer_wire`, the session-side
+//! state machine is `session::peer_conn`).
+//!
 //! `bt_peer_connection` — the async wire driver. Upstream's class
 //! owns the socket; here the stream is a `PeerStream` (ADR-0008 —
 //! any tunnel/proxy lane works) and each phase is an async fn the

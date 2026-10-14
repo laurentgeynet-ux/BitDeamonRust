@@ -1,4 +1,5 @@
-//! Port of `aux_/http_parser` — incremental HTTP request/response
+//! Port of `http_parser.cpp`/`aux_/http_parser.hpp` — incremental
+//! HTTP request/response
 //! parser: status/request line, header multimap (lowercase names),
 //! content-length / content-range / connection / transfer-encoding,
 //! and chunked-body range tracking (`parse_chunk_header`,

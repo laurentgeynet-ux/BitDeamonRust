@@ -160,7 +160,10 @@ fn candidates_and_failcount() {
     assert_eq!(l.num_connect_candidates(), 4);
     let cands = l.find_connect_candidates(1000, &st);
     assert_eq!(cands.len(), 4);
-    assert!(!cands.contains(&i));
+    // candidate keys are `(PeerAddr, port)` — stable under erasure
+    // unlike the Vec indices upstream uses pointers for.
+    let key_of = |l: &PeerList, i: usize| (l.peers()[i].addr.clone(), l.peers()[i].port);
+    assert!(!cands.contains(&key_of(&l, i)));
     // connected peer isn't a candidate
     l.set_connected(l.find_peer(ep(2, 6881).ip()).unwrap(), 900, false);
     assert_eq!(l.num_connect_candidates(), 3);
@@ -172,9 +175,10 @@ fn candidates_and_failcount() {
         &st,
     );
     // just disconnected → still skipped by min_reconnect_time
+    let j = l.find_peer(ep(2, 6881).ip()).unwrap();
     assert!(
         !l.find_connect_candidates(1000, &st)
-            .contains(&l.find_peer(ep(2, 6881).ip()).unwrap())
+            .contains(&key_of(&l, j))
     );
 }
 
@@ -246,15 +250,9 @@ fn ranking_prefers_low_failcount_local() {
     let cands = l.find_connect_candidates(0, &st);
     assert_eq!(cands.len(), 3);
     // lowest failcount first; tie → local first
-    assert_eq!(l.peers()[cands[0]].addr.address(), Some(ep(9, 6881).ip()));
-    assert_eq!(
-        l.peers()[cands[1]].addr.address(),
-        Some("1.1.1.1".parse().unwrap())
-    );
-    assert_eq!(
-        l.peers()[cands[2]].addr.address(),
-        Some("8.8.8.8".parse().unwrap())
-    );
+    assert_eq!(cands[0].0.address(), Some(ep(9, 6881).ip()));
+    assert_eq!(cands[1].0.address(), Some("1.1.1.1".parse().unwrap()));
+    assert_eq!(cands[2].0.address(), Some("8.8.8.8".parse().unwrap()));
 }
 
 #[test]
@@ -274,7 +272,12 @@ fn ranking_uses_primary_source() {
     let (p, _) = add(&mut l, ep(2, 6881), PeerSourceFlags::PEX).unwrap();
     assert_eq!(primary_source(l.peers()[p].source), PeerSourceFlags::PEX);
     let cands = l.find_connect_candidates(0, &st);
-    let pos = |i| cands.iter().position(|&c| c == i).unwrap();
+    let pos = |i: usize| {
+        cands
+            .iter()
+            .position(|c| c.0 == l.peers()[i].addr && c.1 == l.peers()[i].port)
+            .unwrap()
+    };
     assert!(pos(t) < pos(p), "tracker-primary must rank before pex-only");
 }
 

@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `websocket_tracker_connection.cpp`.
+//!
 //! `websocket_tracker_connection` — WebTorrent-style JSON announce
 //! over a WebSocket stream (`websocket.rs` handshake + frames).
 //!

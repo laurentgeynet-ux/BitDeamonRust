@@ -1,3 +1,6 @@
+//! Port of `socket.hpp`/`socket_type.cpp`'s *role* — the socket-variant
+//! becomes trait objects (ADR-0008).
+//!
 //! Injectable transport traits — the seam every UDP/TCP subsystem
 //! (uTP, DHT, UDP trackers, LSD, peer connections) is built upon.
 //!
@@ -76,6 +79,20 @@ pub trait PeerConnector: Send + Sync + Debug + 'static {
         self: Arc<Self>,
         addr: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>>;
+
+    /// `session_impl::bind_outgoing_socket` — connect with the local
+    /// endpoint bound first (the `outgoing_port`/`num_outgoing_ports`
+    /// rotation lands here). Transports that cannot bind per-connect
+    /// (uTP shares a socket, I2P is addressed by destination) ignore
+    /// `bind` — same as upstream's deferred proxy sockets.
+    fn connect_with_bind(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        bind: Option<SocketAddr>,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>> {
+        let _ = bind;
+        self.connect(addr)
+    }
 
     /// Connect by destination string — `"host:port"`, an I2P base64/
     /// `.b32.i2p` destination, an onion service name… Default parses

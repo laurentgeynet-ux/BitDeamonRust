@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `websocket_stream.cpp`/`websocket_stream.hpp`.
+//!
 //! `websocket_stream` — RFC 6455 over an injected stream (upstream
 //! wraps beast::websocket; the wire format is what matters here —
 //! used by `wss://` trackers). Handshake = HTTP Upgrade request +

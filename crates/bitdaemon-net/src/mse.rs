@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of the MSE half of `bt_peer_connection.cpp` +
+//! `pe_crypto.cpp` (DH-768, RC4 key streams, PE1–PE4).
+//!
 //! MSE handshake — `write_pe1_2_dhkey`/`write_pe3_sync`/
 //! `write_pe4_sync` + the incoming halves. BEP-8 message flow:
 //!

@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `web_peer_connection.cpp`/`web_connection_base.cpp`.
+//!
 //! `web_peer_connection`/`web_connection_base` — url-seed /
 //! http-seed request building and response bookkeeping. Upstream
 //! glues this to a socket+parser; here a request is a byte string

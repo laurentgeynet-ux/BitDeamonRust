@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `tracker_event.hpp` + the wire halves of
+//! `http_tracker_connection.cpp`/`udp_tracker_connection.cpp`.
+//!
 //! `tracker_connection` — one full announce exchange per call:
 //! HTTP via `http_get` + `parse_response`, UDP via the BEP-15
 //! connect→announce handshake over the injected `DatagramSocket`.

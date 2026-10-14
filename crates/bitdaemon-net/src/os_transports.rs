@@ -1,5 +1,5 @@
-//! Port of `session_impl`'s default socket layer (`listen_sockets` /
-//! `udp_socket` system side).
+//! Port of `udp_socket.cpp` + `listen_socket_handle.cpp` — the default
+//! (OS) socket layer behind `session_impl`'s `listen_sockets`.
 //!
 //! The **default OS transports** — plain TCP `connect`/`accept` and a
 //! real `UdpSocket`. These are the only implementations allowed to
@@ -48,6 +48,38 @@ impl PeerConnector for TokioTcpConnector {
     ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>> {
         Box::pin(async move {
             let s = TcpStream::connect(addr).await?;
+            let _ = s.set_nodelay(true);
+            Ok(Box::new(s) as BoxedPeerStream)
+        })
+    }
+
+    fn connect_with_bind(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        bind: Option<SocketAddr>,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>> {
+        Box::pin(async move {
+            let s = match bind {
+                None => TcpStream::connect(addr).await?,
+                // `bind_outgoing_socket` — the socket binds before
+                // connect; family follows the remote (upstream picks
+                // `address_v6::any()` for a v6 target).
+                Some(b) => {
+                    let sk = if addr.is_ipv6() {
+                        tokio::net::TcpSocket::new_v6()?
+                    } else {
+                        tokio::net::TcpSocket::new_v4()?
+                    };
+                    // upstream `tcp::acceptor::reuse_address` on
+                    // non-Windows; Windows gets `exclusive_address_
+                    // use` — default reuseaddr=false gives the same
+                    // EADDRINUSE-on-taken-port semantics.
+                    #[cfg(not(windows))]
+                    sk.set_reuseaddr(true)?;
+                    sk.bind(b)?;
+                    sk.connect(addr).await?
+                }
+            };
             let _ = s.set_nodelay(true);
             Ok(Box::new(s) as BoxedPeerStream)
         })

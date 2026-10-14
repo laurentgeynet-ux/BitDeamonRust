@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `http_connection.cpp`/`http_connection.hpp`.
+//!
 //! `http_connection` — the request/response pump on top of
 //! `HttpParser`, over any injected `BoxedPeerStream` (ADR-0008:
 //! tunnels/proxies carry trackers and web seeds verbatim).

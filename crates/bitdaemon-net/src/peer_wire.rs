@@ -1,3 +1,7 @@
+//! Port of the `bt_peer_connection.cpp`/`bt_peer_connection.hpp` packet
+//! layer (message framing only — the conn state machine is
+//! `session::peer_conn`).
+//!
 //! Peer wire protocol codec — `bt_peer_connection` packet serialization:
 //! 68-byte handshake, length-prefixed messages (4-byte BE len + 1-byte
 //! id), keepalive, all standard + FAST + BEP-10 + v2-hash message types.

@@ -2,6 +2,8 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `natpmp.cpp`/`natpmp.hpp`.
+//!
 //! `natpmp` — NAT-PMP wire codec (RFC 6886). Upstream's class owns
 //! a socket + timers; here each datagram is built/parsed by the
 //! caller (injected transport — and note: anonymous lanes should

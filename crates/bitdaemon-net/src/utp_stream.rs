@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `utp_stream.cpp`'s stream-facing half (`utp_socket_impl`'s
+//! state machine is `net::utp_socket`).
+//!
 //! `utp_stream` bridge — adapt the poll-style `UtpSocket` to
 //! `AsyncRead + AsyncWrite` (`PeerStream`) plus a
 //! `PeerConnector` dialing over any injected `DatagramSocket`.

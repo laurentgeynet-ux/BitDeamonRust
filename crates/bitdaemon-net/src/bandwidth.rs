@@ -1,5 +1,5 @@
-//! Port of `aux_/bandwidth_limit` / `aux_/bandwidth_queue_entry` /
-//! `aux_/bandwidth_manager` — the token-bucket rate limiter.
+//! Port of `bandwidth_limit.cpp` + `bandwidth_manager.cpp` +
+//! `bandwidth_queue_entry.cpp` (headers in `aux_/`).
 //!
 //! Upstream stores raw `bandwidth_channel*` in each `bw_request` and a
 //! `shared_ptr<bandwidth_socket>` for the peer. The Rust version uses

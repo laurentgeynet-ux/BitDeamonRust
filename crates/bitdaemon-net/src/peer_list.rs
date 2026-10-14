@@ -143,6 +143,13 @@ pub struct PeerList {
     /// `m_locked_peer` — peer index locked by a callback (never
     /// erased).
     locked: Option<usize>,
+    /// `m_candidate_cache` — leftover ranked candidates from the
+    /// last `find_connect_candidates` fill, popped one per dial by
+    /// `connect_one_peer`. Upstream caches `torrent_peer*`
+    /// (allocator-stable across `m_peers` vector churn); our
+    /// indices shift on erase, so the cache keys by `(addr, port)`
+    /// and re-resolves at pop.
+    candidate_cache: std::collections::VecDeque<(crate::torrent_peer::PeerAddr, u16)>,
     /// `m_allocator` — upstream's `torrent_peer_allocator`; only the
     /// accounting counters survive the by-value `Vec` storage.
     pub alloc: crate::peer_alloc::TorrentPeerAllocator,
@@ -175,6 +182,7 @@ impl PeerList {
             max_failcount: state.max_failcount,
             round_robin: 0,
             locked: None,
+            candidate_cache: std::collections::VecDeque::new(),
             alloc: crate::peer_alloc::TorrentPeerAllocator::default(),
         }
     }
@@ -190,6 +198,20 @@ impl PeerList {
     #[must_use]
     pub fn locked_peer(&self) -> Option<usize> {
         self.locked
+    }
+
+    /// `torrent::step_session_time` — the session clock is a
+    /// u16-seconds epoch upstream; before it wraps, the base steps
+    /// forward and every relative stamp clamps back by the same
+    /// amount (`clamped_subtract_u16`).
+    pub fn step_session_time(&mut self, seconds: u16) {
+        for p in &mut self.peers {
+            p.last_optimistically_unchoked = p.last_optimistically_unchoked.saturating_sub(seconds);
+            p.last_connected = p.last_connected.saturating_sub(seconds);
+        }
+        // stamps shifted → the cached candidate set is still valid
+        // (ordering unchanged), only `last_connected` ordering may
+        // have collapsed to 0s — upstream keeps the cache too.
     }
 
     /// Mutable access — flags patched post-insert (`pe_support`
@@ -635,9 +657,12 @@ impl PeerList {
         &mut self,
         session_time: i32,
         state: &PeerListState,
-    ) -> Vec<usize> {
+    ) -> Vec<(crate::torrent_peer::PeerAddr, u16)> {
         const CANDIDATE_COUNT: usize = 10;
-        let mut peers: Vec<usize> = Vec::with_capacity(CANDIDATE_COUNT);
+        // keys, not indices — `erase_peer` below shifts `m_peers`;
+        // upstream holds allocator-stable `torrent_peer*`.
+        let mut peers: Vec<(crate::torrent_peer::PeerAddr, u16)> =
+            Vec::with_capacity(CANDIDATE_COUNT);
         let mut erase_candidate: Option<usize> = None;
 
         if self.finished != state.is_finished {
@@ -690,26 +715,83 @@ impl PeerList {
             {
                 continue;
             }
+            let key = (pe.addr.clone(), pe.port);
 
-            if peers.len() == CANDIDATE_COUNT
-                && compare_peer(&self.peers[peers[CANDIDATE_COUNT - 1]], pe, state)
-            {
-                continue;
+            if peers.len() == CANDIDATE_COUNT {
+                let worst_key = &peers[CANDIDATE_COUNT - 1];
+                let worst = self
+                    .peers
+                    .iter()
+                    .position(|p| p.addr == worst_key.0 && p.port == worst_key.1);
+                if let Some(wi) = worst
+                    && compare_peer(&self.peers[wi], pe, state)
+                {
+                    continue;
+                }
             }
             if peers.len() >= CANDIDATE_COUNT {
                 peers.truncate(CANDIDATE_COUNT - 1);
             }
             let pos = peers
                 .iter()
-                .position(|&i| !compare_peer(&self.peers[i], pe, state))
+                .position(|k| {
+                    self.peers
+                        .iter()
+                        .position(|p| p.addr == k.0 && p.port == k.1)
+                        .is_none_or(|i| !compare_peer(&self.peers[i], pe, state))
+                })
                 .unwrap_or(peers.len());
-            peers.insert(pos, current);
+            peers.insert(pos, key);
         }
 
         if let Some(ec) = erase_candidate {
             self.erase_peer(ec);
         }
         peers
+    }
+
+    /// Resolve a `candidate_cache` key back to a live index.
+    /// Upstream keeps raw pointers (stable); our key survives
+    /// vector churn — `None` means the entry was erased.
+    fn resolve_cached(&self, key: &(crate::torrent_peer::PeerAddr, u16)) -> Option<usize> {
+        self.peers
+            .iter()
+            .position(|p| p.addr == key.0 && p.port == key.1)
+    }
+
+    /// `connect_one_peer` — pop one connect candidate: stale cache
+    /// entries are re-validated (`is_connect_candidate` only — the
+    /// reconnect delay already gated them at fill time), an empty
+    /// cache is refilled by `find_connect_candidates`, then the
+    /// front peer is handed out. Returns the peer's index.
+    pub fn connect_one_peer(&mut self, session_time: i32, state: &PeerListState) -> Option<usize> {
+        if self.finished != state.is_finished {
+            self.recalculate_connect_candidates(state);
+        }
+        // drop cache entries whose peer was erased or stopped being
+        // a candidate (connected, banned, failcount reached…).
+        let drained: std::collections::VecDeque<_> = std::mem::take(&mut self.candidate_cache);
+        for k in drained {
+            if self
+                .resolve_cached(&k)
+                .is_some_and(|i| self.is_connect_candidate(&self.peers[i]))
+            {
+                self.candidate_cache.push_back(k);
+            }
+        }
+
+        if self.candidate_cache.is_empty() {
+            self.candidate_cache = self.find_connect_candidates(session_time, state).into();
+            self.candidate_cache.front()?;
+        }
+
+        let key = self.candidate_cache.pop_front()?;
+        let i = self.resolve_cached(&key)?;
+        // upstream `TORRENT_ASSERT`s: in_use, !banned, !connection,
+        // connectable, finished → !seed — all inside
+        // `is_connect_candidate`.
+        debug_assert!(self.is_connect_candidate(&self.peers[i]));
+        Some(i)
     }
 
     /// `apply_ip_filter` — every filtered entry is erased; for
@@ -834,6 +916,13 @@ impl PeerList {
         }
         let was = self.is_connect_candidate(&self.peers[index]);
         let was_seed = self.peers[index].seed;
+        // a cached candidate that gets erased must not be popped
+        // later (upstream drops the pointer from `m_candidate_cache`).
+        let key = (
+            crate::torrent_peer::PeerAddr::clone(&self.peers[index].addr),
+            self.peers[index].port,
+        );
+        self.candidate_cache.retain(|k| *k != key);
         self.peers.remove(index);
         self.alloc.account_free();
         self.update_candidates(was, false);

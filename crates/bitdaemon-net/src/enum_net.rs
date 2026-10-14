@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `enum_net.cpp`/`enum_net.hpp` + `aux_/netlink_utils.hpp` +
+//! `route.h` (platform enum via `if-addrs`/`netroute` — ADR-0019).
+//!
 //! `enum_net` — `build_netmask`, `match_addr_mask`, `get_gateway`,
 //! `has_internet_route`, `has_any_internet_route`, `device_for_address`
 //! plus the default OS enumerations: interfaces via `if-addrs`,

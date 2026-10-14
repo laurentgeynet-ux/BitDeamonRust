@@ -2,6 +2,9 @@
 // Copyright (C) 2026 Laurent Geynet
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+//! Port of `proxy_settings.cpp` + the connector halves of
+//! `socks5_stream.cpp`/`http_stream.hpp`.
+//!
 //! `proxy_settings` + `socks5_stream`/`http_stream` glue — a
 //! `SocksConnector`/`HttpConnectConnector` decorates an injected
 //! `PeerConnector`: dial the proxy through the inner transport,
@@ -169,6 +172,42 @@ impl PeerConnector for SocksConnector {
             .map_err(|e| crate::NetError::Transport(std::io::Error::other(e.to_string())))?
         })
     }
+
+    fn connect_with_bind(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        bind: Option<SocketAddr>,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>> {
+        // upstream binds the underlying TCP socket *before* the
+        // proxy handshake — forward `bind` to the inner connector.
+        let inner = self.inner.clone();
+        let (proxy, v, user, pass) = (
+            self.proxy,
+            self.version,
+            self.user.clone(),
+            self.password.clone(),
+        );
+        Box::pin(async move {
+            tokio::spawn(async move {
+                let mut s = inner.connect_with_bind(proxy, bind).await?;
+                socks_connect(
+                    &mut s,
+                    v,
+                    &user,
+                    &pass,
+                    &SocksTarget::Addr(addr),
+                    SocksCommand::Connect,
+                )
+                .await
+                .map_err(|e| {
+                    crate::NetError::Transport(std::io::Error::other(format!("socks: {e}")))
+                })?;
+                Ok(s)
+            })
+            .await
+            .map_err(|e| crate::NetError::Transport(std::io::Error::other(e.to_string())))?
+        })
+    }
 }
 
 /// `http_stream` as a connector — HTTP `CONNECT` tunnel through
@@ -209,6 +248,28 @@ impl PeerConnector for HttpConnectConnector {
         Box::pin(async move {
             tokio::spawn(async move {
                 let mut s = inner.connect(proxy).await?;
+                crate::http_stream::http_connect(&mut s, addr, None, &user, &pass)
+                    .await
+                    .map_err(|e| {
+                        crate::NetError::Transport(std::io::Error::other(format!("connect: {e}")))
+                    })?;
+                Ok(s)
+            })
+            .await
+            .map_err(|e| crate::NetError::Transport(std::io::Error::other(e.to_string())))?
+        })
+    }
+
+    fn connect_with_bind(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        bind: Option<SocketAddr>,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>> {
+        let inner = self.inner.clone();
+        let (proxy, user, pass) = (self.proxy, self.user.clone(), self.password.clone());
+        Box::pin(async move {
+            tokio::spawn(async move {
+                let mut s = inner.connect_with_bind(proxy, bind).await?;
                 crate::http_stream::http_connect(&mut s, addr, None, &user, &pass)
                     .await
                     .map_err(|e| {
