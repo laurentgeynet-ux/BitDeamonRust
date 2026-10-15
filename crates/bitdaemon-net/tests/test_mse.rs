@@ -116,10 +116,9 @@ async fn bt_conn_over_mse() {
         let mut st = HandshakeState::default();
         let (hs, mse) = run_handshake_encrypted_initiator(
             &mut a,
-            &ih_i,
+            &mut kt(ih_i),
             &pid_a,
             true,
-            false,
             false,
             enc_level::RC4,
             Some(32),
@@ -128,6 +127,9 @@ async fn bt_conn_over_mse() {
         .await
         .unwrap();
         assert_eq!(hs.peer_id, pid_b);
+        // `m_encrypted`/`m_rc4_encrypted` — set only after the crypto
+        // negotiation completed (PE4 read), not at MSE entry.
+        assert!(st.encrypted && st.mse_done && st.rc4_encrypted);
         // encrypted have → responder
         let mut rc4 = mse.rc4;
         write_message_rc4(&mut a, &mut rc4, &PeerMessage::Have(PieceIndex(7)))
@@ -152,6 +154,7 @@ async fn bt_conn_over_mse() {
         .await
         .unwrap();
         assert_eq!(hs.peer_id, pid_a);
+        assert!(st.encrypted && st.mse_done && st.rc4_encrypted);
         let mut rc4 = mse.rc4;
         let m = read_message_rc4(&mut b, &mut rc4).await.unwrap();
         assert!(matches!(m, PeerMessage::Have(PieceIndex(7))));
@@ -289,7 +292,10 @@ async fn initiator_rejects_oversized_len_pad() {
 async fn responder_rejects_oversized_len_ia() {
     // `read_pe3`: `len_ia > 68` disconnects
     // `invalid_encrypt_handshake` (peer_error) — craft a raw
-    // initiator whose cryptofield advertises len_ia = 70.
+    // initiator whose cryptofield advertises len_ia = 70. Upstream
+    // writes PE4 *before* this check (`write_pe4_sync` runs right
+    // after the crypto_select pick in `read_pe_cryptofield`), so the
+    // VC+select must already be on the wire when the conn dies.
     let (mut a, mut b): (BoxedPeerStream, BoxedPeerStream) = {
         let (a, b) = tokio::io::duplex(64 * 1024);
         (Box::new(a), Box::new(b))
@@ -324,8 +330,102 @@ async fn responder_rejects_oversized_len_ia() {
     cf.extend(70u16.to_be_bytes()); // len_ia = 70 > MAX_IA
     rc4.encrypt(&mut cf);
     a.write_all(&cf).await.unwrap();
+    // PE4 must arrive before the close: VC + select + len_pad.
+    let mut pe4 = [0u8; 14];
+    a.read_exact(&mut pe4).await.unwrap();
+    rc4.decrypt(&mut pe4);
+    assert_eq!(&pe4[..8], &[0u8; 8]);
+    assert_eq!(
+        u32::from_be_bytes([pe4[8], pe4[9], pe4[10], pe4[11]]),
+        CRYPTO_PLAINTEXT
+    );
     let rb = resp.await.unwrap();
     assert!(matches!(rb, Err(MseError::InvalidEncryptHandshake)));
+}
+
+#[tokio::test]
+async fn responder_writes_pe4_before_len_pad_rejection() {
+    // `read_pe_cryptofield` upstream: `write_pe4_sync` runs right
+    // after the crypto_select pick, *before* `len_pad > 512` →
+    // `invalid_pad_size`. A malformed initiator must still see the
+    // PE4 VC+select on the wire before the close.
+    let (mut a, mut b): (BoxedPeerStream, BoxedPeerStream) = {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        (Box::new(a), Box::new(b))
+    };
+    let want = ih();
+    let skh = stream_key_hash(&want);
+    let resp = tokio::spawn(async move {
+        mse_responder(
+            &mut b,
+            Some(0),
+            move |c| if *c == skh { Some(kt(want)) } else { None },
+            |p| p & CRYPTO_PLAINTEXT,
+        )
+        .await
+    });
+    let mut dh = DhKeyExchange::new();
+    a.write_all(dh.local_key()).await.unwrap();
+    let mut remote = [0u8; 96];
+    a.read_exact(&mut remote).await.unwrap();
+    assert!(dh.compute_secret(&remote));
+    let secret = *dh.secret().unwrap();
+    a.write_all(sync_hash(&secret).as_bytes()).await.unwrap();
+    a.write_all(skey_field(&secret, &want).as_bytes())
+        .await
+        .unwrap();
+    let mut rc4 = init_pe_rc4_handler(&secret, &want, true);
+    let mut cf = Vec::new();
+    cf.extend([0u8; 8]);
+    cf.extend(CRYPTO_PLAINTEXT.to_be_bytes());
+    cf.extend(600u16.to_be_bytes()); // len_pad = 600 > MAX_PAD
+    rc4.encrypt(&mut cf);
+    a.write_all(&cf).await.unwrap();
+    // the responder wrote PE4 before checking len_pad.
+    let mut pe4 = [0u8; 14];
+    a.read_exact(&mut pe4).await.unwrap();
+    rc4.decrypt(&mut pe4);
+    assert_eq!(&pe4[..8], &[0u8; 8]);
+    let rb = resp.await.unwrap();
+    assert!(matches!(rb, Err(MseError::InvalidPadSize)));
+}
+
+#[tokio::test]
+async fn encrypted_flag_only_after_negotiation_completes() {
+    // upstream `m_encrypted` sets at `init_bt_handshake`/`read_pe_ia`
+    // — *after* the crypto negotiation. A conn dying earlier (bad
+    // sync hash, DH failure, abort mid-PE4) must not count
+    // `error_encrypted_peers`: the flag stays false and `dial_fail`
+    // reports `encrypted: false`.
+    let (mut a, mut b): (BoxedPeerStream, BoxedPeerStream) = {
+        let (a, b) = tokio::io::duplex(64 * 1024);
+        (Box::new(a), Box::new(b))
+    };
+    let want = ih();
+    let mut st = HandshakeState::default();
+    let pid = PeerId::from_bytes(&[0xAA; 20]).unwrap();
+    // the remote never answers the DH leg — the initiator stalls in
+    // `mse_initiator`; kill it and inspect the failure legs.
+    let init = tokio::spawn(async move {
+        let r = run_handshake_encrypted_initiator(
+            &mut a,
+            &mut kt(want),
+            &pid,
+            true,
+            false,
+            enc_level::BOTH,
+            Some(0),
+            &mut st,
+        )
+        .await;
+        (r, st)
+    });
+    // feed a degenerate DH key: `compute_secret` fails → DhFailed.
+    b.write_all(&[0u8; 96]).await.unwrap();
+    let (r, st) = init.await.unwrap();
+    assert!(!st.encrypted && !st.mse_done);
+    let fail = r.err().unwrap().dial_fail(true, &st, false);
+    assert!(!fail.encrypted && !fail.rc4 && !fail.mse_done);
 }
 
 #[test]

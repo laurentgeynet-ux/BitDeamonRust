@@ -108,6 +108,41 @@ impl KnownTorrent {
         }
         Ok(())
     }
+
+    /// `read_info_hash`'s `else` branch — the conn is **already
+    /// attached** (dialed, or inbound SKEY-matched): upstream still
+    /// validates the echoed info-hash
+    /// (`bt_peer_connection.cpp:3484-3503`). An echo of the truncated
+    /// v2 hash flips `protocol_v2` (and `wire_ih` follows — the reply
+    /// hash is the post-flip `associated_info_hash()`); any other
+    /// mismatch disconnects `invalid_info_hash` at *failure*.
+    pub fn check_echo(&mut self, echo: &Sha1Hash) -> Result<(), PeerConnError> {
+        if let Some(v2) = self.v2_ih
+            && *echo == v2
+        {
+            self.protocol_v2 = true;
+            self.wire_ih = v2;
+            return Ok(());
+        }
+        if *echo != self.wire_ih || self.wire_ih == Sha1Hash::default() {
+            return Err(PeerConnError::WrongInfoHash(*echo));
+        }
+        Ok(())
+    }
+
+    /// A plain v1 attached view — tests and injected streams that
+    /// carry no torrent v2 context.
+    #[must_use]
+    pub fn v1(ih: Sha1Hash) -> Self {
+        Self {
+            ih,
+            wire_ih: ih,
+            protocol_v2: false,
+            has_v2: false,
+            v2_ih: None,
+            valid_metadata: true,
+        }
+    }
 }
 
 /// Conn crypto/attach state reached during a handshake — mirrors the
@@ -117,10 +152,12 @@ impl KnownTorrent {
 /// alert's torrent handle).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HandshakeState {
-    /// `m_encrypted` — the conn entered the MSE path (`supports_
-    /// encryption()` on the wire).
+    /// `m_encrypted` — the MSE negotiation *completed*
+    /// (`init_bt_handshake`/`read_pe_ia`, post PE4); upstream sets it
+    /// there, not at MSE entry — earlier failures don't count
+    /// `error_encrypted_peers`.
     pub encrypted: bool,
-    /// `m_rc4_encrypted` — PE4 negotiated RC4.
+    /// `m_rc4_encrypted` — PE4 negotiated RC4 (`select_crypto`).
     pub rc4_encrypted: bool,
     /// `init_bt_handshake` ran — the encrypted portion of the
     /// handshake completed (PE4 sync done). Upstream re-arms the
@@ -236,9 +273,8 @@ impl PeerConnError {
             ),
             Self::Wire(_) => (Sev::PeerError, FailOp::Bittorrent, "invalid_message"),
             // upstream `invalid_info_hash` — responder attach
-            // (`attach_to_torrent`) and the attached re-check are
-            // both `failure`. The initiator never validates the
-            // echoed hash, so this variant cannot fire outgoing.
+            // (`attach_to_torrent`) and the attached-conn echo check
+            // are both `failure`.
             Self::WrongInfoHash(_) => (Sev::Failure, FailOp::Bittorrent, "invalid_info_hash"),
             // 0x10 claim on a v1-only torrent — `normal`.
             Self::V2OnV1 => (Sev::Normal, FailOp::Bittorrent, "invalid_info_hash"),
@@ -364,26 +400,28 @@ pub enum PeerGone {
 
 /// `bt_peer_connection::on_connected` + handshake read — sends our
 /// handshake, reads theirs. `dht`/`fast` advertise the reserved bits
-/// upstream sets; `advertise_v2` is upstream's `!protocol_v2 &&
-/// has_v2` → reserved byte 7 bit `0x10` (we accept v2 conns on this
-/// torrent). Upstream never re-validates the echoed info_hash on an
-/// outgoing conn (the whole `read_info_hash` ih-processing block is
-/// under `if (!t)`, and `m_torrent` is set from `init()`), so we
-/// don't either.
+/// upstream sets; reserved byte 7 bit `0x10` goes out when
+/// `kt.has_v2 && !kt.protocol_v2` (we accept v2 conns on this
+/// torrent). The conn is already attached upstream, so the echoed
+/// info-hash is re-validated (`read_info_hash`'s `else` branch): a
+/// v2 echo upgrades `kt.protocol_v2`, a wrong hash disconnects
+/// `invalid_info_hash` at *failure*.
 pub async fn run_handshake(
     s: &mut BoxedPeerStream,
-    info_hash: &Sha1Hash,
+    kt: &mut KnownTorrent,
     our_peer_id: &PeerId,
     dht: bool,
     fast: bool,
-    advertise_v2: bool,
 ) -> Result<Handshake, PeerConnError> {
-    let ours = write_handshake(info_hash, our_peer_id, dht, true, fast, advertise_v2);
+    let advertise_v2 = kt.has_v2 && !kt.protocol_v2;
+    let ours = write_handshake(&kt.wire_ih, our_peer_id, dht, true, fast, advertise_v2);
     s.write_all(&ours).await?;
 
     let mut theirs = [0u8; HANDSHAKE_LEN];
     s.read_exact(&mut theirs).await?;
-    parse_handshake(&theirs).map_err(|_| PeerConnError::Protocol("bad handshake"))
+    let hs = parse_handshake(&theirs).map_err(|_| PeerConnError::Protocol("bad handshake"))?;
+    kt.check_echo(&hs.info_hash)?;
+    Ok(hs)
 }
 
 /// plaintext responder (`on_incoming`): read the peer's handshake
@@ -391,13 +429,16 @@ pub async fn run_handshake(
 /// with ours. `known` resolves the wire hash to a torrent (upstream
 /// disconnects on unknown ih); the returned [`KnownTorrent`] carries
 /// the conn's `protocol_v2` (v2 hash received) and `has_v2` (our
-/// reply advertises `0x10` when the conn stays v1).
+/// reply advertises `0x10` when the conn stays v1). `st.torrent`
+/// records the match so a post-match failure alerts with the
+/// attached torrent handle upstream would have (`disconnect()`).
 pub async fn run_handshake_responder(
     s: &mut BoxedPeerStream,
     our_peer_id: &PeerId,
     dht: bool,
     fast: bool,
     known: impl Fn(&Sha1Hash) -> Option<KnownTorrent>,
+    st: &mut HandshakeState,
 ) -> Result<(Handshake, KnownTorrent), PeerConnError> {
     let mut theirs = [0u8; HANDSHAKE_LEN];
     s.read_exact(&mut theirs).await?;
@@ -405,10 +446,14 @@ pub async fn run_handshake_responder(
     let Some(mut kt) = known(&hs.info_hash) else {
         return Err(PeerConnError::WrongInfoHash(hs.info_hash));
     };
+    // the conn is attached before the v2-bit check runs upstream —
+    // a `V2OnV1` disconnect still carries the torrent handle.
+    st.torrent = Some(kt);
     // upstream order: a received 0x10 flips `protocol_v2` *before*
     // `write_handshake` — the reply advertises `!protocol_v2 &&
     // has_v2` and carries the post-flip `associated_info_hash`.
     kt.apply_v2_bit(&hs)?;
+    st.torrent = Some(kt);
     let advertise_v2 = kt.has_v2 && !kt.protocol_v2;
     let ours = write_handshake(&kt.wire_ih, our_peer_id, dht, true, fast, advertise_v2);
     s.write_all(&ours).await?;
@@ -423,22 +468,26 @@ pub async fn run_handshake_responder(
 /// into the peer's `crypto_select` (upstream `crypto_field &=
 /// allowed_enc_level`). `st` tracks the conn crypto flags the
 /// `disconnect()` classification reads on failure (`m_encrypted`
-/// sets at MSE entry, `m_rc4_encrypted` after PE4).
+/// sets when the negotiation completes, `m_rc4_encrypted` after
+/// PE4). The echoed info-hash is re-validated like a plain
+/// attached conn (`read_info_hash`'s `else` branch).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_handshake_encrypted_initiator(
     s: &mut BoxedPeerStream,
-    info_hash: &Sha1Hash,
+    kt: &mut KnownTorrent,
     our_peer_id: &PeerId,
     dht: bool,
     fast: bool,
-    advertise_v2: bool,
     allowed_enc_level: u8,
     pad: Option<usize>,
     st: &mut HandshakeState,
 ) -> Result<(Handshake, MseResult), PeerConnError> {
+    let advertise_v2 = kt.has_v2 && !kt.protocol_v2;
+    let ours = write_handshake(&kt.wire_ih, our_peer_id, dht, true, fast, advertise_v2);
+    let mut mse = mse_initiator(s, &kt.wire_ih, allowed_enc_level, &ours, pad).await?;
+    // `init_bt_handshake` — `m_encrypted`/`m_rc4_encrypted` set now
+    // that the crypto negotiation completed.
     st.encrypted = true;
-    let ours = write_handshake(info_hash, our_peer_id, dht, true, fast, advertise_v2);
-    let mut mse = mse_initiator(s, info_hash, allowed_enc_level, &ours, pad).await?;
     st.mse_done = true;
     st.rc4_encrypted = mse.rc4_encrypted;
     // ours went out as IA — just read theirs
@@ -448,6 +497,7 @@ pub async fn run_handshake_encrypted_initiator(
         mse.rc4.decrypt(&mut theirs);
     }
     let hs = parse_handshake(&theirs).map_err(|_| PeerConnError::Protocol("bad handshake"))?;
+    kt.check_echo(&hs.info_hash)?;
     Ok((hs, mse))
 }
 
@@ -497,8 +547,10 @@ pub async fn run_handshake_encrypted_responder_prefix(
     select: impl Fn(u32) -> u32,
     st: &mut HandshakeState,
 ) -> Result<(Handshake, MseResult), PeerConnError> {
+    let (mut mse, mut kt) = mse_responder_prefix(s, dh_prefix, pad, find_skey, select).await?;
+    // `init_bt_handshake` — `m_encrypted`/`m_rc4_encrypted` only set
+    // once the crypto negotiation completed (PE4 written, IA read).
     st.encrypted = true;
-    let (mut mse, kt) = mse_responder_prefix(s, dh_prefix, pad, find_skey, select).await?;
     st.mse_done = true;
     st.torrent = Some(kt);
     st.rc4_encrypted = mse.rc4_encrypted;
@@ -517,14 +569,24 @@ pub async fn run_handshake_encrypted_responder_prefix(
         mse.rc4.decrypt(&mut theirs[ia..]);
     }
     let hs = parse_handshake(&theirs).map_err(|_| PeerConnError::Protocol("bad handshake"))?;
-    // upstream skips the whole read_info_hash ih-processing block on
-    // an already-attached conn (`if (!t)`) — the skey pinned the
-    // torrent and `protocol_v2`, and the received ih/0x10 bit are not
-    // re-examined. The reply carries `associated_info_hash` = the
-    // skey-matched version.
+    // attached-conn `read_info_hash` `else` branch — the skey pinned
+    // the torrent, but the echoed ih is still validated: a v2 echo
+    // flips `protocol_v2` (and `wire_ih` — the reply then carries the
+    // v2 hash, upstream's post-flip `associated_info_hash()`), any
+    // other mismatch disconnects `invalid_info_hash` at *failure*.
+    kt.check_echo(&hs.info_hash)?;
+    st.torrent = Some(kt);
     let advertise_v2 = kt.has_v2 && !kt.protocol_v2;
-    let wire_ih = mse.ih;
-    write_bt_handshake(s, &wire_ih, our_peer_id, dht, fast, advertise_v2, &mut mse).await?;
+    write_bt_handshake(
+        s,
+        &kt.wire_ih,
+        our_peer_id,
+        dht,
+        fast,
+        advertise_v2,
+        &mut mse,
+    )
+    .await?;
     Ok((hs, mse))
 }
 
@@ -572,10 +634,11 @@ pub async fn run_handshake_responder_auto(
         let Some(mut kt) = known(&hs.info_hash) else {
             return Err(PeerConnError::WrongInfoHash(hs.info_hash));
         };
-        // same ordering as `run_handshake_responder`: the received
-        // 0x10 bit flips `protocol_v2` before our reply is written.
-        kt.apply_v2_bit(&hs)?;
+        // same ordering as `run_handshake_responder`: the conn is
+        // attached before the received 0x10 bit flips `protocol_v2`
+        // (a `V2OnV1` disconnect still carries the handle).
         st.torrent = Some(kt);
+        kt.apply_v2_bit(&hs)?;
         let advertise_v2 = kt.has_v2 && !kt.protocol_v2;
         let ours = write_handshake(&kt.wire_ih, our_peer_id, dht, true, fast, advertise_v2);
         s.write_all(&ours).await?;

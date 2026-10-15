@@ -348,6 +348,24 @@ pub async fn mse_responder_prefix(
     }
     let provide = u32::from_be_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]);
     let len_pad = u16::from_be_bytes([hdr[12], hdr[13]]) as usize;
+
+    // PE4 — upstream computes `crypto_select = provide &
+    // allowed_enc_level` reduced to a single bit by `prefer_rc4`
+    // (the `select` closure's job); `0` disconnects
+    // `unsupported_encryption_mode` (failure). A multi-bit value
+    // means the closure skipped the reduction — not a writable PE4.
+    // Upstream writes PE4 right here — *before* the len_pad/len_ia
+    // bounds checks inside `read_pe_pad`, so a malformed cryptofield
+    // still sees our VC+select on the wire before the close.
+    let crypto_select = select(provide);
+    if !matches!(crypto_select, CRYPTO_PLAINTEXT | CRYPTO_RC4) {
+        return Err(MseError::UnsupportedEncryptionMode);
+    }
+    let pad = draw_pad(pad);
+    let mut cf = vc_cryptofield(crypto_select, &pad, None);
+    rc4.encrypt(&mut cf);
+    s.write_all(&cf).await?;
+
     // upstream refuses `len_pad < 0 || > 512` before reading the pad
     // (`invalid_pad_size`, peer_error) — not after a 64 KiB read.
     if len_pad > MAX_PAD {
@@ -369,20 +387,6 @@ pub async fn mse_responder_prefix(
         s.read_exact(&mut initial_payload).await?;
         rc4.decrypt(&mut initial_payload);
     }
-
-    // PE4 — select + send. Upstream computes `crypto_select =
-    // provide & allowed_enc_level` reduced to a single bit by
-    // `prefer_rc4` (the `select` closure's job); `0` disconnects
-    // `unsupported_encryption_mode` (failure). A multi-bit value
-    // means the closure skipped the reduction — not a writable PE4.
-    let crypto_select = select(provide);
-    if !matches!(crypto_select, CRYPTO_PLAINTEXT | CRYPTO_RC4) {
-        return Err(MseError::UnsupportedEncryptionMode);
-    }
-    let pad = draw_pad(pad);
-    let mut cf = vc_cryptofield(crypto_select, &pad, None);
-    rc4.encrypt(&mut cf);
-    s.write_all(&cf).await?;
     Ok((
         MseResult {
             rc4,

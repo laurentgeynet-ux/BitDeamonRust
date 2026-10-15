@@ -249,6 +249,7 @@ async fn dial_completion_attaches_off_tick() {
                     valid_metadata: true,
                 })
             },
+            &mut bitdaemon_net::bt_peer_conn::HandshakeState::default(),
         )
         .await;
         tokio::time::sleep(Duration::from_secs(10)).await;

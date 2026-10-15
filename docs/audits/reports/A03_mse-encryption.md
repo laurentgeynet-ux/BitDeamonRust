@@ -620,3 +620,57 @@ pas reproduit). Mineur — API manuelle hors pompe.
 - ordre PE4 sur entrée malformée (D19) ;
 - comptabilisation d'échec accepteur SSL (D20) ;
 - timeout handshake sur `accept_stream` (D21).
+
+## Apply round-2 — résultat
+
+Les six déviations du re-audit sont corrigées sur
+`audit/03-mse-encryption` :
+
+- **D16** — `KnownTorrent::check_echo` valide l'écho ih sur les
+  trois sites attachés (`run_handshake`, MSE initiateur, MSE
+  responder post-skey) : écho v2 tronqué → flip `protocol_v2` +
+  `wire_ih` (la réponse emporte alors le hash v2), écho différent
+  ou nul → `WrongInfoHash` (`invalid_info_hash` @failure).
+  `peer_link_up` retourne désormais le `KnownTorrent` complet
+  (`v2_ih`, `valid_metadata`) — `session.rs:5131`,
+  `torrent.rs:3756`.
+- **D17** — `peer_disconnected` incrémente
+  `ErrorEncryptedPeers`/`ErrorRc4Peers` sur les teardowns
+  `severity > normal` d'après les flags finaux de la conn
+  (`session.rs:4789-4799`).
+- **D18** — `st.encrypted`/`st.mse_done`/`st.rc4_encrypted` ne sont
+  posés qu'au retour réussi de `mse_initiator`/`mse_responder_prefix`
+  (équivalent `init_bt_handshake`/`read_pe_ia`) ; les échecs
+  pré-PE4 ne comptent plus `error_encrypted_peers`.
+- **D19** — `mse_responder_prefix` écrit PE4 juste après le pick
+  `crypto_select` (`mse.rs:360-367`), avant les rejets
+  `len_pad`/`len_ia` — le pair fautif voit VC+select puis le close.
+- **D20** — l'accepteur SSL fait `peer_conn_failed_inbound` sur les
+  jambes d'échec BT post-TLS (erreur et `handshake_timeout`) et le
+  ban `verify_secret_id` ; l'accepteur plain gagne aussi la jambe
+  `ban_ip` (upstream la fait dans `attach_to_torrent`, tous
+  transports).
+- **D21** — `accept_stream` est borné par `handshake_timeout` ; le
+  ban secret-id n'esquive plus le `disconnect()` accounting.
+- **Edge D22** — `connect_peer` manuel résout `ssl_dial_params`
+  (helper partagé avec `spawn_dial`) et TLS-wrappe le torrent SSL.
+
+### Tests ajoutés (round-2)
+
+- `test_bt_peer_conn.rs` : `dial_v2_echo_flips_protocol_v2`,
+  `dial_zero_echo_rejected`, et `wrong_info_hash_rejected` couvre
+  désormais le rejet d'écho côté initiateur attaché.
+- `test_mse.rs` : `responder_writes_pe4_before_len_pad_rejection`
+  et `responder_rejects_oversized_len_ia` (PE4 lu sur le fil avant
+  le close), `encrypted_flag_only_after_negotiation_completes`
+  (flags faux sur échec pré-PE4), asserts `st.encrypted` sur le
+  succès `bt_conn_over_mse`.
+- `test_mse_parity.rs` : `attached_teardown_counts_crypto_legs`
+  (RC4 → les deux legs ; plaintext-MSE → encrypted seul ; non
+  chiffré → aucun ; severity normal → aucun).
+
+### Gates (round-2)
+
+`cargo fmt --all`, `cargo clippy --workspace --all-targets --
+-D warnings`, `cargo test --workspace` (tous verts),
+`cargo doc --workspace --no-deps` sans warnings.
