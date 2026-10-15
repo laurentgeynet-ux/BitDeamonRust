@@ -255,3 +255,49 @@ tick scalers, `update_unchoke_limit`, `preemptive_unchoke`),
   état final identique (les optimistic conservés sont dans `keep`),
   le veto `max_uploads` est bypassé pour `optimistic` des deux côtés —
   différence d'ordre de messages sans conséquence d'état.
+
+## Résultat
+
+Apply exécuté sur `audit/11-choker` — commit `88dd59e`
+`fix(bitdaemon-session): choker parity — uncapped slots, exempt
+conns, class priority, scaler re-arms`.
+
+Déviations corrigées :
+
+- `unchoke_sort` retourne `upload_slots` non plafonné
+  (`choker.rs`) — `unchoke_set_size` n'est plus sous-dimensionné
+  quand `peers < quota`.
+- Sweep d'éligibilité + candidats optimistic : filtre
+  `ignores_unchoke_slots` (conn OU torrent, set vide exempt) —
+  `session.rs:8076`, `session.rs:8247`.
+- `ChokePeer.priority` = `get_priority(upload_channel)` réel via
+  `PeerConn::upload_priority` + `Torrent::upload_priority`
+  (max `priority[UPLOAD]` sur les deux class sets).
+- Intervalle rate-based mesuré via `Session::last_choke`
+  (`now - m_last_choke` upstream).
+- Scalers ré-armés : `ChokePeer` route → `triggered_unchoke` (conn
+  consommatrice) + `triggered_optimistic` (bit optimistic droppé) ;
+  sweep → `triggered_optimistic` sur eviction optimistic ;
+  promotion → idem ; fin de `recalculate_optimistic_unchoke_slots`
+  → `pending_unchoke` quand `num_peers_up_unchoked_all`
+  dépasse `num_unchoke_slots`.
+- `free_upload_slots(pool)` ne compte que les conns
+  consommatrices de slots.
+- `incoming_interested` tail : `PeerEffect::MaybeUnchoke` →
+  `TorrentEffect::MaybeUnchoke` → `maybe_unchoke_this_peer` (choké)
+  ou `Unchoke` redondant (déjà unchoké), gate `graceful_pause` ;
+  le gate `num_have > 0` déplacé de la fonction vers l'appelant
+  handshake (`peer_connected`).
+
+Tests ajoutés (`tests/test_choker.rs`, 9 cas) : retour non plafonné,
+sweep sous quota, exemption sweep + optimistic, ordre par priorité
+de classe, ré-armement sur `NotInterested`, Unchoke redondant,
+absence de gate `num_have` sur Interested, `free_upload_slots`
+exempt. Test existant `unchoke_tick_unchokes_top_peer` ajusté —
+ses pairs `127.0.0.x` tombent légitimement dans la classe `local`
+exempte (comportement upstream) ; remplacés par des IP publiques.
+
+Gates : `cargo fmt --all`, `cargo clippy --workspace --all-targets
+-- -D warnings`, `cargo test --workspace`, `cargo doc --workspace
+--no-deps` — tous verts (un test `bitdaemon-disk` flaky hors
+périmètre, vert au retry isolé).
