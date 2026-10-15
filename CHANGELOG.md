@@ -9,6 +9,32 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- **uTP transport parity (A05)**: `UtpSocket::close()` now carries
+  upstream's `nagle_packet`/`outbuf` guards — a FIN can no longer
+  leave the wire with piggybacked payload; `poll_shutdown` and stream
+  `Drop` actually emit ST_FIN through the socket pump instead of
+  silently unregistering (the FIN path was dead code); `close_reason`
+  can be set on the socket and rides the FIN's extension chain.
+  MTU probes propagate `dont_fragment` through
+  `DatagramSocket::send_to_flags` — `TokioUdpSocket` toggles
+  `IP_MTU_DISCOVER`/`IP_PMTUDISC_PROBE` (rustix, Linux) around the
+  send so over-MTU probes fail instead of fragmenting. Receive path:
+  inbound datagrams drain as one batch → a single deferred STATE
+  ack per burst; a stalled reader no longer wedges the pump
+  (`sock.read()` only when the read channel has capacity); `route()`
+  clones the socket sender under the lock and `try_send`s outside it,
+  dropping on full queues instead of head-of-line blocking.
+  `accept_syn` rejects non-v1/non-SYN datagrams and honors
+  `incoming_packet`'s verdict before registering the socket; the
+  dormant `UtpSocketDemux` allocates random ids keyed `(endpoint,
+  conn_id)` like upstream `equal_range`+`match`. Read errors surface
+  as `ConnectionReset`/`ConnectionAborted` rather than clean EOF;
+  `abort()` chains `test_socket_state()`; the 11 uTP counters
+  (`utp_packets_*`, `utp_*_pkts_in`, loss/timeout/resend, LEDBAT
+  samples) plus the per-state `num_utp_*` gauges are wired through an
+  injected `UtpCounterSink` fed from `Session.counters`; and
+  `remove_datagram_socket` aborts every socket bound to a dead
+  transport (upstream `remove_udp_socket`).
 - **Peer-wire codec & disconnect severity (A01)**: the frame
   length-prefix cap is now upstream's 1 MiB (`packet_size >
   1024*1024` → `packet_too_large`); a `piece` frame shorter than the

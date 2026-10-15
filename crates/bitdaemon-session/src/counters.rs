@@ -10,7 +10,10 @@
 //! `stats_counter_t`; we port the counter enum subset the ported
 //! machinery emits + a typed `SessionStats` snapshot.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+
+use bitdaemon_net::utp_socket::{UtpCounterSink, UtpStat};
 
 /// `bt_peer_connection::dispatch_message`'s packet counter mapping —
 /// the upstream quirk verbatim: wire ids 0..=9 land on
@@ -1072,6 +1075,13 @@ impl Counters {
             c.fetch_add(1, Ordering::Relaxed);
         }
     }
+    /// `inc_stats_counter(idx, n)` by raw index — upstream's
+    /// `num_utp_idle + m_state` arithmetic uses this form.
+    pub fn add_idx(&self, idx: usize, n: i64) {
+        if let Some(c) = self.v.get(idx) {
+            c.fetch_add(n, Ordering::Relaxed);
+        }
+    }
     /// `blend_stats_counter(c, value, ratio)` — move the gauge toward
     /// `value` by `ratio` percent: `v = (v·(100−r) + x·r)/100`.
     pub fn blend(&self, c: Counter, value: i64, ratio: i64) {
@@ -1086,6 +1096,30 @@ impl Counters {
     pub fn value(&self, c: Counter) -> i64 {
         self.v[c as usize].load(Ordering::Relaxed)
     }
+}
+
+/// `utp_socket_manager::inc_stats_counter` bridge — builds the
+/// `UtpConfig::counter_sink` that lands uTP stat increments in this
+/// bank. `UtpStat::StateGauge(s)` resolves to `num_utp_idle + s`,
+/// upstream's exact counter arithmetic.
+#[must_use]
+pub fn utp_counter_sink(counters: &Arc<Counters>) -> UtpCounterSink {
+    let c = counters.clone();
+    Arc::new(move |stat, delta| match stat {
+        UtpStat::PacketLoss => c.add(Counter::UtpPacketLoss, delta),
+        UtpStat::Timeout => c.add(Counter::UtpTimeout, delta),
+        UtpStat::PacketsIn => c.add(Counter::UtpPacketsIn, delta),
+        UtpStat::PacketsOut => c.add(Counter::UtpPacketsOut, delta),
+        UtpStat::FastRetransmit => c.add(Counter::UtpFastRetransmit, delta),
+        UtpStat::PacketResend => c.add(Counter::UtpPacketResend, delta),
+        UtpStat::SamplesAboveTarget => c.add(Counter::UtpSamplesAboveTarget, delta),
+        UtpStat::SamplesBelowTarget => c.add(Counter::UtpSamplesBelowTarget, delta),
+        UtpStat::PayloadPktsIn => c.add(Counter::UtpPayloadPktsIn, delta),
+        UtpStat::PayloadPktsOut => c.add(Counter::UtpPayloadPktsOut, delta),
+        UtpStat::InvalidPktsIn => c.add(Counter::UtpInvalidPktsIn, delta),
+        UtpStat::RedundantPktsIn => c.add(Counter::UtpRedundantPktsIn, delta),
+        UtpStat::StateGauge(state) => c.add_idx(Counter::NumUtpIdle as usize + state, delta),
+    })
 }
 
 /// `session_stats` — the snapshot posted by `post_session_stats`.

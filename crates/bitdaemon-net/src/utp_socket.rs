@@ -17,6 +17,7 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use bitdaemon_common::random::random;
@@ -72,9 +73,48 @@ pub enum UtpError {
     Aborted,
 }
 
+/// Upstream `counters` channels the uTP layer increments, in the
+/// declaration order of `performance_counters.hpp`. Emitted through
+/// [`UtpConfig::counter_sink`]; a `None` sink skips the call like
+/// upstream's `TORRENT_ASSERT`/`inc_stats_counter` on a counters
+/// object, i.e. it is a pure observability hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtpStat {
+    /// `utp_packet_loss`.
+    PacketLoss,
+    /// `utp_timeout`.
+    Timeout,
+    /// `utp_packets_in`.
+    PacketsIn,
+    /// `utp_packets_out`.
+    PacketsOut,
+    /// `utp_fast_retransmit`.
+    FastRetransmit,
+    /// `utp_packet_resend`.
+    PacketResend,
+    /// `utp_samples_above_target`.
+    SamplesAboveTarget,
+    /// `utp_samples_below_target`.
+    SamplesBelowTarget,
+    /// `utp_payload_pkts_in`.
+    PayloadPktsIn,
+    /// `utp_payload_pkts_out`.
+    PayloadPktsOut,
+    /// `utp_invalid_pkts_in`.
+    InvalidPktsIn,
+    /// `utp_redundant_pkts_in`.
+    RedundantPktsIn,
+    /// `num_utp_idle + m_state` — socket-state gauge; the payload is
+    /// the `UtpState` discriminant the delta applies to.
+    StateGauge(usize),
+}
+
+/// `m_sm.inc_stats_counter(stat, delta)` sink.
+pub type UtpCounterSink = Arc<dyn Fn(UtpStat, i64) + Send + Sync>;
+
 /// `utp_socket_manager` settings getters — defaults verbatim from
 /// `settings_pack.cpp`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UtpConfig {
     /// `utp_target_delay` (ms → µs inside).
     pub target_delay_ms: i32,
@@ -96,6 +136,26 @@ pub struct UtpConfig {
     pub cwnd_reduce_timer: i64,
     /// `proxy_type == socks5 || socks5_pw` — affects `mtu_for_dest`.
     pub proxy_socks5: bool,
+    /// `utp_socket_manager::m_counters` — receives the same stat
+    /// increments upstream posts to `counters`.
+    pub counter_sink: Option<UtpCounterSink>,
+}
+
+impl std::fmt::Debug for UtpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UtpConfig")
+            .field("target_delay_ms", &self.target_delay_ms)
+            .field("gain_factor", &self.gain_factor)
+            .field("min_timeout", &self.min_timeout)
+            .field("syn_resends", &self.syn_resends)
+            .field("fin_resends", &self.fin_resends)
+            .field("num_resends", &self.num_resends)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("loss_multiplier", &self.loss_multiplier)
+            .field("cwnd_reduce_timer", &self.cwnd_reduce_timer)
+            .field("proxy_socks5", &self.proxy_socks5)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for UtpConfig {
@@ -111,6 +171,7 @@ impl Default for UtpConfig {
             loss_multiplier: 50,
             cwnd_reduce_timer: 100,
             proxy_socks5: false,
+            counter_sink: None,
         }
     }
 }
@@ -244,7 +305,7 @@ impl UtpSocket {
     pub fn new(recv_id: u16, send_id: u16, cfg: UtpConfig) -> Self {
         debug_assert!(recv_id == send_id.wrapping_add(1) || send_id == recv_id.wrapping_add(1));
         let now = Instant::now();
-        Self {
+        let sock = Self {
             m_timeout: now
                 + std::time::Duration::from_millis(u64::try_from(cfg.connect_timeout).unwrap_or(0)),
             m_last_history_step: now,
@@ -304,7 +365,9 @@ impl UtpSocket {
             m_stalled: false,
             m_confirmed: false,
             cfg,
-        }
+        };
+        sock.inc(UtpStat::StateGauge(UtpState::None as usize), 1);
+        sock
     }
 
     /// `state()`.
@@ -367,8 +430,20 @@ impl UtpSocket {
         self.outbox.drain(..)
     }
 
+    /// `m_sm.inc_stats_counter`.
+    fn inc(&self, stat: UtpStat, delta: i64) {
+        if let Some(sink) = &self.cfg.counter_sink {
+            sink(stat, delta);
+        }
+    }
+
     fn set_state(&mut self, s: UtpState) {
+        if s == self.state {
+            return;
+        }
+        self.inc(UtpStat::StateGauge(self.state as usize), -1);
         self.state = s;
+        self.inc(UtpStat::StateGauge(self.state as usize), 1);
     }
 
     /// `do_connect(ep)` → `send_syn`.
@@ -377,10 +452,18 @@ impl UtpSocket {
         self.send_syn();
     }
 
-    /// `close()` — flush then FIN.
+    /// `close()` — flush then FIN. Mirrors upstream's guards: the FIN
+    /// may only leave once the write buffer is empty *and* a pending
+    /// Nagle packet or a queued packet under `m_seq_nr` has been
+    /// sent — otherwise the FIN could overtake queued payload or be
+    /// stamped with payload in its header buffer.
     pub fn close(&mut self) {
         self.m_out_eof = true;
-        if self.state != UtpState::Connected || self.m_write_buffer_size > 0 {
+        if self.state != UtpState::Connected
+            || self.m_write_buffer_size > 0
+            || self.nagle_packet.is_some()
+            || self.outbuf.at(u32::from(self.m_seq_nr)).is_some()
+        {
             return;
         }
         self.send_fin();
@@ -390,6 +473,13 @@ impl UtpSocket {
     pub fn abort(&mut self) {
         self.m_error = Some(UtpError::Aborted);
         self.set_state(UtpState::ErrorWait);
+        self.test_socket_state();
+    }
+
+    /// `m_close_reason` setter — carried by extension 3 on the next
+    /// packet(s) (and the FIN), per upstream `set_close_reason`.
+    pub fn set_close_reason(&mut self, code: u16) {
+        self.m_close_reason = code;
     }
 
     /// `utp_stream::write_some` — queue payload.
@@ -660,6 +750,7 @@ impl UtpSocket {
             p.buf[2..4].copy_from_slice(&self.m_send_id.to_be_bytes());
             p.buf[16..18].copy_from_slice(&self.m_seq_nr.to_be_bytes());
             if payload_size > 0 {
+                self.inc(UtpStat::PayloadPktsOut, 1);
                 self.write_payload(&mut p.buf[usize::from(p.header_size)..usize::from(p.size)]);
             }
             h_seq_nr = self.m_seq_nr;
@@ -773,6 +864,7 @@ impl UtpSocket {
 
         self.send_packet(&p.buf[..usize::from(p.size)], p.mtu_probe);
         self.m_out_packets += 1;
+        self.inc(UtpStat::PacketsOut, 1);
         p.num_transmissions += 1;
         if self.m_bytes_in_flight == 0 {
             self.m_timeout = now
@@ -853,6 +945,11 @@ impl UtpSocket {
             self.m_bytes_in_flight += size - header_size;
         }
 
+        self.inc(UtpStat::PacketResend, 1);
+        if fast_resend {
+            self.inc(UtpStat::FastRetransmit, 1);
+        }
+
         let now = Instant::now();
         // pre-compute the refreshed SACK payload before taking a
         // mutable borrow of `outbuf` (`write_sack` reads `inbuf`)
@@ -898,11 +995,13 @@ impl UtpSocket {
         }
         self.send_packet(&send_bytes, false);
         self.m_out_packets += 1;
+        self.inc(UtpStat::PacketsOut, 1);
         true
     }
 
     /// `experienced_loss`.
     fn experienced_loss(&mut self, seq_nr: u16, now: Instant) {
+        self.inc(UtpStat::PacketLoss, 1);
         if compare_less_wrap(
             u32::from(seq_nr),
             u32::from(self.m_loss_seq_nr) + 1,
@@ -1212,9 +1311,14 @@ impl UtpSocket {
         let delay_factor = (i64::from(target_delay - delay) << 16) / i64::from(target_delay);
         let scaled_gain: i64;
 
-        if delay >= target_delay && self.m_slow_start {
-            self.m_ssthres = ((self.m_cwnd >> 16) / 2) as i32;
-            self.m_slow_start = false;
+        if delay >= target_delay {
+            if self.m_slow_start {
+                self.m_ssthres = ((self.m_cwnd >> 16) / 2) as i32;
+                self.m_slow_start = false;
+            }
+            self.inc(UtpStat::SamplesAboveTarget, 1);
+        } else {
+            self.inc(UtpStat::SamplesBelowTarget, 1);
         }
 
         let linear_gain = ((window_factor * delay_factor) >> 16) * i64::from(self.cfg.gain_factor);
@@ -1259,15 +1363,19 @@ impl UtpSocket {
     /// `return false` paths — e.g. a SYN with the wrong conn-id while
     /// listening).
     pub fn incoming_packet(&mut self, buf: &[u8], ep: SocketAddr, receive_time: Instant) -> bool {
+        self.inc(UtpStat::PacketsIn, 1);
+        // parse rejects len < 20, version != 1 and type > ST_SYN —
+        // upstream counts each as `utp_invalid_pkts_in`.
         let ph = match UtpHeader::parse(buf) {
             Some(h) => h,
-            None => return false,
+            None => {
+                self.inc(UtpStat::InvalidPktsIn, 1);
+                return false;
+            }
         };
 
-        if buf.len() < UTP_HEADER_LEN || ph.version != 1 {
-            return false;
-        }
         if ph.ty != UtpType::Syn && ph.connection_id != self.m_recv_id {
+            self.inc(UtpStat::InvalidPktsIn, 1);
             return false;
         }
 
@@ -1275,6 +1383,7 @@ impl UtpSocket {
             self.remote = ep;
         }
         if self.state != UtpState::None && ph.ty == UtpType::Syn {
+            self.inc(UtpStat::InvalidPktsIn, 1);
             return true;
         }
 
@@ -1326,6 +1435,7 @@ impl UtpSocket {
                     ACK_MASK as u32,
                 ))
         {
+            self.inc(UtpStat::RedundantPktsIn, 1);
             return true;
         }
 
@@ -1340,6 +1450,10 @@ impl UtpSocket {
             return true;
         }
 
+        if ph.ty == UtpType::Data {
+            self.inc(UtpStat::PayloadPktsIn, 1);
+        }
+
         let max_packets_reorder =
             u32::try_from(16.max(self.m_receive_buffer_capacity / 1100)).unwrap_or(16);
         if self.state != UtpState::None
@@ -1350,6 +1464,7 @@ impl UtpSocket {
                 ACK_MASK as u32,
             )
         {
+            self.inc(UtpStat::RedundantPktsIn, 1);
             return true;
         }
 
@@ -1420,12 +1535,14 @@ impl UtpSocket {
         let mut extension = ph.extension;
         while extension != 0 {
             if header_size + 2 > buf.len() {
+                self.inc(UtpStat::InvalidPktsIn, 1);
                 return true;
             }
             let next_extension = buf[header_size];
             let len = usize::from(buf[header_size + 1]);
             header_size += 2;
             if header_size + len > buf.len() {
+                self.inc(UtpStat::InvalidPktsIn, 1);
                 return true;
             }
             match extension {
@@ -1673,8 +1790,11 @@ impl UtpSocket {
             ignore_loss = true;
         }
 
-        if (!self.outbuf.is_empty() || self.m_close_reason != 0) && !ignore_loss {
-            self.m_num_timeouts = self.m_num_timeouts.saturating_add(1);
+        if !self.outbuf.is_empty() || self.m_close_reason != 0 {
+            if !ignore_loss {
+                self.m_num_timeouts = self.m_num_timeouts.saturating_add(1);
+            }
+            self.inc(UtpStat::Timeout, 1);
         }
 
         if u32::from(self.m_num_timeouts) > self.cfg.num_resends
@@ -1745,6 +1865,15 @@ impl UtpSocket {
             self.set_state(UtpState::ErrorWait);
             self.test_socket_state();
         }
+    }
+}
+
+impl Drop for UtpSocket {
+    /// `~utp_socket_impl` — releases the socket-state gauge.
+    /// Upstream also cancels a deferred-ack registration; the flag
+    /// lives on the socket itself here, so there is nothing to undo.
+    fn drop(&mut self) {
+        self.inc(UtpStat::StateGauge(self.state as usize), -1);
     }
 }
 

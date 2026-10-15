@@ -170,9 +170,54 @@ impl TokioUdpSocket {
     }
 }
 
+impl TokioUdpSocket {
+    /// `set_dont_frag` + `udp_socket::do_send` upstream: for a
+    /// `DONT_FRAGMENT` send (uTP MTU probes), `IP_MTU_DISCOVER` is
+    /// toggled to `PROBE` for the duration of the send and restored
+    /// to `DONT` right after — the upstream socket option is likewise
+    /// scoped per-send (`TORRENT_HAS_DONT_FRAGMENT` is conditional
+    /// upstream; on platforms without a safe sockopt this degrades
+    /// to a plain send, matching upstream's no-op path).
+    async fn send_with_flags(
+        &self,
+        buf: &[u8],
+        target: SocketAddr,
+        flags: crate::transport::DatagramSendFlags,
+    ) -> std::io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        let df_set = flags.contains(crate::transport::DatagramSendFlags::DONT_FRAGMENT)
+            && target.is_ipv4()
+            && rustix::net::sockopt::set_ip_mtu_discover(
+                &self.sock,
+                rustix::net::sockopt::Ipv4PathMtuDiscovery::PROBE,
+            )
+            .is_ok();
+        #[cfg(not(target_os = "linux"))]
+        let _ = flags;
+        let r = self.sock.send_to(buf, target).await;
+        #[cfg(target_os = "linux")]
+        if df_set {
+            let _ = rustix::net::sockopt::set_ip_mtu_discover(
+                &self.sock,
+                rustix::net::sockopt::Ipv4PathMtuDiscovery::DONT,
+            );
+        }
+        r
+    }
+}
+
 impl DatagramSocket for TokioUdpSocket {
     fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> BoxFut<'a, usize> {
         Box::pin(async move { self.sock.send_to(buf, target).await })
+    }
+
+    fn send_to_flags<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+        flags: crate::transport::DatagramSendFlags,
+    ) -> BoxFut<'a, usize> {
+        Box::pin(async move { self.send_with_flags(buf, target, flags).await })
     }
 
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFut<'a, (usize, SocketAddr)> {

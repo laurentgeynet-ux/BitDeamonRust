@@ -4,6 +4,9 @@
 //! receive id).
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
+
+use bitdaemon_common::random::random;
 
 /// `utp_socket_state_t` — first nibble of `type_ver`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,15 +160,15 @@ impl<'a> Iterator for UtpExtensions<'a> {
     }
 }
 
-/// `utp_socket_manager` — demux incoming datagrams to uTP sockets by
-/// `connection_id`. `S` is the per-socket sink (upstream
-/// `utp_socket_impl*`), addressed by its receive id.
+/// `utp_socket_manager` — demux incoming datagrams to uTP sockets.
+/// `S` is the per-socket sink (upstream `utp_socket_impl*`). Upstream
+/// keys `m_utp_sockets` (a multimap) by `recv_id` alone and lets
+/// `match(ep, id)` verify the remote endpoint; folding the endpoint
+/// into the key gives the same discrimination with a plain map.
 #[derive(Debug)]
 pub struct UtpSocketDemux<S> {
-    /// `m_utp_sockets` — recv_id → socket.
-    sockets: HashMap<u16, S>,
-    /// next send-side connection id.
-    next_send_id: u16,
+    /// `m_utp_sockets` — `(remote, recv_id)` → socket.
+    sockets: HashMap<(SocketAddr, u16), S>,
     /// `m_restrict_mtu` — rolling window of path-MTU failures; the
     /// cap is the *max* of the last 3 (upstream semantics: a single
     /// failure doesn't permanently clamp new sockets).
@@ -178,7 +181,6 @@ impl<S> Default for UtpSocketDemux<S> {
     fn default() -> Self {
         Self {
             sockets: HashMap::new(),
-            next_send_id: 0,
             restrict_mtu: [65536; 3],
             mtu_idx: 0,
         }
@@ -186,32 +188,30 @@ impl<S> Default for UtpSocketDemux<S> {
 }
 
 impl<S> UtpSocketDemux<S> {
-    /// `new_utp_socket` — allocate a `(recv_id, send_id)` pair.
-    pub fn new_socket(&mut self, s: S) -> (u16, u16)
-    where
-        S: Send,
-    {
-        self.next_send_id = self.next_send_id.wrapping_add(1);
-        // receive id is the send id of the other direction
-        let send_id = self.next_send_id;
-        let recv_id = send_id + 1;
-        self.sockets.insert(recv_id, s);
+    /// `new_utp_socket` (outgoing branch) — `send_id` is random,
+    /// `recv_id = send_id - 1`; the socket registers under
+    /// `(remote, recv_id)`. Returns `(send_id, recv_id)`.
+    pub fn new_socket(&mut self, remote: SocketAddr, s: S) -> (u16, u16) {
+        let send_id = random(0xffff) as u16;
+        let recv_id = send_id.wrapping_sub(1);
+        self.sockets.insert((remote, recv_id), s);
         (send_id, recv_id)
     }
 
-    /// `remove_socket(id)`.
-    pub fn remove(&mut self, recv_id: u16) -> Option<S> {
-        self.sockets.remove(&recv_id)
+    /// `remove_socket(id)` — by the socket's `(remote, recv_id)` key.
+    pub fn remove(&mut self, remote: SocketAddr, recv_id: u16) -> Option<S> {
+        self.sockets.remove(&(remote, recv_id))
     }
 
     /// `incoming_packet` — returns `(recv_id, header, payload)` when
-    /// the datagram is a valid uTP packet addressed to a known socket.
+    /// the datagram is a valid uTP packet addressed to a known socket
+    /// on that exact endpoint (`match(ep, id)` upstream).
     /// `None` means "not for us" (non-uTP traffic shares the UDP
     /// socket — DHT/trackers).
-    pub fn route<'a>(&self, buf: &'a [u8]) -> Option<(u16, UtpHeader, &'a [u8])> {
+    pub fn route<'a>(&self, from: SocketAddr, buf: &'a [u8]) -> Option<(u16, UtpHeader, &'a [u8])> {
         let h = UtpHeader::parse(buf)?;
         let payload = &buf[UTP_HEADER_LEN..];
-        if !self.sockets.contains_key(&h.connection_id) {
+        if !self.sockets.contains_key(&(from, h.connection_id)) {
             return None;
         }
         Some((h.connection_id, h, payload))

@@ -32,6 +32,9 @@ rustls-webpki.workspace = true
 x509-parser.workspace = true
 tokio-rustls.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 criterion.workspace = true
 rcgen = "0.13"

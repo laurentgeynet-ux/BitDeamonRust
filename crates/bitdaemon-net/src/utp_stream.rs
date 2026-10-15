@@ -31,11 +31,39 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::transport::{BoxedPeerStream, DatagramSocket, PeerConnector};
-use crate::utp_socket::{UtpConfig, UtpSocket, UtpState};
+use crate::transport::{BoxedPeerStream, DatagramSendFlags, DatagramSocket, PeerConnector};
+use crate::utp::{UTP_HEADER_LEN, UtpHeader, UtpType};
+use crate::utp_socket::{UtpConfig, UtpError, UtpSocket, UtpState};
 
-/// One inbound datagram routed to a socket pump.
-type Inbound = (Vec<u8>, SocketAddr);
+/// Message routed to a socket pump (and to the listener queue) —
+/// either an inbound datagram or a transport tear-down
+/// (`remove_udp_socket` upstream: every socket bound to the dead
+/// transport is aborted). `Abort` never reaches the listener queue.
+#[derive(Debug)]
+pub enum InboundMsg {
+    /// One routed datagram + its sender endpoint.
+    Datagram(Vec<u8>, SocketAddr),
+    /// The datagram transport this socket is bound to went away.
+    Abort,
+}
+
+/// Write-side commands from the `UtpStream` — payload bytes, a
+/// graceful close (`poll_shutdown` / drop → FIN), or a close reason
+/// (`utp_close_reason` extension on the FIN).
+#[derive(Debug)]
+enum WriterMsg {
+    Data(Vec<u8>),
+    Close,
+    CloseReason(u16),
+}
+
+/// One registered socket: its inbound channel plus the datagram
+/// transport the pump replies on (kept for `remove_udp_socket`).
+#[derive(Debug)]
+struct SocketEntry {
+    tx: mpsc::Sender<InboundMsg>,
+    dg: Arc<dyn DatagramSocket>,
+}
 
 /// `UtpManager` — the `utp_socket_manager` analogue: demux table +
 /// the socket pump lifecycle. Cheap to clone.
@@ -46,11 +74,11 @@ pub struct UtpManager {
 
 #[derive(Debug)]
 struct ManagerInner {
-    /// `(remote, conn_id)` → socket's inbound channel.
-    sockets: HashMap<(SocketAddr, u16), mpsc::Sender<Inbound>>,
+    /// `(remote, conn_id)` → socket's inbound channel + transport.
+    sockets: HashMap<(SocketAddr, u16), SocketEntry>,
     /// unmatched SYNs go here (the acceptor's queue) — upstream's
     /// `utp_socket_manager` hands unknown SYNs to the listen socket.
-    listener: Option<mpsc::Sender<Inbound>>,
+    listener: Option<mpsc::Sender<InboundMsg>>,
     /// tasks we spawned (kept alive; aborted with the manager).
     tasks: Vec<JoinHandle<()>>,
     /// `connections_limit` — unmatched SYNs are dropped once
@@ -94,34 +122,37 @@ impl UtpManager {
     }
 
     /// `utp_socket_manager::incoming_packet` — demux to the right
-    /// socket by `(remote, conn_id)` (uTP header byte 0 type ≠ RST;
-    /// id at bytes 2–3 big-endian).
+    /// socket by `(remote, conn_id)`. The header gates mirror
+    /// upstream (`< 20` or `version != 1` are dropped here, before
+    /// any socket sees them). Dispatch is `try_send` outside the
+    /// lock: datagrams are lossy by nature and a full socket queue
+    /// must not stall the shared receive pump.
     pub async fn route(&self, from: SocketAddr, buf: &[u8]) {
-        if buf.len() < 20 {
+        if buf.len() < UTP_HEADER_LEN || buf[0] & 0xf != 1 {
             return;
         }
         let id = u16::from_be_bytes([buf[2], buf[3]]);
-        let inner = self.inner.lock().await;
-        // try both receive-id and send-id slots (SYN arrives on the
-        // receive id; subsequent packets on the send id — upstream
-        // tries both lookups).
-        for key in [
-            (from, id),
-            (from, id.wrapping_sub(1)),
-            (from, id.wrapping_add(1)),
-        ] {
-            if let Some(tx) = inner.sockets.get(&key) {
-                let _ = tx.send((buf.to_vec(), from)).await;
-                return;
-            }
-        }
-        // unmatched ST_SYN (type nibble 4) → the listen queue,
-        // unless we're over the upstream SYN-flood cap
-        // (`connections_limit * 2` sockets)
-        if buf[0] >> 4 == 4 && inner.sockets.len() <= inner.conn_limit * 2 {
-            if let Some(tx) = &inner.listener {
-                let _ = tx.send((buf.to_vec(), from)).await;
-            }
+        let (tx, listener) = {
+            let inner = self.inner.lock().await;
+            // upstream `equal_range(id)` + `match(ep, id)`: the
+            // incoming conn-id is always the *receiver's* recv_id, so
+            // an exact `(ep, id)` hit is the upstream shape
+            let tx = inner.sockets.get(&(from, id)).map(|e| e.tx.clone());
+            // unmatched ST_SYN (type nibble 4) → the listen queue,
+            // unless we're over the upstream SYN-flood cap
+            // (`connections_limit * 2` sockets)
+            let listener = if buf[0] >> 4 == 4 && inner.sockets.len() <= inner.conn_limit * 2 {
+                inner.listener.clone()
+            } else {
+                None
+            };
+            (tx, listener)
+        };
+        let msg = InboundMsg::Datagram(buf.to_vec(), from);
+        if let Some(tx) = tx {
+            let _ = tx.try_send(msg);
+        } else if let Some(tx) = listener {
+            let _ = tx.try_send(msg);
         }
     }
 
@@ -147,7 +178,7 @@ impl UtpManager {
 
     /// register the SYN listener — returns the acceptor's queue
     /// (one listener per manager; replacing drops the old queue).
-    pub async fn set_listener(&self) -> mpsc::Receiver<Inbound> {
+    pub async fn set_listener(&self) -> mpsc::Receiver<InboundMsg> {
         let (tx, rx) = mpsc::channel(64);
         self.inner.lock().await.listener = Some(tx);
         rx
@@ -155,7 +186,11 @@ impl UtpManager {
 
     /// accept one inbound SYN — build the responder socket
     /// (`send_id = SYN conn_id`, `recv_id = +1` upstream), register
-    /// its pump, feed the SYN in, and return the stream.
+    /// its pump, feed the SYN in, and return the stream. The SYN
+    /// must parse as version-1 `ST_SYN` and the socket impl must
+    /// accept it (`incoming_packet` return) — otherwise no socket
+    /// is registered at all, matching upstream where the rejected
+    /// packet simply isn't uTP.
     pub async fn accept_syn(
         self: &Arc<Self>,
         dg: Arc<dyn DatagramSocket>,
@@ -163,10 +198,10 @@ impl UtpManager {
         syn: &[u8],
         cfg: UtpConfig,
     ) -> io::Result<UtpStream> {
-        if syn.len() < 20 || syn[0] >> 4 != 4 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a syn"));
-        }
-        let id = u16::from_be_bytes([syn[2], syn[3]]);
+        let h = UtpHeader::parse(syn)
+            .filter(|h| h.ty == UtpType::Syn)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a syn"))?;
+        let id = h.connection_id;
         // upstream `utp_socket_manager::incoming_packet`: responder
         // send_id = the SYN's connection id, recv_id = send_id + 1
         let mut sock = UtpSocket::new(id.wrapping_add(1), id, cfg.clone());
@@ -178,18 +213,21 @@ impl UtpManager {
         // emitted data packets toward the unset remote (0.0.0.0:0)
         // and poisoned outbuf/cwnd before the handshake — a rare but
         // permanent stall.
-        sock.incoming_packet(syn, from, Instant::now());
+        if !sock.incoming_packet(syn, from, Instant::now()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "syn rejected"));
+        }
         sock.send_deferred_ack();
         let recv_id = sock.recv_id();
-        let rx = self.register((from, recv_id)).await;
+        let rx = self.register((from, recv_id), dg.clone()).await;
         let (rd_tx, rd_rx) = mpsc::channel::<Vec<u8>>(64);
-        let (wr_tx, wr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (wr_tx, wr_rx) = mpsc::unbounded_channel::<WriterMsg>();
         // state notifications ride a `watch` — latest-value
         // semantics, never blocks the pump when the consumer isn't
         // listening (upstream fires callbacks fire-and-forget). A
         // bounded mpsc here deadlocked the pump on the first
         // post-Connected transition nobody read.
         let (st_tx, st_rx) = tokio::sync::watch::channel(UtpState::None);
+        let last_error = Arc::new(std::sync::Mutex::new(None));
 
         let dg2 = dg.clone();
         let pump = tokio::spawn(socket_pump(
@@ -199,6 +237,7 @@ impl UtpManager {
             wr_rx,
             rd_tx,
             st_tx,
+            last_error.clone(),
             (from, recv_id),
             self.clone(),
         ));
@@ -207,6 +246,7 @@ impl UtpManager {
             rd_rx,
             wr_tx,
             st_rx: Arc::new(Mutex::new(st_rx)),
+            last_error,
             read_buf: std::collections::VecDeque::new(),
         })
     }
@@ -223,15 +263,43 @@ impl UtpManager {
         })
     }
 
-    /// register a socket pump keyed by `(remote, recv_id)`.
-    async fn register(&self, key: (SocketAddr, u16)) -> mpsc::Receiver<Inbound> {
+    /// register a socket pump keyed by `(remote, recv_id)`; `dg` is
+    /// retained so [`UtpManager::remove_datagram_socket`] can abort
+    /// everything bound to a dead transport.
+    async fn register(
+        &self,
+        key: (SocketAddr, u16),
+        dg: Arc<dyn DatagramSocket>,
+    ) -> mpsc::Receiver<InboundMsg> {
         let (tx, rx) = mpsc::channel(64);
-        self.inner.lock().await.sockets.insert(key, tx);
+        self.inner
+            .lock()
+            .await
+            .sockets
+            .insert(key, SocketEntry { tx, dg });
         rx
     }
 
     async fn unregister(&self, key: (SocketAddr, u16)) {
         self.inner.lock().await.sockets.remove(&key);
+    }
+
+    /// `remove_udp_socket` — abort every uTP socket bound to `dg`.
+    /// Upstream iterates `m_utp_sockets` calling `s->abort()` when a
+    /// listen transport disappears (proxy down, tunnel torn down).
+    pub async fn remove_datagram_socket(&self, dg: &Arc<dyn DatagramSocket>) {
+        let senders: Vec<mpsc::Sender<InboundMsg>> = {
+            let inner = self.inner.lock().await;
+            inner
+                .sockets
+                .values()
+                .filter(|e| Arc::ptr_eq(&e.dg, dg))
+                .map(|e| e.tx.clone())
+                .collect()
+        };
+        for tx in senders {
+            let _ = tx.send(InboundMsg::Abort).await;
+        }
     }
 
     /// dial `remote` — create the socket + pump, return the stream
@@ -249,10 +317,11 @@ impl UtpManager {
         sock.init_mtu(self.mtu_for(remote, cfg.proxy_socks5).await as u16);
         sock.connect(remote);
         let recv_id = sock.recv_id();
-        let rx = self.register((remote, recv_id)).await;
+        let rx = self.register((remote, recv_id), dg.clone()).await;
         let (rd_tx, rd_rx) = mpsc::channel::<Vec<u8>>(64);
-        let (wr_tx, wr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (wr_tx, wr_rx) = mpsc::unbounded_channel::<WriterMsg>();
         let (st_tx, st_rx) = tokio::sync::watch::channel(UtpState::None);
+        let last_error = Arc::new(std::sync::Mutex::new(None));
 
         let dg2 = dg.clone();
         let pump = tokio::spawn(socket_pump(
@@ -262,6 +331,7 @@ impl UtpManager {
             wr_rx,
             rd_tx,
             st_tx,
+            last_error.clone(),
             (remote, recv_id),
             self.clone(),
         ));
@@ -271,6 +341,7 @@ impl UtpManager {
             rd_rx,
             wr_tx,
             st_rx: Arc::new(Mutex::new(st_rx)),
+            last_error,
             read_buf: std::collections::VecDeque::new(),
         })
     }
@@ -288,18 +359,21 @@ impl Default for UtpManager {
 async fn socket_pump(
     mut sock: UtpSocket,
     dg: Arc<dyn DatagramSocket>,
-    mut inbound_rx: mpsc::Receiver<Inbound>,
-    mut wr_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut inbound_rx: mpsc::Receiver<InboundMsg>,
+    mut wr_rx: mpsc::UnboundedReceiver<WriterMsg>,
     rd_tx: mpsc::Sender<Vec<u8>>,
     st_tx: tokio::sync::watch::Sender<UtpState>,
+    last_error: Arc<std::sync::Mutex<Option<UtpError>>>,
     key: (SocketAddr, u16),
     mgr: Arc<UtpManager>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut readbuf = vec![0u8; 16 * 1024];
     let mut last_state = UtpState::None;
+    let mut write_closed = false;
     loop {
-        // drain outgoing datagrams
+        // drain outgoing datagrams — `dont_fragment` rides
+        // `udp_socket::send`'s flags (MTU probes only)
         for d in sock.drain_outbox() {
             tracing::trace!(
                 "pump {key:?} -> ty={} seq={} ack={} len={}",
@@ -308,17 +382,32 @@ async fn socket_pump(
                 u16::from_be_bytes([d.bytes[18], d.bytes[19]]),
                 d.bytes.len()
             );
-            let _ = dg.send_to(&d.bytes, d.to).await;
+            let flags = if d.dont_fragment {
+                DatagramSendFlags::DONT_FRAGMENT
+            } else {
+                DatagramSendFlags::NONE
+            };
+            let _ = dg.send_to_flags(&d.bytes, d.to, flags).await;
         }
-        // push any received payload toward the reader
-        match sock.read(&mut readbuf) {
-            Ok(n) if n > 0 => {
-                if rd_tx.send(readbuf[..n].to_vec()).await.is_err() {
-                    break;
+        // push received payload toward the reader — only while the
+        // read channel has capacity. A stalled reader must never
+        // park the pump: ACKs, ticks and the rest of the receive
+        // path keep running upstream-style.
+        if rd_tx.capacity() > 0 {
+            match sock.read(&mut readbuf) {
+                Ok(n) if n > 0 => {
+                    if rd_tx.send(readbuf[..n].to_vec()).await.is_err() {
+                        break;
+                    }
                 }
+                // EOF/reset surface on the stream via `last_error`;
+                // the socket's own state machine decides when the
+                // pump ends (CloseWait semantics upstream)
+                Err(e) => {
+                    *last_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                }
+                _ => {}
             }
-            Err(_) => break, // EOF/reset → close the stream
-            _ => {}
         }
         if sock.state() != last_state {
             last_state = sock.state();
@@ -328,15 +417,46 @@ async fn socket_pump(
             break;
         }
         tokio::select! {
-            Some((buf, from)) = inbound_rx.recv() => {
-                tracing::trace!("pump {key:?} <- ty={} seq={} ack={} len={}", buf[0]>>4,
-                    u16::from_be_bytes([buf[16],buf[17]]),
-                    u16::from_be_bytes([buf[18],buf[19]]), buf.len());
-                sock.incoming_packet(&buf, from, Instant::now());
-                sock.send_deferred_ack();
+            Some(msg) = inbound_rx.recv() => {
+                match msg {
+                    InboundMsg::Abort => sock.abort(),
+                    InboundMsg::Datagram(buf, from) => {
+                        tracing::trace!("pump {key:?} <- ty={} seq={} ack={} len={}", buf[0]>>4,
+                            u16::from_be_bytes([buf[16],buf[17]]),
+                            u16::from_be_bytes([buf[18],buf[19]]), buf.len());
+                        sock.incoming_packet(&buf, from, Instant::now());
+                        // batch whatever else is queued into this
+                        // receive round — upstream flushes deferred
+                        // acks once per *batch* (`m_deferred_ack_list`),
+                        // not once per datagram
+                        while let Ok(msg) = inbound_rx.try_recv() {
+                            match msg {
+                                InboundMsg::Abort => {
+                                    sock.abort();
+                                    break;
+                                }
+                                InboundMsg::Datagram(buf, from) => {
+                                    sock.incoming_packet(&buf, from, Instant::now());
+                                }
+                            }
+                        }
+                        sock.send_deferred_ack();
+                    }
+                }
             }
-            Some(buf) = wr_rx.recv() => {
-                let _ = sock.write(&buf);
+            msg = wr_rx.recv(), if !write_closed => {
+                match msg {
+                    Some(WriterMsg::Data(buf)) => {
+                        let _ = sock.write(&buf);
+                    }
+                    Some(WriterMsg::Close) | None => {
+                        // poll_shutdown or stream dropped — upstream
+                        // `close()`: FIN once the queue drains
+                        write_closed = true;
+                        sock.close();
+                    }
+                    Some(WriterMsg::CloseReason(code)) => sock.set_close_reason(code),
+                }
             }
             _ = tick.tick() => {
                 sock.tick(Instant::now());
@@ -347,6 +467,9 @@ async fn socket_pump(
             else => break,
         }
     }
+    if let Some(e) = sock.error() {
+        *last_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+    }
     mgr.unregister(key).await;
 }
 
@@ -354,8 +477,11 @@ async fn socket_pump(
 #[derive(Debug)]
 pub struct UtpStream {
     rd_rx: mpsc::Receiver<Vec<u8>>,
-    wr_tx: mpsc::UnboundedSender<Vec<u8>>,
+    wr_tx: mpsc::UnboundedSender<WriterMsg>,
     st_rx: Arc<Mutex<tokio::sync::watch::Receiver<UtpState>>>,
+    /// last socket-level error — read failures surface this rather
+    /// than collapsing everything to EOF (upstream keeps `m_error`).
+    last_error: Arc<std::sync::Mutex<Option<UtpError>>>,
     read_buf: std::collections::VecDeque<u8>,
 }
 
@@ -375,6 +501,21 @@ impl UtpStream {
                 return Err(io::Error::other("utp pump died"));
             }
         }
+    }
+
+    /// `utp_stream::set_close_reason` — tag the FIN with a
+    /// `utp_close_reason` code (`close_reason_t`). Call before
+    /// `poll_shutdown`/drop; the extension rides the FIN.
+    pub fn set_close_reason(&self, code: u16) {
+        let _ = self.wr_tx.send(WriterMsg::CloseReason(code));
+    }
+
+    /// the last socket error surfaced by the pump, if any.
+    fn take_error(&self) -> Option<UtpError> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
     }
 }
 
@@ -397,7 +538,22 @@ impl AsyncRead for UtpStream {
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
-            Poll::Ready(None) => Poll::Ready(Ok(())), // EOF
+            Poll::Ready(None) => match self.take_error() {
+                // upstream: `m_error == eof`/none → clean EOF
+                None | Some(UtpError::Eof) => Poll::Ready(Ok(())),
+                Some(UtpError::ConnectionReset) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "utp connection reset",
+                ))),
+                Some(UtpError::TimedOut) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "utp timed out",
+                ))),
+                Some(UtpError::Aborted) => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "utp connection aborted",
+                ))),
+            },
             Poll::Pending => Poll::Pending,
         }
     }
@@ -409,7 +565,7 @@ impl AsyncWrite for UtpStream {
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.wr_tx.send(buf.to_vec()) {
+        match self.wr_tx.send(WriterMsg::Data(buf.to_vec())) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(_) => Poll::Ready(Err(io::Error::other("utp closed"))),
         }
@@ -418,6 +574,10 @@ impl AsyncWrite for UtpStream {
         Poll::Ready(Ok(()))
     }
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // upstream `utp_stream::close` → `m_impl.close()` — the FIN
+        // leaves once the write buffer and nagle packet drain; the
+        // pump keeps running until `FinSent` resolves
+        let _ = self.wr_tx.send(WriterMsg::Close);
         Poll::Ready(Ok(()))
     }
 }
@@ -445,7 +605,7 @@ pub struct UtpAcceptor {
     /// socket config.
     pub cfg: UtpConfig,
     /// SYN queue (from `UtpManager::set_listener`).
-    rx: Mutex<mpsc::Receiver<Inbound>>,
+    rx: Mutex<mpsc::Receiver<InboundMsg>>,
 }
 
 impl UtpAcceptor {
@@ -469,13 +629,16 @@ impl crate::transport::PeerAcceptor for UtpAcceptor {
     fn accept(self: Arc<Self>) -> crate::transport::AcceptFut {
         let me = self.clone();
         Box::pin(async move {
-            let (syn, from) = me
-                .rx
-                .lock()
-                .await
-                .recv()
-                .await
-                .ok_or(crate::NetError::NoTransport("utp listener closed"))?;
+            let mut rx = me.rx.lock().await;
+            let (syn, from) = loop {
+                match rx.recv().await {
+                    Some(InboundMsg::Datagram(b, f)) => break (b, f),
+                    Some(InboundMsg::Abort) => continue,
+                    None => {
+                        return Err(crate::NetError::NoTransport("utp listener closed"));
+                    }
+                }
+            };
             let s = me
                 .manager
                 .accept_syn(me.datagram.clone(), from, &syn, me.cfg.clone())
