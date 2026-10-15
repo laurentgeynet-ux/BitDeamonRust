@@ -1668,7 +1668,15 @@ impl Session {
                         // → a good suggestion candidate.
                         t.add_suggest_piece(req.piece, &self.settings);
                     }
-                    if let Some(data) = buf.data().map(|d| d.to_vec()) {
+                    // upstream `on_disk_read_complete` returns before
+                    // `write_piece` when `m_disconnecting` — a conn in
+                    // teardown gets neither the block nor the alert.
+                    let conn_gone = self
+                        .torrents
+                        .get(&ih)
+                        .and_then(|t| t.peers.get(&peer))
+                        .is_none_or(|c| c.disconnecting);
+                    if !conn_gone && let Some(data) = buf.data().map(|d| d.to_vec()) {
                         self.push_to_peer(
                             &ih,
                             peer,
@@ -1681,18 +1689,27 @@ impl Session {
                         );
                         // `block_uploaded_alert` — the block went
                         // out to the peer (upstream posts it in
-                        // `peer_connection::on_disk_read_complete`).
-                        let remote = self
+                        // `peer_connection::on_disk_read_complete`)
+                        // with the block *index*, `r.start /
+                        // t->block_size()`, not the byte offset.
+                        let (remote, block) = self
                             .torrents
                             .get(&ih)
-                            .and_then(|t| t.peers.get(&peer))
-                            .and_then(|c| c.remote)
-                            .map_or_else(String::new, |ep| ep.to_string());
+                            .map(|t| {
+                                let remote = t
+                                    .peers
+                                    .get(&peer)
+                                    .and_then(|c| c.remote)
+                                    .map_or_else(String::new, |ep| ep.to_string());
+                                let blk = (req.start.max(0) / t.block_size().max(1)).max(0) as u32;
+                                (remote, blk)
+                            })
+                            .unwrap_or_else(|| (String::new(), 0));
                         self.alerts.post(Alert::BlockUploaded {
                             ih,
                             remote,
                             piece: req.piece,
-                            block: req.start as u32,
+                            block,
                         });
                     }
                 }

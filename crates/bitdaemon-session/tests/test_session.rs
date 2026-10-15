@@ -1649,3 +1649,105 @@ fn wire_unknown_id_skips_packet_counter() {
     assert_eq!(s.counters.value(Counter::ErrorPeers), 1);
     let _ = NUM_COUNTERS;
 }
+
+/// A09 — `block_uploaded_alert` carries the block *index*
+/// (`r.start / t->block_size()` upstream, bt_peer_connection.cpp:2693),
+/// not the byte offset.
+#[test]
+fn block_uploaded_alert_uses_block_index() {
+    use bitdaemon_common::PeerRequest;
+    use bitdaemon_disk::disk_buffer_pool::DiskBufferHolder;
+    use bitdaemon_session::session::DiskCompleted;
+
+    let mut s = Session::new();
+    let t = mk_torrent(4); // piece_length 0x40000 → block_size 0x4000
+    let ih = s.add_torrent(t);
+    s.torrents
+        .get_mut(&ih)
+        .unwrap()
+        .peers
+        .insert(7, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
+    s.alerts
+        .set_mask(bitdaemon_session::alerts::AlertCategory::ALL);
+    s.pop_alerts();
+
+    s.disk_completions()
+        .send(DiskCompleted::Read {
+            ih,
+            peer: 7,
+            req: PeerRequest {
+                piece: PieceIndex(0),
+                start: 0x8000,
+                length: 0x4000,
+            },
+            buf: DiskBufferHolder::from_owned(vec![0xAB; 0x4000]),
+            err: bitdaemon_disk::storage_error::StorageError::default(),
+            issue_time: std::time::Instant::now(),
+        })
+        .unwrap();
+    let mut out = Vec::new();
+    s.drain_disk_completed(&mut out);
+
+    assert!(out.iter().any(|o| matches!(
+        o,
+        SessionOut::ToPeer {
+            msg: PeerMessage::Piece { piece, offset, .. },
+            ..
+        } if *piece == PieceIndex(0) && *offset == 0x8000
+    )));
+    assert!(s.pop_alerts().iter().any(|a| matches!(
+        a,
+        bitdaemon_session::alerts::Alert::BlockUploaded { block: 2, .. }
+    )));
+}
+
+/// A09 — `on_disk_read_complete` returns before `write_piece` when
+/// `m_disconnecting`: a conn in teardown gets neither the block nor
+/// the alert (peer_connection.cpp:5647).
+#[test]
+fn read_complete_skips_disconnecting_conn() {
+    use bitdaemon_common::PeerRequest;
+    use bitdaemon_disk::disk_buffer_pool::DiskBufferHolder;
+    use bitdaemon_session::session::DiskCompleted;
+
+    let mut s = Session::new();
+    let t = mk_torrent(4);
+    let ih = s.add_torrent(t);
+    let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
+    c.disconnecting = true;
+    c.reading_bytes = 0x4000;
+    s.torrents.get_mut(&ih).unwrap().peers.insert(7, c);
+    s.pop_alerts();
+
+    s.disk_completions()
+        .send(DiskCompleted::Read {
+            ih,
+            peer: 7,
+            req: PeerRequest {
+                piece: PieceIndex(0),
+                start: 0,
+                length: 0x4000,
+            },
+            buf: DiskBufferHolder::from_owned(vec![0xAB; 0x4000]),
+            err: bitdaemon_disk::storage_error::StorageError::default(),
+            issue_time: std::time::Instant::now(),
+        })
+        .unwrap();
+    let mut out = Vec::new();
+    s.drain_disk_completed(&mut out);
+
+    // in-flight read accounting still clears (`m_reading_bytes`).
+    assert_eq!(s.torrents[&ih].peers[&7].reading_bytes, 0);
+    assert!(!out.iter().any(|o| matches!(
+        o,
+        SessionOut::ToPeer {
+            msg: PeerMessage::Piece { .. },
+            ..
+        }
+    )));
+    assert!(
+        !s.pop_alerts()
+            .iter()
+            .any(|a| matches!(a, bitdaemon_session::alerts::Alert::BlockUploaded { .. }))
+    );
+}
