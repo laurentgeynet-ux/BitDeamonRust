@@ -263,14 +263,12 @@ impl PartFile {
                 // source doesn't exist — nothing to move
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                // e.g. EXDEV across volumes → copy + remove
+                // e.g. EXDEV across volumes → copy + remove; upstream
+                // propagates the remove's error code (part_file.cpp:326
+                // — only the *rename's* ENOENT is tolerated)
                 Err(_) => {
                     fs::copy_file(&old, &new)?;
-                    match fs::remove(&old) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e),
-                    }
+                    fs::remove(&old)?;
                 }
             }
         }
