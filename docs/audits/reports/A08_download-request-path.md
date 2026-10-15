@@ -454,3 +454,13 @@ request_blocks,torrent,session,piece_picker,peer_info,counters}.rs` ;
   scope A09 ; présence du site notée.
 - **`we_are_interested`/quota legs additionnels du ladder** — hors
   A08 (admission/lifecycle), note de chevauchement dans D3.
+
+### Livraison
+
+- Commit apply : `0018ed0`
+  `fix(session): download request-path parity — A08`
+  (branche `audit/08-download-request-path`,
+  worktree `LibtorrentRust-a08`)
+- PR : https://github.com/laurentgeynet-ux/BitDeamonRust/pull/4
+- Fragment changelog : `docs/audits/changelog/A08.md`
+  (agrégé au prochain passage de `_aggregate_changelog.py`)
