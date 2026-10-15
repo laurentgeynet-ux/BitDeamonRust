@@ -488,3 +488,60 @@ Fichiers Rust que les corrections toucheront (planification des vagues) :
   JSON) est une implémentation dédiée avec clamp
   `min_websocket_announce_interval` (`engine.rs:1009-1034`) — protocole
   distinct de BEP-3, hors champ de comparaison bit-exacte.
+
+## Résultat
+
+### Déviations corrigées
+
+- **Timeouts I/O absents** — `tracker_completion_timeout`/
+  `tracker_receive_timeout`/`stop_tracker_timeout` armés sur les
+  échanges HTTP et UDP ; un tracker muet ne fige plus `updating`.
+- **Compteurs announce approximés** — `uploaded`/`downloaded`/
+  `corrupt`/`redundant` issus des compteurs réels
+  (`report_true_downloaded`), `left` = `bytes_left` corrigé pièce de
+  queue, `num_want` réglable, `key` par torrent, `trackerid`
+  echo+fallback `m_trackerid`.
+- **Machine announce par hash** — slots `(endpoint, v1|v2)` comme
+  `announce_state` upstream ; hybrides annoncent les deux versions,
+  `stopped` ne touche que `start_sent`, burst `completed` latched
+  une fois par version.
+- **Sémantique d'échec** — `retry_interval` des réponses `failure`
+  honorée au-dessus du backoff quadratique, 410 → `dont_try_again`,
+  `deprioritize` quand tous les slots meurent, cascade failover vers
+  le tier suivant ; `tracker_error_alert` porte
+  `times_in_row`/`status_code`/`op` (`TrackerOp` = `operation_t`).
+- **Transport** — `User-Agent` + `Authorization`, redirects
+  cross-origin re-dialés, legs endpoints dans l'ordre upstream
+  (resolve-all → SSRF → filter → boucle par adresse), retries UDP par
+  adresse, cache `connection_id` (`udp_tracker_token_expiry`),
+  compteurs wire bytes `sent/recv_tracker_bytes`, queue
+  `max_concurrent_http_announces` (prioritaires en tête,
+  `num_queued_tracker_announces`).
+- **Réponses** — peers `hostname` filtrés par settings proxy, vote
+  `external ip` par `tracker_ip` résolu, `trackerid` persisté +
+  `trackerid_alert`, `warning message` → `tracker_warning_alert`,
+  réponse announce rafraîchit les champs scrape, scrapes par version.
+
+### Tests ajoutés
+
+- `crates/bitdaemon-session/tests/test_tracker_a04.rs` — 13 cas :
+  compteurs réels, hybride v1+v2, `failed_version` ciblé, latche
+  `completed`, gates `stopped`, retry_interval, 410, deprioritize,
+  cascade tiers, trackerid echo/fallback, scrape par version,
+  payload `tracker_error_alert`.
+- `test_tracker_client.rs` — `udp_conn_id_reused_within_ttl`,
+  `announce_url_trackerid_and_ssrf` (SSRF args tracker + echo
+  trackerid).
+- `test_tracker_list.rs`/`test_announce.rs`/`test_scrape.rs`/
+  `test_alert_types.rs`/`test_status.rs`/`test_recheck.rs`/
+  `test_connect_pump.rs` — fixtures migrées sur les signatures
+  versionnées.
+
+### Livraison
+
+- Commit apply : `bea03c0`
+  `fix(trackers): upstream-fidelity apply of audit A04`
+  (branche `audit/04-trackers`, worktree `LibtorrentRust-a04`)
+- PR : https://github.com/laurentgeynet-ux/BitDeamonRust/pull/5
+- Fragment changelog : `docs/audits/changelog/A04.md`
+  (agrégé au prochain passage de `_aggregate_changelog.py`)
