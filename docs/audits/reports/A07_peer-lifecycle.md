@@ -538,5 +538,5 @@ Côté Rust : `crates/bitdaemon-session/src/{session,torrent,peer_conn,counters,
 - Branche `audit/07-peer-lifecycle`, worktree `LibtorrentRust-a07`.
 - Commit apply : `05fbb80`
   `fix(peer-lifecycle): upstream-fidelity apply of audit A07`
-- PR : à renseigner au merge.
+- PR : https://github.com/laurentgeynet-ux/BitDeamonRust/pull/6
 - Fragment changelog : `docs/audits/changelog/A07.md`.
