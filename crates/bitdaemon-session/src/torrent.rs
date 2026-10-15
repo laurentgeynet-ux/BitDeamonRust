@@ -655,6 +655,10 @@ pub struct Torrent {
     /// passed at add time, applied by `init` once the picker exists
     /// (magnets carry them across the metadata gap).
     pub pending_piece_priorities: Vec<bitdaemon_common::types::DownloadPriority>,
+    /// resume `unfinished_pieces` held until the `check_fastresume`
+    /// verdict — upstream applies them in the *accepted* leg of
+    /// `on_resume_data_checked` (`torrent.cpp:2366`), never on reject.
+    pub pending_unfinished: std::collections::BTreeMap<i32, Bitfield>,
     /// `m_renamed_files` — user renames (`filename_mappings`):
     /// `file_index → new name`.
     pub renamed_files: std::collections::BTreeMap<i32, String>,
@@ -1115,6 +1119,7 @@ impl Torrent {
             deferred_file_priorities: std::collections::BTreeMap::new(),
             default_dont_download: false,
             pending_piece_priorities: Vec::new(),
+            pending_unfinished: std::collections::BTreeMap::new(),
             renamed_files: std::collections::BTreeMap::new(),
             userdata: 0,
             last_seen_complete: -1,
@@ -1453,6 +1458,17 @@ impl Torrent {
         t.enable_pex = !atp
             .flags
             .contains(bitdaemon_common::flags::TorrentFlags::DISABLE_PEX);
+        // upstream ctor (`torrent.cpp:283`): `p.flags &
+        // need_save_resume → m_need_save_resume_data |=
+        // if_metadata_changed`. The flag rides `default_flags`, so a
+        // fresh add starts dirty; `read_resume_data` clears it, so a
+        // resume-loaded torrent starts clean.
+        if atp
+            .flags
+            .contains(bitdaemon_common::flags::TorrentFlags::NEED_SAVE_RESUME)
+        {
+            t.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_METADATA_CHANGED;
+        }
         // upstream `torrent::torrent`: seed_mode only sticks when the
         // resume data is consistent — no dont_download priorities and
         // every piece claimed present. Otherwise the flag is dropped
@@ -1467,7 +1483,7 @@ impl Torrent {
             && !atp
                 .piece_priorities
                 .contains(&bitdaemon_common::types::DownloadPriority::DONT_DOWNLOAD)
-            && atp.have_pieces.all_set();
+            && (atp.have_pieces.is_empty() || atp.have_pieces.all_set());
         if atp
             .flags
             .contains(bitdaemon_common::flags::TorrentFlags::SEED_MODE)
@@ -2592,10 +2608,37 @@ impl Torrent {
         atp.name = self.name.clone().into_bytes();
         atp.storage_mode = self.storage_mode;
         atp.flags = self.flags();
-        atp.have_pieces = self.have.clone();
-        // upstream: `verified` only meaningful in seed mode.
-        if self.seed_mode {
-            atp.verified_pieces = self.seed_verified.clone();
+        // upstream `write_resume_data` (`torrent.cpp:7624-7650`):
+        // `have_pieces` only covers *verified* territory — nothing at
+        // all while `!m_files_checked`, and while `checking_files`
+        // only the `m_num_checked_pieces` prefix (a short bitfield
+        // tells the loader to resume the check). The
+        // `checking_resume_data` window counts as unchecked — its
+        // optimistic claims are never persisted.
+        let max_piece = if self.checking && !self.checking_resume {
+            self.num_pieces - self.checking_pieces
+        } else if self.files_checked {
+            self.num_pieces
+        } else {
+            0
+        };
+        if max_piece > 0 {
+            if self.is_seed() {
+                atp.have_pieces = Bitfield::with_value(max_piece as usize, true);
+            } else {
+                let mut h = Bitfield::with_size(max_piece as usize);
+                for i in 0..max_piece.min(self.have.size() as i32) {
+                    if self.have.get_bit(i as usize) {
+                        h.set_bit(i as usize);
+                    }
+                }
+                atp.have_pieces = h;
+            }
+            // upstream: `verified` only meaningful in seed mode, and
+            // only inside the `max_piece > 0` leg.
+            if self.seed_mode {
+                atp.verified_pieces = self.seed_verified.clone();
+            }
         }
         // `m_trackers` — url + tier pairs.
         for e in self.trackers.trackers.iter() {
@@ -2623,6 +2666,10 @@ impl Torrent {
             }
             atp.peers.push(addr);
         }
+        // upstream `aux::random_shuffle(deferred_peers)` — the
+        // fill-to-100 candidates are a random pick, not list order.
+        use rand::seq::SliceRandom as _;
+        deferred.shuffle(&mut rand::rng());
         for p in deferred {
             if atp.peers.len() >= 100 {
                 break;
@@ -2727,9 +2774,19 @@ impl Torrent {
             }
         }
         if let Some(p) = self.picker.as_ref() {
-            atp.piece_priorities = (0..self.num_pieces)
-                .map(|i| p.piece_priority(PieceIndex(i)))
-                .collect();
+            // upstream (`torrent.cpp:7731-7749`) only writes
+            // `piece_priority` when a piece deviates from
+            // `default_priority` — an all-default torrent omits the
+            // key entirely.
+            let any_nondefault = (0..self.num_pieces).any(|i| {
+                p.piece_priority(PieceIndex(i))
+                    != bitdaemon_common::types::DownloadPriority::DEFAULT
+            });
+            if any_nondefault {
+                atp.piece_priorities = (0..self.num_pieces)
+                    .map(|i| p.piece_priority(PieceIndex(i)))
+                    .collect();
+            }
             for dp in p.get_download_queue() {
                 if dp.finished == 0 && dp.writing == 0 {
                     continue;
@@ -2826,32 +2883,13 @@ impl Torrent {
             }
             picker.set_piece_priority(PieceIndex(i as i32), *prio);
         }
-        self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_DOWNLOAD_PROGRESS;
-        for (piece, blocks) in &atp.unfinished_pieces {
-            let idx = PieceIndex(*piece);
-            if *piece < 0 || *piece >= self.num_pieces || self.have.get_bit(*piece as usize) {
-                continue;
-            }
-            if picker.have_piece(idx) {
-                picker.we_dont_have(idx);
-            }
-            let nbits = picker.blocks_in_piece(idx).min(blocks.size() as i32);
-            for k in 0..nbits {
-                if blocks.get_bit(k as usize) {
-                    picker.mark_as_finished(
-                        PieceBlock {
-                            piece_index: idx,
-                            block_index: k,
-                        },
-                        None,
-                    );
-                }
-            }
-            if picker.is_piece_finished(idx) {
-                // upstream `verify_piece` — needs a hash pass
-                out.push(TorrentEffect::DiskHash { piece: idx });
-            }
-        }
+        // upstream applies `unfinished_pieces` only in the *accepted*
+        // leg of `on_resume_data_checked` (`torrent.cpp:2366-2404`) —
+        // a rejected fastresume must not leave phantom `Finished`
+        // blocks in the picker. Hold them until the verdict;
+        // `apply_resume_claims` runs them on accept, the reject leg
+        // just drops the map.
+        self.pending_unfinished = atp.unfinished_pieces.clone();
         if self.have.count() as i32 == self.num_pieces && self.num_pieces > 0 {
             self.finished = true;
             self.seeding = true;
@@ -3086,6 +3124,12 @@ impl Torrent {
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
+        // upstream `on_resume_data_checked` saves
+        // `m_need_save_resume_data` on entry and restores it at the
+        // end — applying the resume's own state must not dirty it
+        // (a clean fastresume load reports
+        // `need_save_resume_data() == false`).
+        let ns = self.need_save_resume;
         self.checking = false;
         self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_DOWNLOAD_PROGRESS;
         // upstream `files_checked` posts `torrent_checked_alert`
@@ -3128,36 +3172,28 @@ impl Torrent {
         if !accepted {
             // the picker's have-tracking only knows pieces that
             // passed `piece_verified` — resume bits live solely in
-            // `self.have`, clearing it is sufficient.
+            // `self.have`, clearing it is sufficient. `unfinished`
+            // claims were never applied (upstream drops them with
+            // `m_add_torrent_params`).
             self.have.clear_all();
             self.verified_bytes = 0;
             self.init_files_completed();
             self.finished = false;
             self.seeding = false;
+            self.pending_unfinished.clear();
+            // upstream `has_error_status` leg — `m_seed_mode = false`:
+            // a rejected seed-mode claim does not keep promising
+            // pieces it never verified (`torrent.cpp:2408`).
+            self.seed_mode = false;
             // the fastresume-verify window closed — a following
             // `arm_full_recheck` is `checking_files`, not resume data.
             // The `checking_resume_data`→`checking_files`
             // `state_changed` emits inside `arm_full_recheck`.
             self.checking_resume = false;
+            self.need_save_resume = ns;
             return;
         }
-        // `on_resume_data_checked` accepted leg — every claimed
-        // piece gets `piece_flushed` + `num_piece_passed` +
-        // `we_have(i, loading_resume)` (announce/alert/file-progress
-        // edges run; resume-dirty marks suppressed).
-        {
-            let claimed: Vec<PieceIndex> = (0..self.have.size() as i32)
-                .filter(|i| self.have.get_bit(*i as usize))
-                .map(PieceIndex)
-                .collect();
-            for piece in claimed {
-                if let Some(p) = self.picker.as_mut() {
-                    p.piece_flushed(piece);
-                }
-                counters.add(crate::counters::Counter::NumPiecePassed, 1);
-                self.we_have(piece, true, s, counters, out, &mut |_| None);
-            }
-        }
+        self.apply_resume_claims(s, counters, out);
         // the fastresume-verify window is closed — a following
         // `arm_full_recheck` is `checking_files`, not resume data.
         // (Kept set through the apply loop so `we_have`'s
@@ -3218,9 +3254,105 @@ impl Torrent {
         // `set_state`'s `trigger_stop` — leaving the checking states
         // is the stop_when_ready edge upstream.
         self.stop_when_ready_edge(false, out);
+        // `on_resume_data_checked` epilogue — the resume-supplied
+        // state doesn't count as a modification.
+        self.need_save_resume = ns;
     }
 
-    /// `add_tracker_url` — upstream `add_tracker_url`; `source`
+    /// `on_resume_data_checked`'s accepted-leg claim application.
+    /// Every claimed piece gets `piece_flushed`, `num_piece_passed`
+    /// and `we_have(i, loading_resume)`, then the deferred
+    /// `unfinished` blocks are marked (`mark_as_finished`) and
+    /// completed pieces queue a `verify_piece` (`DiskHash`) pass.
+    /// Shared by `on_files_checked` and `on_resume_partial`.
+    fn apply_resume_claims(
+        &mut self,
+        s: &crate::settings::SessionSettings,
+        counters: &crate::counters::Counters,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        let claimed: Vec<PieceIndex> = (0..self.have.size() as i32)
+            .filter(|i| self.have.get_bit(*i as usize))
+            .map(PieceIndex)
+            .collect();
+        for piece in claimed {
+            if let Some(p) = self.picker.as_mut() {
+                p.piece_flushed(piece);
+            }
+            counters.add(crate::counters::Counter::NumPiecePassed, 1);
+            self.we_have(piece, true, s, counters, out, &mut |_| None);
+        }
+        // --- UNFINISHED PIECES --- (upstream torrent.cpp:2366-2404)
+        let pending = std::mem::take(&mut self.pending_unfinished);
+        for (piece, blocks) in &pending {
+            let idx = PieceIndex(*piece);
+            if *piece < 0 || *piece >= self.num_pieces || self.have.get_bit(*piece as usize) {
+                continue;
+            }
+            // being in seed mode and missing a piece is not
+            // compatible — upstream `leave_seed_mode(skip_checking)`.
+            if self.seed_mode {
+                self.seed_mode = false;
+            }
+            let Some(picker) = self.picker.as_mut() else {
+                break;
+            };
+            if picker.have_piece(idx) {
+                picker.we_dont_have(idx);
+            }
+            let nbits = picker.blocks_in_piece(idx).min(blocks.size() as i32);
+            for k in 0..nbits {
+                if blocks.get_bit(k as usize) {
+                    picker.mark_as_finished(
+                        PieceBlock {
+                            piece_index: idx,
+                            block_index: k,
+                        },
+                        None,
+                    );
+                }
+            }
+            if picker.is_piece_finished(idx) {
+                // upstream `verify_piece` — needs a hash pass
+                out.push(TorrentEffect::DiskHash { piece: idx });
+            }
+        }
+    }
+
+    /// `on_resume_data_checked`'s partial-resume leg — an accepted
+    /// fastresume whose `pieces` bitfield stops short of
+    /// `num_pieces` means the previous run was mid-`checking_files`
+    /// when it saved: the claimed prefix stands and a real hash
+    /// check resumes at `start` (upstream `m_checking_piece =
+    /// m_num_checked_pieces = have_pieces.end_index()` +
+    /// `should_start_full_check`, `torrent.cpp:2335-2350`).
+    /// `checking_pieces` counts down the tail; the caller queues a
+    /// `DiskHash` per piece `[start, num_pieces)`.
+    pub fn on_resume_partial(
+        &mut self,
+        start: i32,
+        s: &crate::settings::SessionSettings,
+        counters: &crate::counters::Counters,
+        out: &mut Vec<TorrentEffect>,
+    ) -> i32 {
+        let ns = self.need_save_resume;
+        // claims apply like the accepted leg — `we_have`'s
+        // `is_downloading_state` gate needs `checking_resume` still
+        // set through the apply loop.
+        self.apply_resume_claims(s, counters, out);
+        self.checking_resume = false;
+        self.checking = true;
+        self.checking_pieces = (self.num_pieces - start).max(0);
+        // upstream `should_start_full_check` leg —
+        // `stop_announcing()` then `set_state(checking_files)`
+        // (`torrent.cpp:2346-2349`).
+        self.trackers.stop_announcing(Instant::now());
+        self.emit_state_change(out);
+        self.state_updated();
+        self.need_save_resume = ns;
+        self.checking_pieces
+    }
+
     /// is the `tracker_source` bit (`source_torrent`/
     /// `source_magnet_link`/`source_client`).
     pub fn add_tracker(&mut self, url: String, tier: i32, source: u8) {
@@ -8660,6 +8792,13 @@ impl Torrent {
             return false;
         }
         self.checking = false;
+        // the drain *is* `files_checked()` upstream — the storage
+        // state is proven now; `m_files_checked` gates resume writes
+        // and late-add extension replays.
+        self.files_checked = true;
+        for ext in &self.extensions {
+            ext.on_files_checked();
+        }
         // recheck completion → `state_updated()` upstream.
         self.state_updated();
         // upstream `files_checked` — `is_finished()` → `finished()`

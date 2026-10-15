@@ -796,10 +796,19 @@ pub enum DiskCompleted {
         /// torrent.
         ih: Sha1Hash,
         /// resume accepted — neither `need_full_check` nor
-        /// `fatal_disk_error` set on the returned `status_t`.
+        /// `fatal_disk_error` nor `file_exist` set on the returned
+        /// `status_t` (upstream `has_error_status`).
         accepted: bool,
         /// the job's `status_t` (`disk_status` bits) verbatim.
         status: i32,
+        /// `aux::contains_resume_data` of the submitted params —
+        /// gates `fastresume_rejected_alert` (`torrent.cpp:2314`).
+        had_resume: bool,
+        /// bit-size of the resume `pieces` bitfield (0 = none) —
+        /// `< num_pieces` on accept means a mid-check snapshot:
+        /// upstream resumes `checking_files` at `end_index()`
+        /// (`torrent.cpp:2335-2344`).
+        have_bits: i32,
         /// job result.
         err: StorageError,
     },
@@ -1032,7 +1041,6 @@ impl Default for Session {
             next_portmap_handle: 0,
             pending_out: Vec::new(),
             stats_header_posted: false,
-
             boost_connections: 0,
             prio_torrents: std::collections::VecDeque::new(),
             next_downloading_connect_torrent: 0,
@@ -2111,8 +2119,16 @@ impl Session {
                     ih,
                     accepted,
                     status,
+                    had_resume,
+                    have_bits,
                     err,
                 } => {
+                    // `m_abort` (`torrent.cpp:2247`) — a torrent torn
+                    // down mid-check drops the whole verdict, alerts
+                    // included (`get_handle()` can't outlive it).
+                    if !self.torrents.contains_key(&ih) {
+                        continue;
+                    }
                     // `torrent::files_checked`: resume accepted → the
                     // optimistic `have` bits stand; rejected →
                     // `need_full_check`: per-piece `disk_hash` jobs
@@ -2131,41 +2147,91 @@ impl Session {
                     let mut eff = Vec::new();
                     let ok = err.is_ok() && accepted;
                     if let Some(t) = self.torrents.get_mut(&ih) {
-                        t.on_files_checked(ok, &self.settings, &self.counters, &mut eff);
-                        // upstream `files_checked` — an auto-managed
-                        // torrent forces a queue recalculation.
+                        // partial `pieces` bitfield + clean verdict —
+                        // the save landed mid-`checking_files`:
+                        // upstream resumes the hash pass at
+                        // `have_pieces.end_index()` instead of
+                        // calling `files_checked` (`torrent.cpp:2335
+                        // -2350`). Needs a picker to re-verify into.
+                        let partial_from = if ok
+                            && have_bits > 0
+                            && have_bits < t.num_pieces
+                            && t.picker.is_some()
+                        {
+                            Some(have_bits)
+                        } else {
+                            None
+                        };
+                        if let Some(start) = partial_from {
+                            if t.on_resume_partial(start, &self.settings, &self.counters, &mut eff)
+                                > 0
+                            {
+                                for p in start..t.num_pieces {
+                                    eff.push(TorrentEffect::DiskHash {
+                                        piece: bitdaemon_common::types::PieceIndex(p),
+                                    });
+                                }
+                            }
+                        } else {
+                            t.on_files_checked(ok, &self.settings, &self.counters, &mut eff);
+                            if !ok && t.arm_full_recheck(&mut eff) > 0 {
+                                for p in 0..t.num_pieces {
+                                    eff.push(TorrentEffect::DiskHash {
+                                        piece: bitdaemon_common::types::PieceIndex(p),
+                                    });
+                                }
+                            }
+                        }
+                        // upstream `files_checked`/`trigger_auto_manage`
+                        // — an auto-managed torrent forces a queue
+                        // recalculation.
                         if t.auto_managed {
                             self.auto_manage_scaler = 0;
                         }
-                        if !ok && t.arm_full_recheck(&mut eff) > 0 {
-                            for p in 0..t.num_pieces {
-                                eff.push(TorrentEffect::DiskHash {
-                                    piece: bitdaemon_common::types::PieceIndex(p),
-                                });
-                            }
-                        }
                     }
-                    if err.is_err() {
-                        // `on_check_files`'s `fatal_disk_error` leg
-                        // — `handle_disk_error("check_resume_data")`
-                        // (set_error + pause) and the torrent drops
-                        // out of auto-management so the queue does
-                        // not restart it.
+                    // `on_check_files`'s `fatal_disk_error` leg
+                    // — `handle_disk_error("check_resume_data")`
+                    // (set_error + pause) and the torrent drops out
+                    // of auto-management. Only `status`-flagged
+                    // fatal errors count — a `verify_resume_data`
+                    // mismatch is carried by `err` for the alert but
+                    // is *not* fatal upstream (it just rejects the
+                    // resume → recheck).
+                    if status & i32::from(bitdaemon_disk::storage::disk_status::FATAL_DISK_ERROR)
+                        != 0
+                    {
                         self.on_disk_error(ih, &err, DiskJobClass::None, None, out);
                         if let Some(t) = self.torrents.get_mut(&ih) {
                             t.auto_managed = false;
                         }
                     }
-                    // `fastresume_rejected_alert` — the resume
-                    // verdict came back rejected (upstream posts it
-                    // on every !accepted check; `op`/`file` from the
-                    // failing job when known).
-                    if err.is_ok() && !accepted {
+                    // `fastresume_rejected_alert` (`torrent.cpp:
+                    // 2314-2323`) — posted when the check failed or
+                    // carried an error *and* the params actually
+                    // held resume data (`contains_resume_data`); a
+                    // no-resume `need_full_check` (files exist) does
+                    // not alert.
+                    if had_resume && (err.is_err() || !accepted) {
                         self.alerts.post(Alert::FastresumeRejected {
                             ih,
-                            error: "resume data rejected".into(),
-                            op: "check_fastresume".into(),
-                            file: String::new(),
+                            error: if err.is_err() {
+                                err.to_string()
+                            } else {
+                                "resume data rejected".into()
+                            },
+                            op: if err.is_err() {
+                                err.operation.name().to_string()
+                            } else {
+                                "check_fastresume".into()
+                            },
+                            file: if err.is_err() {
+                                self.torrents
+                                    .get(&ih)
+                                    .map(|t| t.resolve_filename(err.file.0))
+                                    .unwrap_or_default()
+                            } else {
+                                String::new()
+                            },
                         });
                     }
                     self.route(ih, eff, out);
@@ -2729,22 +2795,36 @@ impl Session {
         t.checking_resume = true;
         let storage = t.storage;
         let tx = self.disk_tx.clone();
+        // `aux::contains_resume_data` (add_torrent_params.cpp:39) —
+        // `!have_pieces.empty() || seed_mode`.
+        let had_resume = resume_data.as_ref().is_some_and(|r| {
+            !r.have_pieces.is_empty()
+                || r.flags
+                    .contains(bitdaemon_common::flags::TorrentFlags::SEED_MODE)
+        });
+        let have_bits = resume_data
+            .as_ref()
+            .map_or(0, |r| r.have_pieces.size() as i32);
         disk.async_check_files(
             storage,
             resume_data,
             links,
             Box::new(move |ret, err| {
                 // `ret` is upstream's `status_t` (`disk_status`) —
-                // the resume is accepted when neither
-                // `need_full_check` nor `fatal_disk_error` is set.
+                // `has_error_status` = `need_full_check` |
+                // `fatal_disk_error` | `file_exist`
+                // (torrent.cpp:2307-2310).
                 let rejected = ret
                     & (i32::from(bitdaemon_disk::storage::disk_status::NEED_FULL_CHECK)
-                        | i32::from(bitdaemon_disk::storage::disk_status::FATAL_DISK_ERROR))
+                        | i32::from(bitdaemon_disk::storage::disk_status::FATAL_DISK_ERROR)
+                        | i32::from(bitdaemon_disk::storage::disk_status::FILE_EXIST))
                     != 0;
                 let _ = tx.send(DiskCompleted::CheckFiles {
                     ih,
                     accepted: !rejected,
                     status: ret,
+                    had_resume,
+                    have_bits,
                     err,
                 });
             }),
@@ -2980,10 +3060,13 @@ impl Session {
         use bitdaemon_common::flags::TorrentFlags as TF;
         if atp.ti.is_some() {
             if atp.flags.contains(TF::NO_VERIFY_FILES) {
+                let had_resume = !atp.have_pieces.is_empty() || atp.flags.contains(TF::SEED_MODE);
                 let _ = self.disk_tx.send(DiskCompleted::CheckFiles {
                     ih,
                     accepted: true,
                     status: 0,
+                    had_resume,
+                    have_bits: atp.have_pieces.size() as i32,
                     err: StorageError::default(),
                 });
             } else {
@@ -3336,104 +3419,6 @@ impl Session {
         if self.torrents.contains_key(ih) {
             self.do_connect_boost(ih, out);
         }
-    }
-
-    /// `torrent::start_announcing` — gates upstream applies, in
-    /// order: `is_paused()`, the `checking_files` state,
-    /// `!m_files_checked && valid_metadata()` (metadata is on disk
-    /// but unchecked — announce after `files_checked`), and the
-    /// `m_announcing` latch. Announcing arms the tracker slots
-    /// (`m_trackers.reset()` → `started` again), clears the
-    /// per-session stat counters (`m_total_failed_bytes`,
-    /// `m_total_redundant_bytes`, `m_stat.clear()` — fresh session
-    /// from the tracker's point of view) and fires an immediate
-    /// announce, `high_priority` while the connect boost is armed.
-    /// The tail reprioritizes DHT (peer-starved) and LSD.
-    fn start_announcing(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
-        let now = Instant::now();
-        let (pid, port) = (self.peer_id, self.listen_port);
-        let mut sent = Vec::new();
-        let (to_all_tiers, to_all_trackers) = (
-            self.settings.announce_to_all_tiers,
-            self.settings.announce_to_all_trackers,
-        );
-        let (num_want, report_true, apply_filter) = (
-            self.settings.num_want,
-            self.settings.report_true_downloaded,
-            self.settings.apply_ip_filter_to_trackers,
-        );
-        let prioritize = self
-            .torrents
-            .get(ih)
-            .is_some_and(|t| t.peer_list.num_peers() < 50)
-            && self.dht.get_node(false).is_some();
-        let announced = if let Some(t) = self.torrents.get_mut(ih) {
-            if t.is_paused()
-                || (t.checking && !t.checking_resume)
-                || (!t.files_checked && t.ti.is_some())
-                || t.announcing
-            {
-                false
-            } else {
-                t.announcing = true;
-                // `m_trackers.reset()` + the stat reset.
-                t.trackers.reset();
-                t.failed_bytes = 0;
-                t.redundant_bytes = 0;
-                t.payload_uploaded = 0;
-                t.payload_downloaded = 0;
-                t.protocol_uploaded = 0;
-                t.protocol_downloaded = 0;
-                t.ip_overhead_uploaded = 0;
-                t.ip_overhead_downloaded = 0;
-                // `high_priority = m_connect_boost_counter > 0` —
-                // queue-jumps the request at the tracker manager.
-                let high_priority = t.connect_boost_counter > 0;
-                let is_seed = t.is_seed();
-                let eff_event = if t.finished && !t.seeding && !t.seed_mode {
-                    4
-                } else {
-                    0
-                };
-                let supports = [t.info_hashes.has_v1(), t.info_hashes.has_v2()];
-                let picks =
-                    t.trackers
-                        .due(now, is_seed, to_all_tiers, to_all_trackers, supports, false);
-                for (idx, v) in picks {
-                    Self::dispatch_announce(
-                        t,
-                        *ih,
-                        idx,
-                        v,
-                        eff_event,
-                        is_seed,
-                        pid,
-                        port,
-                        apply_filter,
-                        num_want,
-                        report_true,
-                        high_priority,
-                        out,
-                        &mut sent,
-                    );
-                }
-                true
-            }
-        } else {
-            false
-        };
-        if !announced {
-            return;
-        }
-        if prioritize {
-            self.prioritize_dht(*ih);
-        }
-        // `has_lsd()` → `prioritize_lsd`: the torrent jumps the LSD
-        // broadcast queue.
-        if self.services.lsd && self.torrents.contains_key(ih) {
-            self.lsd_queue.push_back(*ih);
-        }
-        self.post_tracker_announces(sent);
     }
 
     /// `torrent::do_pause`/`~torrent` — `stopped` for trackers that
@@ -5179,6 +5164,104 @@ impl Session {
         if let Some(t) = self.torrents.get_mut(ih) {
             t.dial_locals.insert(remote, local);
         }
+    }
+
+    /// `torrent::start_announcing` — gates upstream applies, in
+    /// order: `is_paused()`, the `checking_files` state,
+    /// `!m_files_checked && valid_metadata()` (metadata is on disk
+    /// but unchecked — announce after `files_checked`), and the
+    /// `m_announcing` latch. Announcing arms the tracker slots
+    /// (`m_trackers.reset()` → `started` again), clears the
+    /// per-session stat counters (`m_total_failed_bytes`,
+    /// `m_total_redundant_bytes`, `m_stat.clear()` — fresh session
+    /// from the tracker's point of view) and fires an immediate
+    /// announce, `high_priority` while the connect boost is armed.
+    /// The tail reprioritizes DHT (peer-starved) and LSD.
+    fn start_announcing(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
+        let now = Instant::now();
+        let (pid, port) = (self.peer_id, self.listen_port);
+        let mut sent = Vec::new();
+        let (to_all_tiers, to_all_trackers) = (
+            self.settings.announce_to_all_tiers,
+            self.settings.announce_to_all_trackers,
+        );
+        let (num_want, report_true, apply_filter) = (
+            self.settings.num_want,
+            self.settings.report_true_downloaded,
+            self.settings.apply_ip_filter_to_trackers,
+        );
+        let prioritize = self
+            .torrents
+            .get(ih)
+            .is_some_and(|t| t.peer_list.num_peers() < 50)
+            && self.dht.get_node(false).is_some();
+        let announced = if let Some(t) = self.torrents.get_mut(ih) {
+            if t.is_paused()
+                || (t.checking && !t.checking_resume)
+                || (!t.files_checked && t.ti.is_some())
+                || t.announcing
+            {
+                false
+            } else {
+                t.announcing = true;
+                // `m_trackers.reset()` + the stat reset.
+                t.trackers.reset();
+                t.failed_bytes = 0;
+                t.redundant_bytes = 0;
+                t.payload_uploaded = 0;
+                t.payload_downloaded = 0;
+                t.protocol_uploaded = 0;
+                t.protocol_downloaded = 0;
+                t.ip_overhead_uploaded = 0;
+                t.ip_overhead_downloaded = 0;
+                // `high_priority = m_connect_boost_counter > 0` —
+                // queue-jumps the request at the tracker manager.
+                let high_priority = t.connect_boost_counter > 0;
+                let is_seed = t.is_seed();
+                let eff_event = if t.finished && !t.seeding && !t.seed_mode {
+                    4
+                } else {
+                    0
+                };
+                let supports = [t.info_hashes.has_v1(), t.info_hashes.has_v2()];
+                let picks =
+                    t.trackers
+                        .due(now, is_seed, to_all_tiers, to_all_trackers, supports, false);
+                for (idx, v) in picks {
+                    Self::dispatch_announce(
+                        t,
+                        *ih,
+                        idx,
+                        v,
+                        eff_event,
+                        is_seed,
+                        pid,
+                        port,
+                        apply_filter,
+                        num_want,
+                        report_true,
+                        high_priority,
+                        out,
+                        &mut sent,
+                    );
+                }
+                true
+            }
+        } else {
+            false
+        };
+        if !announced {
+            return;
+        }
+        if prioritize {
+            self.prioritize_dht(*ih);
+        }
+        // `has_lsd()` → `prioritize_lsd`: the torrent jumps the LSD
+        // broadcast queue.
+        if self.services.lsd && self.torrents.contains_key(ih) {
+            self.lsd_queue.push_back(*ih);
+        }
+        self.post_tracker_announces(sent);
     }
 
     /// a disk write/read/hash completed for `ih`.
@@ -10073,13 +10156,24 @@ impl Session {
     /// when any `if_*` bit is requested but none of those
     /// categories changed since the last dump, upstream posts
     /// `save_resume_data_failed_alert(resume_data_not_modified)`.
+    /// `m_abort` → `save_resume_data_failed_alert(torrent_removed)`
+    /// and `FLUSH_DISK_CACHE` → `async_release_files` before the
+    /// snapshot (`torrent.cpp:10096-10129`).
     pub fn save_resume_data(
         &mut self,
         ih: &Sha1Hash,
         flags: bitdaemon_common::flags::ResumeDataFlags,
     ) {
         use bitdaemon_common::flags::ResumeDataFlags as RF;
+        // upstream `m_abort` (`torrent.cpp:10096-10101`) — a removed
+        // torrent rejects with
+        // `save_resume_data_failed_alert(errors::torrent_removed)`,
+        // not silence.
         let Some(t) = self.torrents.get_mut(ih) else {
+            self.alerts.post(Alert::SaveResumeDataFailed {
+                ih: *ih,
+                error: "torrent removed".into(),
+            });
             return;
         };
         let conditions = flags & RF::ONLY_IF_MODIFIED;

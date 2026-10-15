@@ -87,3 +87,63 @@ Baseline upstream `e7381c7bc`. Références :
 - Ordre des clés du dict : `Dictionary` (BTree) tri byte-lexicographique — conforme bencode ; upstream `entry::dict` aussi ordonné.
 - `verified`/`mask` des `trees` en file-version 1 : format '0'/'1' géré — conforme (`resume_data.rs:174-207`).
 - Caps `bitfield_from_resume` : les triples `(bit_limit, piece_limit)` Rust reproduisent exactement les `piece_limit`/`piece_limit*2`/`INT_MAX` upstream (`resume_data.rs:34-40, 183-207, 344-350, 407`).
+
+## Résultat
+
+Appliqué sur `audit/21-resume-data` — HEAD de `audit/21-resume-data` (fix(session): resume-data parity — verdict plumbing).
+
+### Déviations corrigées
+
+1. **`have_pieces` non gaté** → `to_resume_data` n'écrit `pieces` que
+   si `files_checked`, et seulement le préfixe `num_checked_pieces`
+   pendant `checking_files` (rien pendant `checking_resume`).
+   `verified` confiné à la jambe `max_piece > 0` + `seed_mode`.
+2. **`unfinished` appliqué avant verdict** → nouveau champ
+   `pending_unfinished` ; application différée dans
+   `apply_resume_claims` (jambe acceptée de `on_files_checked` /
+   `on_resume_partial`), purge sur rejet.
+3. **Rejet n'éteignait pas `seed_mode`** → la jambe rejet fait
+   `seed_mode = false` + clear `have`/`verified_bytes`/claims.
+4. **Pas de reprise partielle** → `CheckFiles` transporte
+   `have_bits` ; bitfield court accepté → `on_resume_partial(start)`
+   arme `checking_files` à `end_index()` (stop_announcing +
+   state_updated) ; `recheck_piece_done` pose `files_checked` +
+   replay extensions au drain.
+5. **Masque `rejected`** → `FILE_EXIST` ajouté
+   (`has_error_status`) ; `CheckFiles` transporte `status` verbatim.
+6. **`FastresumeRejected` mal gaté** → conditionné à `had_resume`
+   (`contains_resume_data`), `op`/`file`/`error` réels sur erreur ;
+   erreur de verify non fatale ne passe plus par `handle_disk_error`
+   (pas de pause ni drop auto-manage) — seul `FATAL_DISK_ERROR` le
+   fait. Garde `m_abort` (torrent retiré → drop verdict + alertes).
+7. **`need_save_resume` sali** → sauvegardé/restauré dans
+   `on_files_checked` (et `on_resume_partial`) ; le flag est seedé
+   depuis `NEED_SAVE_RESUME` à la construction.
+8. **`piece_priority` tout-default** → clé omise.
+9. **`save_resume_data`** → alerte `SaveResumeDataFailed`
+   (`torrent removed`) si absent ; flag `flush_disk_cache` →
+   `flush_cache` (`async_release_files`) avant snapshot ;
+   `TorrentHandle::save_resume_data_flush` exposé.
+10. **Deferred peers** → shuffle (`rand::rng()`) avant le cap 100.
+11. **Seed-mode ctor** → `have_pieces` vide = vacuement all-present
+    (`is_empty() || all_set()`).
+
+### Tests ajoutés
+
+- `test_resume.rs` : `save_omits_have_before_files_checked`,
+  `save_writes_checked_prefix_while_checking`,
+  `rejected_fastresume_unwinds_claims`,
+  `accepted_load_preserves_need_save_resume`,
+  `partial_resume_continues_check_from_prefix` ; mises à jour
+  `load_restores_verified_and_unfinished`,
+  `load_full_unfinished_triggers_verify`,
+  `save_includes_unfinished_blocks` (priorités omises).
+- `test_recheck.rs` : `check_files_rejected_gates_fastresume_alert`
+  (no-resume silencieux / resume rejeté / erreur verify non fatale /
+  fatal → pause+drop auto-manage).
+- `test_magnet.rs`, `test_storage_ops.rs` : signatures ajustées.
+
+### Gates
+
+`cargo fmt`, `clippy -D warnings`, `test --workspace`,
+`doc --no-deps` — verts.
