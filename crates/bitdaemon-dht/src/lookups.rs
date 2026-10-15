@@ -53,8 +53,15 @@ pub struct ReplyData {
     pub token: Option<Vec<u8>>,
     /// `r.values` — compact peer list (`get_peers`).
     pub peers: Vec<SocketAddr>,
-    /// `r.nodes` / `r.nodes2` — node lists to traverse into.
+    /// `r.nodes` / `r.nodes2` — node lists carried back to the
+    /// consumer (and, when [`ReplyData::traverse`] is set,
+    /// traversed by the search).
     pub nodes: Vec<(NodeId, SocketAddr)>,
+    /// false for `sample_infohashes` — upstream's observer
+    /// collects `nodes` into the callback but deliberately skips
+    /// `traversal_observer::reply`, so discovered nodes are never
+    /// traversed (`sample_infohashes.cpp:131-135`).
+    pub traverse: bool,
     /// `r.interval` (sample_infohashes refresh hint, minutes).
     pub interval: Option<i64>,
     /// `r.num` (BEP-51: how many infohashes the node claims).
@@ -228,7 +235,10 @@ impl Lookup {
         if !id_e.is_valid() || id_e.string_length() != 20 {
             return None; // upstream: timeout()
         }
-        let mut out = ReplyData::default();
+        let mut out = ReplyData {
+            traverse: true,
+            ..ReplyData::default()
+        };
         let id = NodeId::from_bytes(id_e.string_value())?;
         out.id = Some(id);
 
@@ -292,23 +302,30 @@ impl Lookup {
                 }
             }
             LookupKind::SampleInfohashes => {
+                // `sample_infohashes_observer::reply` — every field
+                // is mandatory and range-checked; anything malformed
+                // is `timeout()` (the observer fails), not a partial
+                // success.
                 let iv = r.dict_find_int(b"interval");
-                if !!iv.is_valid() {
-                    out.interval = Some(iv.int_value());
-                }
                 let n = r.dict_find_int(b"num");
-                if !!n.is_valid() {
-                    out.num = Some(n.int_value());
-                }
                 let s = r.dict_find_string(b"samples");
-                if !!s.is_valid() {
-                    let b = s.string_value();
-                    for chunk in b.chunks_exact(20) {
-                        if let Some(id2) = NodeId::from_bytes(chunk) {
-                            out.samples.push(id2);
-                        }
+                if !iv.is_valid()
+                    || !(0..=21600).contains(&iv.int_value())
+                    || !n.is_valid()
+                    || !(0..=i64::from(i32::MAX)).contains(&n.int_value())
+                    || !s.is_valid()
+                    || s.string_value().len() % 20 != 0
+                {
+                    return None;
+                }
+                out.interval = Some(iv.int_value());
+                out.num = Some(n.int_value());
+                for chunk in s.string_value().chunks_exact(20) {
+                    if let Some(id2) = NodeId::from_bytes(chunk) {
+                        out.samples.push(id2);
                     }
                 }
+                out.traverse = false;
             }
             _ => {}
         }

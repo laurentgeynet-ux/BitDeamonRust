@@ -234,6 +234,21 @@ impl RpcManager {
         ret.max(Duration::from_millis(200))
     }
 
+    /// Drop pending transactions whose tag satisfies `pred` —
+    /// upstream `rpc_manager::tick` erases `flag_done` observers
+    /// (aborted or already-answered entries) without firing a
+    /// timeout. Returns how many transactions were dropped.
+    pub fn drop_tags(&mut self, mut pred: impl FnMut(u64) -> bool) -> usize {
+        let mut dropped = 0;
+        self.transactions.retain(|_, list| {
+            let before = list.len();
+            list.retain(|p| !pred(p.tag));
+            dropped += before - list.len();
+            !list.is_empty()
+        });
+        dropped
+    }
+
     /// `allocated_observers()` — in-flight requests.
     #[must_use]
     pub fn outstanding(&self) -> usize {
