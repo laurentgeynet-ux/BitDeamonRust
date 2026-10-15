@@ -117,12 +117,17 @@ impl SocksConnector {
     }
 
     /// build one from `ProxySettings` (`Socks4`/`Socks5*`).
+    /// Upstream `instantiate_connection` only installs credentials
+    /// for `socks5_pw` — `socks5`/`socks4` never carry a username on
+    /// the wire even when `proxy_username` is set, so they get empty
+    /// credentials here too.
     #[must_use]
     pub fn from_settings(
         inner: Arc<dyn PeerConnector>,
         proxy_addr: SocketAddr,
         p: &ProxySettings,
     ) -> Self {
+        let with_creds = p.proxy_type == ProxyType::Socks5Password;
         Self::new(
             inner,
             proxy_addr,
@@ -130,8 +135,16 @@ impl SocksConnector {
                 ProxyType::Socks4 => 4,
                 _ => 5,
             },
-            p.username.clone(),
-            p.password.clone(),
+            if with_creds {
+                p.username.clone()
+            } else {
+                String::new()
+            },
+            if with_creds {
+                p.password.clone()
+            } else {
+                String::new()
+            },
         )
     }
 }

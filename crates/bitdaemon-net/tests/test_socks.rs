@@ -864,8 +864,14 @@ async fn socks5_udp_associate_relay() {
         }),
         udp,
         proxy,
-        "",
-        "",
+        bitdaemon_net::socks_udp::Socks5UdpConfig {
+            user: String::new(),
+            password: String::new(),
+            authenticate: false,
+            proxy_peer: true,
+            proxy_tracker: true,
+            local_ep: None,
+        },
     )
     .await
     .expect("associate");
@@ -891,5 +897,453 @@ async fn socks5_udp_associate_relay() {
     frag[2] = 1;
     assert!(socks5_unwrap(&frag).is_none());
 
+    server_task.await.unwrap();
+}
+
+// ---------- A24 regression tests ----------
+
+/// Shared mocks for the associate-path tests: a `PeerConnector`
+/// handing out scripted duplex streams, and a channel-backed
+/// `DatagramSocket`.
+mod udp_mocks {
+    use bitdaemon_net::transport::{BoxedPeerStream, DatagramSocket, PeerConnector};
+    use std::fmt::Debug;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    #[derive(Debug)]
+    pub struct Ctrl {
+        pub streams: std::sync::Mutex<std::collections::VecDeque<BoxedPeerStream>>,
+    }
+    impl PeerConnector for Ctrl {
+        fn connect(
+            self: Arc<Self>,
+            _addr: SocketAddr,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = bitdaemon_net::Result<BoxedPeerStream>>
+                    + Send
+                    + Sync,
+            >,
+        > {
+            let s = self.streams.lock().unwrap().pop_front();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(s);
+            Box::pin(async move {
+                rx.await
+                    .map_err(|_| bitdaemon_net::NetError::NoTransport("no mock"))?
+                    .ok_or(bitdaemon_net::NetError::NoTransport("no mock"))
+            })
+        }
+    }
+
+    pub struct Udp {
+        pub rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+        pub tx: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
+        pub me: SocketAddr,
+    }
+    impl Debug for Udp {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Udp").finish()
+        }
+    }
+    impl DatagramSocket for Udp {
+        fn send_to<'a>(
+            &'a self,
+            buf: &'a [u8],
+            to: SocketAddr,
+        ) -> bitdaemon_net::transport::BoxFut<'a, usize> {
+            Box::pin(async move {
+                let _ = self.tx.send((buf.to_vec(), to));
+                Ok(buf.len())
+            })
+        }
+        fn recv_from<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> bitdaemon_net::transport::BoxFut<'a, (usize, SocketAddr)> {
+            Box::pin(async move {
+                let (d, from) = self
+                    .rx
+                    .lock()
+                    .await
+                    .recv()
+                    .await
+                    .ok_or_else(|| std::io::Error::other("closed"))?;
+                let n = d.len().min(buf.len());
+                buf[..n].copy_from_slice(&d[..n]);
+                Ok((n, from))
+            })
+        }
+        fn local_addr(&self) -> SocketAddr {
+            self.me
+        }
+    }
+}
+
+/// D2 — a domain BND reply must still yield a usable relay:
+/// proxy IP + BND.PORT (`udp_socket.cpp` `read_domainname`).
+#[tokio::test]
+async fn socks5_associate_domain_bnd_keeps_bnd_port() {
+    use bitdaemon_net::socks_udp::{Socks5UdpConfig, Socks5UdpSocket};
+    use udp_mocks::*;
+
+    let proxy = SocketAddr::from(([127, 0, 0, 1], 1080));
+    let bnd_port: u16 = 19001;
+    let (client, mut server) = duplex(4096);
+    let server_task = tokio::spawn(async move {
+        let mut m = [0u8; 3];
+        server.read_exact(&mut m).await.unwrap();
+        server.write_all(&[5, 0]).await.unwrap();
+        let mut req = [0u8; 10];
+        server.read_exact(&mut req).await.unwrap();
+        assert_eq!(&req[..4], &[5, 3, 0, 1]);
+        // reply: ATYP 3, domain "relay", BND.PORT
+        let mut rep = vec![5u8, 0, 0, 3, 5];
+        rep.extend_from_slice(b"relay");
+        rep.extend_from_slice(&bnd_port.to_be_bytes());
+        server.write_all(&rep).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    });
+
+    let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let udp = Arc::new(Udp {
+        rx: tokio::sync::Mutex::new(in_rx),
+        tx: out_tx,
+        me: SocketAddr::from(([10, 0, 0, 9], 5555)),
+    });
+    drop(in_tx);
+    let sock = Socks5UdpSocket::associate(
+        Arc::new(Ctrl {
+            streams: std::sync::Mutex::new(
+                [Box::new(client) as bitdaemon_net::transport::BoxedPeerStream].into(),
+            ),
+        }),
+        udp,
+        proxy,
+        Socks5UdpConfig {
+            user: String::new(),
+            password: String::new(),
+            authenticate: false,
+            proxy_peer: true,
+            proxy_tracker: true,
+            local_ep: None,
+        },
+    )
+    .await
+    .expect("associate");
+    assert_eq!(
+        sock.local_addr(),
+        SocketAddr::from(([127, 0, 0, 1], bnd_port))
+    );
+    server_task.await.unwrap();
+}
+
+/// D4 — datagrams not arriving from the relay endpoint are dropped
+/// (`p.from != m_socks5_connection->target()` upstream).
+#[tokio::test]
+async fn socks5_udp_recv_drops_non_relay_source() {
+    use bitdaemon_net::socks_udp::{Socks5UdpConfig, Socks5UdpSocket, socks5_wrap};
+    use bitdaemon_net::transport::DatagramSocket;
+    use udp_mocks::*;
+
+    let proxy = SocketAddr::from(([127, 0, 0, 1], 1080));
+    let relay = SocketAddr::from(([127, 0, 0, 1], 19000));
+    let (client, mut server) = duplex(4096);
+    let server_task = tokio::spawn(async move {
+        let mut m = [0u8; 3];
+        server.read_exact(&mut m).await.unwrap();
+        server.write_all(&[5, 0]).await.unwrap();
+        let mut req = [0u8; 10];
+        server.read_exact(&mut req).await.unwrap();
+        let mut rep = vec![5u8, 0, 0, 1];
+        rep.extend_from_slice(&[127, 0, 0, 1]);
+        rep.extend_from_slice(&19000u16.to_be_bytes());
+        server.write_all(&rep).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    });
+
+    let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let udp = Arc::new(Udp {
+        rx: tokio::sync::Mutex::new(in_rx),
+        tx: out_tx,
+        me: SocketAddr::from(([10, 0, 0, 9], 5555)),
+    });
+    let sock = Socks5UdpSocket::associate(
+        Arc::new(Ctrl {
+            streams: std::sync::Mutex::new(
+                [Box::new(client) as bitdaemon_net::transport::BoxedPeerStream].into(),
+            ),
+        }),
+        udp,
+        proxy,
+        Socks5UdpConfig {
+            user: String::new(),
+            password: String::new(),
+            authenticate: false,
+            proxy_peer: true,
+            proxy_tracker: true,
+            local_ep: None,
+        },
+    )
+    .await
+    .expect("associate");
+
+    let src = SocketAddr::from(([203, 0, 113, 9], 6881));
+    let spoofed = SocketAddr::from(([198, 51, 100, 1], 9999));
+    // a wrapped datagram from a *different* socket — dropped
+    in_tx.send((socks5_wrap(src, b"spoof"), spoofed)).unwrap();
+    // then a legit relayed one — delivered
+    in_tx.send((socks5_wrap(src, b"real"), relay)).unwrap();
+    let mut buf = [0u8; 128];
+    let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+    assert_eq!(from, src);
+    assert_eq!(&buf[..n], b"real");
+    server_task.await.unwrap();
+}
+
+/// D7 — `send_hostname` wraps ATYP-3 datagrams for the relay.
+#[tokio::test]
+async fn socks5_udp_send_hostname() {
+    use bitdaemon_net::socks_udp::{Socks5UdpConfig, Socks5UdpSocket, socks5_wrap_hostname};
+    use bitdaemon_net::transport::{DatagramSendFlags, DatagramSocket};
+    use udp_mocks::*;
+
+    let proxy = SocketAddr::from(([127, 0, 0, 1], 1080));
+    let relay = SocketAddr::from(([127, 0, 0, 1], 19000));
+    let (client, mut server) = duplex(4096);
+    let server_task = tokio::spawn(async move {
+        let mut m = [0u8; 3];
+        server.read_exact(&mut m).await.unwrap();
+        server.write_all(&[5, 0]).await.unwrap();
+        let mut req = [0u8; 10];
+        server.read_exact(&mut req).await.unwrap();
+        let mut rep = vec![5u8, 0, 0, 1];
+        rep.extend_from_slice(&[127, 0, 0, 1]);
+        rep.extend_from_slice(&19000u16.to_be_bytes());
+        server.write_all(&rep).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    });
+
+    let (_in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let udp = Arc::new(Udp {
+        rx: tokio::sync::Mutex::new(in_rx),
+        tx: out_tx,
+        me: SocketAddr::from(([10, 0, 0, 9], 5555)),
+    });
+    let sock = Socks5UdpSocket::associate(
+        Arc::new(Ctrl {
+            streams: std::sync::Mutex::new(
+                [Box::new(client) as bitdaemon_net::transport::BoxedPeerStream].into(),
+            ),
+        }),
+        udp,
+        proxy,
+        Socks5UdpConfig {
+            user: String::new(),
+            password: String::new(),
+            authenticate: false,
+            proxy_peer: true,
+            proxy_tracker: true,
+            local_ep: None,
+        },
+    )
+    .await
+    .expect("associate");
+
+    sock.send_hostname(
+        "tr.example.com",
+        443,
+        b"ann",
+        DatagramSendFlags::TRACKER_CONNECTION,
+    )
+    .await
+    .unwrap();
+    let (dgram, to) = out_rx.recv().await.unwrap();
+    assert_eq!(to, relay);
+    assert_eq!(dgram, socks5_wrap_hostname("tr.example.com", 443, b"ann"));
+    server_task.await.unwrap();
+}
+
+/// D10 — per-datagram proxy gating: unproxied classes go direct,
+/// everything else through the relay.
+#[tokio::test]
+async fn socks5_udp_per_usage_gating() {
+    use bitdaemon_net::socks_udp::{Socks5UdpConfig, Socks5UdpSocket, socks5_wrap};
+    use bitdaemon_net::transport::{DatagramSendFlags, DatagramSocket};
+    use udp_mocks::*;
+
+    let proxy = SocketAddr::from(([127, 0, 0, 1], 1080));
+    let relay = SocketAddr::from(([127, 0, 0, 1], 19000));
+    let (client, mut server) = duplex(4096);
+    let server_task = tokio::spawn(async move {
+        let mut m = [0u8; 3];
+        server.read_exact(&mut m).await.unwrap();
+        server.write_all(&[5, 0]).await.unwrap();
+        let mut req = [0u8; 10];
+        server.read_exact(&mut req).await.unwrap();
+        let mut rep = vec![5u8, 0, 0, 1];
+        rep.extend_from_slice(&[127, 0, 0, 1]);
+        rep.extend_from_slice(&19000u16.to_be_bytes());
+        server.write_all(&rep).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    });
+
+    let (_in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let udp = Arc::new(Udp {
+        rx: tokio::sync::Mutex::new(in_rx),
+        tx: out_tx,
+        me: SocketAddr::from(([10, 0, 0, 9], 5555)),
+    });
+    // peers proxied, trackers NOT — mirrors a mixed config
+    let sock = Socks5UdpSocket::associate(
+        Arc::new(Ctrl {
+            streams: std::sync::Mutex::new(
+                [Box::new(client) as bitdaemon_net::transport::BoxedPeerStream].into(),
+            ),
+        }),
+        udp,
+        proxy,
+        Socks5UdpConfig {
+            user: String::new(),
+            password: String::new(),
+            authenticate: false,
+            proxy_peer: true,
+            proxy_tracker: false,
+            local_ep: None,
+        },
+    )
+    .await
+    .expect("associate");
+
+    let target = SocketAddr::from(([192, 0, 2, 1], 6881));
+    // tracker traffic exempt → direct, unwrapped, to the tracker
+    sock.send_to_flags(b"scrape", target, DatagramSendFlags::TRACKER_CONNECTION)
+        .await
+        .unwrap();
+    let (dgram, to) = out_rx.recv().await.unwrap();
+    assert_eq!(to, target);
+    assert_eq!(dgram, b"scrape");
+    // peer traffic → wrapped, to the relay
+    sock.send_to_flags(b"utp", target, DatagramSendFlags::PEER_CONNECTION)
+        .await
+        .unwrap();
+    let (dgram, to) = out_rx.recv().await.unwrap();
+    assert_eq!(to, relay);
+    assert_eq!(dgram, socks5_wrap(target, b"utp"));
+    // unclassed traffic (DHT) → proxied
+    sock.send_to(b"dht", target).await.unwrap();
+    let (dgram, to) = out_rx.recv().await.unwrap();
+    assert_eq!(to, relay);
+    assert_eq!(dgram, socks5_wrap(target, b"dht"));
+    server_task.await.unwrap();
+}
+
+/// D1 — `SocksConnector::from_settings` must not advertise user/pass
+/// for `proxy_type == socks5` even when a username is configured
+/// (upstream only installs credentials for `socks5_pw`).
+#[tokio::test]
+async fn socks5_type_ignores_configured_username() {
+    use bitdaemon_net::proxy::{ProxySettings, ProxyType, SocksConnector};
+    use bitdaemon_net::transport::{BoxedPeerStream, PeerConnector};
+
+    #[derive(Debug)]
+    struct M(std::sync::Mutex<Option<BoxedPeerStream>>);
+    impl PeerConnector for M {
+        fn connect(
+            self: Arc<Self>,
+            _a: SocketAddr,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = bitdaemon_net::Result<BoxedPeerStream>>
+                    + Send
+                    + Sync,
+            >,
+        > {
+            let s = self.0.lock().unwrap().take();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(s);
+            Box::pin(async move {
+                rx.await
+                    .map_err(|_| bitdaemon_net::NetError::NoTransport("no mock"))?
+                    .ok_or(bitdaemon_net::NetError::NoTransport("no mock"))
+            })
+        }
+    }
+
+    let (client, mut server) = duplex(4096);
+    let server_task = tokio::spawn(async move {
+        // no-auth greeting despite the configured username
+        let mut g = [0u8; 3];
+        server.read_exact(&mut g).await.unwrap();
+        assert_eq!(g, [5, 1, 0]);
+        server.write_all(&[5, 0]).await.unwrap();
+        let mut req = [0u8; 10];
+        server.read_exact(&mut req).await.unwrap();
+        server
+            .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+    });
+
+    let ps = ProxySettings {
+        proxy_type: ProxyType::Socks5,
+        hostname: "127.0.0.1".into(),
+        port: 1080,
+        username: "alice".into(),
+        password: "secret".into(),
+        ..ProxySettings::default()
+    };
+    let conn = Arc::new(SocksConnector::from_settings(
+        Arc::new(M(std::sync::Mutex::new(Some(Box::new(client))))),
+        "127.0.0.1:1080".parse().unwrap(),
+        &ps,
+    ));
+    conn.connect("10.0.0.1:6881".parse().unwrap())
+        .await
+        .unwrap();
+    server_task.await.unwrap();
+}
+
+/// D8 — CONNECT to an unspecified endpoint is rejected before any
+/// wire write (`invalid_argument` upstream); UDP ASSOCIATE stays free
+/// to send 0.0.0.0:0.
+#[tokio::test]
+async fn socks5_connect_unspecified_rejected() {
+    let (mut client, _server) = duplex(4096);
+    let target = SocksTarget::Addr(SocketAddr::from(([0, 0, 0, 0], 0)));
+    let err = socks_connect(&mut client, 5, "", "", &target, SocksCommand::Connect)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SocksError::UnspecifiedEndpoint));
+}
+
+/// D9 — an unknown ATYP in the reply maps to
+/// `address_family_not_supported` upstream.
+#[tokio::test]
+async fn socks5_unknown_atyp_maps_family_error() {
+    let (mut client, mut server) = duplex(4096);
+    let server_task = tokio::spawn(async move {
+        let mut g = [0u8; 3];
+        server.read_exact(&mut g).await.unwrap();
+        server.write_all(&[5, 0]).await.unwrap();
+        let mut req = [0u8; 10];
+        server.read_exact(&mut req).await.unwrap();
+        // reply with atyp 0x7f (unknown)
+        server
+            .write_all(&[5, 0, 0, 0x7f, 0, 0, 0, 0])
+            .await
+            .unwrap();
+    });
+    let target = SocksTarget::Addr(SocketAddr::from(([10, 0, 0, 1], 80)));
+    let err = socks_connect(&mut client, 5, "", "", &target, SocksCommand::Connect)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SocksError::AddrFamilyNotSupported));
     server_task.await.unwrap();
 }

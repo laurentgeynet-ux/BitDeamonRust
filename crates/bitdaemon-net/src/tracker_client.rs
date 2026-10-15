@@ -433,30 +433,74 @@ pub struct TrackerTimeouts {
     pub conn_id_ttl: Duration,
 }
 
+/// UDP tracker destination — `m_target` upstream: either a resolved
+/// endpoint or a hostname the SOCKS5 proxy resolves (`proxy_hostnames`
+/// and a socks5 proxy → `send_hostname` ATYP-3 datagrams, no local
+/// DNS leak, see `udp_tracker_connection::start`).
+#[derive(Debug, Clone, Copy)]
+pub enum UdpTarget<'a> {
+    /// Resolved endpoint.
+    Addr(SocketAddr),
+    /// Unresolved `host:port` — requires a proxy datagram lane that
+    /// implements [`DatagramSocket::send_hostname`].
+    Name { host: &'a str, port: u16 },
+}
+
+impl UdpTarget<'_> {
+    /// `m_target.is_v6()` — names resolve to the unspecified v4
+    /// placeholder upstream; literal IPv6 names report v6.
+    fn is_ipv6(self) -> bool {
+        match self {
+            Self::Addr(a) => a.is_ipv6(),
+            Self::Name { host, .. } => host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_ipv6()),
+        }
+    }
+
+    /// `udp_socket::send`/`send_hostname` with
+    /// `tracker_connection` set — the per-datagram proxy gate.
+    async fn send(self, dgram: &dyn DatagramSocket, pkt: &[u8]) -> std::io::Result<usize> {
+        let flags = crate::transport::DatagramSendFlags::TRACKER_CONNECTION;
+        match self {
+            Self::Addr(a) => dgram.send_to_flags(pkt, a, flags).await,
+            Self::Name { host, port } => dgram.send_hostname(host, port, pkt, flags).await,
+        }
+    }
+}
+
 /// BEP-15 connect phase — answered `connection_id`s are cached per
 /// tracker address (`udp_tracker_connection_manager::
 /// m_connection_cache` upstream) and reused while unexpired.
 async fn udp_connect(
     dgram: &dyn DatagramSocket,
     demux: &UdpTrackerDemux,
-    tracker: SocketAddr,
+    tracker: UdpTarget<'_>,
     timeouts: &TrackerTimeouts,
     stats: &mut crate::http_conn::WireStats,
 ) -> Result<u64, AnnounceError> {
-    if let Some(id) = demux.cached_conn_id(tracker.ip()) {
+    // the connection-id cache is keyed by resolved IP — a proxied
+    // hostname has none (`m_target` is the unspecified placeholder).
+    let cache_key = match tracker {
+        UdpTarget::Addr(a) => Some(a.ip()),
+        UdpTarget::Name { .. } => None,
+    };
+    if let Some(id) = cache_key.and_then(|ip| demux.cached_conn_id(ip)) {
         return Ok(id);
     }
     let tid = new_tid();
     let mut w = udp_waiter(demux, tid);
     let pkt = build_connect(tid);
-    let _ = dgram.send_to(&pkt, tracker).await?;
+    let _ = tracker.send(dgram, &pkt).await?;
     stats.sent += pkt.len() as i64 + 28; // UDP/IP header estimate
     loop {
         let buf = wait_reply(&mut w, timeouts.receive).await?;
         stats.recv += buf.len() as i64 + 28;
         match parse_connect_response(&buf, tid) {
             Ok(id) => {
-                demux.store_conn_id(tracker.ip(), id, timeouts.conn_id_ttl);
+                if let Some(ip) = cache_key {
+                    demux.store_conn_id(ip, id, timeouts.conn_id_ttl);
+                }
                 return Ok(id);
             }
             Err(UdpTrackerError::Tracker(m)) => {
@@ -483,7 +527,7 @@ async fn udp_connect(
 pub async fn announce_udp(
     dgram: &dyn DatagramSocket,
     demux: &UdpTrackerDemux,
-    tracker: SocketAddr,
+    tracker: UdpTarget<'_>,
     p: &AnnounceParams,
     opts: &crate::http_tracker::AnnounceOptions,
     timeouts: TrackerTimeouts,
@@ -527,7 +571,7 @@ pub async fn announce_udp(
     };
     let mut w = udp_waiter(demux, tid);
     let pkt = build_announce(conn_id, tid, &req);
-    let _ = dgram.send_to(&pkt, tracker).await?;
+    let _ = tracker.send(dgram, &pkt).await?;
     stats.sent += pkt.len() as i64 + 28;
     loop {
         let buf = wait_reply(&mut w, timeouts.receive).await?;
@@ -562,7 +606,7 @@ pub async fn announce_udp(
 pub async fn scrape_udp(
     dgram: &dyn DatagramSocket,
     demux: &UdpTrackerDemux,
-    tracker: SocketAddr,
+    tracker: UdpTarget<'_>,
     info_hash: &[u8; 20],
     timeouts: TrackerTimeouts,
     stats: &mut crate::http_conn::WireStats,
@@ -572,7 +616,7 @@ pub async fn scrape_udp(
     let tid = new_tid();
     let pkt = build_scrape(conn_id, tid, &[*info_hash]);
     let mut w = udp_waiter(demux, tid);
-    let _ = dgram.send_to(&pkt, tracker).await?;
+    let _ = tracker.send(dgram, &pkt).await?;
     stats.sent += pkt.len() as i64 + 28;
     loop {
         let buf = wait_reply(&mut w, timeouts.receive).await?;

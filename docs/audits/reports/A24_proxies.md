@@ -219,3 +219,51 @@ proxifiés même si `proxy_peer_connections`).
 - `host_len < 3` sur BND domaine (upstream : seulement dans
   `socks5_stream`, pas dans le chemin UDP) — check conservé côté Rust,
   partagé entre les deux chemins ; écart minimal documenté en D2.
+
+## Résultat
+
+Appliqué sur `audit/24-proxies` (worktree `C:/Projet/wt/LibtorrentRust-a24`).
+
+### Déviations corrigées
+
+- **D1** — credentials seulement pour `Socks5Password`/`HttpPassword`
+  (`instantiate`, `SocksConnector`, `HttpConnectConnector`,
+  `socks4` userid).
+- **D2** — réponse bound retourne `Socks5Bound` ; BND domaine préserve
+  `BND.PORT` (fallback IP proxy + port retourné).
+- **D3** — conservé : substitution IP proxy quand `BND.ADDR` est
+  non-spécifié (comportement upstream).
+- **D4** — `recv_from` droppe les datagrammes non-relais.
+- **D5** — timeout connect 10 s, retry backoff `min(120,f²/2)+5`s,
+  watchdog de fermeture du TCP de contrôle.
+- **D6** — `socks5_udp_send_local_ep` câblé dans la requête
+  UDP ASSOCIATE.
+- **D7** — `DatagramSocket::send_hostname` ajouté ; UDP trackers
+  émettent `UdpTarget::Name` en ATYP 3 sous `proxy_hostnames`
+  (announce + scrape côté engine).
+- **D8** — CONNECT vers une adresse numérique non-spécifiée rejeté
+  avant tout I/O (`UnspecifiedEndpoint`).
+- **D9** — ATYP inconnu dans la réponse mappe vers l'erreur famille
+  adéquate (`socks5_unknown_atyp_maps_family_error`).
+- **D10** — `DatagramSendFlags` distingue peer/tracker/unclassifié ;
+  gating par datagramme (`proxy_peer_connections`,
+  `proxy_tracker_connections`).
+
+### Tests ajoutés (`crates/bitdaemon-net/tests/test_socks.rs`)
+
+- `socks5_type_ignores_configured_username` (D1)
+- `socks5_associate_domain_bnd_keeps_bnd_port` (D2)
+- `socks5_udp_recv_drops_non_relay_source` (D4)
+- `socks5_udp_send_hostname` (D7)
+- `socks5_connect_unspecified_rejected` (D8)
+- `socks5_unknown_atyp_maps_family_error` (D9)
+- `socks5_udp_per_usage_gating` (D10)
+- `socks5_udp_associate_relay` (chemin end-to-end du relais)
+
+### Gates
+
+`cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo test --workspace` (115 suites, 0 échec), `cargo doc --workspace
+--no-deps` — tous verts.
+
+Commit : `6329d0a` (`audit/24-proxies`, rebasée sur `main` `3e73574`).

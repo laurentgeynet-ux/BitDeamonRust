@@ -697,14 +697,31 @@ impl Engine {
             return;
         }
         let v4 = DatagramSocket::local_addr(dg.as_ref()).is_ipv4();
+        // `socks5_udp_send_local_ep` — upstream sends the listen
+        // socket's local endpoint (interface IP + listen port) as
+        // DST instead of 0.0.0.0:0.
+        let local_ep = {
+            let s = slock(&self.session);
+            s.settings
+                .socks5_udp_send_local_ep
+                .then(|| SocketAddr::new(dg.local_addr().ip(), s.listen_port))
+        };
         match resolve_for_socket(&self.resolver, &p.hostname, p.port, v4).await {
             Ok(proxy_addr) => {
                 match bitdaemon_net::socks_udp::Socks5UdpSocket::associate(
                     Arc::clone(&self.connector),
                     dg,
                     proxy_addr,
-                    &p.username,
-                    &p.password,
+                    bitdaemon_net::socks_udp::Socks5UdpConfig {
+                        user: p.username.clone(),
+                        password: p.password.clone(),
+                        // upstream only sets credentials for
+                        // `socks5_pw` (`udp_socket.cpp` `on_connected`)
+                        authenticate: p.proxy_type == ProxyType::Socks5Password,
+                        proxy_peer: p.proxy_peer_connections,
+                        proxy_tracker: p.proxy_tracker_connections,
+                        local_ep,
+                    },
                 )
                 .await
                 {
@@ -1250,42 +1267,85 @@ impl Engine {
                         return;
                     };
                     let port = u16::try_from(c.port).unwrap_or(80);
-                    let v4 = DatagramSocket::local_addr(dg.as_ref()).is_ipv4();
-                    match udp_tracker_endpoints(&resolver, &c.hostname, port, v4, &params.filter)
-                        .await
+                    // `udp_tracker_connection::start` — `proxy_hostnames`
+                    // + a socks5 proxy → the name rides ATYP-3
+                    // datagrams (`send_hostname`); resolving it locally
+                    // would leak it in cleartext DNS.
+                    let hostnames_via_proxy = {
+                        let s = slock(&session);
+                        s.settings.proxy_hostnames
+                            && matches!(
+                                s.settings.proxy_type,
+                                bitdaemon_net::proxy::ProxyType::Socks5
+                                    | bitdaemon_net::proxy::ProxyType::Socks5Password
+                            )
+                    };
+                    if hostnames_via_proxy && !bitdaemon_net::ip_helpers::is_ip_address(&c.hostname)
                     {
-                        Err(e) => Err(e),
-                        Ok(eps) => {
-                            // upstream `udp_tracker_connection::fail`
-                            // — a failed target is dropped and the
-                            // next resolved endpoint gets a fresh
-                            // attempt with a re-armed deadline.
-                            let mut result = Err(AnnounceError::TimedOut);
-                            for addr in eps {
-                                match tokio::time::timeout(
-                                    completion,
-                                    announce_udp(
-                                        dg.as_ref(),
-                                        &demux,
-                                        addr,
-                                        &params,
-                                        &opts,
-                                        timeouts,
-                                        &mut stats,
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(r)) => {
-                                        source_ip = Some(addr.ip());
-                                        result = Ok(r);
-                                        break;
+                        match tokio::time::timeout(
+                            completion,
+                            announce_udp(
+                                dg.as_ref(),
+                                &demux,
+                                bitdaemon_net::tracker_client::UdpTarget::Name {
+                                    host: &c.hostname,
+                                    port,
+                                },
+                                &params,
+                                &opts,
+                                timeouts,
+                                &mut stats,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => Err(AnnounceError::TimedOut),
+                        }
+                    } else {
+                        let v4 = DatagramSocket::local_addr(dg.as_ref()).is_ipv4();
+                        match udp_tracker_endpoints(
+                            &resolver,
+                            &c.hostname,
+                            port,
+                            v4,
+                            &params.filter,
+                        )
+                        .await
+                        {
+                            Err(e) => Err(e),
+                            Ok(eps) => {
+                                // upstream `udp_tracker_connection::fail`
+                                // — a failed target is dropped and the
+                                // next resolved endpoint gets a fresh
+                                // attempt with a re-armed deadline.
+                                let mut result = Err(AnnounceError::TimedOut);
+                                for addr in eps {
+                                    match tokio::time::timeout(
+                                        completion,
+                                        announce_udp(
+                                            dg.as_ref(),
+                                            &demux,
+                                            bitdaemon_net::tracker_client::UdpTarget::Addr(addr),
+                                            &params,
+                                            &opts,
+                                            timeouts,
+                                            &mut stats,
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(r)) => {
+                                            source_ip = Some(addr.ip());
+                                            result = Ok(r);
+                                            break;
+                                        }
+                                        Ok(Err(e)) => result = Err(e),
+                                        Err(_) => result = Err(AnnounceError::TimedOut),
                                     }
-                                    Ok(Err(e)) => result = Err(e),
-                                    Err(_) => result = Err(AnnounceError::TimedOut),
                                 }
+                                result
                             }
-                            result
                         }
                     }
                 }
@@ -1503,44 +1563,85 @@ impl Engine {
                         return;
                     };
                     let port = u16::try_from(c.port).unwrap_or(80);
-                    let v4 = DatagramSocket::local_addr(dg.as_ref()).is_ipv4();
-                    // scrape carries no torrent `ip_filter` — upstream
-                    // still applies the session filter via `req.filter`
-                    // … which `scrape_tracker` leaves unset, so the
-                    // endpoints go in unfiltered like upstream.
-                    match udp_tracker_endpoints(&resolver, &c.hostname, port, v4, &None).await {
-                        Err(e) => Err(e),
-                        Ok(eps) => {
-                            let mut result = Err(AnnounceError::TimedOut);
-                            for addr in eps {
-                                match tokio::time::timeout(
-                                    completion,
-                                    bitdaemon_net::tracker_client::scrape_udp(
-                                        dg.as_ref(),
-                                        &demux,
-                                        addr,
-                                        &info_hash,
-                                        timeouts,
-                                        &mut stats,
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(r)) => {
-                                        source_ip = Some(addr.ip());
-                                        result = Ok(bitdaemon_net::http_tracker::TrackerResponse {
-                                            complete: i64::from(r.complete),
-                                            incomplete: i64::from(r.incomplete),
-                                            downloaded: i64::from(r.downloaded),
-                                            ..Default::default()
-                                        });
-                                        break;
+                    // same `proxy_hostnames` + socks5 shortcut as the
+                    // announce path — the proxy resolves the name.
+                    let hostnames_via_proxy = {
+                        let s = slock(&session);
+                        s.settings.proxy_hostnames
+                            && matches!(
+                                s.settings.proxy_type,
+                                bitdaemon_net::proxy::ProxyType::Socks5
+                                    | bitdaemon_net::proxy::ProxyType::Socks5Password
+                            )
+                    };
+                    if hostnames_via_proxy && !bitdaemon_net::ip_helpers::is_ip_address(&c.hostname)
+                    {
+                        match tokio::time::timeout(
+                            completion,
+                            bitdaemon_net::tracker_client::scrape_udp(
+                                dg.as_ref(),
+                                &demux,
+                                bitdaemon_net::tracker_client::UdpTarget::Name {
+                                    host: &c.hostname,
+                                    port,
+                                },
+                                &info_hash,
+                                timeouts,
+                                &mut stats,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(r)) => Ok(bitdaemon_net::http_tracker::TrackerResponse {
+                                complete: i64::from(r.complete),
+                                incomplete: i64::from(r.incomplete),
+                                downloaded: i64::from(r.downloaded),
+                                ..Default::default()
+                            }),
+                            Ok(Err(e)) => Err(e),
+                            Err(_) => Err(AnnounceError::TimedOut),
+                        }
+                    } else {
+                        let v4 = DatagramSocket::local_addr(dg.as_ref()).is_ipv4();
+                        // scrape carries no torrent `ip_filter` — upstream
+                        // still applies the session filter via `req.filter`
+                        // … which `scrape_tracker` leaves unset, so the
+                        // endpoints go in unfiltered like upstream.
+                        match udp_tracker_endpoints(&resolver, &c.hostname, port, v4, &None).await {
+                            Err(e) => Err(e),
+                            Ok(eps) => {
+                                let mut result = Err(AnnounceError::TimedOut);
+                                for addr in eps {
+                                    match tokio::time::timeout(
+                                        completion,
+                                        bitdaemon_net::tracker_client::scrape_udp(
+                                            dg.as_ref(),
+                                            &demux,
+                                            bitdaemon_net::tracker_client::UdpTarget::Addr(addr),
+                                            &info_hash,
+                                            timeouts,
+                                            &mut stats,
+                                        ),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(r)) => {
+                                            source_ip = Some(addr.ip());
+                                            result =
+                                                Ok(bitdaemon_net::http_tracker::TrackerResponse {
+                                                    complete: i64::from(r.complete),
+                                                    incomplete: i64::from(r.incomplete),
+                                                    downloaded: i64::from(r.downloaded),
+                                                    ..Default::default()
+                                                });
+                                            break;
+                                        }
+                                        Ok(Err(e)) => result = Err(e),
+                                        Err(_) => result = Err(AnnounceError::TimedOut),
                                     }
-                                    Ok(Err(e)) => result = Err(e),
-                                    Err(_) => result = Err(AnnounceError::TimedOut),
                                 }
+                                result
                             }
-                            result
                         }
                     }
                 }
@@ -1862,7 +1963,12 @@ impl Engine {
                     bitdaemon_net::proxy::ProxyType::Http
                         | bitdaemon_net::proxy::ProxyType::HttpPassword
                 );
-            if using_http_proxy && !proxy.username.is_empty() {
+            // upstream sends `Proxy-Authorization` for `http_pw` only
+            // (`http_connection.cpp`), even if `proxy_username` is set.
+            if using_http_proxy
+                && proxy.proxy_type == bitdaemon_net::proxy::ProxyType::HttpPassword
+                && !proxy.username.is_empty()
+            {
                 headers.proxy_authorization = format!(
                     "Basic {}",
                     String::from_utf8_lossy(&bitdaemon_core::escape_string::base64encode(
@@ -3322,12 +3428,26 @@ impl Engine {
                     )
                     .await
                     {
-                        Ok(addr) => Arc::new(bitdaemon_net::proxy::HttpConnectConnector::new(
-                            connector.clone(),
-                            addr,
-                            peer_proxy.username.clone(),
-                            peer_proxy.password.clone(),
-                        )),
+                        Ok(addr) => {
+                            // `http_pw` only — upstream never installs
+                            // credentials for plain `http` proxies.
+                            let pw = peer_proxy.proxy_type
+                                == bitdaemon_net::proxy::ProxyType::HttpPassword;
+                            Arc::new(bitdaemon_net::proxy::HttpConnectConnector::new(
+                                connector.clone(),
+                                addr,
+                                if pw {
+                                    peer_proxy.username.clone()
+                                } else {
+                                    String::new()
+                                },
+                                if pw {
+                                    peer_proxy.password.clone()
+                                } else {
+                                    String::new()
+                                },
+                            ))
+                        }
                         Err(_) => {
                             send_err(bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
                                 std::io::ErrorKind::Other,
@@ -4782,11 +4902,22 @@ async fn web_seed_dial(
         // `http_connect_stream` — CONNECT tunnel for https.
         let pa =
             proxy_addr.ok_or_else(|| WebSeedDialError::Io("proxy address missing".to_string()))?;
+        // `http_pw` only — upstream never installs credentials for
+        // plain `http` proxies (`instantiate_connection.cpp`).
+        let pw = proxy.proxy_type == ProxyType::HttpPassword;
         let cc = Arc::new(HttpConnectConnector::new(
             connector.clone(),
             pa,
-            proxy.username.clone(),
-            proxy.password.clone(),
+            if pw {
+                proxy.username.clone()
+            } else {
+                String::new()
+            },
+            if pw {
+                proxy.password.clone()
+            } else {
+                String::new()
+            },
         ));
         if name_via_proxy || proxy.send_host_in_connect {
             // hostname in CONNECT (`m_dst_name`) — no local resolve.

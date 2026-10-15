@@ -90,7 +90,7 @@ async fn udp_announce_e2e() {
     let r = announce_udp(
         sock,
         &udp.demux,
-        target,
+        bitdaemon_net::tracker_client::UdpTarget::Addr(target),
         &params(),
         &bitdaemon_net::http_tracker::AnnounceOptions::default(),
         bitdaemon_net::tracker_client::TrackerTimeouts {
@@ -124,7 +124,7 @@ async fn udp_conn_id_reused_within_ttl() {
     announce_udp(
         sock,
         &udp.demux,
-        target,
+        bitdaemon_net::tracker_client::UdpTarget::Addr(target),
         &params(),
         &opts,
         timeouts,
@@ -135,7 +135,7 @@ async fn udp_conn_id_reused_within_ttl() {
     announce_udp(
         sock,
         &udp.demux,
-        target,
+        bitdaemon_net::tracker_client::UdpTarget::Addr(target),
         &params(),
         &opts,
         timeouts,
