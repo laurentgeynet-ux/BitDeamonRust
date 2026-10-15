@@ -362,6 +362,11 @@ pub struct PeerConn {
     pub rate_down_payload: i32,
     /// last sampled `stat_up_total` for payload-rate computation.
     pub last_up_total: i64,
+    /// `m_uploaded_last_second` — payload bytes uploaded during the
+    /// last `second_tick` interval (`stat::last_payload_uploaded()`);
+    /// the instantaneous quantity `fill_send_buffer`'s dynamic
+    /// watermark scales with — *not* the EMA `rate_up_speed`.
+    pub uploaded_last_second: i64,
     /// last sampled `stat_down_total` for rate computation.
     pub last_down_total: i64,
     /// last sampled all-channel totals (`stat_*_total +
@@ -589,6 +594,7 @@ impl PeerConn {
             download_rate_peak: 0,
             upload_rate_peak: 0,
             last_up_total: 0,
+            uploaded_last_second: 0,
             last_down_total: 0,
             last_up_wire: 0,
             last_down_wire: 0,
@@ -1081,6 +1087,7 @@ impl PeerConn {
         piece_length: i64,
         files: Option<&bitdaemon_core::FileStorage>,
         is_seed: bool,
+        super_seeding: bool,
         max_piece_count: i32,
         max_in_queue: i32,
         counters: &crate::counters::Counters,
@@ -1363,6 +1370,20 @@ impl PeerConn {
                 // `incoming_request` — `piece_requests` counts every
                 // request wire message, valid or not.
                 counters.inc(crate::counters::Counter::PieceRequests);
+                // upstream order: the super-seed gate runs *before*
+                // `incoming_have_none` — a request outside the leaked
+                // set is rejected without touching `m_has_metadata`
+                // (peer_connection.cpp:2408-2447).
+                if super_seeding && !self.superseed_pieces.contains(&Some(r.piece)) {
+                    counters.inc(crate::counters::Counter::InvalidPieceRequests);
+                    self.num_invalid_requests += 1;
+                    eff.push(PeerEffect::RejectRequest(r));
+                    eff.push(PeerEffect::InvalidRequest(format!(
+                        "piece not super-seeded: piece {}",
+                        r.piece.0
+                    )));
+                    return;
+                }
                 // an omitted bitfield reads as `have_none` before the
                 // first request; upstream runs the real
                 // `incoming_have_none` (`m_has_metadata` on; the

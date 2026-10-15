@@ -4246,8 +4246,10 @@ impl Torrent {
         let Some(c) = self.peers.get_mut(&peer_id) else {
             return;
         };
-        let watermark = (i64::from(c.rate_up_speed) * i64::from(s.send_buffer_watermark_factor)
-            / 100)
+        // upstream `buffer_size_watermark = m_uploaded_last_second *
+        // send_buffer_watermark_factor / 100` — payload bytes of the
+        // last second, clamped to [low_watermark, watermark].
+        let watermark = (c.uploaded_last_second * i64::from(s.send_buffer_watermark_factor) / 100)
             .clamp(s.send_buffer_low_watermark, s.send_buffer_watermark as i64)
             .max(0) as usize;
         // upstream iterates the whole queue, not just the front: a
@@ -4480,44 +4482,6 @@ impl Torrent {
                     });
                 }
                 PeerEffect::ReadRequest(req) => {
-                    // super-seeding: requests outside the piece we
-                    // leaked get rejected outright (upstream
-                    // `incoming_request` → `write_reject_request`
-                    // + `invalid_request_alert`).
-                    if self.super_seeding {
-                        // `super_seeded_piece` — either of the two
-                        // leaked slots honors the request.
-                        let leaked = self
-                            .peers
-                            .get(&peer_id)
-                            .is_some_and(|c| c.superseed_pieces.contains(&Some(req.piece)));
-                        if !leaked {
-                            counters.inc(crate::counters::Counter::InvalidPieceRequests);
-                            counters.add(crate::counters::Counter::PieceRejects, 1);
-                            if let Some(c) = self.peers.get_mut(&peer_id) {
-                                c.num_invalid_requests += 1;
-                                // rejected requests never enter
-                                // `m_requests` upstream — drop the
-                                // entry peer_conn queued.
-                                c.upload_queue
-                                    .retain(|u| !(u.piece == req.piece && u.start == req.start));
-                                // `write_reject_request` is gated
-                                // on the FAST extension upstream.
-                                if c.supports_fast {
-                                    out.push(TorrentEffect::SendTo {
-                                        peer: peer_id,
-                                        msg: PeerMessage::RejectRequest(req),
-                                    });
-                                }
-                            }
-                            out.push(TorrentEffect::Alert(crate::alerts::Alert::InvalidRequest {
-                                ih: self.info_hash,
-                                remote: remote.clone(),
-                                msg: "piece not super-seeded".into(),
-                            }));
-                            continue;
-                        }
-                    }
                     // upstream `incoming_request`: a peer we choke
                     // only gets BEP-6 `accept_fast` pieces (the set we
                     // offered it — `allowed_fast` is the incoming side);
@@ -4556,8 +4520,18 @@ impl Torrent {
                         // watermark.
                         self.fill_send_buffer(peer_id, s, counters, out);
                     } else {
+                        // upstream `incoming_request` folds
+                        // `!user_have_piece && !predictive && !seed_mode`
+                        // into the same *invalid* branch as the shape
+                        // check — `invalid_piece_requests` +
+                        // `m_num_invalid_requests` + the every-10th
+                        // choke-reminder / >300 disconnect machinery,
+                        // in addition to the reject + alert.
+                        counters.inc(crate::counters::Counter::InvalidPieceRequests);
                         counters.add(crate::counters::Counter::PieceRejects, 1);
+                        let mut reminder: Option<TorrentEffect> = None;
                         if let Some(c) = self.peers.get_mut(&peer_id) {
+                            c.num_invalid_requests += 1;
                             c.upload_queue.retain(|u| {
                                 !(u.piece == req.piece
                                     && u.start == req.start
@@ -4566,6 +4540,24 @@ impl Torrent {
                             // rejected requests never entered the
                             // `num_peers_up_requests` gauge, so the
                             // removal can't drop it either.
+                            // `peer_conn` runs the same leg for
+                            // shape-invalid requests
+                            // (`peer_connection.cpp:2562-2579`).
+                            if !c.peer_interested && c.num_invalid_requests % 10 == 0 && c.choked {
+                                if c.num_invalid_requests > 300 && !c.peer_choked {
+                                    reminder = Some(TorrentEffect::DisconnectPeer {
+                                        peer: peer_id,
+                                        reason: "too many requests when choked",
+                                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                                    });
+                                } else {
+                                    c.last_choke_ms = c.now_ms;
+                                    reminder = Some(TorrentEffect::SendTo {
+                                        peer: peer_id,
+                                        msg: PeerMessage::Choke,
+                                    });
+                                }
+                            }
                         }
                         out.push(TorrentEffect::Alert(crate::alerts::Alert::InvalidRequest {
                             ih: self.info_hash,
@@ -4577,6 +4569,9 @@ impl Torrent {
                                 peer: peer_id,
                                 msg: PeerMessage::RejectRequest(req),
                             });
+                        }
+                        if let Some(e) = reminder {
+                            out.push(e);
                         }
                     }
                 }
@@ -5306,6 +5301,7 @@ impl Torrent {
                 self.piece_length,
                 self.files.as_deref(),
                 is_seed,
+                self.super_seeding,
                 s.max_piece_count,
                 s.max_allowed_in_request_queue,
                 counters,
@@ -9809,6 +9805,12 @@ impl Torrent {
                 // per-peer `stat::rate()` — 5-second exponential moving average
                 // matching upstream `stat_channel::second_tick` (`m_5_sec_average = m_5_sec_average * 4 / 5 + sample / 5`).
                 for c in self.peers.values_mut() {
+                    // `m_uploaded_last_second` — payload bytes since
+                    // the previous tick (upstream samples it in
+                    // `second_tick` via `last_payload_uploaded()`);
+                    // `fill_send_buffer`'s watermark uses this
+                    // instantaneous payload figure, not the EMAs.
+                    c.uploaded_last_second = (c.stat_up_total - c.last_up_total).max(0);
                     let down_delta = c.stat_down_total - c.last_down_total;
                     let current_down =
                         (down_delta as f64 / dt).clamp(0.0, f64::from(i32::MAX)) as i32;
@@ -10898,6 +10900,13 @@ impl Torrent {
         // `m_last_choke` — requests from a choked peer are only
         // tolerated for 2 s after our last Choke.
         c.last_choke_ms = c.now_ms;
+        // upstream `send_choke` emits `write_choke()` *before* draining
+        // `m_requests` with rejects — the wire order is Choke then
+        // RejectRequests.
+        out.push(TorrentEffect::SendTo {
+            peer: id,
+            msg: PeerMessage::Choke,
+        });
         let mut keep = Vec::new();
         for r in c.upload_queue.drain(..) {
             if c.accept_fast.contains(&r.piece) {
@@ -10925,10 +10934,6 @@ impl Torrent {
         }
         // `choke_peer` → `state_updated()` upstream (num_uploads).
         self.state_updated();
-        out.push(TorrentEffect::SendTo {
-            peer: id,
-            msg: PeerMessage::Choke,
-        });
         true
     }
 

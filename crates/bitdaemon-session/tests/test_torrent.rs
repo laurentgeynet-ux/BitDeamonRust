@@ -53,6 +53,7 @@ fn peer_bitfield_refcounts_picker() {
         0x4000 * 8,
         None,
         false,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -347,11 +348,15 @@ fn fill_send_buffer_gates_reads_on_watermark() {
     );
     assert!(t.peers[&1].upload_queue.is_empty());
 
-    // upstream's watermark scales with the measured upload rate:
-    // rate_up_speed × factor/100, clamped to [low, high].
+    // upstream's watermark scales with `m_uploaded_last_second` —
+    // the payload bytes moved during the last tick
+    // (`last_payload_uploaded()`), not the EMA rate:
+    // uploaded_last_second × factor/100, clamped to [low, high].
+    // A high EMA with zero payload last tick must NOT raise it.
     let mut c2 = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
     c2.choked = false;
-    c2.rate_up_speed = 1_000_000; // 1 MB/s × 50 % → 500 KiB cap
+    c2.rate_up_speed = 1_000_000; // EMA alone must not inflate the cap
+    c2.uploaded_last_second = 0;
     for i in 0..3 {
         c2.upload_queue.push(PeerRequest {
             piece: PieceIndex(i),
@@ -367,11 +372,32 @@ fn fill_send_buffer_gates_reads_on_watermark() {
         &bitdaemon_session::counters::Counters::default(),
         &mut out4,
     );
+    // 10 KiB low watermark → only the first 16 KiB read fits.
     assert_eq!(
         out4.iter()
             .filter(|e| matches!(e, TorrentEffect::DiskRead { .. }))
             .count(),
-        3
+        1
+    );
+    // last-second payload sampled at 1 MiB → 500 KiB cap admits all.
+    {
+        let c = t.peers.get_mut(&2).unwrap();
+        c.uploaded_last_second = 1_000_000;
+        c.reading_bytes = 0;
+        c.send_buffer = 0;
+    }
+    let mut out5 = Vec::new();
+    t.fill_send_buffer(
+        2,
+        &s,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out5,
+    );
+    assert_eq!(
+        out5.iter()
+            .filter(|e| matches!(e, TorrentEffect::DiskRead { .. }))
+            .count(),
+        2
     );
 }
 
@@ -614,4 +640,107 @@ fn piece_pass_rewards_dead_conn_downloader() {
     let p = &t.peer_list.peers()[i];
     assert!(!p.on_parole);
     assert_eq!(p.trust_points, -3);
+}
+
+/// A09 — `send_choke` emits the `Choke` wire message *before* draining
+/// the queued upload requests with rejects
+/// (`peer_connection::send_choke`, peer_connection.cpp:3848→3859).
+#[test]
+fn choke_emits_choke_before_rejects() {
+    use bitdaemon_common::PeerRequest;
+    use bitdaemon_session::counters::Counters;
+
+    let mut have = Bitfield::new();
+    have.resize_with(4, true);
+    let mut t = Torrent::new(
+        Sha1Hash::from_bytes(&[9u8; 20]).unwrap(),
+        4,
+        0x40000,
+        have,
+        StorageIndex(0),
+    );
+    let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
+    c.choked = false;
+    c.supports_fast = true;
+    for i in 0..2 {
+        c.upload_queue.push(PeerRequest {
+            piece: PieceIndex(i),
+            start: 0,
+            length: 0x4000,
+        });
+    }
+    t.add_peer(1, c);
+
+    let counters = Counters::default();
+    let mut out = Vec::new();
+    assert!(t.choke_peer(
+        1,
+        &counters,
+        &bitdaemon_net::peer_class::PeerClassPool::new(),
+        &mut out,
+    ));
+
+    let wire: Vec<u8> = out
+        .iter()
+        .filter_map(|e| match e {
+            TorrentEffect::SendTo { msg, .. } => Some(msg.wire_id()),
+            _ => None,
+        })
+        .collect();
+    // Choke (0) first, then the two RejectRequest (0x10).
+    assert_eq!(wire, vec![0, 0x10, 0x10]);
+}
+
+/// A09 — a shape-valid request for a piece we don't have (nor
+/// predictive, nor seed mode) goes through upstream's *invalid*
+/// branch: `invalid_piece_requests` + `m_num_invalid_requests`, not
+/// just the reject (`peer_connection.cpp:2519-2582`).
+#[test]
+fn missing_piece_request_counts_invalid() {
+    use bitdaemon_common::PeerRequest;
+    use bitdaemon_session::counters::{Counter, Counters};
+    use bitdaemon_session::peer_conn::PeerEffect;
+
+    let mut t = torrent(4); // have: all false, not seed, no predictive
+    let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
+    c.choked = false;
+    c.peer_interested = true;
+    c.supports_fast = true;
+    // peer_conn already queued the shape-valid request.
+    c.upload_queue.push(PeerRequest {
+        piece: PieceIndex(0),
+        start: 0,
+        length: 0x4000,
+    });
+    t.add_peer(1, c);
+
+    let counters = Counters::default();
+    let mut out = Vec::new();
+    t.apply_peer_effects(
+        1,
+        vec![PeerEffect::ReadRequest(PeerRequest {
+            piece: PieceIndex(0),
+            start: 0,
+            length: 0x4000,
+        })],
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &counters,
+        &mut out,
+    );
+
+    assert_eq!(counters.value(Counter::InvalidPieceRequests), 1);
+    assert_eq!(t.peers[&1].num_invalid_requests, 1);
+    // request dropped from `m_requests` + BEP-6 reject + alert.
+    assert!(t.peers[&1].upload_queue.is_empty());
+    assert!(out.iter().any(|e| matches!(
+        e,
+        TorrentEffect::SendTo {
+            msg: PeerMessage::RejectRequest(_),
+            ..
+        }
+    )));
+    assert!(out.iter().any(|e| matches!(
+        e,
+        TorrentEffect::Alert(bitdaemon_session::alerts::Alert::InvalidRequest { .. })
+    )));
 }

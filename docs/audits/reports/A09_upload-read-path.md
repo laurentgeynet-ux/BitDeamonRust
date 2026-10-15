@@ -223,3 +223,35 @@ merges séquentiels requis.
 - **`file_error_alert` sans champ `op`** : upstream embarque
   `error.operation` ; l'`Alert::FileError` Rust porte ih/path/error
   (session.rs:1629-1633) — surface d'alerte déjà scopée.
+
+## Résultat
+
+Apply exécuté sur `audit/09-upload-read-path` — les 6 déviations sont
+corrigées, gates vertes (`fmt` / `clippy -D warnings` /
+`test --workspace` / `doc --no-deps`).
+
+- **D1** — `choke_peer` pousse `Choke` avant le drain de rejects
+  (`torrent.rs`, `send_choke` upstream). Régression :
+  `choke_emits_choke_before_rejects` (test_torrent).
+- **D2** — branche not-have : `invalid_piece_requests` +
+  `num_invalid_requests` + machinerie rappel-choke/disconnect
+  (inerte comme upstream — `incoming_interested` est simulé avant).
+  Régression : `missing_piece_request_counts_invalid` (test_torrent).
+- **D3** — `BlockUploaded.block` = `start / block_size`. Régression :
+  `block_uploaded_alert_uses_block_index` (test_session).
+- **D4** — gate `disconnecting` avant `Piece`/`BlockUploaded` sur
+  `DiskCompleted::Read`. Régression :
+  `read_complete_skips_disconnecting_conn` (test_session).
+- **D5** — nouveau champ `PeerConn::uploaded_last_second` samplé dans
+  la boucle de rates (payload du dernier tick) ; le watermark
+  `fill_send_buffer` l'utilise. Régression : test existant
+  `fill_send_buffer_gates_reads_on_watermark` réécrit — l'EMA seule
+  n'admet plus rien au-delà du low watermark.
+- **D6** — rejet super-seed déplacé dans `PeerConn::dispatch` (nouveau
+  param `super_seeding`) avant `incoming_have_none` ; branche torrent
+  supprimée. Régression : `superseed_rejects_before_have_none`
+  (test_peer_dispatch). Signature `dispatch` étendue — tous les
+  call-sites test mis à jour.
+
+`docs/PORTING.md` row `peer_connection.cpp` enrichi (note A09) ;
+changelog en fragment `docs/audits/changelog/A09.md`.

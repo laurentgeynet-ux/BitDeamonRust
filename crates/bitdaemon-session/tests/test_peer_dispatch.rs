@@ -28,6 +28,7 @@ fn bitfield_then_have() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -44,6 +45,7 @@ fn bitfield_then_have() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -84,6 +86,7 @@ fn choke_aborts_unsent_requests() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -120,6 +123,7 @@ fn piece_marks_download_and_requests_more() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -148,6 +152,7 @@ fn invalid_request_rejected_and_alerted() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -187,6 +192,7 @@ fn valid_request_queues_for_upload() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -203,6 +209,7 @@ fn valid_request_queues_for_upload() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -233,6 +240,7 @@ fn choked_request_rejected_then_disconnects() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -251,6 +259,7 @@ fn choked_request_rejected_then_disconnects() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -283,6 +292,7 @@ fn choked_accept_fast_request_served_with_budget() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -302,6 +312,7 @@ fn choked_accept_fast_request_served_with_budget() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -334,6 +345,7 @@ fn request_queue_cap_rejects() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         1,
         &bitdaemon_session::counters::Counters::default(),
@@ -359,6 +371,7 @@ fn request_before_metadata_rejected() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -395,6 +408,7 @@ fn oversized_piece_disconnects() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -440,6 +454,7 @@ fn piece_matching_request_queue_migrates() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -488,6 +503,7 @@ fn unsolicited_piece_inserts_not_wanted_and_writes() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -539,6 +555,7 @@ fn seed_drops_piece_as_seed_waste() {
         0x40000,
         None,
         true,
+        false,
         0x200000,
         2000,
         &counters,
@@ -576,6 +593,7 @@ fn empty_piece_disconnects_invalid_piece() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -619,6 +637,7 @@ fn piece_before_bitfield_runs_have_none() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -656,6 +675,7 @@ fn request_counters() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         2000,
         &counters,
@@ -677,6 +697,7 @@ fn request_counters() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -700,6 +721,7 @@ fn request_counters() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         0, // max_in_queue = 0 → any queued request overflows
         &counters,
@@ -718,6 +740,7 @@ fn request_counters() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         2000,
         &counters,
@@ -732,6 +755,7 @@ fn request_counters() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -765,6 +789,7 @@ fn reject_aborts_and_frees_inflight_block() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -817,6 +842,7 @@ fn malformed_reject_is_a_noop() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -837,6 +863,7 @@ fn malformed_reject_is_a_noop() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -885,6 +912,7 @@ fn invalid_piece_shapes_disconnect() {
             0x4000,
             0x40000,
             None,
+            false,
             false,
             0x200000,
             2000,
@@ -938,6 +966,7 @@ fn reject_of_timed_out_block_does_not_reabort() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -979,6 +1008,7 @@ fn parole_reject_requeues_request() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -1024,6 +1054,7 @@ fn fast_messages_require_fast_negotiation() {
             0x40000,
             None,
             false,
+            false,
             0x200000,
             2000,
             &bitdaemon_session::counters::Counters::default(),
@@ -1058,6 +1089,7 @@ fn fast_messages_accepted_when_negotiated() {
             0x4000,
             0x40000,
             None,
+            false,
             false,
             0x200000,
             2000,
@@ -1096,6 +1128,7 @@ fn choke_without_fast_rejects_download_queue() {
         0x40000,
         None,
         false,
+        false,
         0x200000,
         2000,
         &bitdaemon_session::counters::Counters::default(),
@@ -1124,6 +1157,7 @@ fn choke_without_fast_rejects_download_queue() {
         0x4000,
         0x40000,
         None,
+        false,
         false,
         0x200000,
         2000,
@@ -1159,4 +1193,52 @@ fn choke_without_fast_rejects_download_queue() {
         "implicit reject flushes the request queue: {eff:?}"
     );
     assert_eq!(c.pipeline.outstanding_bytes, 0);
+}
+
+/// A09 — super-seeding: a request outside the leaked slots is
+/// rejected *before* `incoming_have_none` runs (upstream order,
+/// peer_connection.cpp:2408-2447) — `m_has_metadata` stays cleared
+/// and the bitfield-omission leg does not fire.
+#[test]
+fn superseed_rejects_before_have_none() {
+    let counters = bitdaemon_session::counters::Counters::default();
+    let mut c = conn();
+    c.supports_fast = true;
+    // peer advertised ut_metadata with no size → has_metadata cleared.
+    c.has_metadata = false;
+    let r = bitdaemon_common::PeerRequest {
+        piece: PieceIndex(1),
+        start: 0,
+        length: 0x4000,
+    };
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Request(r),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        true, // super_seeding — piece 1 not in superseed_pieces
+        0x200000,
+        2000,
+        &counters,
+        &mut eff,
+    );
+    assert!(c.upload_queue.is_empty());
+    assert!(!c.bitfield_received, "have_none must not run");
+    assert!(!c.has_metadata, "m_has_metadata must stay cleared");
+    assert_eq!(c.num_invalid_requests, 1);
+    assert_eq!(
+        counters.value(bitdaemon_session::counters::Counter::InvalidPieceRequests),
+        1
+    );
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, PeerEffect::RejectRequest(_)))
+    );
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, PeerEffect::InvalidRequest(_)))
+    );
 }
