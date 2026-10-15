@@ -252,3 +252,40 @@ remplacé par `disk_cache` sur pread). Sévérité : cosmétique/dead-code.
   de remise en cache** (`disk_io.rs:580-603`) ==
   `flush_cache_blocks` (`pread_disk_io.cpp:1837-1853`,
   `flushed.set_bit` même en erreur).
+
+## Résultat
+
+Appliqué sur `audit/16-disk-cache-pool` (branche du worktree
+`C:/Projet/wt/LibtorrentRust-a16`).
+
+- **D1 corrigé** : `DiskCache::in_flight_blocks` trace les buffers pris
+  par `take_*_run` ; la boucle watermark de `flush_after_insert` sort
+  quand le niveau *prédit* `write_blocks - in_flight` atteint le low
+  watermark (`disk_io.rs`, `disk_cache.rs`).
+- **D2 corrigé** : `num_cached_blocks` ne croît que sur slot réellement
+  occupé ; le writer supersédé perd `CACHED` → `job_done` relâche son
+  slot `write_blocks`. Fuites adjacentes couvertes : buffers résiduels
+  relâchés via le compte retourné par `abort_all_writers`
+  (`remove_torrent`, `abort_jobs`), orphans drainés avant le drop du
+  storage (handlers exactement une fois), `Drop` draine les orphans
+  restants, writer hors-bornes aborté au lieu d'être droppé.
+- **D3 corrigé** : le drain évalue `write_blocks` global et itère
+  `take_coalesced` sur toutes les storages (snapshot `Arc`, pas de
+  lock storages→cache maintenu — ordre inverse utilisé par
+  `RemoveTorrent`).
+- **D4 gardé** (choix humain) : `cache_expiry`/`flush_expired` restent
+  une extension documentée — déplacé en Non-bugs.
+- **D5 corrigé** : `v2_pending` supprimé.
+- **D6 corrigé** : `NEEDS_HASHER_KICK` posé à l'émission, effacé dans
+  `hashed_block`.
+- **D7 corrigé** : `StoreBuffer::insert` → `entry().or_insert`.
+
+Tests de régression ajoutés :
+`disk_cache::tests::{duplicate_insert_keeps_block_count_and_supersedes,
+in_flight_blocks_tracks_taken_runs, hasher_kick_emitted_once_per_cursor,
+abort_all_writers_reports_buffers}`,
+`test_disk_io::duplicate_write_releases_back_pressure_slot`,
+`test_store_buffer::duplicate_insert_keeps_first_buffer`.
+
+Gates : `cargo fmt` ✓ · `clippy -D warnings` ✓ · `cargo test
+--workspace` ✓ (0 échec) · `cargo doc` ✓.

@@ -105,3 +105,21 @@ fn erase_missing_is_noop_release() {
     sb.erase(loc(1, 2, 0));
     assert!(sb.is_empty());
 }
+
+/// A16 D7 — upstream `unordered_map::insert` keeps the existing entry
+/// on a duplicate key: the store (and so the back-pressure level) is
+/// unchanged, the first buffer wins.
+#[test]
+fn duplicate_insert_keeps_first_buffer() {
+    let sb = StoreBuffer::new(Arc::new(|_| {}));
+    sb.set_max_size(64);
+    let l = loc(1, 2, 0);
+    let b1: Arc<[u8]> = vec![1u8; 2].into();
+    let b2: Arc<[u8]> = vec![2u8; 2].into();
+    sb.insert(l, b1, None);
+    sb.insert(l, b2, None);
+    assert_eq!(sb.len(), 1, "duplicate key does not grow the store");
+    sb.get(l, |b| {
+        assert_eq!(b, &[1u8; 2], "the first buffer stays");
+    });
+}
