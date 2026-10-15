@@ -8984,16 +8984,69 @@ impl Session {
                     out.push(SessionOut::Torrent(TorrentEffect::FileCompleted(index)));
                 }
                 TorrentEffect::MetadataReceived => {
-                    // `torrent::init` — magnets defer storage creation
-                    // until the info dict arrives (file layout was
-                    // unknown). Without this the picker runs but every
-                    // disk job routes to a nonexistent index and the
-                    // download stalls at 0%.
-                    if let Some(idx) = self.create_storage_torrent(&ih) {
-                        self.check_files(ih, None);
-                        tracing::debug!(storage = idx.0, "magnet storage initialized");
+                    // upstream `set_metadata` — before `init()`, the
+                    // resolved info-hash set is checked against every
+                    // other torrent in the session (`find_torrent`
+                    // loop, `torrent.cpp:8363-8395`): two metadata-less
+                    // magnets resolving to the same swarm error +
+                    // pause BOTH and post `torrent_conflict_alert`
+                    // (no `metadata_received_alert`, no storage —
+                    // upstream returns before the `m_torrent_file`
+                    // swap; ours keeps the resolved metadata but the
+                    // torrent is paused-errored and cannot progress).
+                    use bitdaemon_common::info_hash::ProtocolVersion as PV;
+                    let clash = self
+                        .torrents
+                        .get(&ih)
+                        .map(|t| t.info_hashes)
+                        .and_then(|hashes| {
+                            self.torrents.iter().find_map(|(&k, o)| {
+                                if k == ih {
+                                    return None;
+                                }
+                                let mut hit = false;
+                                o.info_hashes.for_each(|oh, _| {
+                                    hit |= oh == hashes.get(PV::V1) || oh == hashes.get(PV::V2);
+                                });
+                                hit.then_some(k)
+                            })
+                        });
+                    if let Some(other_ih) = clash {
+                        for eih in [other_ih, ih] {
+                            if let Some(t) = self.torrents.get_mut(&eih) {
+                                // `set_error(errors::duplicate_torrent,
+                                // error_file_metadata)` + `pause()`.
+                                t.set_error(
+                                    "duplicate torrent",
+                                    crate::status::ERROR_FILE_METADATA,
+                                );
+                                t.paused = true;
+                                t.state_updated();
+                            }
+                            self.alerts.post(Alert::TorrentError {
+                                ih: eih,
+                                error: "duplicate torrent".into(),
+                                file: String::new(),
+                            });
+                        }
+                        self.alerts.post(Alert::TorrentConflict {
+                            ih,
+                            other: None,
+                            url: String::new(),
+                        });
+                    } else {
+                        // `torrent::init` — magnets defer storage
+                        // creation until the info dict arrives (file
+                        // layout was unknown). Without this the picker
+                        // runs but every disk job routes to a
+                        // nonexistent index and the download stalls
+                        // at 0%.
+                        if let Some(idx) = self.create_storage_torrent(&ih) {
+                            self.check_files(ih, None);
+                            tracing::debug!(storage = idx.0, "magnet storage initialized");
+                        }
+                        self.alerts.post(Alert::MetadataReceived { ih });
                     }
-                    self.alerts.post(Alert::MetadataReceived { ih });
                 }
                 TorrentEffect::MetadataFailed => {
                     self.alerts.post(Alert::MetadataFailed {

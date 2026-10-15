@@ -68,3 +68,34 @@ Chevauchements probables : A20 (state machine, `torrent.rs`), A21 (resume, `torr
 - **Handshake sortant `metadata_size`** : annoncé via `engine.rs:3973-3977` quand `!(priv && valid_metadata)` — conforme à `add_handshake`/`create_ut_metadata_plugin` (`ut_metadata.cpp:173-179, 606-612`).
 - **`has_metadata` conn** : ctor `true`, effacé par handshake `ut_metadata` sans `metadata_size`, reposé par les messages piece-level (`peer_conn.rs:197-202, 1817, 1236-1241`) — conforme à `m_has_metadata`/`set_has_metadata` upstream.
 - **Commentaire `metadata_tick_peer` trompeur** (`torrent.rs:2004-2009` dit « first drain … then maybe_send » alors que le code fait `maybe_send` d'abord — comme upstream `tick()` :386-393) : docstring à corriger à l'apply, pas un bug.
+
+## Résultat
+
+Apply effectué dans le worktree `LibtorrentRust-a19` (branche
+`audit/19-magnet-metadata`), les six déviations corrigées :
+
+- **D1** : `set_metadata_verdict` vérifie le jeu complet `InfoHash` —
+  SHA-1 si v1 (avec fallback v2-tronqué-dans-slot-v1 via SHA-256), puis
+  SHA-256 complet si v2 (`torrent.cpp:8277-8310`). Les magnets v2-only
+  et hybrides keyed-v2 résolvent désormais.
+- **D2** : collision au resolve détectée dans le handler
+  `MetadataReceived` (`session.rs`) — torrent déjà connu partageant un
+  hash résolu → les deux marqués conflict/pause avec effet alerte,
+  comme `torrent.cpp:8363-8418`.
+- **D3** : sweep `disconnect_if_redundant` post-init dans
+  `set_metadata_verdict` après l'init picker (`torrent.cpp:8445-8447`).
+- **D4** : `prioritize_pieces` early-return `is_seed()` +
+  `need_save_resume` uniquement sous `filter_updated`.
+- **D5** : `NumTotalPiecesAdded` incrémenté de `num_pieces` au resolve
+  (et au chemin d'init normal), positions `torrent.cpp:458`/`:8442`.
+- **D6** : `to_resume_data` écrit `self.info_hashes` complet pour un
+  magnet — v2 dans `info-hash2`, hybride v1+v2, plus de hash tronqué
+  dans le slot v1.
+
+**Tests** : `tests/test_magnet.rs` — 8 régressions ajoutées (v2-only
+resolve, v2-tronqué, hybride keyed-v2, collision, sweep redundant,
+seed no-op, compteur, resume v2) ; 15/15 verts.
+**Gates** : `fmt`, `clippy -D warnings`, `cargo test --workspace`,
+`cargo doc --no-deps` — tous verts.
+**Commit** : ce commit sur `audit/19-magnet-metadata` (merge `--no-ff`
+dans `main`).

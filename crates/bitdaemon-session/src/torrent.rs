@@ -1257,6 +1257,14 @@ impl Torrent {
                     t.update_piece_priorities(&fp, s, counters, out);
                 }
                 t.apply_resume_data(atp, s, counters, out);
+                // upstream torrent ctor (`torrent.cpp:458`) — the
+                // metadata-present add charges
+                // `num_total_pieces_added`; the magnet path pays it
+                // in `set_metadata` instead.
+                counters.add(
+                    crate::counters::Counter::NumTotalPiecesAdded,
+                    i64::from(ti.num_pieces()),
+                );
                 t
             }
             None => {
@@ -1548,11 +1556,37 @@ impl Torrent {
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) -> MetadataVerdict {
+        // upstream `set_metadata` (`torrent.cpp:8277-8310`) — the
+        // verify runs per *declared* hash, not against the session
+        // map key: with a v1 hash, a SHA-1 miss can still be a
+        // truncated v2 (v1-keyed magnet of a v2-only torrent); with
+        // a v2 hash the full SHA-256 must match. A v2-only magnet's
+        // `info_hash` IS the truncated v2, so SHA-1 alone can never
+        // verify it.
         use sha1::Digest as _;
-        let mut h = sha1::Sha1::new();
-        h.update(metadata);
-        let actual = Sha1Hash::from_bytes(&h.finalize()).unwrap_or_default();
-        if actual != self.info_hash {
+        let sha256 = |m: &[u8]| -> sha2::Sha256 {
+            let mut h = sha2::Sha256::new();
+            h.update(m);
+            h
+        };
+        if self.info_hashes.has_v1() {
+            let mut h = sha1::Sha1::new();
+            h.update(metadata);
+            let v1_match =
+                Sha1Hash::from_bytes(&h.finalize()).unwrap_or_default() == self.info_hashes.v1;
+            if !v1_match {
+                let h2 = sha256(metadata).finalize();
+                if h2[..20] != self.info_hashes.v1.as_bytes()[..] {
+                    return MetadataVerdict::HashMismatch;
+                }
+            }
+        }
+        if self.info_hashes.has_v2()
+            && sha256(metadata).finalize().as_slice() != self.info_hashes.v2.as_bytes()
+        {
+            return MetadataVerdict::HashMismatch;
+        }
+        if !self.info_hashes.has_v1() && !self.info_hashes.has_v2() {
             return MetadataVerdict::HashMismatch;
         }
         let node = match bdecode_checked(metadata) {
@@ -1706,6 +1740,19 @@ impl Torrent {
         // `have` only materialized now): tell whoever holds pieces
         // we want, else the swarm keeps us choked forever.
         self.update_interest_all(counters, out);
+        // upstream `set_metadata` tail (`torrent.cpp:8442-8447`) —
+        // the piece count lands in `num_total_pieces_added` here
+        // (the metadata-present add does it in `from_params`), then
+        // every conn re-runs `disconnect_if_redundant`: peers that
+        // only existed to serve metadata may now be redundant.
+        counters.add(
+            crate::counters::Counter::NumTotalPiecesAdded,
+            i64::from(self.num_pieces),
+        );
+        let ids: Vec<u64> = self.peers.keys().copied().collect();
+        for id in ids {
+            self.disconnect_if_redundant(id, out);
+        }
         MetadataVerdict::Ok
     }
 
@@ -2001,12 +2048,12 @@ impl Torrent {
         }
     }
 
-    /// `ut_metadata_peer_plugin::tick` for one conn — first drain
-    /// its queued incoming requests while the send buffer is under
-    /// the 160 KiB serve limit (upstream `tick()`), then
-    /// `maybe_send_request`: `!valid_metadata && ext id != 0 &&
-    /// sent_requests < 2 && has_metadata` (advertised `metadata_size`
-    /// or retry timer expired).
+    /// `ut_metadata_peer_plugin::tick` for one conn — upstream
+    /// `tick()` order: `maybe_send_request` first (`!valid_metadata
+    /// && ext id != 0 && sent_requests < 2 && has_metadata` —
+    /// advertised `metadata_size` or retry timer expired), then the
+    /// incoming-queue drain while the send buffer is under the
+    /// 160 KiB serve limit.
     fn metadata_tick_peer(&mut self, peer: u64, out: &mut Vec<TorrentEffect>) {
         // upstream `tick()` — `maybe_send_request` first, then the
         // incoming-queue drain.
@@ -2463,7 +2510,12 @@ impl Torrent {
         if let Some(ti) = &self.ti {
             atp.info_hashes = *ti.info_hashes();
         } else {
-            atp.info_hashes.v1 = self.info_hash;
+            // upstream `write_resume_data`: `ret.info_hashes =
+            // m_info_hash` — the full add-time set, not just the
+            // session-map key. A v2-only magnet must land in
+            // `info-hash2`; writing its truncated hash into the v1
+            // slot would restore as a phantom v1 torrent.
+            atp.info_hashes = self.info_hashes;
         }
         // `m_save_path` — without it a restored torrent silently
         // downloads into the caller's CWD instead of its real
@@ -8083,6 +8135,12 @@ impl Torrent {
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
+        // upstream `prioritize_pieces` (`torrent.cpp:5966-5974`) —
+        // seeds return before anything (their picker may not even
+        // exist), and metadata-less calls are dropped outright.
+        if self.is_seed() || !self.valid_metadata() {
+            return;
+        }
         let was_finished = self.is_finished();
         let mut filter_updated = false;
         if let Some(picker) = self.picker.as_mut() {
@@ -8090,7 +8148,11 @@ impl Torrent {
                 filter_updated |= picker.set_piece_priority(PieceIndex(i as i32), *prio);
             }
         }
-        self.need_save_resume = true;
+        // upstream only dirties resume data when a priority actually
+        // changed (`filter_updated` → `set_need_save_resume`).
+        if filter_updated {
+            self.need_save_resume = true;
+        }
         // `remove_time_critical_pieces` — a piece filtered to
         // `dont_download` loses its deadline (canceled alerts post).
         if filter_updated {
