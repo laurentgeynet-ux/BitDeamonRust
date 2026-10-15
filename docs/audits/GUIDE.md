@@ -84,11 +84,13 @@ comportement correct.
 Pour chaque rapport validé :
 
 ```sh
-git worktree add ../LibtorrentRust-a05 -b audit/05-utp-transport
+git worktree add C:/Projet/wt/LibtorrentRust-a05 -b audit/05-utp-transport
 ```
 
-Puis ouvrez une session Devin **sur ce dossier**
-(`D:\Projet\LibtorrentRust-a05`) — les skills sont commités, donc
+Le worktree vit sur **C:** (SSD) — D: est lent, les builds y seraient
+pénibles ; seuls les pointeurs `.git` restent sur D:. Puis ouvrez une
+session Devin **sur ce dossier**
+(`C:\Projet\wt\LibtorrentRust-a05`) — les skills sont commités, donc
 découverts dans le worktree aussi — et lancez :
 
 ```
@@ -100,7 +102,7 @@ complets dans le worktree (`fmt --all`, `clippy --workspace`,
 `test --workspace`, `doc`), écrit le fragment
 `docs/audits/changelog/A05.md` + `## Résultat` dans le rapport, puis
 **merge automatique sur `main` local** : `git rebase main` dans le
-worktree (+ gates si conflits), `git -C ../LibtorrentRust merge
+worktree (+ gates si conflits), `git -C D:/Projet/LibtorrentRust merge
 --no-ff audit/05-utp-transport`, suppression du worktree et de la
 branche. Tout reste local — pas de push, pas de PR, pas de GitHub.
 
@@ -127,9 +129,9 @@ place). Le worktree n'est obligatoire que pour la concurrence.
   si le checkout principal est occupé). En cas de conflit sur
   `torrent.rs` / `peer_conn.rs` / `session.rs` / `PORTING.md` :
   l'agent rebase sa branche sur `main` frais **dans son worktree**,
-  re-run des gates, puis `git -C ../LibtorrentRust merge` à nouveau —
-  tout automatique.
-- Après merge : `git worktree remove ../LibtorrentRust-aNN` +
+  re-run des gates, puis `git -C D:/Projet/LibtorrentRust merge` à
+  nouveau — tout automatique.
+- Après merge : `git worktree remove C:/Projet/wt/LibtorrentRust-aNN` +
   `git branch -d audit/NN-<slug>` — ne pas laisser traîner les
   branches mergées.
 
@@ -187,7 +189,7 @@ révèle un recouvrement chaud, re-planifiez-le vers la vague 4.
 **Conflit de merge sur `torrent.rs` ?**
 Normal en vague 4 — c'est pour ça que les merges sont séquentiels.
 L'agent le résout tout seul : `git rebase main` dans son worktree,
-re-run gates, puis nouveau `git -C ../LibtorrentRust merge`.
+re-run gates, puis nouveau `git -C D:/Projet/LibtorrentRust merge`.
 
 **Une session cloud n'a pas `D:\` ?**
 Le skill résout upstream via `$LIBTORRENT_ROOT` puis clone

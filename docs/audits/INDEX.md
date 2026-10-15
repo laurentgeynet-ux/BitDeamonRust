@@ -77,13 +77,14 @@ Mode `apply` par audit — prérequis : rapport commité + validé. Le
 sans intervention, merge compris :
 
 ```sh
-git worktree add ../LibtorrentRust-aNN -b audit/NN-<slug>
+git worktree add C:/Projet/wt/LibtorrentRust-aNN -b audit/NN-<slug>
+# worktree sur C: (SSD) — D: est lent ; .git reste sur D:
 # l'agent travaille dans ce dossier (target/ isolé → builds parallèles) :
 # gates + changelog fragment + PORTING.md + ## Résultat, commits sur
 # sa branche — puis, automatiquement :
 git rebase main   # dans le worktree, résout les conflits + re-gates
-git -C ../LibtorrentRust merge --no-ff audit/NN-<slug>   # merge sur main
-git worktree remove ../LibtorrentRust-aNN && git branch -d audit/NN-<slug>
+git -C D:/Projet/LibtorrentRust merge --no-ff audit/NN-<slug>   # merge sur main
+git worktree remove C:/Projet/wt/LibtorrentRust-aNN && git branch -d audit/NN-<slug>
 ```
 
 Merges **séquentiels** (un à la fois — si le checkout principal est

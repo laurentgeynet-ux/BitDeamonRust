@@ -148,13 +148,17 @@ autres).
 7. **Worktree + branche** :
 
    ```sh
-   git worktree add ../LibtorrentRust-a26 -b audit/26-dht
+   git worktree add C:/Projet/wt/LibtorrentRust-a26 -b audit/26-dht
    ```
 
-   Travailler dans `D:/Projet/LibtorrentRust-a26` : `target/` isolé,
-   builds réellement parallèles. `sccache` mutualise la compilation
-   des deps entre worktrees : `RUSTC_WRAPPER=sccache` (bash) ou
-   `$env:RUSTC_WRAPPER="sccache"` (PowerShell).
+   Travailler dans `C:/Projet/wt/LibtorrentRust-a26` : `target/` isolé,
+   builds réellement parallèles — **le worktree vit sur C: (SSD)**, pas
+   sur D: qui est lent ; seuls les pointeurs `.git` restent sur D:. Le
+   checkout principal reste `D:/Projet/LibtorrentRust` : dans les
+   commandes `git -C` ci-dessous, c'est ce chemin absolu qui est visé.
+   `sccache` mutualise la compilation des deps entre worktrees :
+   `RUSTC_WRAPPER=sccache` (bash) ou `$env:RUSTC_WRAPPER="sccache"`
+   (PowerShell).
 
 8. **Corriger en Rust idiomatique** — pas de translittération ; commenter
    les legs subtils avec leur référence upstream.
@@ -181,13 +185,14 @@ autres).
     garantir un merge propre, `git rebase main` d'abord dans le
     worktree (résoudre les éventuels conflits `torrent.rs`/
     `peer_conn.rs`/`session.rs`/`PORTING.md` là + re-run des gates),
-    puis `git -C ../LibtorrentRust merge --no-ff audit/26-dht`
-    — le merge s'exécute dans le checkout principal (apply solo dans
-    le checkout principal : `git checkout main` puis `git merge
-    --no-ff` en place). Les merges se chaînent **un à la fois** — si le
-    checkout principal est verrouillé ou déjà en merge, attendre et
-    réessayer. Cleanup immédiat : `git worktree remove
-    ../LibtorrentRust-a26` puis `git branch -d audit/26-dht`.
+    puis `git -C D:/Projet/LibtorrentRust merge --no-ff
+    audit/26-dht` — le merge s'exécute dans le checkout
+    principal (apply solo dans le checkout principal : `git checkout
+    main` puis `git merge --no-ff` en place). Les merges se chaînent
+    **un à la fois** — si le checkout principal est verrouillé ou déjà
+    en merge, attendre et réessayer. Cleanup immédiat :
+    `git worktree remove C:/Projet/wt/LibtorrentRust-a26` puis
+    `git branch -d audit/26-dht`.
 14. **Résultat** : ajouter une section `## Résultat` au rapport
     (déviations corrigées, tests ajoutés, hash du commit) — commitée
     sur la branche **avant** le merge pour partir avec lui.
