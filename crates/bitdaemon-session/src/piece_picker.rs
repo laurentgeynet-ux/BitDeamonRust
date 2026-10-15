@@ -282,6 +282,36 @@ impl std::ops::BitOr for PickerOptions {
     }
 }
 
+/// `peer_connection::picker_options()` — the torrent-level legs:
+/// `sequential` XOR (below `initial_picker_threshold` →
+/// `prioritize_partials`, deliberately *not* rarest-first — upstream
+/// random-picks while the first pieces complete) XOR `rarest_first`;
+/// `prioritize_partials` is OR'd on top when the
+/// `prioritize_partial_pieces` setting is on. `rarest_first` and
+/// `sequential` are mutually exclusive upstream (asserted there).
+/// The per-peer legs — `snubbed` → `reverse` else
+/// `piece_extent_affinity`, and `on_parole` — need conn state and
+/// live in `PeerConn::picker_options`.
+#[must_use]
+pub fn picker_options(
+    sequential_download: bool,
+    num_have: i32,
+    initial_picker_threshold: i32,
+    prioritize_partial_pieces: bool,
+) -> PickerOptions {
+    let mut ret = if sequential_download {
+        PickerOptions::SEQUENTIAL
+    } else if num_have < initial_picker_threshold {
+        PickerOptions::PRIORITIZE_PARTIALS
+    } else {
+        PickerOptions::RAREST_FIRST
+    };
+    if prioritize_partial_pieces {
+        ret.set(PickerOptions::PRIORITIZE_PARTIALS);
+    }
+    ret
+}
+
 /// `picker_flags_t` (`alert_types.hpp`) — which picker paths were
 /// taken; surfaced to the picker log alert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

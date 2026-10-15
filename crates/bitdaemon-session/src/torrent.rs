@@ -6449,13 +6449,17 @@ impl Torrent {
             }
             _ => return false,
         };
-        // `is_sequential_download()` — user `sequential` OR the
-        // `auto_sequential` well-seeded heuristic.
-        let mut opts = if self.is_sequential_download() {
-            PickerOptions::RAREST_FIRST | PickerOptions::SEQUENTIAL
-        } else {
-            PickerOptions::RAREST_FIRST
-        };
+        // `picker_options()` — `sequential` XOR (below
+        // `initial_picker_threshold` → `prioritize_partials`, no
+        // rarest_first: upstream random-picks while the first
+        // pieces complete) XOR `rarest_first`; the per-peer legs
+        // (snubbed/extent-affinity, parole) land in `drive_requests`.
+        let mut opts = crate::piece_picker::picker_options(
+            self.is_sequential_download(),
+            self.num_have(),
+            s.initial_picker_threshold,
+            s.prioritize_partial_pieces,
+        );
         if !self.time_critical.is_empty() {
             opts = opts | PickerOptions::TIME_CRITICAL;
         }
@@ -6474,6 +6478,7 @@ impl Torrent {
             num_peers: self.peers.len() as i32,
             whole_pieces_threshold: s.whole_pieces_threshold,
             strict_end_game_mode: s.strict_end_game_mode,
+            piece_extent_affinity: s.piece_extent_affinity,
             piece_length: self.piece_length,
             block_size,
         };
@@ -6756,6 +6761,7 @@ impl Torrent {
             num_peers: (self.peers.len() + 1) as i32,
             whole_pieces_threshold: 0,
             strict_end_game_mode: false,
+            piece_extent_affinity: s.piece_extent_affinity,
             piece_length: self.piece_length,
             block_size: self.block_size(),
         };
@@ -6771,6 +6777,22 @@ impl Torrent {
             (i64::from(if keepalive { 1 } else { 4 }) * 1024 * 1024).max(self.piece_length);
         let preferred_size = min_size.max(s.urlseed_max_request_bytes);
         let block_size_i64 = i64::from(self.block_size());
+        // `web_peer_connection::picker_options` — the same base
+        // upstream computes for any conn; the virtual peer is never
+        // snubbed/on-parole, so the extent-affinity `else` leg can
+        // land (gated on rarest-first mode like upstream).
+        let mut web_opts = crate::piece_picker::picker_options(
+            self.is_sequential_download(),
+            self.num_have(),
+            s.initial_picker_threshold,
+            s.prioritize_partial_pieces,
+        );
+        if web_opts.contains(PickerOptions::RAREST_FIRST)
+            && s.piece_extent_affinity
+            && self.time_critical.is_empty()
+        {
+            web_opts.set(PickerOptions::PIECE_EXTENT_AFFINITY);
+        }
         let pctx = crate::request_blocks::PeerRequestCtx {
             no_download: false,
             disconnecting: false,
@@ -6782,7 +6804,7 @@ impl Torrent {
             allowed_fast: &allowed_fast,
             peer_pieces: &all,
             peer_key: Some(key),
-            picker_options: PickerOptions::RAREST_FIRST,
+            picker_options: web_opts,
             suggested_pieces: &suggested,
         };
         let mut picked = Vec::new();
@@ -6815,7 +6837,7 @@ impl Torrent {
             if !self
                 .picker
                 .as_mut()
-                .is_some_and(|p| p.mark_as_downloading(b, Some(key), PickerOptions::RAREST_FIRST))
+                .is_some_and(|p| p.mark_as_downloading(b, Some(key), web_opts))
             {
                 continue;
             }
@@ -7829,23 +7851,22 @@ impl Torrent {
                 }
             }
         }
+        // `picker_options()` — the same base + per-peer legs as the
+        // request path (upstream re-marks with `p->picker_options()`).
+        let base = crate::piece_picker::picker_options(
+            self.is_sequential_download(),
+            self.num_have(),
+            s.initial_picker_threshold,
+            s.prioritize_partial_pieces,
+        );
+        let extent = s.piece_extent_affinity;
+        let tc = !self.time_critical.is_empty();
         for (id, block) in inflight {
             if let (Some(p), Some(c)) = (self.picker.as_mut(), self.peers.get(&id)) {
-                // `picker_options()` — parole/snubbed peers pick
-                // differently (same rule as the request path).
-                let mut opts = crate::piece_picker::PickerOptions::RAREST_FIRST;
-                if c.on_parole {
-                    opts = opts
-                        | crate::piece_picker::PickerOptions::ON_PAROLE
-                        | crate::piece_picker::PickerOptions::PRIORITIZE_PARTIALS;
-                }
-                if c.pipeline.snubbed {
-                    opts = opts | crate::piece_picker::PickerOptions::REVERSE;
-                }
+                let opts = c.picker_options(base, extent, tc);
                 p.mark_as_downloading(block, c.peer_key().or(Some(id)), opts);
             }
         }
-        let _ = s;
         let _ = counters;
     }
 
@@ -9517,10 +9538,16 @@ impl Torrent {
             num_peers: self.peers.len() as i32,
             whole_pieces_threshold: s.whole_pieces_threshold,
             strict_end_game_mode: s.strict_end_game_mode,
+            piece_extent_affinity: s.piece_extent_affinity,
             piece_length: self.piece_length,
             block_size,
         };
-        let opts = PickerOptions::RAREST_FIRST;
+        let opts = crate::piece_picker::picker_options(
+            self.is_sequential_download(),
+            self.num_have(),
+            s.initial_picker_threshold,
+            s.prioritize_partial_pieces,
+        );
         let view = PipelineView {
             piece_length: self.piece_length,
             block_size,
@@ -9826,12 +9853,18 @@ impl Torrent {
                     // upstream behavior.
                     c.pipeline.desired_queue_size = 2;
                     let key = c.peer_key();
+                    // `snub_peer` picks via `request_a_block` →
+                    // `picker_options()` — the conn just flipped
+                    // snubbed, so the per-peer legs apply here too
+                    // (reverse pick inside the rarest-first branch).
+                    let peer_opts =
+                        c.picker_options(opts, tctx.piece_extent_affinity, tctx.time_critical_mode);
                     let outstanding = c.outstanding();
                     let disconnecting = c.disconnecting;
                     let rate = i64::from(c.rate_down_payload);
                     let mut ctx = c.request_ctx(false, disconnecting, rate);
                     ctx.outstanding = &outstanding;
-                    ctx.picker_options = opts;
+                    ctx.picker_options = peer_opts;
                     let mut picked: Vec<(PieceBlock, bool)> = Vec::new();
                     let mut pc_stats = counters;
                     let (invoked, eg) = crate::request_blocks::request_a_block_out(
@@ -9854,7 +9887,9 @@ impl Torrent {
                         c.set_endgame(e, counters);
                     }
                     for (b, busy) in picked {
-                        if p.mark_as_downloading(b, key, opts) && !c.add_request(b, busy, false) {
+                        if p.mark_as_downloading(b, key, peer_opts)
+                            && !c.add_request(b, busy, false)
+                        {
                             p.abort_download(b, key);
                         }
                     }
@@ -11547,6 +11582,23 @@ impl Torrent {
         self.sequential || self.auto_sequential
     }
 
+    /// `torrent::num_have` — pieces that passed the hash check
+    /// (`m_seed_mode` pretends all; without a picker the
+    /// `m_have_all` leg falls back on the full count).
+    #[must_use]
+    pub fn num_have(&self) -> i32 {
+        if self.seed_mode {
+            return self.num_pieces;
+        }
+        if let Some(p) = self.picker.as_ref() {
+            return p.num_have();
+        }
+        if self.have.all_set() {
+            return self.num_pieces;
+        }
+        0
+    }
+
     /// `set_seed` — mark a *connected* peer as (not) a seed:
     /// flips the peer-list `seed` flag and re-counts
     /// `m_num_seeds`, then re-runs the auto-sequential heuristic
@@ -11810,7 +11862,7 @@ impl Torrent {
     /// Requests batch and go on the wire at the end.
     pub fn request_time_critical_pieces(
         &mut self,
-        _s: &crate::settings::SessionSettings,
+        s: &crate::settings::SessionSettings,
         _counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
@@ -11906,6 +11958,7 @@ impl Torrent {
                 &mut peers,
                 &mut ignore_peers,
                 &mut touched,
+                s,
                 piece,
                 &pi,
                 timed_out,
@@ -11982,6 +12035,7 @@ impl Torrent {
         peers: &mut Vec<u64>,
         ignore_peers: &mut Vec<u64>,
         touched: &mut Vec<u64>,
+        s: &crate::settings::SessionSettings,
         piece: PieceIndex,
         pi: &crate::piece_picker::DownloadingPiece,
         timed_out: i64,
@@ -12097,11 +12151,27 @@ impl Torrent {
             } else {
                 // new critical request — mark in the picker, then
                 // front-insert (`add_request(b, busy, true)`).
-                let key = self.peers[&id].peer_key();
+                // `add_request` marks with `picker_options()` — the
+                // per-peer legs are no-ops here (candidates are
+                // already filtered non-parole/non-snubbed and TC is
+                // open) but we compute them anyway for parity.
+                let (key, mark_opts) = {
+                    let c = &self.peers[&id];
+                    let base = crate::piece_picker::picker_options(
+                        self.is_sequential_download(),
+                        self.num_have(),
+                        s.initial_picker_threshold,
+                        s.prioritize_partial_pieces,
+                    );
+                    (
+                        c.peer_key(),
+                        c.picker_options(base, s.piece_extent_affinity, true),
+                    )
+                };
                 let marked = self
                     .picker
                     .as_mut()
-                    .is_some_and(|p| p.mark_as_downloading(b, key, PickerOptions::RAREST_FIRST));
+                    .is_some_and(|p| p.mark_as_downloading(b, key, mark_opts));
                 if !marked
                     || !self
                         .peers

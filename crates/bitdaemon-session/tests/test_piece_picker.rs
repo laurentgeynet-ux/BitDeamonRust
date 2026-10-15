@@ -469,6 +469,7 @@ fn tctx() -> TorrentRequestCtx {
         num_peers: 10,
         whole_pieces_threshold: 0,
         strict_end_game_mode: false,
+        piece_extent_affinity: false,
         piece_length: i64::from(PIECE_SIZE),
         block_size: 0x4000,
     }
@@ -578,6 +579,144 @@ fn request_block_endgame() {
         assert!(picker.mark_as_downloading(b, Some(2), PickerOptions::NONE));
         assert!(picker.is_requested(b));
     }
+}
+
+#[test]
+fn request_block_busy_waits_for_empty_queue() {
+    // upstream re-reads `dq.size() + rq.size()` *after* the pick loop
+    // — blocks queued by this very pass count. A pass that queues
+    // free blocks but can't fill `num_requests` must NOT also send
+    // the busy block: the peer's queue is no longer empty.
+    let mut picker = PiecePicker::new(i64::from(2 * PIECE_SIZE), PIECE_SIZE);
+    let have = all_have(2);
+    picker.inc_refcount_bitfield(&have);
+    // piece 1 fully requested by peer 1 → `piece_full` (busy pool)
+    for b in 0..BLOCKS_PER_PIECE {
+        assert!(picker.mark_as_downloading(pb(1, b), Some(1), PickerOptions::NONE));
+    }
+    let t = tctx();
+    let outstanding: Vec<PieceBlock> = Vec::new();
+    let c = PeerRequestCtx {
+        no_download: false,
+        disconnecting: false,
+        // enough slots to take all of piece 0 and still want more
+        desired_queue_size: 2 * BLOCKS_PER_PIECE,
+        outstanding: &outstanding,
+        prefer_contiguous_blocks: 0,
+        download_payload_rate: 0,
+        peer_choked: false,
+        allowed_fast: &[],
+        peer_pieces: &have,
+        peer_key: Some(2),
+        picker_options: PickerOptions::RAREST_FIRST,
+        suggested_pieces: &[],
+    };
+    let mut stats = Stats([0; 16]);
+    let mut free = Vec::new();
+    let mut busy = Vec::new();
+    let (invoked, endgame) = request_a_block_out(&mut picker, &t, &c, &mut stats, |b, is_busy| {
+        if is_busy {
+            busy.push(b);
+        } else {
+            free.push(b);
+        }
+        true
+    });
+    assert!(invoked);
+    assert_eq!(endgame, Some(true));
+    // all of piece 0's blocks got queued — the queue is non-empty,
+    // so the busy block stays unpicked this pass
+    assert_eq!(free.len(), BLOCKS_PER_PIECE as usize);
+    assert!(busy.is_empty());
+    // once every outstanding request drains (empty queues again),
+    // the busy block becomes requestable — last resort semantics.
+    // Commit pass 1's staged picks in the picker first (the marks
+    // land post-call in `drive_requests`).
+    for &b in &free {
+        assert!(picker.mark_as_downloading(b, Some(2), PickerOptions::NONE));
+    }
+    let c2 = PeerRequestCtx {
+        desired_queue_size: 4,
+        ..c
+    };
+    let mut busy2 = Vec::new();
+    let (invoked2, _e2) = request_a_block_out(&mut picker, &t, &c2, &mut stats, |b, is_busy| {
+        if is_busy {
+            busy2.push(b);
+        }
+        true
+    });
+    assert!(invoked2);
+    assert_eq!(busy2.len(), 1);
+    assert_eq!(busy2[0].piece_index, p(1));
+}
+
+#[test]
+fn picker_options_legs() {
+    use bitdaemon_session::piece_picker::picker_options;
+    // `sequential` XOR threshold XOR rarest_first — never both
+    assert_eq!(picker_options(true, 0, 4, false), PickerOptions::SEQUENTIAL);
+    // below `initial_picker_threshold` upstream does NOT set
+    // rarest_first — random pick + prioritize partials
+    assert_eq!(
+        picker_options(false, 0, 4, false),
+        PickerOptions::PRIORITIZE_PARTIALS
+    );
+    assert_eq!(
+        picker_options(false, 3, 4, false),
+        PickerOptions::PRIORITIZE_PARTIALS
+    );
+    assert_eq!(
+        picker_options(false, 4, 4, false),
+        PickerOptions::RAREST_FIRST
+    );
+    // `prioritize_partial_pieces` setting ORs on top of any branch
+    assert_eq!(
+        picker_options(false, 10, 4, true),
+        PickerOptions::RAREST_FIRST | PickerOptions::PRIORITIZE_PARTIALS
+    );
+    assert_eq!(
+        picker_options(true, 10, 4, true),
+        PickerOptions::SEQUENTIAL | PickerOptions::PRIORITIZE_PARTIALS
+    );
+}
+
+#[test]
+fn peer_picker_options_legs() {
+    let mut conn = PeerConn::new(4, PeerPipeline::new(3, 10, 250), 0);
+    let base = PickerOptions::RAREST_FIRST;
+    // plain peer: base passes through
+    assert_eq!(conn.picker_options(base, false, false), base);
+    // snubbed → reverse (inside the rarest_first branch only)
+    conn.pipeline.snubbed = true;
+    assert_eq!(
+        conn.picker_options(base, true, false),
+        base | PickerOptions::REVERSE
+    );
+    // snubbed under sequential: upstream never enters the branch
+    assert_eq!(
+        conn.picker_options(PickerOptions::SEQUENTIAL, true, false),
+        PickerOptions::SEQUENTIAL
+    );
+    conn.pipeline.snubbed = false;
+    // not snubbed + extent-affinity setting + no TC → extent leg
+    assert_eq!(
+        conn.picker_options(base, true, false),
+        base | PickerOptions::PIECE_EXTENT_AFFINITY
+    );
+    // TC open suppresses extent affinity
+    assert_eq!(conn.picker_options(base, true, true), base);
+    // extent affinity requires rarest_first (else branch upstream)
+    assert_eq!(
+        conn.picker_options(PickerOptions::PRIORITIZE_PARTIALS, true, false),
+        PickerOptions::PRIORITIZE_PARTIALS
+    );
+    // parole legs apply on any branch
+    conn.on_parole = true;
+    assert_eq!(
+        conn.picker_options(PickerOptions::SEQUENTIAL, true, false),
+        PickerOptions::SEQUENTIAL | PickerOptions::ON_PAROLE | PickerOptions::PRIORITIZE_PARTIALS
+    );
 }
 
 // ---------- peer_pipeline (peer_connection request pipeline) ----------
