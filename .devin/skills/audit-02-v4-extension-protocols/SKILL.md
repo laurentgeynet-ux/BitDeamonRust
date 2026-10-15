@@ -19,7 +19,8 @@ affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 
-- **Upstream** (baseline `e7381c7bc`, lecture seule) : `src/ut_metadata.cpp`, `src/ut_pex.cpp`, `src/smart_ban.cpp`, `src/bt_peer_connection.cpp` (extended legs), `src/peer_connection.cpp` (incoming_suggest/allowed_fast/dont_have)
+- **Upstream code** (baseline `e7381c7bc`, lecture seule) : `src/ut_metadata.cpp`, `src/ut_pex.cpp`, `src/smart_ban.cpp`, `src/bt_peer_connection.cpp` (extended legs), `src/peer_connection.cpp` (incoming_suggest/allowed_fast/dont_have)
+- **Upstream tests** (oracle de spécification) : `test/test_fast_extension.cpp`, `test/test_magnet.cpp`, `test/test_privacy.cpp`, `test/test_utp.cpp`
   Checkout upstream, résolu dans l'ordre : `$LIBTORRENT_ROOT` si
   définie → `D:/Projet/libtorrent/libtorrent` (poste local) → sinon
   `git clone https://github.com/arvidn/libtorrent ../libtorrent`
@@ -36,7 +37,7 @@ affiner avec la section `## Fichiers du fix` du rapport.
 - [ ] upload_only message : sémantique sur les deux sens (peer announces vs we announce)
 - [ ] holepunch rendez-vous : relay, connect msg, erreurs
 
-## Protocole — deux modes
+## Protocole d'audit renforcé — deux modes
 
 L'invocation précise le mode ; **défaut : `rapport`**. Le découpage existe
 parce que plusieurs audits peuvent tourner en parallèle : la phase
@@ -44,29 +45,49 @@ d'analyse est read-only sur le repo (zéro conflit), la phase de
 correction s'exécute dans un worktree + branche dédiés ; l'apply finit
 par un merge automatique sur `main` local + cleanup — tout local.
 
-### Analyse commune (mode A l'exécute, mode B s'appuie sur le rapport)
+### Méthodologie d'analyse (mode A l'exécute, mode B s'appuie sur le rapport)
 
-1. **Cartographier le chemin Rust d'abord** (grep/lecture), sans lire upstream —
-   noter la machine d'état, les gates, les compteurs, les alertes, l'ordre des effets.
-2. **Lire les fonctions upstream correspondantes** dans le checkout
-   résolu ci-dessus (baseline `e7381c7bc`, lecture seule — ne jamais
-   modifier).
-3. **Diff sémantique** : ordre des opérations, gates, compteurs `counters::`,
-   alertes (type + payload + timing), gestion d'erreur, comportement filaire.
+L'audit ne doit JAMAIS être un simple survol superficiel ou un diff nominal de fonctions.
+Il suit 4 étapes rigoureuses :
 
-   Méthode : les fichiers upstream font 6-10k lignes (`torrent.cpp`,
-   `peer_connection.cpp`, `session_impl.cpp`) — ne jamais les lire en
-   bloc. `grep` le nom de la fonction visée, lire ±80 lignes autour,
-   suivre les appels ; ça préserve la fenêtre de contexte. Avant de
-   consigner une déviation, `grep` aussi les crates sous-jacentes
-   (`bitdaemon-common`, `-core`, `-net`, `-disk`) : la logique C++ du
-   fichier audité a pu être déplacée dans un helper d'une couche
-   inférieure — une absence dans le fichier listé n'est pas une
-   déviation.
+1. **Cartographie Rust & inventaire des tests existants** (read-only) :
+   - Grep/lecture du chemin Rust : noter la machine d'état, les gates, les compteurs, les alertes, l'ordre des effets.
+   - **Vérifier la couverture de tests Rust actuelle** dans `crates/<crate>/tests/` et les sous-modules `#[cfg(test)]` : quels invariants sont réellement testés vs non couverts ?
+
+2. **Exploration Upstream (Code C++ ET Tests `test/test_*.cpp`)** :
+   - Résoudre le checkout upstream (baseline `e7381c7bc`, lecture seule).
+   - **Ne pas se limiter à ±80 lignes autour de la fonction** : traquer l'ensemble du cycle de vie de l'état :
+     - Valeurs par défaut issues de `settings_pack` et constructeurs.
+     - Flags `m_flags` et mutations inter-méthodes.
+     - **Destructeurs RAII et méthodes de nettoyage (`disconnect()`, `abort()`, `clear()`, `teardown`)**.
+   - **Examiner les tests upstream listés (`test/test_*.cpp`)** : les tests C++ sont la spécification vivante de libtorrent (15 ans de bugs et d'edge cases encodés). Relever chaque scénario de test (malformed input, out-of-order, timeouts, rechecks).
+
+3. **Grille d'Analyse à 5 Lentilles d'Audit (MANDATOIRE pour chaque point)** :
+   Chaque point de la checklist et chaque chemin critique doit être passé au crible des 5 lentilles :
+   - **Lentille 1 — Fuzzing & Bornes (Malformed / Adversarial)** :
+     - Casts d'entiers dangereux (`as usize` sur des entiers signés `i32` pouvant être négatifs, dépassement `u32::MAX`).
+     - Payloads anormaux : taille 0, payload tronqué, oversized (> 16 KiB / 2 MiB), buffers incohérents.
+     - Indices hors-bornes : piece/block index hors limites, bitfield mal dimensionné, hashes v2 non validés.
+   - **Lentille 2 — Taxonomie d'Erreur & Disconnect (Drop Silencieux vs Disconnect)** :
+     - Upstream fait-il `disconnect(errors::...)` avec alerte `peer_error_alert` et incrémentation de `failcount`, ou Rust fait-il un simple `return Ok(())` / drop silencieux laissant le pair zombie ?
+     - Différenciation nette entre drop silencieux (bruit réseau bénin) et disconnect obligatoire (violation de protocole).
+   - **Lentille 3 — Cycle de vie, Nettoyage & Invariants d'état** :
+     - Sur erreur, déconnexion, pause, recheck ou hash-failure : toutes les requêtes en vol sont-elles purgées ? Les blocs picker libérés (`abort_download`) ? Les timers annulés ?
+     - Invalidation des complétions asynchrones obsolètes : utilisation de tokens/générations (`picker_gen`) pour éviter qu'une réponse disque ou réseau tardive n'altère un état réinitialisé.
+   - **Lentille 4 — Concurrence, Canaux Tokio & Backpressure** :
+     - Canaux `tokio::sync::mpsc` : comportement en cas de canal saturé (`try_send` qui drop sans avertissement vs `send().await`). Risques de deadlock ou de perte d'événements critiques (complétions disque, alertes).
+     - Ordonnancement des événements : pas de starvation des timers par les événements réseau/disque.
+   - **Lentille 5 — Parité des Alertes, Compteurs & Hot-Apply** :
+     - Types et timing d'alertes : payload exact, `alert_mask` respecté.
+     - Compteurs `counters::` : inc/dec/set aux sites exacts, pas de double comptage ou de compteur mort.
+     - Hot-apply : les modifications via `apply_settings` prennent-elles effet immédiatement ou seulement au prochain redémarrage ?
+
+4. **Test Gap Analysis (Scénarios de test orphelins)** :
+   - Recenser les tests upstream (`test/test_*.cpp`) qui n'ont AUCUN équivalent dans la suite de tests Rust. Tout test absent constitue une zone de risque prioritaire.
 
 ### Mode A — `rapport` (read-only, 100% parallélisable)
 
-4. Écrire le rapport dans `docs/audits/reports/A02_extension-protocols.md` —
+5. Écrire le rapport dans `docs/audits/reports/A02_extension-protocols.md` —
    **seul fichier écrit**, unique à cet audit, donc plusieurs audits en
    mode rapport tournent simultanément dans le même checkout. Template :
 
@@ -74,11 +95,12 @@ par un merge automatique sur `main` local + cleanup — tout local.
    # Audit A02 — rapport d'analyse
 
    ## Verdicts checklist
-   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
-   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
-   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
-   `## Déviations`. Un rapport « tout conforme » sans preuve par item
-   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   Un verdict par item — `conforme` / `déviation` / `N-A`.
+   Chaque verdict DOIT obligatoirement inclure :
+   1. La preuve exacte (`fichier.rs:ligne` vs `src/foo.cpp:ligne`).
+   2. La ou les lentilles auditées (ex: [Limites], [Disconnect], [Cycle de vie]).
+   3. Le test Rust protecteur (`crates/<crate>/tests/...`) ou la preuve formelle.
+   *Règle anti-complaisance* : Un verdict « conforme » sans preuve vérifiable ou sans test associé est irrecevable.
    - ut_metadata : request/data/reject, throttling, caps `metadata_size`, chunk 16K ordering, tracker-hash reset — verdict : … — preuve : …
    - ut_pex : added/dropped, flags (seed/upload_only/encryption/utp/holepunch), IPv6 form, max 50 pairs, `lt_v2` flag strip — verdict : … — preuve : …
    - lt_donthave inbound — drop silencieux si `packet_size != 6`, disconnect si index hors bitfield, redondant ignoré — verdict : … — preuve : …
@@ -87,32 +109,36 @@ par un merge automatique sur `main` local + cleanup — tout local.
    - upload_only message : sémantique sur les deux sens (peer announces vs we announce) — verdict : … — preuve : …
    - holepunch rendez-vous : relay, connect msg, erreurs — verdict : … — preuve : …
 
+   ## Couverture des tests upstream (test/test_*.cpp)
+   Inventaire des scénarios testés par libtorrent upstream sur ce périmètre vs statut en Rust :
+   - `test_foo.cpp::test_nom_du_test` — statut : couvert (`crates/.../tests/foo.rs`) / manquant / partiel — impact
+
    ## Déviations
    Chaque déviation porte un **sketch de fix concret** — hunk de diff
    ou edit-spec exacte (quel symbole, quel code à la place, réf.
-   upstream à la ligne près). Un « fix proposé » vague (« ajouter une
-   vérif ») est incomplet : l'apply doit pouvoir l'exécuter sans
-   re-designer. Le sketch n'est PAS un patch garanti : il date de
-   l'analyse, le contexte peut avoir bougé — l'apply l'applique en
-   sémantique et boucle les gates. Format :
+   upstream à la ligne près). Format :
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
-     (`src/foo.cpp`, fonction) — sévérité (wire-visible / état /
-     cosmétique)
+     (`src/foo.cpp:ligne` ou `test/test_foo.cpp:ligne`) — sévérité (`critique` / `wire-visible` / `état-interne` / `cosmétique`) — lentille ([Limites], [Erreur], etc.)
      - **sketch** : `avant → après` minimal (diff ou edit-spec) +
-       réf. upstream `src/foo.cpp:ligne` + test de régression suggéré
+       réf. upstream `src/foo.cpp:ligne`
+     - **test de régression suggéré** : description précise du test unitaire
+       à porter (basé sur le scénario de test upstream correspondant)
+
+   ## Invariants de frontière (Seam Checks)
+   Vérification des interactions aux frontières avec les autres sous-systèmes (Session ↔ Disk ↔ Net ↔ Core).
 
    ## Fichiers du fix
    Fichiers Rust que les corrections toucheront (planification des vagues).
 
    ## Non-bugs tranchés
-   Écarts volontaires, avec justification upstream.
+   Écarts volontaires avec justification upstream ou contrainte safe Rust (ADR).
    ```
 
    Ne modifier **aucun** fichier existant en dehors du rapport. Pas de
    build/test cargo — l'analyse ne compile pas (et `target/`
    verrouillé sérialiserait les audits parallèles).
 
-5. **Commit du rapport sur `main`** — pathspec-limited : le `-- <path>`
+6. **Commit du rapport sur `main`** — pathspec-limited : le `-- <path>`
    n'embarque que ce fichier, même si un audit voisin a stagé autre
    chose dans l'index partagé entre-temps :
 
@@ -126,7 +152,7 @@ par un merge automatique sur `main` local + cleanup — tout local.
    ne voit que du contenu commité. Les commits de rapports ne se
    conflitent jamais entre eux (fichiers disjoints, fast-forward).
 
-6. **STOP côté code** : pas de fix, pas de gate. Le mode `apply` est
+7. **STOP côté code** : pas de fix, pas de gate. Le mode `apply` est
    une invocation séparée qui part du rapport commité **et relu**.
 
 ### Mode B — `apply` (worktree + branche dédiée)
@@ -141,7 +167,7 @@ que plusieurs `apply` sont parallèles, le worktree est obligatoire
 marchent dessus, et `cargo test` tourne sur le code transitoire des
 autres).
 
-7. **Worktree + branche** :
+8. **Worktree + branche** :
 
    ```sh
    git worktree add C:/Projet/wt/LibtorrentRust-a02 -b audit/02-extension-protocols
@@ -156,13 +182,14 @@ autres).
    `RUSTC_WRAPPER=sccache` (bash) ou `$env:RUSTC_WRAPPER="sccache"`
    (PowerShell).
 
-8. **Corriger en Rust idiomatique** — pas de translittération ; commenter
+9. **Corriger en Rust idiomatique** — pas de translittération ; commenter
    les legs subtils avec leur référence upstream.
-9. **Tests de régression** pour chaque déviation corrigée.
-10. **Gates obligatoires** (dans le worktree) : `cargo fmt --all` ·
+10. **Tests de régression obligatoires** : porter le scénario de test
+    upstream identifié pour chaque déviation corrigée.
+11. **Gates obligatoires** (dans le worktree) : `cargo fmt --all` ·
     `cargo clippy --workspace --all-targets -- -D warnings` ·
     `cargo test --workspace` · `cargo doc --workspace --no-deps`.
-11. **Changelog en fragment** : écrire les entrées Keep-a-Changelog dans
+12. **Changelog en fragment** : écrire les entrées Keep-a-Changelog dans
     `docs/audits/changelog/A02.md` sous `### Fixed` (ou autre section) —
     **ne pas éditer `CHANGELOG.md`** (conflit de merge garanti entre
     audits parallèles ; agrégation post-merge via
@@ -174,10 +201,10 @@ autres).
     (`ported` → `verified`…). Les edits sont par row → recouvrements
     quasi nuls entre apply parallèles ; en cas de conflit au merge,
     rebase + gates comme pour le reste.
-12. Commit `fix(<crate>): <scope> parity — <mot-clé>` **sur la branche
+13. Commit `fix(<crate>): <scope> parity — <mot-clé>` **sur la branche
     `audit/02-extension-protocols`** — jamais sur `main`. **Tout reste local** :
     pas de push, pas de PR, pas de GitHub.
-13. **Merge sur `main` — automatique, dernier acte de l'apply.** Pour
+14. **Merge sur `main` — automatique, dernier acte de l'apply.** Pour
     garantir un merge propre, `git rebase main` d'abord dans le
     worktree (résoudre les éventuels conflits `torrent.rs`/
     `peer_conn.rs`/`session.rs`/`PORTING.md` là + re-run des gates),
@@ -189,16 +216,19 @@ autres).
     en merge, attendre et réessayer. Cleanup immédiat :
     `git worktree remove C:/Projet/wt/LibtorrentRust-a02` puis
     `git branch -d audit/02-extension-protocols`.
-14. **Résultat** : ajouter une section `## Résultat` au rapport
+15. **Résultat** : ajouter une section `## Résultat` au rapport
     (déviations corrigées, tests ajoutés, hash du commit) — commitée
     sur la branche **avant** le merge pour partir avec lui.
 
-## Pièges connus (checklists transverses)
+## Pièges connus (checklists transverses d'anomalies fréquentes)
 
-- Compteurs `counters::` déclarés mais jamais incrémentés/décrémentés.
-- Legs silencieux upstream (validation early-return, `is_disconnecting`,
-  `is_deleted`, `!has_picker`, `!has_storage`, `session_is_closing`).
-- Ordre effets wire-visible : messages sortants dans l'ordre upstream exact.
-- Comportement dead-code upstream à conserver inerte (ex. `cancel_block`
-  post-`mark_as_writing` — `is_requested` false en `state_writing`).
-- `unwrap`/`expect`/`todo!` interdits hors tests ; `#![forbid(unsafe_code)]`.
+- **Casts d'entiers signés / non-signés** : tout `as usize` sur une valeur issue du réseau ou du disque (ex: `i32`) doit être précédé d'un check `>= 0` sous peine de panique ou d'allocation géante (OOM).
+- **Drop silencieux vs Disconnect** : ne jamais remplacer un `disconnect(errors::...)` upstream par un `return Ok(())` silencieux — cela crée des pairs zombies.
+- **Fuites de ressources d'état** : sur déconnexion, vérifier que les requêtes en vol sont annulées, les blocs picker libérés (`abort_download`), et les timers arrêtés.
+- **Stale generation & Race conditions** : vérifier que les complétions asynchrones (disque, hash, DNS) vérifient toujours la génération (`picker_gen`) pour ignorer les résultats obsolètes post-recheck ou pause.
+- **Saturation des canaux Tokio (`mpsc`)** : traquer tout appel `try_send` susceptible de perdre des messages critiques en cas de forte charge, ou `send.await` susceptible de deadlocker l'acteur.
+- **Compteurs `counters::` déclarés mais jamais incrémentés/décrémentés** ou doublement incrémentés.
+- **Legs silencieux upstream** (validation early-return, `is_disconnecting`, `is_deleted`, `!has_picker`, `!has_storage`, `session_is_closing`).
+- **Ordre effets wire-visible** : messages sortants dans l'ordre upstream exact.
+- **Comportement dead-code upstream à conserver inerte** (ex. `cancel_block` post-`mark_as_writing` — `is_requested` false en `state_writing`).
+- **`unwrap`/`expect`/`todo!` interdits hors tests** ; `#![forbid(unsafe_code)]` respecté rigoureusement.

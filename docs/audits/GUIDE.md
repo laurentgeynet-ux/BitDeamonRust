@@ -44,16 +44,26 @@ dossier, plusieurs sessions en même temps — c'est prévu pour) :
 /audit-05-v1-utp-transport
 ```
 
-Le mode `rapport` est le défaut ; inutile de le préciser. L'agent :
+Le mode `rapport` est le défaut ; inutile de le préciser. L'agent applique
+une méthodologie rigoureuse en 4 étapes :
 
-1. lit le chemin Rust, puis les fonctions upstream ciblées par grep
-   (jamais les fichiers entiers — certains font 10 000 lignes) ;
-2. écrit `docs/audits/reports/A05_utp-transport.md` — verdicts par item
-   de checklist (avec preuve `fichier:ligne`), déviations, fichiers que
-   le fix touchera, non-bugs tranchés ;
-3. le commit sur `main` en pathspec-limited (`git commit -- <path>`) :
-   n'embarque que son rapport même si un audit voisin a stagé autre
-   chose entre-temps.
+1. **Cartographie Rust & tests** : repère le chemin d'exécution et vérifie la
+   couverture de tests unitaires existante en Rust (`crates/<crate>/tests/`) ;
+2. **Exploration Upstream (Code C++ ET Tests `test/test_*.cpp`)** : analyse les
+   fichiers sources upstream, mais aussi les destructeurs RAII, le cycle de vie
+   (`disconnect`, `abort`), et les cas de tests C++ (spécification vivante des
+   edge cases et attaques) ;
+3. **Grille d'Analyse à 5 Lentilles d'Audit (MANDATOIRE)** :
+   - *Fuzzing & Limites* (casts d'entiers signés/non-signés, payloads 0/oversized, bornes) ;
+   - *Taxonomie d'Erreur* (drop silencieux vs déconnexion avec `peer_error_alert`) ;
+   - *Cycle de vie & Nettoyage* (requêtes purgées, picker libéré, invalidation par `picker_gen`) ;
+   - *Concurrence & Backpressure* (canaux Tokio mpsc saturés, pas de starvation) ;
+   - *Parité Alertes & Compteurs* (`counters::`, alert masks, hot-apply settings) ;
+4. **Test Gap Analysis & Rapport** : dresse l'inventaire des tests upstream orphelins
+   en Rust et consigne verdicts étayés, déviations et sketches de fix dans
+   `docs/audits/reports/A05_utp-transport.md` ;
+5. **Commit sur `main`** en pathspec-limited (`git commit -- <path>`) : n'embarque
+   que son rapport même si un audit voisin a stagé autre chose entre-temps.
 
 Vous pouvez lancer les 24 audits restants d'un coup — en sessions
 locales parallèles ou en sessions cloud. Aucune coordination

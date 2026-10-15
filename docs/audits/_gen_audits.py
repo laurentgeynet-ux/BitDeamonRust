@@ -4,7 +4,7 @@ import os
 import re
 import shutil
 
-PROTOCOL = """## Protocole — deux modes
+PROTOCOL = """## Protocole d'audit renforcé — deux modes
 
 L'invocation précise le mode ; **défaut : `rapport`**. Le découpage existe
 parce que plusieurs audits peuvent tourner en parallèle : la phase
@@ -12,29 +12,49 @@ d'analyse est read-only sur le repo (zéro conflit), la phase de
 correction s'exécute dans un worktree + branche dédiés ; l'apply finit
 par un merge automatique sur `main` local + cleanup — tout local.
 
-### Analyse commune (mode A l'exécute, mode B s'appuie sur le rapport)
+### Méthodologie d'analyse (mode A l'exécute, mode B s'appuie sur le rapport)
 
-1. **Cartographier le chemin Rust d'abord** (grep/lecture), sans lire upstream —
-   noter la machine d'état, les gates, les compteurs, les alertes, l'ordre des effets.
-2. **Lire les fonctions upstream correspondantes** dans le checkout
-   résolu ci-dessus (baseline `e7381c7bc`, lecture seule — ne jamais
-   modifier).
-3. **Diff sémantique** : ordre des opérations, gates, compteurs `counters::`,
-   alertes (type + payload + timing), gestion d'erreur, comportement filaire.
+L'audit ne doit JAMAIS être un simple survol superficiel ou un diff nominal de fonctions.
+Il suit 4 étapes rigoureuses :
 
-   Méthode : les fichiers upstream font 6-10k lignes (`torrent.cpp`,
-   `peer_connection.cpp`, `session_impl.cpp`) — ne jamais les lire en
-   bloc. `grep` le nom de la fonction visée, lire ±80 lignes autour,
-   suivre les appels ; ça préserve la fenêtre de contexte. Avant de
-   consigner une déviation, `grep` aussi les crates sous-jacentes
-   (`bitdaemon-common`, `-core`, `-net`, `-disk`) : la logique C++ du
-   fichier audité a pu être déplacée dans un helper d'une couche
-   inférieure — une absence dans le fichier listé n'est pas une
-   déviation.
+1. **Cartographie Rust & inventaire des tests existants** (read-only) :
+   - Grep/lecture du chemin Rust : noter la machine d'état, les gates, les compteurs, les alertes, l'ordre des effets.
+   - **Vérifier la couverture de tests Rust actuelle** dans `crates/<crate>/tests/` et les sous-modules `#[cfg(test)]` : quels invariants sont réellement testés vs non couverts ?
+
+2. **Exploration Upstream (Code C++ ET Tests `test/test_*.cpp`)** :
+   - Résoudre le checkout upstream (baseline `e7381c7bc`, lecture seule).
+   - **Ne pas se limiter à ±80 lignes autour de la fonction** : traquer l'ensemble du cycle de vie de l'état :
+     - Valeurs par défaut issues de `settings_pack` et constructeurs.
+     - Flags `m_flags` et mutations inter-méthodes.
+     - **Destructeurs RAII et méthodes de nettoyage (`disconnect()`, `abort()`, `clear()`, `teardown`)**.
+   - **Examiner les tests upstream listés (`test/test_*.cpp`)** : les tests C++ sont la spécification vivante de libtorrent (15 ans de bugs et d'edge cases encodés). Relever chaque scénario de test (malformed input, out-of-order, timeouts, rechecks).
+
+3. **Grille d'Analyse à 5 Lentilles d'Audit (MANDATOIRE pour chaque point)** :
+   Chaque point de la checklist et chaque chemin critique doit être passé au crible des 5 lentilles :
+   - **Lentille 1 — Fuzzing & Bornes (Malformed / Adversarial)** :
+     - Casts d'entiers dangereux (`as usize` sur des entiers signés `i32` pouvant être négatifs, dépassement `u32::MAX`).
+     - Payloads anormaux : taille 0, payload tronqué, oversized (> 16 KiB / 2 MiB), buffers incohérents.
+     - Indices hors-bornes : piece/block index hors limites, bitfield mal dimensionné, hashes v2 non validés.
+   - **Lentille 2 — Taxonomie d'Erreur & Disconnect (Drop Silencieux vs Disconnect)** :
+     - Upstream fait-il `disconnect(errors::...)` avec alerte `peer_error_alert` et incrémentation de `failcount`, ou Rust fait-il un simple `return Ok(())` / drop silencieux laissant le pair zombie ?
+     - Différenciation nette entre drop silencieux (bruit réseau bénin) et disconnect obligatoire (violation de protocole).
+   - **Lentille 3 — Cycle de vie, Nettoyage & Invariants d'état** :
+     - Sur erreur, déconnexion, pause, recheck ou hash-failure : toutes les requêtes en vol sont-elles purgées ? Les blocs picker libérés (`abort_download`) ? Les timers annulés ?
+     - Invalidation des complétions asynchrones obsolètes : utilisation de tokens/générations (`picker_gen`) pour éviter qu'une réponse disque ou réseau tardive n'altère un état réinitialisé.
+   - **Lentille 4 — Concurrence, Canaux Tokio & Backpressure** :
+     - Canaux `tokio::sync::mpsc` : comportement en cas de canal saturé (`try_send` qui drop sans avertissement vs `send().await`). Risques de deadlock ou de perte d'événements critiques (complétions disque, alertes).
+     - Ordonnancement des événements : pas de starvation des timers par les événements réseau/disque.
+   - **Lentille 5 — Parité des Alertes, Compteurs & Hot-Apply** :
+     - Types et timing d'alertes : payload exact, `alert_mask` respecté.
+     - Compteurs `counters::` : inc/dec/set aux sites exacts, pas de double comptage ou de compteur mort.
+     - Hot-apply : les modifications via `apply_settings` prennent-elles effet immédiatement ou seulement au prochain redémarrage ?
+
+4. **Test Gap Analysis (Scénarios de test orphelins)** :
+   - Recenser les tests upstream (`test/test_*.cpp`) qui n'ont AUCUN équivalent dans la suite de tests Rust. Tout test absent constitue une zone de risque prioritaire.
 
 ### Mode A — `rapport` (read-only, 100% parallélisable)
 
-4. Écrire le rapport dans `docs/audits/reports/A{aid}_{slug}.md` —
+5. Écrire le rapport dans `docs/audits/reports/A{aid}_{slug}.md` —
    **seul fichier écrit**, unique à cet audit, donc plusieurs audits en
    mode rapport tournent simultanément dans le même checkout. Template :
 
@@ -42,39 +62,44 @@ par un merge automatique sur `main` local + cleanup — tout local.
    # Audit A{aid} — rapport d'analyse
 
    ## Verdicts checklist
-   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
-   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
-   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
-   `## Déviations`. Un rapport « tout conforme » sans preuve par item
-   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   Un verdict par item — `conforme` / `déviation` / `N-A`.
+   Chaque verdict DOIT obligatoirement inclure :
+   1. La preuve exacte (`fichier.rs:ligne` vs `src/foo.cpp:ligne`).
+   2. La ou les lentilles auditées (ex: [Limites], [Disconnect], [Cycle de vie]).
+   3. Le test Rust protecteur (`crates/<crate>/tests/...`) ou la preuve formelle.
+   *Règle anti-complaisance* : Un verdict « conforme » sans preuve vérifiable ou sans test associé est irrecevable.
 {checklist_verdicts}
+
+   ## Couverture des tests upstream (test/test_*.cpp)
+   Inventaire des scénarios testés par libtorrent upstream sur ce périmètre vs statut en Rust :
+   - `test_foo.cpp::test_nom_du_test` — statut : couvert (`crates/.../tests/foo.rs`) / manquant / partiel — impact
 
    ## Déviations
    Chaque déviation porte un **sketch de fix concret** — hunk de diff
    ou edit-spec exacte (quel symbole, quel code à la place, réf.
-   upstream à la ligne près). Un « fix proposé » vague (« ajouter une
-   vérif ») est incomplet : l'apply doit pouvoir l'exécuter sans
-   re-designer. Le sketch n'est PAS un patch garanti : il date de
-   l'analyse, le contexte peut avoir bougé — l'apply l'applique en
-   sémantique et boucle les gates. Format :
+   upstream à la ligne près). Format :
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
-     (`src/foo.cpp`, fonction) — sévérité (wire-visible / état /
-     cosmétique)
+     (`src/foo.cpp:ligne` ou `test/test_foo.cpp:ligne`) — sévérité (`critique` / `wire-visible` / `état-interne` / `cosmétique`) — lentille ([Limites], [Erreur], etc.)
      - **sketch** : `avant → après` minimal (diff ou edit-spec) +
-       réf. upstream `src/foo.cpp:ligne` + test de régression suggéré
+       réf. upstream `src/foo.cpp:ligne`
+     - **test de régression suggéré** : description précise du test unitaire
+       à porter (basé sur le scénario de test upstream correspondant)
+
+   ## Invariants de frontière (Seam Checks)
+   Vérification des interactions aux frontières avec les autres sous-systèmes (Session ↔ Disk ↔ Net ↔ Core).
 
    ## Fichiers du fix
    Fichiers Rust que les corrections toucheront (planification des vagues).
 
    ## Non-bugs tranchés
-   Écarts volontaires, avec justification upstream.
+   Écarts volontaires avec justification upstream ou contrainte safe Rust (ADR).
    ```
 
    Ne modifier **aucun** fichier existant en dehors du rapport. Pas de
    build/test cargo — l'analyse ne compile pas (et `target/`
    verrouillé sérialiserait les audits parallèles).
 
-5. **Commit du rapport sur `main`** — pathspec-limited : le `-- <path>`
+6. **Commit du rapport sur `main`** — pathspec-limited : le `-- <path>`
    n'embarque que ce fichier, même si un audit voisin a stagé autre
    chose dans l'index partagé entre-temps :
 
@@ -88,7 +113,7 @@ par un merge automatique sur `main` local + cleanup — tout local.
    ne voit que du contenu commité. Les commits de rapports ne se
    conflitent jamais entre eux (fichiers disjoints, fast-forward).
 
-6. **STOP côté code** : pas de fix, pas de gate. Le mode `apply` est
+7. **STOP côté code** : pas de fix, pas de gate. Le mode `apply` est
    une invocation séparée qui part du rapport commité **et relu**.
 
 ### Mode B — `apply` (worktree + branche dédiée)
@@ -103,7 +128,7 @@ que plusieurs `apply` sont parallèles, le worktree est obligatoire
 marchent dessus, et `cargo test` tourne sur le code transitoire des
 autres).
 
-7. **Worktree + branche** :
+8. **Worktree + branche** :
 
    ```sh
    git worktree add C:/Projet/wt/LibtorrentRust-a{aid} -b audit/{aid}-{slug}
@@ -118,13 +143,14 @@ autres).
    `RUSTC_WRAPPER=sccache` (bash) ou `$env:RUSTC_WRAPPER="sccache"`
    (PowerShell).
 
-8. **Corriger en Rust idiomatique** — pas de translittération ; commenter
+9. **Corriger en Rust idiomatique** — pas de translittération ; commenter
    les legs subtils avec leur référence upstream.
-9. **Tests de régression** pour chaque déviation corrigée.
-10. **Gates obligatoires** (dans le worktree) : `cargo fmt --all` ·
+10. **Tests de régression obligatoires** : porter le scénario de test
+    upstream identifié pour chaque déviation corrigée.
+11. **Gates obligatoires** (dans le worktree) : `cargo fmt --all` ·
     `cargo clippy --workspace --all-targets -- -D warnings` ·
     `cargo test --workspace` · `cargo doc --workspace --no-deps`.
-11. **Changelog en fragment** : écrire les entrées Keep-a-Changelog dans
+12. **Changelog en fragment** : écrire les entrées Keep-a-Changelog dans
     `docs/audits/changelog/A{aid}.md` sous `### Fixed` (ou autre section) —
     **ne pas éditer `CHANGELOG.md`** (conflit de merge garanti entre
     audits parallèles ; agrégation post-merge via
@@ -136,10 +162,10 @@ autres).
     (`ported` → `verified`…). Les edits sont par row → recouvrements
     quasi nuls entre apply parallèles ; en cas de conflit au merge,
     rebase + gates comme pour le reste.
-12. Commit `fix(<crate>): <scope> parity — <mot-clé>` **sur la branche
+13. Commit `fix(<crate>): <scope> parity — <mot-clé>` **sur la branche
     `audit/{aid}-{slug}`** — jamais sur `main`. **Tout reste local** :
     pas de push, pas de PR, pas de GitHub.
-13. **Merge sur `main` — automatique, dernier acte de l'apply.** Pour
+14. **Merge sur `main` — automatique, dernier acte de l'apply.** Pour
     garantir un merge propre, `git rebase main` d'abord dans le
     worktree (résoudre les éventuels conflits `torrent.rs`/
     `peer_conn.rs`/`session.rs`/`PORTING.md` là + re-run des gates),
@@ -151,25 +177,29 @@ autres).
     en merge, attendre et réessayer. Cleanup immédiat :
     `git worktree remove C:/Projet/wt/LibtorrentRust-a{aid}` puis
     `git branch -d audit/{aid}-{slug}`.
-14. **Résultat** : ajouter une section `## Résultat` au rapport
+15. **Résultat** : ajouter une section `## Résultat` au rapport
     (déviations corrigées, tests ajoutés, hash du commit) — commitée
     sur la branche **avant** le merge pour partir avec lui.
 
-## Pièges connus (checklists transverses)
+## Pièges connus (checklists transverses d'anomalies fréquentes)
 
-- Compteurs `counters::` déclarés mais jamais incrémentés/décrémentés.
-- Legs silencieux upstream (validation early-return, `is_disconnecting`,
-  `is_deleted`, `!has_picker`, `!has_storage`, `session_is_closing`).
-- Ordre effets wire-visible : messages sortants dans l'ordre upstream exact.
-- Comportement dead-code upstream à conserver inerte (ex. `cancel_block`
-  post-`mark_as_writing` — `is_requested` false en `state_writing`).
-- `unwrap`/`expect`/`todo!` interdits hors tests ; `#![forbid(unsafe_code)]`.
+- **Casts d'entiers signés / non-signés** : tout `as usize` sur une valeur issue du réseau ou du disque (ex: `i32`) doit être précédé d'un check `>= 0` sous peine de panique ou d'allocation géante (OOM).
+- **Drop silencieux vs Disconnect** : ne jamais remplacer un `disconnect(errors::...)` upstream par un `return Ok(())` silencieux — cela crée des pairs zombies.
+- **Fuites de ressources d'état** : sur déconnexion, vérifier que les requêtes en vol sont annulées, les blocs picker libérés (`abort_download`), et les timers arrêtés.
+- **Stale generation & Race conditions** : vérifier que les complétions asynchrones (disque, hash, DNS) vérifient toujours la génération (`picker_gen`) pour ignorer les résultats obsolètes post-recheck ou pause.
+- **Saturation des canaux Tokio (`mpsc`)** : traquer tout appel `try_send` susceptible de perdre des messages critiques en cas de forte charge, ou `send.await` susceptible de deadlocker l'acteur.
+- **Compteurs `counters::` déclarés mais jamais incrémentés/décrémentés** ou doublement incrémentés.
+- **Legs silencieux upstream** (validation early-return, `is_disconnecting`, `is_deleted`, `!has_picker`, `!has_storage`, `session_is_closing`).
+- **Ordre effets wire-visible** : messages sortants dans l'ordre upstream exact.
+- **Comportement dead-code upstream à conserver inerte** (ex. `cancel_block` post-`mark_as_writing` — `is_requested` false en `state_writing`).
+- **`unwrap`/`expect`/`todo!` interdits hors tests** ; `#![forbid(unsafe_code)]` respecté rigoureusement.
 """
 
 AUDITS = [
     ("01", "disk-write-pipeline", "Pipeline disque — bloc entrant → écriture",
      "incoming block → async_write → cache → flush → completion",
      "`src/disk_io_thread.cpp`, `src/disk_job.cpp`, `src/disk_job_fence.cpp`, `src/peer_connection.cpp` (incoming_piece)",
+     "`test/test_disk_io.cpp`, `test/test_fence.cpp`, `test/test_storage.cpp`",
      "`crates/bitdaemon-disk/src/disk_io.rs`, `disk_cache.rs`, `disk_job*.rs`, `crates/bitdaemon-session/src/peer_conn.rs`, `torrent.rs`",
      ["Dispatch `DiskWrite` : stamp `picker_gen`, fence ordering, part-file routing",
       "Positioned I/O : mapping bloc → offsets fichier multi-fichiers, sparse writes",
@@ -182,6 +212,7 @@ AUDITS = [
     ("02", "upload-read-path", "Chemin upload/read (Request → fill_send_buffer → async_read)",
      "Request entrant → validation → upload queue → read disque → Piece ; choke drain, rejects, compteurs",
      "`src/peer_connection.cpp` (incoming_request, fill_send_buffer, write_reject_request, on_choke drain), `src/torrent.cpp` (on_read_piece)",
+     "`test/test_read_piece.cpp`, `test/test_fast_extension.cpp`, `test/test_transfer.cpp`",
      "`crates/bitdaemon-session/src/peer_conn.rs`, `torrent.rs`, `net::peer_wire`",
      ["`incoming_request` : validation piece/start/len (len ≤ 32K sauf allowed_fast), reject vs accept",
       "Upload queue : FIFO, choked peers non servis, `fill_send_buffer` ordering",
@@ -192,6 +223,7 @@ AUDITS = [
     ("03", "piece-lifecycle", "Cycle de vie des pièces",
      "incoming_piece → flush → hash → piece_verified → Have → hash_failed → restore",
      "`src/torrent.cpp` (on_piece_verified, piece_passed, piece_failed, on_piece_sync, on_piece_fail_sync, we_have, penalize_peers, received_piece, announce_piece)",
+     "`test/test_checking.cpp`, `test/test_recheck.cpp`, `test/test_hash_picker.cpp`, `test/test_merkle.cpp`, `test/test_merkle_tree.cpp`",
      "`crates/bitdaemon-session/src/torrent.rs`, `piece_picker.rs`, `session.rs`",
      ["`picker_gen` gates write ET hash completions — in-flight invalidé par force_recheck/inconsistent",
       "hash-fail : `lock_piece` + `ClearPiece` fence → `on_piece_sync` différé (restore filtré v2 blocks, hash_failed_alert post-restore, re-mark duplicates)",
@@ -204,6 +236,7 @@ AUDITS = [
     ("04", "storage-ops-file-prio", "Ops storage & priorités fichiers",
      "move_storage / delete_files / rename_file / prioritize_files / file_priority + complétions",
      "`src/torrent.cpp` (move_storage, delete_files, rename_file, prioritize_files, on_file_priority), `src/storage_utils.cpp` (move_storage rollback, delete_files), `src/session_impl.cpp` (remove_torrent)",
+     "`test/test_storage.cpp`, `test/test_priority.cpp`, `test/test_remap_files.cpp`, `test/test_file_progress.cpp`, `test/test_remove_torrent.cpp`",
      "`crates/bitdaemon-session/src/session.rs`, `torrent.rs`, `session_handle.rs`, `alerts.rs`",
      ["`prioritize_files` async : `SetFilePriority` → `async_set_file_priority` → `on_file_priority` — jamais inline",
       "Sérialisation `outstanding_file_priority` + `deferred_file_priorities` (merge par index, replay à la complétion)",
@@ -216,6 +249,7 @@ AUDITS = [
     ("05", "download-request-path", "Chemin download (request→write) & rejects",
      "request_a_block → add_request → send_block_requests → Piece → on_reject → timeouts/snub/endgame",
      "`src/peer_connection.cpp` (request_a_block, add_request, send_block_requests_impl, incoming_reject_request, incoming_piece, snub_peer, second_tick)",
+     "`test/test_back_pressure.cpp`, `test/test_merge_block_requests.cpp`, `test/test_fast_extension.cpp`, `test/test_transfer.cpp`",
      "`crates/bitdaemon-session/src/peer_conn.rs`, `peer_pipeline.rs`, `torrent.rs`",
      ["`send_block_requests` : merger `request_large_blocks`, gates disconnecting/pause/checking/upload_mode, `m_last_piece` stampé en sortie",
       "`incoming_piece` : ordre is_downloaded→async_write→mark_as_writing, waste buckets, unsnub fenêtré, `piece_seed`",
@@ -228,6 +262,7 @@ AUDITS = [
     ("06", "peer-wire-codec", "Codec peer-wire & framing",
      "Encodage/décodage de tous les messages, bornes de longueur, entrées malformées, handshake.",
      "`src/bt_peer_connection.cpp` (on_receive, dispatch), `include/libtorrent/bt_peer_connection.hpp`, `src/peer_connection.cpp` (incoming_* dispatch)",
+     "`test/test_fast_extension.cpp`, `test/test_hash_picker.cpp`, `test/test_receive_buffer.cpp`, `test/test_buffer.cpp`, `test/test_bitfield.cpp`",
      "`crates/bitdaemon-net/src/peer_wire.rs`, `crates/bitdaemon-session/src/peer_conn.rs` (dispatch)",
      ["Length-prefix 4B BE inclut l'id, keepalive = len 0 — bornes exactes upstream (`packet_size` checks par message)",
       "Chaque `msg_*` : round-trip encode/decode + rejet des tailles invalides (have len 5, request len 13, bitfield len = ceil(n/8)+1…)",
@@ -235,10 +270,13 @@ AUDITS = [
       "Messages hors-ordre : have/bitfield avant handshake, piece avant bitfield, reject sans request",
       "Dépassements : oversized piece (packet_too_large), truncated frames, length incohérente → disconnect vs drop silencieux",
       "Compteurs `num_incoming_*` par type de message (funnel dispatch)",
-      "Port/dht_port message, extension id 0 handshake vs ids étendus"], "", None),
+      "Port/dht_port message, extension id 0 handshake vs ids étendus",
+      "Messages v2 : validation base/index/count/proof_layers (jamais de panique sur int négatif ou wrap)",
+      "Bitfield surdimensionné ou sous-dimensionné : rejet strict selon specs upstream"], "", None),
     ("07", "extension-protocols", "Protocoles d'extension (ut_metadata, ut_pex, lt_*, suggest, smartban, holepunch)",
      "Extensions BEP-10 : métadata, pex, dont_have/have_none, suggest+allowed_fast, smart_ban, upload_only, holepunch.",
      "`src/ut_metadata.cpp`, `src/ut_pex.cpp`, `src/smart_ban.cpp`, `src/bt_peer_connection.cpp` (extended legs), `src/peer_connection.cpp` (incoming_suggest/allowed_fast/dont_have)",
+     "`test/test_fast_extension.cpp`, `test/test_magnet.cpp`, `test/test_privacy.cpp`, `test/test_utp.cpp`",
      "`crates/bitdaemon-net/src/bep10.rs`, `crates/bitdaemon-session/src/peer_conn.rs` (extended arm), `session.rs` (metadata/pex routing)",
      ["ut_metadata : request/data/reject, throttling, caps `metadata_size`, chunk 16K ordering, tracker-hash reset",
       "ut_pex : added/dropped, flags (seed/upload_only/encryption/utp/holepunch), IPv6 form, max 50 pairs, `lt_v2` flag strip",
@@ -250,6 +288,7 @@ AUDITS = [
     ("08", "choker", "Choker & optimistic unchoke",
      "Sélection des pairs unchokés : comparateurs, quotas, rotation optimiste, interaction snub/seed.",
      "`src/choker.cpp` (unchoke_sort), `src/peer_connection.cpp` (choke_this_peer, maybe_unchoke_this_peer), `src/session_impl.cpp` (unchoke tick)",
+     "`test/test_auto_unchoke.cpp`, `test/test_peer_classes.cpp`, `test/test_transfer.cpp`",
      "`crates/bitdaemon-session/src/choker.rs`, `torrent.rs` (unchoke legs), `session.rs`",
      ["`unchoke_sort` verbatim : comparateurs rate-based/RR/fastest/anti-leech, quota `piece_length·quota` + 60 s, nth_element top-slots",
       "Slots : fixed vs rate-based, `unchoke_slots_limit`, seed expansions",
@@ -260,6 +299,7 @@ AUDITS = [
     ("09", "time-critical", "Pipeline time-critical (deadlines)",
      "set_piece_deadline, request_time_critical_pieces, make_time_critical, cancel_non_critical, expiration de deadlines.",
      "`src/torrent.cpp` (set_piece_deadline, update_piece_deadline, request_time_critical_pieces), `src/peer_connection.cpp` (make_time_critical, can_request_time_critical)",
+     "`test/test_time_critical.cpp`, `test/test_piece_picker.cpp`",
      "`crates/bitdaemon-session/src/torrent.rs` (time_critical map, cancel_non_critical), `peer_conn.rs` (make_time_critical, queued_time_critical)",
      ["Deadlines : insertion, watch via ticker, alert expiry → recancel",
       "`queued_time_critical` : compteur de préfixe exact (insert/remove/choke-clear/shift)",
@@ -270,6 +310,7 @@ AUDITS = [
     ("10", "peer-lifecycle", "Cycle de vie des pairs & admission",
      "attach/detach, états de connexion, limites half-open, taxonomie des disconnects, admission entrante.",
      "`src/torrent.cpp` (attach_peer, remove_peer, connect_to_peer, peer_list), `src/session_impl.cpp` (incoming conn gates, max half-open)",
+     "`test/test_peer_list.cpp`, `test/test_peer_priority.cpp`, `test/test_ip_filter.cpp`, `test/test_remove_torrent.cpp`",
      "`crates/bitdaemon-session/src/torrent.rs` (attach_peer/remove_peer), `session.rs` (connect pump), `peer_list.rs`",
      ["Ordre attach : refcount picker, `set_peer_class`, interested eval, bitfield init",
       "remove_peer : abort outstanding (gate `!timed_out && !not_wanted` !), refcount dec, stats fold, gauges",
@@ -281,6 +322,7 @@ AUDITS = [
     ("11", "trackers", "Trackers (HTTP/UDP announce, scrape, backoff, tiers)",
      "Cycle announce complet : events, backoff, failover tiers, scrape, réponses, erreurs.",
      "`src/tracker_client.cpp`, `src/http_tracker_connection.cpp`, `src/udp_tracker_connection.cpp`, `src/torrent.cpp` (announce_with_tracker, enable_all_trackers, scrape_tracker)",
+     "`test/test_tracker.cpp`, `test/test_tracker_list.cpp`, `test/test_tracker_manager.cpp`, `test/udp_tracker.cpp`, `test/test_http_connection.cpp`",
      "`crates/bitdaemon-net/src/tracker*` (clients http/udp), `crates/bitdaemon-session/src/tracker_list.rs`, `torrent.rs` (announce legs), `engine.rs`",
      ["Events : none/started/stopped/completed — completed envoyé UNE fois au premier finish, re-announces sans event",
       "Backoff : échecs exponentiels `announce_interval * (1.5^n)`, cap, jitter, `fail_limit` → tracker suivant du tier",
@@ -293,6 +335,7 @@ AUDITS = [
     ("12", "web-seeds", "Web seeds (HTTP peer)",
      "web_peer_connection/http_seed_connection : GET ranges, keep-alive, erreurs, retry, comptabilité par seed.",
      "`src/web_peer_connection.cpp`, `src/http_seed_connection.cpp`, `src/web_connection_base.cpp`, `src/torrent.cpp` (retry_web_seed, maybe_connect_web_seeds)",
+     "`test/test_web_seed.cpp`, `test/test_web_seed_chunked.cpp`, `test/test_web_seed_redirect.cpp`, `test/test_web_seed_ban.cpp`, `test/web_seed_suite.cpp`, `test/test_url_seed.cpp`",
      "`crates/bitdaemon-net/src/web_seed*`, `crates/bitdaemon-session/src/session.rs` (on_web_seed_*), `torrent.rs` (web_seeds)",
      ["Range requests : pièces complètes vs blocs, `block_size` alignment, coalescing contigu",
       "Erreurs : HTTP non-200, redirect loops, content-length mismatch, EOF mid-piece → url_seed_alert + seed marqué",
@@ -303,6 +346,7 @@ AUDITS = [
     ("13", "utp-transport", "Transport uTP",
      "utp_stream : paquets, états connexion, resend, delay/rtt, MTU, buffers out-of-order, fermeture.",
      "`src/utp_stream.cpp`, `src/utp_socket_manager.cpp`, `include/libtorrent/utp_socket_manager.hpp`",
+     "`test/test_utp.cpp`, `test/test_packet_buffer.cpp`",
      "`crates/bitdaemon-net/src/utp*.rs`",
      ["Packet types : ST_DATA/FIN/STATE/RESET/SYN — header 20B exact (version, ext, conn_id, ts, tsdiff, wnd, seq, ack)",
       "State machine : SYN_SENT → CONNECTED → FIN_SENT/CLOSE_WAIT, syn retransmit, connect timeout",
@@ -315,6 +359,7 @@ AUDITS = [
     ("14", "mse-encryption", "Chiffrement MSE/PE",
      "Handshake DH, crypto_provide/select, RC4, padding, politiques enc.",
      "`src/pe_crypto.cpp`, `src/encryption.cpp`, `src/peer_connection.cpp` (enc handshake)",
+     "`test/test_pe_crypto.cpp`",
      "`crates/bitdaemon-net/src/pe_crypto.rs` / `encryption*.rs`, `peer_wire.rs` (enc wrapper)",
      ["Handshake : DH 768 bits, SKEY = info_hash côté initiator, génération clés publiques",
       "crypto_provide/crypto_select : bits plaintext/rc4, sync sur len(PadC), IA vs req1/req2/req3",
@@ -326,6 +371,7 @@ AUDITS = [
     ("15", "proxies", "Proxies (SOCKS5/HTTP CONNECT)",
      "socks5_stream, http_stream, instantiate_connection — auth, UDP associate, erreurs, settings par usage.",
      "`src/socks5_stream.cpp`, `src/http_stream.cpp`, `src/instantiate_connection.cpp`, `src/session_impl.cpp` (proxy settings)",
+     "`test/test_http_connection.cpp`, `test/test_socket_io.cpp`, `test/socks.py`",
      "`crates/bitdaemon-net/src/proxy*.rs` / `socks5*.rs` / `http_stream*.rs`, transport",
      ["SOCKS5 : méthodes auth (no-auth, user/pass), commandes connect/UDP associate, erreurs → mapping",
       "HTTP CONNECT : auth basic, tunnel keep-alive, host header",
@@ -336,6 +382,7 @@ AUDITS = [
     ("16", "ssl-torrents", "Torrents SSL",
      "ssl_stream : fingerprint cert vs info-hash, mutual TLS, cert settings, listen ssl, alertes.",
      "`src/ssl_stream.cpp`, `include/libtorrent/ssl_stream.hpp`, `src/torrent.cpp` (ssl legs), `src/session_impl.cpp` (ssl listen)",
+     "`test/test_ssl.cpp`",
      "`crates/bitdaemon-net/src/ssl_stream.rs`, `crates/bitdaemon-session/src/session.rs` (ssl listen legs), `engine.rs`",
      ["Fingerprint : digest cert SHA-256/SHA-1 vs info-hash v1/v2 → règles d'acceptation exactes",
       "Mutual TLS : verify_peer + verify_fail_if_no_peer_cert, client cert depuis `ssl_cert`/`ssl_key`",
@@ -346,6 +393,7 @@ AUDITS = [
     ("17", "dht", "DHT (krpc, traversals, items, sécurité)",
      "Mainline DHT : messages, traversals, tokens, BEP-44/51, routage, refresh, boot, rate limiting.",
      "`src/kademlia/*.cpp`, `src/dht_tracker.cpp`, `src/node.cpp`, `src/routing_table.cpp`, `src/item.cpp`",
+     "`test/test_dht.cpp`, `test/test_dht_storage.cpp`, `test/test_dos_blocker.cpp`, `test/test_direct_dht.cpp`",
      "`crates/bitdaemon-dht/src/*.rs`, `session.rs` (dht outbox/announce)",
      ["KRPC : encode/decode q/r/e, transaction ids, error [code,msg]",
       "Traversals : find_node, get_peers (token collect), announce_peer (write-token check, implied_port), sample_infohashes",
@@ -359,6 +407,7 @@ AUDITS = [
     ("18", "disk-cache-pool", "Cache disque & buffer pool",
      "Coalescing, watermark, éviction, dirty expiry, bornes pool, back-pressure cache.",
      "`src/disk_buffer_pool.cpp`, `src/store_buffer.cpp`, `src/disk_io_thread.cpp` (cache legs), `src/disk_job.cpp` (FLUSH)",
+     "`test/test_disk_cache.cpp`, `test/test_store_buffer.cpp`, `test/disk_cache_test_utils.hpp`",
      "`crates/bitdaemon-disk/src/disk_cache.rs`, `disk_buffer*`, `disk_io.rs`",
      ["Coalescing : runs contigus par pièce, un syscall par run",
       "Watermark : seuil haut blocage vs bas déblocage, hystérésis exacte",
@@ -370,6 +419,7 @@ AUDITS = [
     ("19", "partfile-filepool", "part_file & file_pool",
      "Slots part-file, export, migration priorités, récupération corruption ; pool fd LRU, caps, erreurs reopen.",
      "`src/part_file.cpp`, `src/file_pool.cpp`, `src/posix_part_file.cpp`",
+     "`test/test_part_file.cpp`, `test/test_file.cpp`, `test/test_copy_file.cpp`",
      "`crates/bitdaemon-disk/src/part_file.rs`, `file_pool.rs`",
      ["part_file : header format (magic, version, endianness!), slot alloc/free FIFO, export_on_flush, bit `flushed`",
       "Corruption : header illisible → comportement upstream, missing file, taille mismatch",
@@ -379,6 +429,7 @@ AUDITS = [
     ("20", "resume-data", "Resume data — round-trip + snapshot sous I/O",
      "read/write resume complet, verify_resume_data verdicts, cohérence du snapshot pendant écritures en vol.",
      "`src/read_resume_data.cpp`, `src/write_resume_data.cpp`, `src/torrent.cpp` (check_fastresume, on_resume_data_checked, save_resume_data)",
+     "`test/test_resume.cpp`, `test/test_read_resume.cpp`",
      "`crates/bitdaemon-session/src/session.rs`/`torrent.rs` (resume paths), `core::resume*`",
      ["Champs : pieces bitfield, unfinished, priorities, trackers, peers+banned, seeds_dht, limits, totals, active/seeding time, flags (upload/share/seed/auto_managed/paused/apply_ip_filter), save_path, renamed/mapped_files, file_format_version, ih v2, comment/created_by/creation_date",
       "verify_resume_data verdicts : no_resume/need_full_check, fichiers manquants/modifiés/tailles, `partial`",
@@ -389,6 +440,7 @@ AUDITS = [
     ("21", "torrent-state-machine", "Machine d'état torrent",
      "Transitions add→checking→downloading→finished→seeding, pauses, state_updated/save_resume triggers, seed_mode.",
      "`src/torrent.cpp` (set_state, files_checked, on_torrent_paused, do_pause/do_resume, finished, start/stop_announcing)",
+     "`test/test_torrent.cpp`, `test/test_checking.cpp`, `test/test_add_torrent.cpp`, `test/test_remove_torrent.cpp`",
      "`crates/bitdaemon-session/src/torrent.rs` (set_state, checking flags, finished/seeding), `session.rs`",
      ["Ladder : checking_files/checking_resume/downloading_metadata/downloading/finished/seeding + transitions interdites",
       "paused : `m_paused | m_session_paused`, graceful pause (announces stop, disconnects différés)",
@@ -400,6 +452,7 @@ AUDITS = [
     ("22", "magnet-metadata", "Magnet & acquisition metadata",
      "Magnet add, ut_metadata pacing, info-hash verify, priorités/trackers conservés, ops sans metadata.",
      "`src/torrent.cpp` (init, on_metadata, set_metadata), `src/ut_metadata.cpp` (request pacing)",
+     "`test/test_magnet.cpp`, `test/test_create_torrent.cpp`, `test/test_torrent_info.cpp`",
      "`crates/bitdaemon-session/src/torrent.rs` (init/magnet path), `session.rs` (metadata dispatch)",
      ["Phases : magnet add → metadata download → verify hash → init picker/files → apply pending state",
       "ut_metadata pacing upstream (intervalle entre requêtes, ban on flood)",
@@ -410,6 +463,7 @@ AUDITS = [
     ("23", "settings-session-state", "Settings hot-apply & .session",
      "apply_settings legs par clé, session_params/.session round-trip, deprecated keys.",
      "`src/settings_pack.cpp`, `src/session_impl.cpp` (apply_settings, load_state, save_state), `src/session_params.cpp`",
+     "`test/test_settings_pack.cpp`, `test/test_session_params.cpp`, `test/test_session.cpp`",
      "`crates/bitdaemon-session/src/settings.rs` (apply_settings legs), `session.rs` (SessionState)",
      ["apply_settings : chaque clé ayant un effet live vs celles ne s'appliquant qu'au prochain storage/conn",
       "Clés sans effet live : documenté comme upstream",
@@ -419,6 +473,7 @@ AUDITS = [
     ("24", "piece-picker", "Piece picker — cas limites",
      "reverse/partial/rarest-first, priorities, streaming, share mode, endgame busy, invariants.",
      "`src/piece_picker.cpp` (pick_pieces, update_pieces, share mode legs)",
+     "`test/test_piece_picker.cpp`, `test/test_priority.cpp`, `test/test_apply_pad.cpp`",
      "`crates/bitdaemon-session/src/piece_picker.rs`, `request_blocks.rs`",
      ["Rarest-first : weighted random, ordre des priority buckets",
       "Reverse : ordre de pick pour snubbed peers (convergence sur mêmes pièces)",
@@ -431,6 +486,7 @@ AUDITS = [
     ("25", "counters-sweep", "Sweep conformité compteurs/stats",
      "Chaque `Counter` ↔ sites upstream inc/dec/set ; session_stats snapshot ; sliding_average.",
      "`include/libtorrent/performance_counters.hpp`, tous les `inc_stats_counter`/`set_value`/`blend_stats_counter`",
+     "`test/test_sliding_average.cpp`, `test/test_stat_cache.cpp`, `test/test_session.cpp`",
      "`crates/bitdaemon-session/src/counters.rs` + tous les sites d'appel",
      ["Exhaustif : pour CHAQUE counter upstream, le site Rust correspondant (ou N/A documenté)",
       "Jamais incrémentés : pattern trouvé 2× — suspecter tous les compteurs",
@@ -441,6 +497,7 @@ AUDITS = [
     ("26", "path-metainfo-security", "Sanitization chemins & parsing metainfo (sécurité)",
      "file_storage sanitize (.., ADS, device names, drives, abs), symlink, doublons ; metainfo malformé.",
      "`src/file_storage.cpp` (sanitize_path), `src/torrent_info.cpp` (parse errors), `src/path.cpp`",
+     "`test/test_file_storage.cpp`, `test/test_torrent_info.cpp`, `test/test_utf8.cpp`",
      "`crates/bitdaemon-core/src/file_storage.rs`, `path*.rs`, `torrent_info.rs`",
      ["`..` traversal : sanitization identique upstream (éléments retirés, pas rejet global)",
       "ADS `file:`/`file$`, noms réservés Windows (CON/PRN/AUX/NUL/COM1-9/LPT1-9) → renaming identique",
@@ -452,6 +509,7 @@ AUDITS = [
     ("27", "engine-glue", "Glue engine/session",
      "engine.rs : boucle dispatch, ordonnancement commandes, timers, pont disque, starvation.",
      "`src/session_impl.cpp` (dispatch loop ordering) — l'équivalent local est `engine.rs`",
+     "`test/test_session.cpp`, `test/test_alert_manager.cpp`, `test/test_alert_types.cpp`",
      "`crates/bitdaemon/src/engine.rs`",
      ["Ordonnancement : ordre commandes vs ticks vs disk completions vs net events",
       "Tick starvation : le bug corrigé — vérifier toutes les sources de réveil",
@@ -462,6 +520,7 @@ AUDITS = [
     ("28", "nat-traversal", "NAT traversal (LSD/UPnP/NAT-PMP)",
      "LSD multicast, UPnP IGD lifecycle, NAT-PMP/PCP mappings, external IP election.",
      "`src/lsd.cpp`, `src/upnp.cpp`, `src/natpmp.cpp`, `src/session_impl.cpp` (portmap legs)",
+     "`test/test_upnp.cpp`, `test/test_natpmp.cpp`, `test/test_lsd.cpp`, `test/test_broadcast_socket.cpp`",
      "`crates/bitdaemon-net/src/lsd*.rs`, `upnp*.rs`, `natpmp*.rs`, `session.rs`/`engine.rs`",
      ["LSD : multicast group/port, cadence par torrent, cookie, receive → peer feed, off en anonymous_mode",
       "UPnP : SSDP discover, WANIP/WANPPP, AddPortMapping + renew, DeletePortMapping au stop",
@@ -472,6 +531,7 @@ AUDITS = [
     ("29", "bandwidth-classes", "Bandwidth manager & peer classes",
      "Quotas par canal, request_bandwidth, class filters, rate channels, mixed mode, overhead.",
      "`src/bandwidth_manager.cpp`, `src/bandwidth_queue_entry.hpp`, `src/bandwidth_limit.cpp`, `src/peer_class.cpp`",
+     "`test/test_bandwidth_limiter.cpp`, `test/test_peer_classes.cpp`",
      "`crates/bitdaemon-net/src/peer_class*.rs`, `crates/bitdaemon-session/src/session.rs` (bw quota paths)",
      ["Channels : upload/download/protocol + classes (global/tcp/local/i2p) — assignation conn→class à l'attach",
       "request_bandwidth : quota granted, temp queuing, expiry",
@@ -572,7 +632,7 @@ def derived_status(aid, slug):
     return f"done — commit `{h.group(1)}`" if h else "done — rapport"
 
 
-status_of = {a[0]: (derived_status(a[0], a[1]) or a[8]) for a in AUDITS}
+status_of = {a[0]: (derived_status(a[0], a[1]) or a[9]) for a in AUDITS}
 
 # INDEX.md — all rows
 idx = [
@@ -585,7 +645,7 @@ idx = [
     "| # | Audit | Périmètre | Statut |",
     "|---|---|---|---|",
 ]
-for aid, slug, title, scope, _up, _rs, _chk, _traps, _status in AUDITS:
+for aid, slug, title, scope, _up, _tests, _rs, _chk, _traps, _status in AUDITS:
     idx.append(f"| A{aid} | {title} | {scope} | {status_of[aid] or 'à faire'} |")
 idx += [
     "",
@@ -599,8 +659,8 @@ idx += [
     f"/audit-01-v{WAVE_OF['01']}-peer-wire-codec en mode apply",
     "```",
     "",
-    "Le skill embarque : périmètre, fichiers upstream/Rust, checklist,",
-    "protocole à deux modes, pièges connus.",
+    "Le skill embarque : périmètre, fichiers upstream (code + tests), Rust,",
+    "checklist, protocole renforcé (5 lentilles d'analyse), pièges connus.",
     "",
     "## Workflow parallèle — 2 phases",
     "",
@@ -716,7 +776,7 @@ for old in os.listdir(skills_root):
     if old.startswith("audit-") and os.path.isdir(p):
         shutil.rmtree(p)
 
-for aid, slug, title, scope, up, rs, chk, traps, _status in AUDITS:
+for aid, slug, title, scope, up, tests, rs, chk, traps, _status in AUDITS:
     w = WAVE_OF[aid]
     wspec = WAVES[w]
     sname = f"audit-{aid}-v{w}-{slug}"
@@ -746,7 +806,8 @@ for aid, slug, title, scope, up, rs, chk, traps, _status in AUDITS:
         "",
         "## Fichiers",
         "",
-        f"- **Upstream** (baseline `e7381c7bc`, lecture seule) : {up}",
+        f"- **Upstream code** (baseline `e7381c7bc`, lecture seule) : {up}",
+        f"- **Upstream tests** (oracle de spécification) : {tests}",
         "  Checkout upstream, résolu dans l'ordre : `$LIBTORRENT_ROOT` si",
         "  définie → `D:/Projet/libtorrent/libtorrent` (poste local) → sinon",
         "  `git clone https://github.com/arvidn/libtorrent ../libtorrent`",
