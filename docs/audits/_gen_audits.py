@@ -204,7 +204,7 @@ AUDITS = [
       "Messages hors-ordre : have/bitfield avant handshake, piece avant bitfield, reject sans request",
       "Dépassements : oversized piece (packet_too_large), truncated frames, length incohérente → disconnect vs drop silencieux",
       "Compteurs `num_incoming_*` par type de message (funnel dispatch)",
-      "Port/dht_port message, extension id 0 handshake vs ids étendus"], "", None),
+      "Port/dht_port message, extension id 0 handshake vs ids étendus"], "", "done — commit `9072a9e`"),
     ("07", "extension-protocols", "Protocoles d'extension (ut_metadata, ut_pex, lt_*, suggest, smartban, holepunch)",
      "Extensions BEP-10 : métadata, pex, dont_have/have_none, suggest+allowed_fast, smart_ban, upload_only, holepunch.",
      "`src/ut_metadata.cpp`, `src/ut_pex.cpp`, `src/smart_ban.cpp`, `src/bt_peer_connection.cpp` (extended legs), `src/peer_connection.cpp` (incoming_suggest/allowed_fast/dont_have)",

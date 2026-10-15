@@ -9,9 +9,7 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
-### Fixed
-
-- **Peer-wire codec & disconnect severity (A06)**: the frame
+- **Peer-wire codec & disconnect severity (A01)**: the frame
   length-prefix cap is now upstream's 1 MiB (`packet_size >
   1024*1024` → `packet_too_large`); a `piece` frame shorter than the
   9-byte header is consumed silently like upstream `on_piece` instead

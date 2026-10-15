@@ -1,4 +1,4 @@
-# Audit A06 — Codec peer-wire & framing
+# Audit A01 — Codec peer-wire & framing
 
 Baseline upstream : `e7381c7bc` (`src/bt_peer_connection.cpp`,
 `src/peer_connection.cpp`, `peer_connection_interface.hpp`).
