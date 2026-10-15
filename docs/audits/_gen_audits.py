@@ -9,8 +9,8 @@ PROTOCOL = """## Protocole — deux modes
 L'invocation précise le mode ; **défaut : `rapport`**. Le découpage existe
 parce que plusieurs audits peuvent tourner en parallèle : la phase
 d'analyse est read-only sur le repo (zéro conflit), la phase de
-correction s'exécute dans un worktree + branche dédiés ; le merge est
-local et décidé par l'humain.
+correction s'exécute dans un worktree + branche dédiés ; l'apply finit
+par un merge automatique sur `main` local + cleanup — tout local.
 
 ### Analyse commune (mode A l'exécute, mode B s'appuie sur le rapport)
 
@@ -134,19 +134,21 @@ autres).
     rebase + gates comme pour le reste.
 12. Commit `fix(<crate>): <scope> parity — <mot-clé>` **sur la branche
     `audit/{aid}-{slug}`** — jamais sur `main`. **Tout reste local** :
-    pas de push, pas de PR, pas de GitHub. Signaler « prêt à merger »
-    et **s'arrêter** — le merge n'a lieu que sur ordre explicite de
-    l'humain (« merge »). Sur cet ordre : `git merge
-    audit/{aid}-{slug}` dans le checkout principal — **un merge à la
-    fois** ; si conflits (`torrent.rs`/`peer_conn.rs`/`session.rs`/
-    `PORTING.md`), rebase de la branche sur `main` frais **dans le
-    worktree** + re-run des gates, puis nouveau `git merge`.
-13. **Résultat** : ajouter une section `## Résultat` au rapport
-    (déviations corrigées, tests ajoutés, hash du commit).
-    **Hygiène post-merge** : `git worktree remove
+    pas de push, pas de PR, pas de GitHub.
+13. **Merge sur `main` — automatique, dernier acte de l'apply.** Pour
+    garantir un merge propre, `git rebase main` d'abord dans le
+    worktree (résoudre les éventuels conflits `torrent.rs`/
+    `peer_conn.rs`/`session.rs`/`PORTING.md` là + re-run des gates),
+    puis `git -C ../LibtorrentRust merge --no-ff audit/{aid}-{slug}`
+    — le merge s'exécute dans le checkout principal (apply solo dans
+    le checkout principal : `git checkout main` puis `git merge
+    --no-ff` en place). Les merges se chaînent **un à la fois** — si le
+    checkout principal est verrouillé ou déjà en merge, attendre et
+    réessayer. Cleanup immédiat : `git worktree remove
     ../LibtorrentRust-a{aid}` puis `git branch -d audit/{aid}-{slug}`.
-    Une branche mergée qui traîne encombre la vue et trompe la
-    planification.
+14. **Résultat** : ajouter une section `## Résultat` au rapport
+    (déviations corrigées, tests ajoutés, hash du commit) — commitée
+    sur la branche **avant** le merge pour partir avec lui.
 
 ## Pièges connus (checklists transverses)
 
@@ -542,7 +544,7 @@ for sub, desc in [
                 "que le sien). Alimente le mode apply."),
     ("changelog", "Fragments de changelog produits par le mode apply (un par\n"
                   "audit, au lieu d'éditer CHANGELOG.md — élimine les conflits\n"
-                  "de merge). Agrégés dans CHANGELOG.md après merge des PRs\n"
+                  "de merge). Agrégés dans CHANGELOG.md après les merges locaux\n"
                   "via `python docs/audits/_aggregate_changelog.py`."),
 ]:
     p = os.path.join("docs", "audits", sub)
@@ -616,25 +618,26 @@ idx += [
     "`## Non-bugs tranchés`. Un `apply` sur rapport brut applique des",
     "faux positifs possibles en branche.",
     "",
-    "### Phase 2 — application (worktrees, merge local par l'humain)",
+    "### Phase 2 — application (worktrees, merge local automatique)",
     "",
-    "Mode `apply` par audit — prérequis : rapport commité + validé :",
+    "Mode `apply` par audit — prérequis : rapport commité + validé. Le",
+    "« apply » de l'humain EST le feu vert : tout s'enchaîne ensuite",
+    "sans intervention, merge compris :",
     "",
     "```sh",
     "git worktree add ../LibtorrentRust-aNN -b audit/NN-<slug>",
     "# l'agent travaille dans ce dossier (target/ isolé → builds parallèles) :",
-    "# gates + changelog fragment + PORTING.md + ## Résultat, commit sur",
-    "# sa branche, puis signale « prêt à merger » — tout reste LOCAL.",
-    "# Sur ordre « merge » de l'humain : git merge audit/NN-<slug>",
-    "# dans le checkout principal (un merge à la fois) :",
-    "git merge audit/NN-<slug>",
-    "# après merge :",
+    "# gates + changelog fragment + PORTING.md + ## Résultat, commits sur",
+    "# sa branche — puis, automatiquement :",
+    "git rebase main   # dans le worktree, résout les conflits + re-gates",
+    "git -C ../LibtorrentRust merge --no-ff audit/NN-<slug>   # merge sur main",
     "git worktree remove ../LibtorrentRust-aNN && git branch -d audit/NN-<slug>",
     "```",
     "",
-    "Merges **séquentiels** ; en cas de conflit sur les fichiers chauds,",
-    "rebase de la branche dans son worktree + re-run des gates, puis",
-    "nouveau `git merge`.",
+    "Merges **séquentiels** (un à la fois — si le checkout principal est",
+    "verrouillé ou déjà en merge, attendre et réessayer). En cas de",
+    "conflit sur les fichiers chauds : le rebase les résout dans le",
+    "worktree + re-run des gates avant le `git -C ... merge`.",
     "",
     "### Vagues d'application conseillées (recouvrement de fichiers,",
     "pas de numéros de crate : A02 et A13 sont tous deux dans",
@@ -661,7 +664,7 @@ idx += [
     "### Agrégation changelog",
     "",
     "```sh",
-    "python docs/audits/_aggregate_changelog.py   # après merge des PRs",
+    "python docs/audits/_aggregate_changelog.py   # après les merges locaux",
     "```",
     "",
     "Fusionne `docs/audits/changelog/A*.md` dans `CHANGELOG.md` sous",
@@ -676,8 +679,7 @@ idx += [
     "  (PowerShell).",
     "- 2-4 builds workspace concurrents max en local (cargo utilise déjà tous",
     "  les cœurs). Pour du parallélisme massif : sessions cloud séparées,",
-    "  une par audit — chacune a sa machine et son checkout ; l'agent",
-    "  push juste sa branche pour que l'humain la merge en local.",
+    "  une par audit — chacune a sa machine et son checkout.",
     "",
     "## Ordre — les numéros SONT l'ordre conseillé",
     "",
@@ -691,7 +693,7 @@ idx += [
     "Rapports : aucun ordre — tous parallélisables.",
     "",
     "En parallèle (2-4 apply) : piocher dans la même vague de préférence,",
-    "et merger dans l'ordre des numéros quand deux PRs se recouvrent.",
+    "et merger dans l'ordre des numéros quand deux apply se recouvrent.",
     "",
 ]
 with open("docs/audits/INDEX.md", "w", encoding="utf-8") as f:

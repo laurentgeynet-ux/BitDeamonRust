@@ -70,25 +70,26 @@ validé par un humain ; les déviations contestées basculent dans
 `## Non-bugs tranchés`. Un `apply` sur rapport brut applique des
 faux positifs possibles en branche.
 
-### Phase 2 — application (worktrees, merge local par l'humain)
+### Phase 2 — application (worktrees, merge local automatique)
 
-Mode `apply` par audit — prérequis : rapport commité + validé :
+Mode `apply` par audit — prérequis : rapport commité + validé. Le
+« apply » de l'humain EST le feu vert : tout s'enchaîne ensuite
+sans intervention, merge compris :
 
 ```sh
 git worktree add ../LibtorrentRust-aNN -b audit/NN-<slug>
 # l'agent travaille dans ce dossier (target/ isolé → builds parallèles) :
-# gates + changelog fragment + PORTING.md + ## Résultat, commit sur
-# sa branche, puis signale « prêt à merger » — tout reste LOCAL.
-# Sur ordre « merge » de l'humain : git merge audit/NN-<slug>
-# dans le checkout principal (un merge à la fois) :
-git merge audit/NN-<slug>
-# après merge :
+# gates + changelog fragment + PORTING.md + ## Résultat, commits sur
+# sa branche — puis, automatiquement :
+git rebase main   # dans le worktree, résout les conflits + re-gates
+git -C ../LibtorrentRust merge --no-ff audit/NN-<slug>   # merge sur main
 git worktree remove ../LibtorrentRust-aNN && git branch -d audit/NN-<slug>
 ```
 
-Merges **séquentiels** ; en cas de conflit sur les fichiers chauds,
-rebase de la branche dans son worktree + re-run des gates, puis
-nouveau `git merge`.
+Merges **séquentiels** (un à la fois — si le checkout principal est
+verrouillé ou déjà en merge, attendre et réessayer). En cas de
+conflit sur les fichiers chauds : le rebase les résout dans le
+worktree + re-run des gates avant le `git -C ... merge`.
 
 ### Vagues d'application conseillées (recouvrement de fichiers,
 pas de numéros de crate : A02 et A13 sont tous deux dans
@@ -113,7 +114,7 @@ branche avant d'en appliquer une autre sur le même fichier.
 ### Agrégation changelog
 
 ```sh
-python docs/audits/_aggregate_changelog.py   # après merge des PRs
+python docs/audits/_aggregate_changelog.py   # après les merges locaux
 ```
 
 Fusionne `docs/audits/changelog/A*.md` dans `CHANGELOG.md` sous
@@ -128,8 +129,7 @@ supprime les fragments. Commit : `docs(changelog): aggregate audit entries`.
   (PowerShell).
 - 2-4 builds workspace concurrents max en local (cargo utilise déjà tous
   les cœurs). Pour du parallélisme massif : sessions cloud séparées,
-  une par audit — chacune a sa machine et son checkout ; l'agent
-  push juste sa branche pour que l'humain la merge en local.
+  une par audit — chacune a sa machine et son checkout.
 
 ## Ordre — les numéros SONT l'ordre conseillé
 
@@ -143,4 +143,4 @@ position dans la numérotation (ils ont déjà été exécutés là).
 Rapports : aucun ordre — tous parallélisables.
 
 En parallèle (2-4 apply) : piocher dans la même vague de préférence,
-et merger dans l'ordre des numéros quand deux PRs se recouvrent.
+et merger dans l'ordre des numéros quand deux apply se recouvrent.

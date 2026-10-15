@@ -42,8 +42,8 @@ affiner avec la section `## Fichiers du fix` du rapport.
 L'invocation précise le mode ; **défaut : `rapport`**. Le découpage existe
 parce que plusieurs audits peuvent tourner en parallèle : la phase
 d'analyse est read-only sur le repo (zéro conflit), la phase de
-correction s'exécute dans un worktree + branche dédiés ; le merge est
-local et décidé par l'humain.
+correction s'exécute dans un worktree + branche dédiés ; l'apply finit
+par un merge automatique sur `main` local + cleanup — tout local.
 
 ### Analyse commune (mode A l'exécute, mode B s'appuie sur le rapport)
 
@@ -174,19 +174,21 @@ autres).
     rebase + gates comme pour le reste.
 12. Commit `fix(<crate>): <scope> parity — <mot-clé>` **sur la branche
     `audit/04-trackers`** — jamais sur `main`. **Tout reste local** :
-    pas de push, pas de PR, pas de GitHub. Signaler « prêt à merger »
-    et **s'arrêter** — le merge n'a lieu que sur ordre explicite de
-    l'humain (« merge »). Sur cet ordre : `git merge
-    audit/04-trackers` dans le checkout principal — **un merge à la
-    fois** ; si conflits (`torrent.rs`/`peer_conn.rs`/`session.rs`/
-    `PORTING.md`), rebase de la branche sur `main` frais **dans le
-    worktree** + re-run des gates, puis nouveau `git merge`.
-13. **Résultat** : ajouter une section `## Résultat` au rapport
-    (déviations corrigées, tests ajoutés, hash du commit).
-    **Hygiène post-merge** : `git worktree remove
+    pas de push, pas de PR, pas de GitHub.
+13. **Merge sur `main` — automatique, dernier acte de l'apply.** Pour
+    garantir un merge propre, `git rebase main` d'abord dans le
+    worktree (résoudre les éventuels conflits `torrent.rs`/
+    `peer_conn.rs`/`session.rs`/`PORTING.md` là + re-run des gates),
+    puis `git -C ../LibtorrentRust merge --no-ff audit/04-trackers`
+    — le merge s'exécute dans le checkout principal (apply solo dans
+    le checkout principal : `git checkout main` puis `git merge
+    --no-ff` en place). Les merges se chaînent **un à la fois** — si le
+    checkout principal est verrouillé ou déjà en merge, attendre et
+    réessayer. Cleanup immédiat : `git worktree remove
     ../LibtorrentRust-a04` puis `git branch -d audit/04-trackers`.
-    Une branche mergée qui traîne encombre la vue et trompe la
-    planification.
+14. **Résultat** : ajouter une section `## Résultat` au rapport
+    (déviations corrigées, tests ajoutés, hash du commit) — commitée
+    sur la branche **avant** le merge pour partir avec lui.
 
 ## Pièges connus (checklists transverses)
 
