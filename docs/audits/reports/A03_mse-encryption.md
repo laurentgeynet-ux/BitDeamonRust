@@ -448,3 +448,175 @@ différé ; échec inbound post-attach comptabilisé sans peer-entry ;
 `cargo fmt --all` · `cargo clippy --workspace --all-targets --
 -D warnings` · `cargo test --workspace` (108 binaires verts) ·
 `cargo doc --workspace --no-deps` — tous passent dans le worktree.
+
+## Re-audit à froid (post-apply round-1)
+
+Relecture indépendante de la baseline `e7381c7bc` et du code post-
+apply. Les fixes D1–D15 sont confirmés appliqués et fidèles (skey
+v1+v2 via `known_torrent_by_skey`, `peer_link_up` = `on_connected`,
+write-backs `pe_support` gatés `outgoing && pe_enabled`, sanitize
+`allowed_enc_level`/`enc_policy`, bornes pad/IA, `crypto_select`
+initiateur masqué, alertes/compteurs `disconnect()` pré-attach via
+`disconnect_alert_counters`). Cinq déviations résiduelles + un edge
+suivent — dont une qui **invalide une affirmation du rapport
+round-1**.
+
+### Corrections d'affirmations round-1
+
+- La ligne « pas de re-validation de l'ih echo côté initiateur
+  attaché (upstream saute le bloc sous `if (!t)`) » (section Bonus
+  parité) est **fausse** : upstream ne saute pas le traitement de
+  l'ih sur conn attachée — `read_info_hash` a une branche `else`
+  qui valide l'écho et flippe `protocol_v2`
+  (`bt_peer_connection.cpp:3482-3503`). Le commentaire Rust à
+  `bt_peer_conn.rs:520-524` répète la même mauvaise lecture. → D16.
+
+### D16 — écho info-hash jamais validé sur conn attachée (+ flip
+`protocol_v2` par l'ih) — **wire-visible + état**
+
+Sites : `bt_peer_conn.rs:384-387` (`run_handshake` — dial plaintext),
+`:450-451` (`run_handshake_encrypted_initiator` — dial MSE),
+`:519-528` (`run_handshake_encrypted_responder_prefix` — inbound
+attaché par SKEY). Les trois parsent `hs` et l'utilisent sans jamais
+comparer `hs.info_hash` à `associated_info_hash()`.
+
+Upstream (`bt_peer_connection.cpp:3482-3503`, branche `else` de
+`if (!t)` — donc toute conn déjà attachée : dialée, ou attachée par
+SKEY côté inbound) :
+
+- ih reçu == hash v2 tronqué **et** torrent `has_v2` →
+  `peer_info_struct()->protocol_v2 = true` — le `write_handshake`
+  qui suit (3512) emporte alors le hash **v2** (post-flip
+  `associated_info_hash()`) et n'annonce plus le bit `0x10`.
+- sinon ih reçu != `associated_info_hash()` (ou hash associé
+  tout-à-zéro) → `disconnect(errors::invalid_info_hash, bittorrent,
+  failure)` — alerte `peer_disconnected` + `disconnected_peers` +
+  legs `error_*`.
+
+Conséquences Rust : (a) un pair qui a prouvé le SKEY mais échoit un
+ih arbitraire reste attaché au torrent résolu — upstream le tue à
+sévérité failure (divergence état + compteurs/alertes manquants) ;
+(b) le dial plaintext/MSE accepte pareillement un écho incohérent ;
+(c) un inbound qui SKEYe en v1 sur hybride mais handshake en v2 n'est
+pas upgradé `protocol_v2` (upstream : oui — et la réponse change de
+hash). Fix : dans la branche attachée, `if echo == v2_ih && has_v2 →
+protocol_v2=true` puis ré-évaluer `wire_ih`/`advertise_v2` ; `else if
+echo != associated → WrongInfoHash` (déjà mappé `(Failure, Bittorrent,
+"invalid_info_hash")`). Il faut passer `has_v2`/`v2_ih` aux jambes
+initiator (disponibles via `peer_link_up`). **Gap de test** : aucun
+test ne couvre l'écho ih sur conn attachée (les 3 sites) ni le flip
+v2-par-écho.
+
+### D17 — legs crypto absents de `peer_disconnected` post-attach —
+**compteur**
+
+`session.rs:4736-4781` (teardown de conn *attachée*, sev > normal) :
+incrémente `error_tcp/utp` + `error_incoming/outgoing` mais pas
+`error_encrypted_peers`/`error_rc4_peers` — upstream les compte dans
+`disconnect()` quand `type()==bittorrent && op != connect &&
+supports_encryption()` (+ `rc4_encrypted()` pour rc4)
+(`peer_connection.cpp:4414-4422`). L'apply round-1 n'a couvert que
+les conns pré-attach (`disconnect_alert_counters` :5063-5070). Fix :
+lire `c.supports_encryption`/`c.rc4_encrypted` dans le lookup
+`t.peers[peer]` (:4717-4722) et ajouter les deux legs sous
+`sev > Normal`. **Gap de test** : teardown sev>normal d'une conn
+chiffrée attachée.
+
+### D18 — `st.encrypted` posé à l'entrée MSE, pas à la fin de la
+négociation — **compteur**
+
+`bt_peer_conn.rs:439,500` posent `st.encrypted = true` dès l'entrée
+du handshake ; la doc :425-426 prétend que `m_encrypted` « sets at
+MSE entry » upstream — faux : `m_encrypted` ne passe vrai qu'à
+`init_bt_handshake`/fin de `read_pe_ia` (responder `3300`,
+initiator `:3223/3278` → `init_bt_handshake`), `m_rc4_encrypted` à
+`select_crypto` (`:666`, `:3199-3201`). Conséquence : tout échec MSE
+en amont de la négociation (sync_hash_not_found, ih inconnu,
+vc_not_zero, unsupported_encryption_mode, invalid_pad_size,
+invalid_encrypt_handshake) incrémente `error_encrypted_peers` via
+`fail.encrypted` là où upstream ne le compte pas — seuls les échecs
+post-négociation le devraient. `st.rc4_encrypted` (posé à `mse_done`)
+n'est pas surestimé. **Compteur uniquement.**
+
+### D19 — PE4 non émis avant le refus de `len_pad`/`len_ia`
+malformés — **wire-visible mineur**
+
+`mse.rs:344-385` : le répondeur lit `[VC][provide][len_pad][pad]
+[len_ia][ia]`, valide `len_pad>512` (:353), `len_ia>68` (:364) et le
+`select` (:379) puis seulement écrit PE4 (:383-385). Upstream écrit
+PE4 dès le `select` validé (`write_pe4_sync` :3183) puis valide
+`len_pad` (:3204-3209 → `invalid_pad_size` peer_error) et `len_ia`
+(:3250-3254 → `invalid_encrypt_handshake` peer_error). Un initiateur
+fautif reçoit donc PE4-then-close upstream, close-sec en Rust —
+distinguable sur le fil (fingerprint), sans impact interop. Le cas
+`select==0` → pas de PE4 des deux côtés ✓. Fix optionnel : écrire
+PE4 avant les validations pad/IA pour aligner l'empreinte.
+
+### D20 — accepteur SSL : jambes d'échec partagées absentes —
+**état/compteur** (périmètre partagé A23)
+
+`engine.rs:4562-4582` : un échec du handshake BT post-TLS fait
+`warn` + `NumPeersHalfOpen--` seulement — pas de
+`peer_conn_failed_inbound` (donc ni `disconnected_peers`,
+`error_incoming/tcp` à sev>normal, ni alerte `peer_disconnected`/
+`peer_error`), ni la jambe `verify_secret_id`→`ban_ip` sur ih
+inconnu — upstream `attach_to_torrent` l'applique à toute conn
+(`peer_connection.cpp:1326-1338`, les conns SSL traversent
+`read_info_hash` pareil). L'échec TLS lui-même poste `PeerError`
+(:4500-4504) mais sans les compteurs `disconnect()`. L'exemption
+MSE/politiques SSL est conforme (`!is_ssl` upstream).
+
+### D21 — `accept_stream` (transports injectés) sans timeout de
+handshake — **état**
+
+`engine.rs:4898-5007` : ni `spawn_handshake_watchdog` ni
+`tokio::time::timeout` autour de `run_handshake_responder_auto` — un
+flux injecté (voies anonymes/i2p) qui fige en cours de handshake ne
+meurt jamais : socket ouverte + `num_peers_half_open` gonflé.
+Upstream arme `handshake_timeout`/inactivité sur toute conn
+(`peer_connection` ctor → `on_tick`). L'accepteur plain et l'accepteur
+SSL ont tous deux un timeout.
+
+### Edge — `connect_peer` manuel ignore le flag SSL du torrent
+
+`engine.rs:~3505-3570` : dial TCP direct + `peer_link_up(ih, remote,
+false)` — un `connect_peer` API sur un torrent SSL partirait en
+plaintext/MSE là où upstream `connect_to_peer` instancie
+`ssl_stream` (le leg `ssl_params` de `spawn_dial` :3821-3843 n'y est
+pas reproduit). Mineur — API manuelle hors pompe.
+
+### Faux positifs / conformités re-confirmés
+
+- Sévérité par défaut `disconnect()` = `normal`
+  (`peer_connection_interface.hpp:45` + default arg) — le leg `0x10`
+  sur v1-only (`invalid_info_hash` sans arg → normal) ✓ mappé
+  `V2OnV1` → Normal.
+- `error_peers` n'est incrémenté qu'à `error == peer_error`
+  (`peer_connection.cpp:4353`) — Rust :4782 ✓ ; `m_failed` =
+  `error > normal` → `sev > Normal` à :4729 ✓.
+- `crypto_select == 0` → `unsupported_encryption_mode` @failure
+  **avant** PE4 (upstream :3176-3183) — Rust :379-381 équivalent.
+- `len_pad` borné avant la lecture du pad des deux côtés
+  (upstream :3204-3209 ↔ `mse.rs:353`) ; `len_ia` lu dans le bloc
+  pad déchiffré (`subspan` :3244 ↔ `tail[len_pad..]` :359) ✓.
+- IA réinjectée (`cut(0,20)` :3313 ↔ préfixe `theirs[..ia]`
+  bt_peer_conn.rs:510-515) ; `len_ia == 0` → lecture directe ✓.
+- `fast_reconnect` : bras `pe_enabled+pe_support` uniquement
+  (upstream :239-241 ↔ `torrent.rs:3796-3803`) ✓ ; re-arm
+  `pe_support` post-PE4 gated `is_outgoing && pe_enabled`
+  (`rearm_pe_support`, `session.rs:4959-4967`) ✓.
+- Index skey v1+v2 tronqué ✓ (`known_torrent_by_skey`,
+  `session.rs:5150-5164` = `m_obfuscated_index`).
+- Pas de compteurs `disconnection_*_peers`/`conn_attempts` dans
+  cette baseline — absence conforme.
+
+### Gaps de tests résiduels
+
+- écho ih sur conn attachée (3 sites) + flip `protocol_v2` par
+  écho v2 (D16) — les tests `test_bt_peer_conn.rs` ne couvrent que
+  la jambe non-attachée ;
+- legs `error_encrypted`/`error_rc4` sur teardown post-attach (D17) ;
+- fenêtre `st.encrypted` pré-négociation (D18) ;
+- ordre PE4 sur entrée malformée (D19) ;
+- comptabilisation d'échec accepteur SSL (D20) ;
+- timeout handshake sur `accept_stream` (D21).
