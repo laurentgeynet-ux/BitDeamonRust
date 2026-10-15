@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Generate per-audit SKILL.md workflows + docs/audits/INDEX.md."""
 import os
+import re
 import shutil
 
 PROTOCOL = """## Protocole — deux modes
@@ -541,6 +542,23 @@ for sub, desc in [
     with open(os.path.join(p, "README.md"), "w", encoding="utf-8") as f:
         f.write(f"# docs/audits/{sub}\n\n{desc}\n")
 
+# Derived status: a report containing a `## Résultat` section means the
+# audit ran the full loop (rapport -> apply -> merged). Static AUDITS
+# status stays as fallback for audits done before the report system.
+def derived_status(aid, slug):
+    p = os.path.join("docs", "audits", "reports", f"A{aid}_{slug}.md")
+    if not os.path.exists(p):
+        return None
+    txt = open(p, encoding="utf-8").read()
+    m = re.search(r"^##\s+Résultat\b(.*?)(?=^##\s|\Z)", txt, re.S | re.M)
+    if not m:
+        return None
+    h = re.search(r"commit[^`]*`([0-9a-f]{7,40})`", m.group(1), re.I)
+    return f"done — commit `{h.group(1)}`" if h else "done — rapport"
+
+
+status_of = {a[0]: (derived_status(a[0], a[1]) or a[8]) for a in AUDITS}
+
 # INDEX.md — all rows
 idx = [
     "# Registre des audits — couverture complète BitDaemon vs libtorrent",
@@ -552,9 +570,12 @@ idx = [
     "| # | Audit | Périmètre | Statut |",
     "|---|---|---|---|",
 ]
-for aid, slug, title, scope, _up, _rs, _chk, _traps, status in AUDITS:
-    idx.append(f"| A{aid} | {title} | {scope} | {status or 'à faire'} |")
+for aid, slug, title, scope, _up, _rs, _chk, _traps, _status in AUDITS:
+    idx.append(f"| A{aid} | {title} | {scope} | {status_of[aid] or 'à faire'} |")
 idx += [
+    "",
+    "*Statut* : `done` est dérivé de la section `## Résultat` du rapport",
+    "d'audit — régénérer après merge : `python docs/audits/_gen_audits.py`.",
     "",
     "## Utilisation",
     "",
@@ -611,7 +632,6 @@ idx += [
     "| Vague | Audits | Raison |",
     "|---|---|---|",
 ]
-status_of = {a[0]: a[8] for a in AUDITS}
 for w in sorted(WAVES):
     spec = WAVES[w]
     todo = [f"A{i}" for i in spec["ids"] if not status_of.get(i)]
