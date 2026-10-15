@@ -223,3 +223,25 @@ restreints à une fenêtre de teardown et aux jauges de statut ; les
 mécanismes additionnels Rust (piece gate, flush pool, serializer,
 abort drain) sont des ré-implémentations justifiées des invariants
 upstream, à couvrir par les tests listés ci-dessus.
+
+## Résultat
+
+Corrections appliquées sur `audit/14-disk-write-pipeline` :
+
+- **D1 corrigée** — guard `aborted` dans l'arm `PeerEffect::DiskWrite`
+  de `torrent.rs`, placé après le leg redondant et avant l'un-snub
+  (position `is_deleted` upstream) ; `skipped_writes` supprime les
+  effets appariés `MarkDownloaded`/`GracefulCheck`. Test :
+  `aborted_torrent_drops_incoming_piece` (`test_download_path.rs`).
+- **D2 corrigée** — `state_updated()` appelé dans l'arm erreur de
+  `DiskCompleted::Write` (`session.rs`) pour les échecs aborted *et*
+  réels, avant `on_disk_error` (== `update_gauge()` puis
+  `handle_disk_error`). Test : `failed_write_marks_state_updated`
+  (`test_session.rs`).
+
+Gates : `cargo fmt --all`, `cargo clippy --workspace --all-targets
+-- -D warnings`, `cargo test --workspace` (113 suites, 0 échec),
+`cargo doc --workspace --no-deps` — toutes vertes.
+
+Row `peer_connection.cpp` de `docs/PORTING.md` enrichie (clause A14) ;
+fragment changelog `docs/audits/changelog/A14.md`.

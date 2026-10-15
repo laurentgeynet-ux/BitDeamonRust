@@ -281,3 +281,55 @@ fn down_requests_gauge_reconciles_once() {
     t.sync_down_requests(&counters);
     assert_eq!(counters.value(Counter::NumPeersDownRequests), 0);
 }
+
+/// `incoming_piece` — the `is_deleted` leg (peer_connection.cpp:2990):
+/// a block arriving while the torrent is being torn down never
+/// reaches `async_write` and never runs `mark_as_writing`. The effect
+/// batch can outlive `abort()` — `disconnect_all` empties `peers` but
+/// the apply side must still drop the write.
+#[test]
+fn aborted_torrent_drops_incoming_piece() {
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let b = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    let mut c = conn(4);
+    c.pipeline.snubbed = true;
+    c.pipeline.download_queue.push(PendingBlock::new(b));
+    c.pipeline.outstanding_bytes = 0x4000;
+    let mut eff = Vec::new();
+    c.dispatch(
+        &full_piece(3),
+        4,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        false,
+        0x200000,
+        2000,
+        &Counters::default(),
+        &mut eff,
+    );
+    t.add_peer(1, c);
+    let counters = Counters::default();
+    let mut pool = PeerClassPool::new();
+    let mut abort_out = Vec::new();
+    t.abort(&counters, &mut pool, &mut abort_out);
+    let mut out = Vec::new();
+    t.apply_peer_effects(1, eff, &SessionSettings::default(), &counters, &mut out);
+    assert!(
+        !out.iter()
+            .any(|e| matches!(e, TorrentEffect::DiskWrite { .. })),
+        "is_deleted leg: the block never reaches disk: {out:?}"
+    );
+    let st = t.picker.as_ref().unwrap().piece_info(PieceIndex(3));
+    assert_eq!(st.writing, 0, "is_deleted returns before mark_as_writing");
+    assert!(
+        !out.iter()
+            .any(|e| matches!(e, TorrentEffect::Alert(Alert::PeerUnsnubbed { .. }))),
+        "is_deleted returns before the unsnub leg too: {out:?}"
+    );
+}

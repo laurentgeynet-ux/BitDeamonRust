@@ -4677,6 +4677,16 @@ impl Torrent {
                         skipped_writes.push(block);
                         continue;
                     }
+                    // `incoming_piece` — upstream returns when the
+                    // torrent `is_deleted` (teardown): the block never
+                    // reaches disk and `mark_as_writing` never runs.
+                    // The `skipped_writes` marker drops the paired
+                    // `MarkDownloaded` and the `GracefulCheck` leg.
+                    if self.aborted {
+                        pending_unsnub = false;
+                        skipped_writes.push(block);
+                        continue;
+                    }
                     // `incoming_piece` — the block is going to disk:
                     // a timely arrival un-snubs the peer here
                     // (upstream's `m_snubbed = false` +
