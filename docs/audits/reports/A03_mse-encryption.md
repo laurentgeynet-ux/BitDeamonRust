@@ -370,3 +370,81 @@ aux audits session-side.
   `unsupported_encryption_mode[_selected]`/`invalid_pad_size` — la
   sémantique wire est conservée, les noms divergent (convention
   AGENTS §4.9 tolérée).
+
+## Résultat
+
+Appliqué sur `audit/03-mse-encryption`, commit `33a77de`
+(`fix(net,session): upstream-fidelity apply of audit A03 — MSE/PE
+parity`), merge local sur `main` (workflow mis à jour — pas de PR).
+
+### Déviations corrigées (15/15)
+
+- **D1** `crypto_select` initiateur masqué par `allowed_enc_level`
+  avant le test `== 0` + réduction à un bit (`mse.rs`,
+  `allowed_enc_level` passé en paramètre).
+- **D2** `len_pad` borné ≤ 512 aux deux jambes → `invalid_pad_size`/
+  `peer_error` immédiat ; `len_ia` borné `0..=68` →
+  `invalid_encrypt_handshake`.
+- **D3** pads PadA/PadB/PadC/PadD tirés `random(0..=512)` inclusif,
+  clamp `MAX_PAD` (512 possible) — l'empreinte n'est plus
+  déterministe.
+- **D4** skey/index : `known_torrent`/`known_torrent_by_skey`
+  résolvent v1 **et** v2-tronqué ; `KnownTorrent{ih, wire_ih,
+  protocol_v2, has_v2, v2_ih, valid_metadata}` ; le handshake sortant
+  émet `associated_info_hash()` selon `protocol_v2`.
+- **D5** `supportcrypto` annoncé sous `in_enc_policy != disabled &&
+  announce_crypto_support`.
+- **D6** IA partielle réinjectée en tête du handshake (`cut(0,20)`),
+  RC4 inconditionnel.
+- **D7** alertes + compteurs de `disconnect()` reproduits :
+  `DialFail{FailOp, DisconnectSeverity, reason}` ; `peer_error` vs
+  `peer_disconnected` exclusifs, postés même pré-attach ; legs
+  `error_{tcp,utp,incoming,outgoing}_peers` + crypto.
+- **D8** `fast_reconnect` armé sur le dial MSE `pe_enabled`
+  (`arm_fast_reconnect` : rewind `last_connected`, cap, flag parqué
+  jusqu'à `connection_closed`).
+- **D9** toggle `pe_support` déplacé de la sélection vers
+  `peer_link_up` (= `on_connected`, post-connect).
+- **D10** write-backs `pe_support` gatés `is_outgoing && pe_enabled`
+  (`rearm_pe_support` post-PE4, clear post-plaintext).
+- **D11** `ErrorEncryptedPeers`/`ErrorRc4Peers` incrémentés (champ
+  `rc4_encrypted` sur `PeerConn`, propagé via `DialDone`).
+- **D12** `PeerFlags::RC4_ENCRYPTED`/`PLAINTEXT_ENCRYPTED` posés dans
+  `peer_info` (`m_encrypted` → l'un des deux).
+- **D13** `sanitize_settings` : `allowed_enc_level` hors {1,2,3} →
+  `pe_both`, `enc_policy` hors {0,1,2} → `pe_disabled`
+  (`EncPolicy::from_int` corrigé Enabled→Disabled).
+- **D14** gate répondeur : `select` réduit à un bit puis borné —
+  `select==0` → `unsupported_encryption_mode`/`failure` ; initiateur
+  masqué `==0` → `..._selected`/`peer_error`.
+- **D15** commentaires `mse.rs` corrigés (`invalid_pad_size` vs
+  `invalid_encrypt_handshake`, `random(512)` inclusif).
+
+Bonus parité couverts en passant : bit réservé `0x10` entrant flippe
+`protocol_v2` avant l'écriture de la réponse (`0x10` sur v1-only →
+`invalid_info_hash`/`failure` ; v1-only garde son hash v1) ; pas de
+re-validation de l'ih echo côté initiateur attaché (upstream saute le
+bloc sous `if (!t)`) ; échec uTP → severity normale + retry TCP
+différé ; échec inbound post-attach comptabilisé sans peer-entry ;
+`pex_lt_v2` forcé sur les swarms v2-only.
+
+### Tests ajoutés
+
+- `bitdaemon-net/tests/test_mse.rs` : select masqué/réduit, bornes
+  `len_pad`/`len_ia`, skey round-trip + rejet, RC4 negotiated,
+  handshake complet sur MSE.
+- `bitdaemon-net/tests/test_bt_peer_conn.rs` : bit `0x10` entrant
+  (flip `protocol_v2` avant réponse, rejet sur v1-only), rejet
+  responder ih inconnu.
+- `bitdaemon-session/tests/test_mse_parity.rs` (9 tests) : toggles
+  `pe_support` à link-up, write-backs gatés, re-arm post-PE4,
+  compteurs par sévérité/direction/crypto, échec inbound sans
+  peer-entry, `fast_reconnect` saute le cooldown, sanitize
+  `allowed_enc_level`, dual-index v1/v2 + skey, flags
+  `peer_info` encryption.
+
+### Gates
+
+`cargo fmt --all` · `cargo clippy --workspace --all-targets --
+-D warnings` · `cargo test --workspace` (108 binaires verts) ·
+`cargo doc --workspace --no-deps` — tous passent dans le worktree.
