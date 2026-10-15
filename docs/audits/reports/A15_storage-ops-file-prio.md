@@ -248,3 +248,26 @@ les audits session-core concurrents.
   que l'ordre lexicographique-reverse upstream — superset correct de
   « subdirectories first » (un dir parent ne peut pas être supprimé
   avant son enfant dans les deux ordres).
+
+## Résultat
+
+Apply sur `audit/15-storage-ops-file-prio` — les 5 déviations corrigées :
+
+- **D1** — nouveau `TorrentEffect::Pause` routé vers
+  `Session::set_paused`/`do_pause` ; la branche `file_error` de
+  `on_file_priority` ne flippe plus `paused` en direct. Test
+  `file_priority_error_runs_full_pause` (FileError op + TorrentPaused +
+  announce gates off).
+- **D2** — `TorrentHandle::file_priorities()` resize à `num_files` /
+  `default_priority` sous métadonnées valides.
+- **D3** — `TorrentHandle::get_file_priority(index)` ajouté
+  (pad/OOB/négatif → `dont_download`, slot non alloué → `default`).
+- **D4** — `move_storage` metadata-less poste le path *demandé* dans
+  `storage_moved` (le `complete()`'d va dans `save_path`). Test
+  `move_storage_without_metadata_posts_requested_path`.
+- **D5** — `Alert::FileError` porte `op` (renseigné aux 4 sites de
+  construction). Test `file_priority_getters` + assert `op ==
+  "file_open"` dans le test D1.
+
+Gates : `fmt` · `clippy -D warnings` · `cargo test --workspace` ·
+`cargo doc --no-deps` — toutes vertes dans le worktree.

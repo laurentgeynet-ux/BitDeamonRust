@@ -1631,6 +1631,7 @@ impl Session {
                         self.alerts.post(Alert::FileError {
                             ih,
                             path,
+                            op: err.operation.name().to_string(),
                             error: err.to_string(),
                         });
                         let failures = self
@@ -5155,6 +5156,9 @@ impl Session {
         }
         // `!valid_metadata()` — no file structure known; upstream
         // adopts the path and posts `storage_moved` without a job.
+        // The alert carries the *requested* path (`save_path` arg);
+        // `m_save_path` stores the `complete()`'d form
+        // (torrent.cpp:9331-9338).
         if t.files.is_none() {
             let newp = bitdaemon_disk::fs::complete(&path);
             let old = t.save_path.clone();
@@ -5162,7 +5166,7 @@ impl Session {
             t.need_save_resume = true;
             self.alerts.post(Alert::StorageMoved {
                 ih: *ih,
-                path: newp.to_string_lossy().into_owned(),
+                path: path.to_string_lossy().into_owned(),
                 old_path: old,
             });
             return;
@@ -6921,6 +6925,9 @@ impl Session {
             self.alerts.post(Alert::FileError {
                 ih: Sha1Hash::default(),
                 path: String::new(),
+                op: bitdaemon_disk::storage_error::Operation::FileWrite
+                    .name()
+                    .to_string(),
                 error: format!(
                     "disk flush failed (x{})",
                     flush_errs - self.prev_flush_errors
@@ -8682,6 +8689,7 @@ impl Session {
         self.alerts.post(Alert::FileError {
             ih,
             path,
+            op: err.operation.name().to_string(),
             error: err.to_string(),
         });
         if err.io.kind() == K::OutOfMemory {
@@ -8875,6 +8883,12 @@ impl Session {
                         t.graceful_pause = false;
                     }
                     self.do_pause(&ih, out);
+                }
+                TorrentEffect::Pause => {
+                    // `torrent::pause()` requested from inside a
+                    // torrent error path — full `set_paused`/`do_pause`
+                    // machinery, not a bare flag flip.
+                    self.set_paused(&ih, true, out);
                 }
                 TorrentEffect::DisconnectPeer { peer, reason, sev } => {
                     // `peer_connection::disconnect` — teardown +

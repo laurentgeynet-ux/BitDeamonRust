@@ -1007,13 +1007,24 @@ impl TorrentHandle {
         s.route_into_pending(self.info_hash, eff);
     }
 
-    /// `file_priorities` — current per-file priorities.
+    /// `file_priorities` — current per-file priorities. Upstream
+    /// resizes the stored vector to `num_files` (default fill) once
+    /// metadata is valid (`torrent::file_priorities`).
     #[must_use]
     pub fn file_priorities(&self) -> Vec<bitdaemon_common::types::DownloadPriority> {
         lock(&self.session)
             .torrents
             .get(&self.info_hash)
-            .map_or_else(Vec::new, |t| t.file_priorities.clone())
+            .map_or_else(Vec::new, |t| {
+                let mut v = t.file_priorities.clone();
+                if let Some(fs) = &t.files {
+                    v.resize(
+                        fs.num_files().max(0) as usize,
+                        bitdaemon_common::types::DownloadPriority::DEFAULT,
+                    );
+                }
+                v
+            })
     }
 
     /// `prioritize_pieces` — direct per-piece overrides.
@@ -1862,6 +1873,35 @@ impl TorrentHandle {
     #[must_use]
     pub fn get_file_priorities(&self) -> Vec<bitdaemon_common::types::DownloadPriority> {
         self.file_priorities()
+    }
+
+    /// `torrent_handle::file_priority(index)` getter — `dont_download`
+    /// for pad files and out-of-range indexes, `default_priority` for
+    /// slots beyond the stored vector (upstream
+    /// `torrent::file_priority`).
+    #[must_use]
+    pub fn get_file_priority(
+        &self,
+        index: bitdaemon_common::types::FileIndex,
+    ) -> bitdaemon_common::types::DownloadPriority {
+        use bitdaemon_common::types::DownloadPriority;
+        lock(&self.session).torrents.get(&self.info_hash).map_or(
+            DownloadPriority::DONT_DOWNLOAD,
+            |t| {
+                if index.0 < 0 {
+                    return DownloadPriority::DONT_DOWNLOAD;
+                }
+                if let Some(fs) = &t.files {
+                    if index.0 >= fs.num_files() || fs.pad_file_at(index) {
+                        return DownloadPriority::DONT_DOWNLOAD;
+                    }
+                }
+                t.file_priorities
+                    .get(index.0 as usize)
+                    .copied()
+                    .unwrap_or(DownloadPriority::DEFAULT)
+            },
+        )
     }
 
     /// `torrent_handle::file_priority` — set one file's priority.

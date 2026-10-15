@@ -537,6 +537,8 @@ pub enum Alert {
         ih: Sha1Hash,
         /// file path.
         path: String,
+        /// `operation` name (`file_stat`, `file_write`, …).
+        op: String,
         /// error.
         error: String,
     },
@@ -1357,7 +1359,14 @@ impl Alert {
             Self::TorrentResumed { ih } => format!("{ih} torrent resumed"),
             Self::TorrentChecked(ih) => format!("{ih} torrent checked"),
             Self::UrlSeed { ih, url, msg } => format!("{ih} url seed {url}: {msg}"),
-            Self::FileError { ih, path, error } => format!("{ih} file error {path}: {error}"),
+            Self::FileError {
+                ih,
+                path,
+                op,
+                error,
+            } => {
+                format!("{ih} file error ({op}) {path}: {error}")
+            }
             Self::MetadataFailed { ih, error } => format!("{ih} metadata failed: {error}"),
             Self::MetadataReceived { ih } => format!("{ih} metadata received"),
             Self::UdpError { remote, op, error } => format!("udp {op} to {remote} failed: {error}"),
