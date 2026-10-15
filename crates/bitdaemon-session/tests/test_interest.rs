@@ -111,8 +111,11 @@ fn allowed_fast_set_on_fast_peer() {
     let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
     c.supports_fast = true;
     s.peer_connected(&ih, 1, c, "127.0.0.1:6881".parse().unwrap(), &mut out);
+    // upstream defers the allowed-fast set to the FIRST inbound
+    // `Interested` (`m_sent_allowed_fast` in `on_interested`) — not
+    // at attach.
     assert!(
-        out.iter().any(|e| matches!(
+        !out.iter().any(|e| matches!(
             e,
             SessionOut::ToPeer {
                 msg: PeerMessage::AllowedFast(_),
@@ -120,5 +123,25 @@ fn allowed_fast_set_on_fast_peer() {
             }
         )),
         "{out:?}"
+    );
+    let t = s.torrents.get_mut(&ih).unwrap();
+    let mut eff = Vec::new();
+    t.on_peer_message(
+        1,
+        &PeerMessage::Interested,
+        0,
+        &s.settings,
+        &s.counters,
+        &mut eff,
+    );
+    assert!(
+        eff.iter().any(|e| matches!(
+            e,
+            bitdaemon_session::torrent::TorrentEffect::SendTo {
+                msg: PeerMessage::AllowedFast(_),
+                ..
+            }
+        )),
+        "{eff:?}"
     );
 }

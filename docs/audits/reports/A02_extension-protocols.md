@@ -296,3 +296,59 @@ les fichiers chauds — séquencer avec les autres audits session-core.
 - **`upload_only`/`share_mode` entrant à 1 byte** : `data.len() != 1`
   drop (= `packet_size != 3` upstream) ✓ ; `share_mode` ignoré sur seed
   (`peer_conn.rs:1672`) ✓.
+
+## Résultat
+
+Apply exécuté sur la branche `audit/02-extension-protocols` (worktree
+`../LibtorrentRust-a02`, parallèle à A05). Gates : `cargo fmt --all` ✓ ·
+`cargo clippy --workspace --all-targets -- -D warnings` ✓ ·
+`cargo test --workspace` ✓ (107 suites) · `cargo doc --workspace
+--no-deps` ✓.
+
+### Déviations corrigées
+
+| # (rapport) | Correction |
+|---|---|
+| W1 — plugin ids acceptés sans annonce | dispatch `peer_conn` : `local_* != 0 && ext_* != 0` sinon `invalid_message` peer_error ; ids locaux remis à 0 à l'attach quand le plugin est absent (privé/i2p) |
+| W2 — metadata malformé drop | `parse_metadata_packet` tri-état (`Msg`/`UnknownType`/`Malformed`) ; >17 KiB / non-dict / clés absentes → `invalid_metadata_message` peer_error |
+| W3 — pas de throttle serveur | file `metadata_incoming_requests` par conn (cap 1024) + watermark 160 KiB + `dont_have` en overflow ; drain dans `metadata_tick` |
+| W4 — pas de requête chaînée | `maybe_send_metadata_request` après chaque `piece` acceptée (et au handshake), séparée du drain de queue |
+| W5 — `ut_metadata` sur privé | handshake engine : `!(is_priv && valid_metadata)` ; `metadata_size` suit le plugin ; ids locaux alignés |
+| W6 — `send_allowed_set` cassé | déclenché au premier `Interested` (`sent_allowed_fast`), supprimé de l'attach ; délègue à la version conn qui peuple `accept_fast`/compteurs ; gate `upload_only` corrigé (notre état, pas celui du pair) |
+| — `SuggestPiece` index négatif | drop explicite `i.0 < 0` côté torrent |
+| — compteurs pex/i2p | `num_incoming_pex` en fin de traitement réussi uniquement ; requêtes metadata invalides hors `num_incoming_metadata` |
+| — holepunch `connect` | legs `p->connection`/`p->banned` → ignore ; `supports_utp` + flag `holepunch` sur l'entrée → `conn.holepunch_mode` à l'attach (dial async) |
+| — smart_ban | `Ban(key, addr)` : re-résolution par IP (`find_peers`), gate `!banned`, first-wins par bloc, `ban_peer` + `num_banned_peers` + `update_want_peers`, `erase_peers`/`clear` câblés à `remove_peer`/`disconnect_all`, désactivé sur v2/abort |
+| — `update_peer_port` | port `p` du handshake → `peer_list.update_peer_port` + `duplicate_peer_id` disconnect sur collision + `update_want_peers` |
+| — `local_ut_metadata_id` | champ mort à valeur fausse (1 = id pex) supprimé ; les envois utilisent `conn.ext_ut_metadata` (id remote, = upstream `m_message_index`) |
+
+### Robustesse ajoutée
+
+- `metadata_packet` clamp le payload hors-borne (plus de panic sur
+  `piece` invalide — le bras servant vérifie déjà, filet de sécurité).
+
+### Tests ajoutés/ajustés
+
+- `test_extensions.rs` : `ut_metadata_requires_announced_extension`,
+  `ut_metadata_malformed_disconnects_peer_error`,
+  `ut_metadata_request_serving_and_counter_timing` (dont_have sans
+  compteur / piece avec compteur),
+  `ut_metadata_piece_chains_next_request` (sizing handshake + chaînage),
+  `allowed_fast_deferred_to_first_interested` (+ `accept_fast` peuplé,
+  pas de re-send), `suggest_negative_index_dropped`,
+  `ut_pex_severities` (>500 KiB et malformé → peer_error, compteur
+  intouché).
+- `test_ut_metadata.rs` : `parse_verdicts` (tri-état + borne
+  `data_section`), appels `parse_msg` migrés sur le nouvel enum.
+- `test_piece_picker.rs` : `BanDecision::Ban` porte l'adresse.
+- `test_interest.rs` : `allowed_fast_set_on_fast_peer` réécrit sur la
+  sémantique upstream (rien à l'attach, set au premier `Interested`).
+
+### Non-corrections assumées (trace)
+
+- `i2p_pex` per-conn socket gate : le transport I2P/SAM n'existe pas
+  encore (scope audit transport) — `conn.i2p` n'est jamais set en prod,
+  le gate torrent `!priv && is_i2p` est l'approximation documentée.
+- `do_connect_boost` après PEX `peers_added` : nécessite
+  `session_time`/politique d'encryption côté session — approximé par
+  `want_peers = true` + `state_updated` (dial au prochain tick ≤1 s).

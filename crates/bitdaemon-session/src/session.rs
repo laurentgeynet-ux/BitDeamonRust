@@ -4056,6 +4056,34 @@ impl Session {
             // It gates the `DhtPort` reply leg of `on_dht_port`.
             conn.sent_bitfield = t.valid_metadata();
             conn.local_dht_port = self.dht_port;
+            // `bt_peer_connection` ctor — the local plugin ids are
+            // `find_plugin`-assigned: a missing plugin leaves its
+            // index at 0 so `on_extended`'s fixed-id dispatch can't
+            // be claimed by a peer that guesses the numeric id.
+            // `ut_metadata`: absent only for a private torrent that
+            // already has metadata — a private *magnet* still needs
+            // the plugin to fetch it (`valid_metadata && priv`).
+            // `ut_pex`: `!priv` and never on a pure-i2p torrent.
+            // `i2p_pex`: torrent `!priv && i2p`, and upstream only
+            // attaches the peer plugin on i2p sockets (the SAM
+            // transport isn't implemented yet — `conn.i2p` is never
+            // set in production).
+            let is_priv = t.ti.as_ref().is_some_and(|ti| ti.is_private());
+            let torrent_i2p = t.ti.as_ref().is_some_and(|ti| ti.is_i2p());
+            conn.local_ut_metadata = u8::from(!(is_priv && t.valid_metadata())) * 2;
+            conn.local_ut_pex = u8::from(!is_priv && !torrent_i2p);
+            conn.local_i2p_pex = u8::from((!is_priv && torrent_i2p) || conn.i2p.is_some())
+                * crate::i2p_pex::I2P_PEX_ID;
+            // `set_holepunch_mode` — upstream flags the conn right
+            // after `connect_to_peer`; our dial is async so the
+            // swarm entry carried the flag to this attach.
+            if let Some(i) = t.peer_index(remote) {
+                if let Some(p) = t.peer_list.peers_mut().get_mut(i)
+                    && std::mem::take(&mut p.holepunch)
+                {
+                    conn.holepunch_mode = true;
+                }
+            }
             // upstream `peer_connection::init` sends `port` when
             // the peer negotiated DHT and our dht is bound.
             if conn.supports_dht
@@ -4078,9 +4106,9 @@ impl Session {
                 if t.share_mode {
                     t.recalc_share_mode(&self.settings, &self.counters, &mut eff);
                 }
-                // BEP-6: FAST peers get their allowed-fast set right
-                // after connect (upstream `send_allowed_set`).
-                t.send_allowed_set(peer, &mut eff);
+                // upstream does NOT `send_allowed_set` at attach —
+                // it fires once on the first inbound `Interested`
+                // (`m_sent_allowed_fast` in `on_interested`).
                 // `write_handshake` tail — `maybe_send_hash_request`
                 // on a v2 conn starts fetching missing merkle layers
                 // immediately.

@@ -777,7 +777,7 @@ fn smart_ban_differing_crc() {
     // same peer, different digest on second failure → ban
     assert_eq!(
         sb.record_failed_block(pb, 42, a, good),
-        BanDecision::Ban(42)
+        BanDecision::Ban(42, a)
     );
     // other peer's differing digest just records its own entry
     assert_eq!(sb.record_failed_block(pb, 7, a, good), BanDecision::None);
@@ -800,7 +800,7 @@ fn smart_ban_on_piece_passed() {
     );
     // piece now passes; block digest is `good` → the bad sender banned
     let bans = sb.on_piece_passed(PieceIndex(3), 32 * 1024, |_| Some(good));
-    assert_eq!(bans, vec![BanDecision::Ban(5)]);
+    assert_eq!(bans, vec![BanDecision::Ban(5, a)]);
     // erase_peers drops entries
     sb.record_failed_block(
         PieceBlock {

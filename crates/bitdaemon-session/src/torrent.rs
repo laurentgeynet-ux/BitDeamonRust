@@ -372,9 +372,6 @@ pub struct Torrent {
     /// raw info dict (the bytes `ut_metadata` serves). Set by
     /// `set_metadata`/`from_params`.
     pub metadata_raw: Option<Vec<u8>>,
-    /// our local extension id for `ut_metadata` (the id WE put in
-    /// our handshake; peers address it back).
-    pub local_ut_metadata_id: u8,
     /// `m_magnet_link` — added without metadata.
     pub magnet: bool,
     /// `m_private` (BEP-27) — disables LSD/PEX/DHT peer discovery.
@@ -741,81 +738,36 @@ pub enum MetadataVerdict {
 impl Torrent {
     /// `peer_connection::send_allowed_set` — BEP-6: when the peer
     /// negotiated the FAST extension, advertise a deterministic
-    /// set of pieces it may request even while choked. Seed =
-    /// SHA-1(remote_ip_bytes || info_hash), re-hashed per batch of
-    /// 5 u32 draws — port verbatim.
-    pub fn send_allowed_set(&mut self, peer_id: u64, out: &mut Vec<TorrentEffect>) {
-        use sha1::{Digest, Sha1};
-        const NUM_ALLOWED: usize = 5; // settings.allowed_fast_set_size
+    /// set of pieces it may request even while choked (called once,
+    /// on the peer's first `Interested`). The conn-level builder
+    /// records `m_accept_fast`/`m_accept_fast_piece_cnt` itself so
+    /// choked peers can actually claim the offered pieces.
+    pub fn send_allowed_set(&mut self, peer_id: u64, set_size: i32, out: &mut Vec<TorrentEffect>) {
+        // upstream gates: `!valid_metadata`, `super_seeding`,
+        // `upload_only()` — OUR upload-only state, not the peer's.
         if self.super_seeding
-            || self.metadata_raw.is_none() && self.picker.is_none()
+            || !self.valid_metadata()
             || self.num_pieces <= 0
+            || self.is_upload_only()
         {
             return;
         }
-        let Some(c) = self.peers.get(&peer_id) else {
+        let Some(c) = self.peers.get_mut(&peer_id) else {
             return;
         };
-        if !c.supports_fast || c.remote_upload_only {
+        if !c.supports_fast {
             return;
         }
-        let Some(remote) = c.remote else { return };
-        // upstream: when the set covers all pieces, allow every
-        // piece the peer lacks (skip hash determinism entirely).
-        if NUM_ALLOWED >= self.num_pieces as usize {
-            for i in 0..self.num_pieces {
-                if !self.have.get_bit(i as usize) || c.has_piece(PieceIndex(i)) {
-                    continue;
-                }
-                out.push(TorrentEffect::SendTo {
-                    peer: peer_id,
-                    msg: PeerMessage::AllowedFast(PieceIndex(i)),
-                });
-            }
-            return;
-        }
-        let mut x = Vec::new();
-        match remote.ip() {
-            std::net::IpAddr::V4(a) => x.extend_from_slice(&a.octets()),
-            std::net::IpAddr::V6(a) => x.extend_from_slice(&a.octets()),
-        }
-        x.extend_from_slice(self.info_hash.as_bytes());
-        let mut hash: [u8; 20] = Sha1::digest(&x).into();
-        let mut accept: Vec<PieceIndex> = Vec::with_capacity(10);
-        let mut attempts = 0usize;
-        let mut loops = 0usize;
-        loop {
-            for i in 0..(hash.len() / 4) {
-                loops += 1;
-                let Some(chunk) = hash
-                    .get(i * 4..i * 4 + 4)
-                    .and_then(|s| <[u8; 4]>::try_from(s).ok())
-                else {
-                    break;
-                };
-                let p = u32::from_be_bytes(chunk) % self.num_pieces as u32;
-                let piece = PieceIndex(p as i32);
-                if accept.contains(&piece) {
-                    if loops > 500 {
-                        return;
-                    }
-                    continue;
-                }
-                // pieces the peer already has are pointless.
-                let has = self.peers.get(&peer_id).is_some_and(|c| c.has_piece(piece));
-                if self.have.get_bit(piece.0 as usize) && !has {
-                    out.push(TorrentEffect::SendTo {
-                        peer: peer_id,
-                        msg: PeerMessage::AllowedFast(piece),
-                    });
-                    accept.push(piece);
-                }
-                attempts += 1;
-                if attempts >= NUM_ALLOWED {
-                    return;
-                }
-            }
-            hash = Sha1::digest(hash).into();
+        let msgs = c.send_allowed_set(
+            &self.info_hash,
+            self.num_pieces,
+            set_size,
+            true,
+            false,
+            false,
+        );
+        for msg in msgs {
+            out.push(TorrentEffect::SendTo { peer: peer_id, msg });
         }
     }
 
@@ -881,7 +833,6 @@ impl Torrent {
             piece_priority_dirty: false,
             metadata_tracker: UtMetadataTracker::new(),
             metadata_raw: None,
-            local_ut_metadata_id: 1,
             magnet: false,
             private: false,
             smart_ban: SmartBan::new(),
@@ -1537,48 +1488,120 @@ impl Torrent {
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
-        let Some((msg, piece, total, data)) = crate::ut_metadata::parse_metadata_packet(body)
-        else {
+        // upstream `on_extended`: `length > 17*1024` is a
+        // `invalid_metadata_message` peer-error disconnect — a
+        // 16 KiB piece plus the dict header can never exceed it.
+        if body.len() > 17 * 1024 {
+            out.push(TorrentEffect::DisconnectPeer {
+                peer,
+                reason: "invalid metadata message",
+                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+            });
             return;
-        };
-        match msg {
-            crate::ut_metadata::MetadataMsg::Request => {
+        }
+        let parsed = crate::ut_metadata::parse_metadata_packet(body);
+        // replies ride the extension id the *peer* advertised for
+        // `ut_metadata` (upstream `write_metadata_packet` uses
+        // `m_message_index`); a zero id means it never advertised —
+        // unreachable here because dispatch already gated on it.
+        let ext_id = self.peers.get(&peer).map_or(0, |c| c.ext_ut_metadata);
+        match parsed {
+            crate::ut_metadata::MetadataParse::Malformed => {
+                // bdecode failure / non-dict / missing or non-int
+                // `msg_type`|`piece` → `invalid_metadata_message`.
+                out.push(TorrentEffect::DisconnectPeer {
+                    peer,
+                    reason: "invalid metadata message",
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                });
+                return;
+            }
+            crate::ut_metadata::MetadataParse::UnknownType => {
+                // upstream's switch has no `default` — counted and
+                // consumed, nothing else.
+            }
+            crate::ut_metadata::MetadataParse::Msg(
+                crate::ut_metadata::MetadataMsg::Request,
+                piece,
+                _,
+                _,
+            ) => {
                 // upstream: `!valid_metadata() || piece < 0 ||
-                // piece >= npieces` → `dont_have`. The bounds check
-                // also guards the `piece * 16k` slice in
-                // `metadata_packet` against negative/overflowing
-                // piece indices.
+                // piece >= npieces` → `dont_have` + `return true` —
+                // the early return skips the `num_incoming_metadata`
+                // bump at the tail (invalid requests aren't counted).
+                // The bounds check also guards the `piece * 16k`
+                // slice in `metadata_packet`.
                 let npieces = self
                     .metadata_raw
                     .as_ref()
                     .map_or(0i64, |md| md.len().div_ceil(16 * 1024) as i64);
-                let valid = piece >= 0 && piece < npieces;
-                let resp = match &self.metadata_raw {
-                    Some(md) if valid => crate::ut_metadata::metadata_packet(
-                        crate::ut_metadata::MetadataMsg::Piece,
-                        piece as i32,
-                        true,
-                        md,
-                    ),
-                    _ => crate::ut_metadata::metadata_packet(
-                        crate::ut_metadata::MetadataMsg::Reject,
+                if self.metadata_raw.is_none() || piece < 0 || piece >= npieces {
+                    // `write_metadata_packet` no-ops when the peer
+                    // never advertised an id (`m_message_index == 0`).
+                    if ext_id != 0 {
+                        let resp = crate::ut_metadata::metadata_packet(
+                            crate::ut_metadata::MetadataMsg::Reject,
+                            piece as i32,
+                            false,
+                            &[],
+                        );
+                        out.push(TorrentEffect::SendTo {
+                            peer,
+                            msg: PeerMessage::Extended {
+                                id: ext_id,
+                                data: resp.into(),
+                            },
+                        });
+                    }
+                    return;
+                }
+                // `send_buffer_size() < send_buffer_limit` (160 KiB)
+                // → serve now; else queue on the conn (cap 1024);
+                // overflow → `dont_have` (that leg still counts).
+                let send_buffer_size = self.peers.get(&peer).map_or(0, |c| c.send_buffer);
+                let queued = self
+                    .peers
+                    .get(&peer)
+                    .is_some_and(|c| c.metadata_incoming_requests.len() < 1024);
+                let resp_ty = if send_buffer_size < 0x4000 * 10 {
+                    crate::ut_metadata::MetadataMsg::Piece
+                } else if queued {
+                    if let Some(c) = self.peers.get_mut(&peer) {
+                        c.metadata_incoming_requests.push_back(piece as i32);
+                    }
+                    counters.inc(crate::counters::Counter::NumIncomingMetadata);
+                    return;
+                } else {
+                    crate::ut_metadata::MetadataMsg::Reject
+                };
+                // `write_metadata_packet` no-ops when the peer never
+                // advertised an id (`m_message_index == 0`).
+                if ext_id != 0 {
+                    let resp = crate::ut_metadata::metadata_packet(
+                        resp_ty,
                         piece as i32,
                         self.metadata_raw.is_some(),
                         self.metadata_raw.as_deref().unwrap_or(&[]),
-                    ),
-                };
-                out.push(TorrentEffect::SendTo {
-                    peer,
-                    msg: PeerMessage::Extended {
-                        id: self.local_ut_metadata_id,
-                        data: resp.into(),
-                    },
-                });
+                    );
+                    out.push(TorrentEffect::SendTo {
+                        peer,
+                        msg: PeerMessage::Extended {
+                            id: ext_id,
+                            data: resp.into(),
+                        },
+                    });
+                }
             }
-            crate::ut_metadata::MetadataMsg::Piece => {
+            crate::ut_metadata::MetadataParse::Msg(
+                crate::ut_metadata::MetadataMsg::Piece,
+                piece,
+                total,
+                data,
+            ) => {
                 // upstream: a `piece` we never asked this peer for is
                 // "UNWANTED / TIMED OUT" and dropped before touching
-                // the tracker.
+                // the tracker — and before the incoming counter.
                 let Some(conn) = self.peers.get_mut(&peer) else {
                     return;
                 };
@@ -1590,7 +1613,21 @@ impl Torrent {
                     return;
                 };
                 conn.metadata_sent_requests.remove(pos);
-                let r = self.on_ut_metadata_data(data, piece as i32, total, peer, 30 * 1024 * 1024);
+                let r =
+                    self.on_ut_metadata_data(data, piece as i32, total, peer, s.max_metadata_size);
+                // upstream counts every message that reaches the
+                // switch — the wanted piece lands here.
+                counters.inc(crate::counters::Counter::NumIncomingMetadata);
+                if matches!(r, MetadataResult::Redundant) {
+                    // `received_metadata` early leg —
+                    // `add_redundant_bytes(piece_unknown)` on a
+                    // duplicate payload.
+                    self.add_redundant_bytes(
+                        data.len() as i64,
+                        crate::peer_conn::WasteReason::Unknown,
+                        counters,
+                    );
+                }
                 if matches!(r, MetadataResult::Complete) {
                     // upstream `set_metadata` → `state_updated()`
                     // (valid_metadata flips → status changes).
@@ -1637,34 +1674,46 @@ impl Torrent {
                         }
                     }
                 }
+                // upstream `maybe_send_request()` runs right after a
+                // piece lands — the next request goes out on this
+                // batch, not on the next 1 Hz tick.
+                self.maybe_send_metadata_request(peer, out);
+                return;
             }
-            crate::ut_metadata::MetadataMsg::Reject => {
-                // upstream `dont_have`: erase the piece from
-                // `m_sent_requests` and hold off re-asking this peer
-                // for at least a minute (`m_request_limit =
-                // max(now + minutes(1), m_request_limit)`).
-                if let Some(c) = self.peers.get_mut(&peer) {
-                    c.metadata_sent_requests.retain(|&p| i64::from(p) != piece);
-                    let retry = Instant::now() + Duration::from_secs(60);
-                    c.metadata_request_limit =
-                        Some(c.metadata_request_limit.map_or(retry, |t| t.max(retry)));
-                }
+            crate::ut_metadata::MetadataParse::Msg(
+                crate::ut_metadata::MetadataMsg::Reject,
+                piece,
+                _,
+                _,
+            ) => {
+                // upstream `dont_have`: `m_request_limit` bumps even
+                // when the piece was never asked for; the erase and
+                // the counter only run for a known request.
+                let Some(c) = self.peers.get_mut(&peer) else {
+                    return;
+                };
+                let retry = Instant::now() + Duration::from_secs(60);
+                c.metadata_request_limit =
+                    Some(c.metadata_request_limit.map_or(retry, |t| t.max(retry)));
+                let Some(pos) = c
+                    .metadata_sent_requests
+                    .iter()
+                    .position(|&p| i64::from(p) == piece)
+                else {
+                    return;
+                };
+                c.metadata_sent_requests.remove(pos);
             }
         }
+        counters.inc(crate::counters::Counter::NumIncomingMetadata);
     }
 
-    /// `ut_metadata_plugin` tick — while metadata is missing, ask
-    /// peers that advertised `ut_metadata` for the next piece.
+    /// `ut_metadata_plugin` tick — drains each conn's queued
+    /// incoming metadata requests (serving side, runs even when we
+    /// hold metadata) and, while metadata is missing, asks peers
+    /// that advertised `ut_metadata` for the next piece.
     pub fn metadata_tick(&mut self, out: &mut Vec<TorrentEffect>) {
-        if self.piece_hashes.is_some() {
-            return;
-        }
-        let ids: Vec<u64> = self
-            .peers
-            .iter()
-            .filter(|(_, c)| c.ext_ut_metadata != 0)
-            .map(|(id, _)| *id)
-            .collect();
+        let ids: Vec<u64> = self.peers.keys().copied().collect();
         for id in ids {
             self.metadata_tick_peer(id, out);
         }
@@ -1693,18 +1742,69 @@ impl Torrent {
         }
     }
 
-    /// ask `peer` for the next needed metadata piece.
-    /// Mirrors `ut_metadata_peer_plugin::maybe_send_request`:
-    /// `!valid_metadata && ext id != 0 && sent_requests < 2 &&
-    /// has_metadata` (advertised `metadata_size` or retry timer
-    /// expired).
+    /// `ut_metadata_peer_plugin::tick` for one conn — first drain
+    /// its queued incoming requests while the send buffer is under
+    /// the 160 KiB serve limit (upstream `tick()`), then
+    /// `maybe_send_request`: `!valid_metadata && ext id != 0 &&
+    /// sent_requests < 2 && has_metadata` (advertised `metadata_size`
+    /// or retry timer expired).
     fn metadata_tick_peer(&mut self, peer: u64, out: &mut Vec<TorrentEffect>) {
+        // upstream `tick()` — `maybe_send_request` first, then the
+        // incoming-queue drain.
+        self.maybe_send_metadata_request(peer, out);
+        // serving drain — `while !m_incoming_requests.empty() &&
+        // send_buffer_size < send_buffer_limit` upstream.
+        while self.peers.get(&peer).is_some_and(|c| {
+            c.ext_ut_metadata != 0
+                && c.send_buffer < 0x4000 * 10
+                && !c.metadata_incoming_requests.is_empty()
+                && self.metadata_raw.is_some()
+        }) {
+            let piece = self
+                .peers
+                .get_mut(&peer)
+                .and_then(|c| c.metadata_incoming_requests.pop_front());
+            let Some(piece) = piece else { break };
+            let (ext, md) = match (
+                self.peers.get(&peer).map(|c| c.ext_ut_metadata),
+                self.metadata_raw.as_deref(),
+            ) {
+                (Some(ext), Some(md)) => (ext, md),
+                _ => break,
+            };
+            let resp = crate::ut_metadata::metadata_packet(
+                crate::ut_metadata::MetadataMsg::Piece,
+                piece,
+                true,
+                md,
+            );
+            let msg = PeerMessage::Extended {
+                id: ext,
+                data: resp.into(),
+            };
+            // charge the conn send buffer so the drain loop's
+            // watermark reflects what we just queued.
+            if let Some(c) = self.peers.get_mut(&peer) {
+                c.send_buffer += bitdaemon_net::peer_wire::wire_len(&msg);
+            }
+            out.push(TorrentEffect::SendTo { peer, msg });
+        }
+    }
+
+    /// `maybe_send_request` — `is_disconnecting` first, then
+    /// `!valid_metadata && m_message_index != 0 &&
+    /// sent_requests < 2 && has_metadata()` (advertised
+    /// `metadata_size` or expired retry limit).
+    fn maybe_send_metadata_request(&mut self, peer: u64, out: &mut Vec<TorrentEffect>) {
         if self.piece_hashes.is_some() {
             return;
         }
         let Some(conn) = self.peers.get(&peer) else {
             return;
         };
+        if conn.disconnecting {
+            return;
+        }
         let ext = conn.ext_ut_metadata;
         if ext == 0 || conn.metadata_sent_requests.len() >= 2 {
             return;
@@ -1752,6 +1852,7 @@ impl Torrent {
         peer_id: u64,
         body: &[u8],
         max_pex_peers: usize,
+        counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
         if !self.enable_pex {
@@ -1840,6 +1941,10 @@ impl Torrent {
             self.want_peers = true;
             self.state_updated();
         }
+        // `num_incoming_pex` counts at the handler tail upstream —
+        // a parsed-and-processed message only (not the disabled /
+        // oversized / flooded / malformed early returns).
+        counters.inc(crate::counters::Counter::NumIncomingPex);
     }
 
     /// `second_tick`'s pex section — every `PEX_INTERVAL` send each
@@ -1950,7 +2055,15 @@ impl Torrent {
 
     /// `i2p_pex` receive — add destination hashes to the swarm list;
     /// flood/bad messages disconnect the peer (upstream verdicts).
-    pub fn on_i2p_pex_packet(&mut self, peer_id: u64, body: &[u8], out: &mut Vec<TorrentEffect>) {
+    /// `num_incoming_pex` bumps on the processed path only
+    /// (i2p_pex.cpp counts after the add loop).
+    pub fn on_i2p_pex_packet(
+        &mut self,
+        peer_id: u64,
+        body: &[u8],
+        counters: &crate::counters::Counters,
+        out: &mut Vec<TorrentEffect>,
+    ) {
         let now = std::time::Instant::now();
         let disable = !self.enable_pex;
         if disable {
@@ -1966,6 +2079,7 @@ impl Torrent {
                     // — new candidates make the torrent dialable.
                     self.update_want_peers();
                 }
+                counters.inc(crate::counters::Counter::NumIncomingPex);
             }
             crate::i2p_pex::I2pPexVerdict::Disconnect(reason) => {
                 // upstream severities (i2p_pex.cpp): `too_frequent_pex`
@@ -3262,6 +3376,9 @@ impl Torrent {
                 p.abort_download(b, key);
             }
         }
+        // `smart_ban::on_erase_peers` — entries recorded against a
+        // dead conn handle are dropped with it.
+        self.smart_ban.erase_peers(&[id]);
         // `~peer_connection` — transition gauges drop with the conn
         // (upstream decrements each live flag; `num_peers_connected`
         // is recomputed via `set` on our side).
@@ -3339,6 +3456,44 @@ impl Torrent {
 
     /// resolve a picker's downloader key (`block_info.peer`,
     /// `peer_key()`) back to its live connection id.
+    /// `smart_ban`'s ban application — upstream
+    /// `on_read_{failed,ok}_block` tail: `find_peers(addr)`
+    /// re-resolves the swarm entry (survives conn churn), an already
+    /// `banned` entry short-circuits, else `ban_peer` marks it +
+    /// `update_want_peers` + `num_banned_peers`, and the live conn —
+    /// by handle or same-IP — gets `disconnect(peer_banned)` at
+    /// normal severity.
+    fn apply_smart_ban(
+        &mut self,
+        key: u64,
+        addr: std::net::IpAddr,
+        counters: &crate::counters::Counters,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        let Some(i) = self.peer_list.find_peer(addr) else {
+            return;
+        };
+        if self.peer_list.peers()[i].banned {
+            return;
+        }
+        self.peer_list.ban_peer(i);
+        counters.inc(crate::counters::Counter::NumBannedPeers);
+        self.update_want_peers();
+        let conn = self.conn_by_key(key).or_else(|| {
+            self.peers
+                .iter()
+                .find(|(_, c)| c.remote.is_some_and(|r| r.ip() == addr))
+                .map(|(id, _)| *id)
+        });
+        if let Some(peer) = conn {
+            out.push(TorrentEffect::DisconnectPeer {
+                peer,
+                reason: "peer_banned",
+                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+            });
+        }
+    }
+
     fn conn_by_key(&self, key: u64) -> Option<u64> {
         self.peers
             .iter()
@@ -3963,8 +4118,56 @@ impl Torrent {
                     waste_pick = false;
                 }
                 PeerEffect::ExtHandshake => {
-                    // peer just advertised ut_metadata — ask right away
-                    self.metadata_tick_peer(peer_id, out);
+                    // `metadata_size` advertised → pre-size the
+                    // download tracker (`metadata_size` upstream —
+                    // ignored once valid metadata landed).
+                    // upstream `on_extension_handshake`: only a
+                    // positive `metadata_size` sizes the tracker; a
+                    // size-less peer also clears `m_has_metadata`
+                    // (handled in dispatch).
+                    if let Some(sz) = self
+                        .peers
+                        .get(&peer_id)
+                        .and_then(|c| c.metadata_size)
+                        .filter(|&sz| sz > 0)
+                    {
+                        self.metadata_tracker
+                            .metadata_size(sz, self.valid_metadata());
+                    }
+                    // the `p` listen port also lands on the swarm
+                    // entry — `torrent::update_peer_port` keeps ut_pex
+                    // gossiping a dialable endpoint for inbound conns.
+                    if let Some(c) = self.peers.get(&peer_id)
+                        && c.received_listen_port
+                        && let (Some(remote), Some(port)) = (c.remote, c.peer_listen_port)
+                        && remote.port() != port
+                        && let Some(i) = self.peer_index(remote)
+                    {
+                        // `peer_list::update_peer_port` — `false` on a
+                        // collision with an already-connected entry:
+                        // this peer is a duplicate →
+                        // `disconnect(errors::duplicate_peer_id)` at the
+                        // default (normal) severity upstream.
+                        if !self.peer_list.update_peer_port(
+                            port,
+                            i,
+                            bitdaemon_common::flags::PeerSourceFlags::INCOMING,
+                            &self.peer_list_state,
+                        ) {
+                            out.push(TorrentEffect::DisconnectPeer {
+                                peer: peer_id,
+                                reason: "duplicate_peer_id",
+                                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                            });
+                        }
+                        // `torrent::update_peer_port` tail —
+                        // `peers_erased(st.erased)` + `update_want_peers`.
+                        self.update_want_peers();
+                    }
+                    // peer just advertised ut_metadata — upstream
+                    // `on_extension_handshake` runs
+                    // `maybe_send_request` (not the full tick).
+                    self.maybe_send_metadata_request(peer_id, out);
                     // v2: peers that know `hash_request` can fill
                     // missing merkle layers (`maybe_send_hash_request`).
                     self.maybe_send_hash_request(peer_id, out);
@@ -3977,10 +4180,62 @@ impl Torrent {
                     self.on_metadata_packet(peer_id, &body, s, counters, out);
                 }
                 PeerEffect::PexPacket(body) => {
-                    self.on_pex_packet(peer_id, &body, s.max_pex_peers as usize, out);
+                    self.on_pex_packet(peer_id, &body, s.max_pex_peers as usize, counters, out);
                 }
                 PeerEffect::I2pPexPacket(body) => {
-                    self.on_i2p_pex_packet(peer_id, &body, out);
+                    self.on_i2p_pex_packet(peer_id, &body, counters, out);
+                }
+                PeerEffect::SendAllowedSet => {
+                    self.send_allowed_set(peer_id, s.allowed_fast_set_size, out);
+                }
+                PeerEffect::AllowedFast(i) => {
+                    // `incoming_allowed_fast` — conn-disconnecting
+                    // drop, negative drop; with metadata the index is
+                    // bounded by the peer's bitfield and pieces we
+                    // already have are skipped; then the offer is
+                    // recorded.
+                    let drop = self.peers.get(&peer_id).is_none_or(|c| {
+                        c.disconnecting
+                            || i.0 < 0
+                            || (self.valid_metadata()
+                                && (i.0 >= c.peer_pieces.size() as i32
+                                    || self.have.get_bit(i.0.max(0) as usize)))
+                    });
+                    if !drop {
+                        if let Some(c) = self.peers.get_mut(&peer_id) {
+                            c.on_allowed_fast(i);
+                        }
+                    }
+                    // `peer_is_interesting` — the peer offers a piece
+                    // we want: send `Interested` (update_interest at
+                    // the tail covers it) and pick a block unless
+                    // we're choked with an empty allowed-fast set.
+                    let interesting = !drop
+                        && self.valid_metadata()
+                        && self.picker.is_some()
+                        && self.piece_priority(i).is_some_and(|p| {
+                            p != bitdaemon_common::types::DownloadPriority::DONT_DOWNLOAD
+                        })
+                        && !self.have.get_bit(i.0 as usize)
+                        && self.peers.get(&peer_id).is_some_and(|c| c.has_piece(i));
+                    let choked_no_fast = self
+                        .peers
+                        .get(&peer_id)
+                        .is_none_or(|c| c.peer_choked && c.allowed_fast.is_empty());
+                    if interesting && !choked_no_fast && self.drive_peer(peer_id, s, counters, out)
+                    {
+                        counters.inc(crate::counters::Counter::InterestingPiecePicks);
+                    }
+                }
+                PeerEffect::RemoteShareMode => {
+                    // `set_share_mode` — only when the session
+                    // supports share mode; seeds can't be demoted.
+                    if s.support_share_mode
+                        && let Some(c) = self.peers.get_mut(&peer_id)
+                        && !c.is_seed()
+                    {
+                        c.remote_share_mode = true;
+                    }
                 }
                 PeerEffect::Holepunch(hp) => {
                     self.on_holepunch(peer_id, hp, out);
@@ -4058,11 +4313,13 @@ impl Torrent {
                     }
                 }
                 PeerEffect::SuggestPiece(i) => {
-                    // `incoming_suggest` — disconnecting conns ignore
-                    // it; with metadata, out-of-range indices and
-                    // pieces we already have are dropped.
-                    let drop = self.peers.get(&peer_id).is_some_and(|c| {
+                    // `incoming_suggest` — disconnecting conns and
+                    // negative indices are ignored; with metadata,
+                    // out-of-range indices and pieces we already have
+                    // are dropped.
+                    let drop = self.peers.get(&peer_id).is_none_or(|c| {
                         c.disconnecting
+                            || i.0 < 0
                             || (self.valid_metadata()
                                 && (i.0 >= c.peer_pieces.size() as i32
                                     || self.have.get_bit(i.0 as usize)))
@@ -4189,22 +4446,28 @@ impl Torrent {
                 if !crate::ut_holepunch::connect_allowed(&hp.ep, remote_local) {
                     return;
                 }
-                // upstream `add_peer` + skip when `p->connection`
-                // (already connected) or `p->banned`; else mark
-                // `supports_utp`, `connect_to_peer` and
-                // `update_want_peers` — the connect pump dials it.
+                // upstream `add_peer` — `nullptr` (full list) or
+                // `p->connection` (already connected/dialing) or
+                // `p->banned` all abort the connect. Otherwise the
+                // entry is marked uTP-capable and force-dialed
+                // (`connect_to_peer(p, /*ignore_limit*/ true)`); the
+                // `holepunch` entry flag carries `set_holepunch_mode`
+                // across our async dial to the attach.
                 let added =
                     self.add_swarm_peer(hp.ep, bitdaemon_common::flags::PeerSourceFlags::PEX, out);
                 let Some(i) = added else {
                     return;
                 };
-                if let Some(p) = self.peer_list.peers_mut().get_mut(i) {
-                    if p.connection.is_some() || p.banned {
-                        return;
+                match self.peer_list.peers_mut().get_mut(i) {
+                    Some(p) if p.connection.is_none() && !p.banned => {
+                        p.supports_utp = true;
+                        p.holepunch = true;
                     }
-                    p.supports_utp = true;
+                    _ => return,
                 }
-                self.want_peers = true;
+                // `connect_to_peer(p, true)` + `update_want_peers` —
+                // the connect pump picks the candidate up.
+                self.update_want_peers();
             }
             HpMessage::Failed => {}
         }
@@ -5636,32 +5899,30 @@ impl Torrent {
                 ext.on_piece_failed(piece);
             }
             // `smart_ban`'s `on_piece_failed` records the
-            // per-block CRC of every downloader.
-            let decision = self.smart_ban.on_piece_failed(
-                piece,
-                psize,
-                &downloaders,
-                &mut addr,
-                &mut read_digest,
-            );
+            // per-block CRC of every downloader — skipped on
+            // aborted torrents (`is_aborted` gate upstream) and on
+            // v2 torrents, where the plugin is never created
+            // (`create_smart_ban_plugin` returns null: merkle block
+            // hashes already isolate corrupt senders).
+            let smart_ban_on = !self.aborted && !self.ti.as_ref().is_some_and(|ti| ti.v2());
+            if smart_ban_on {
+                // upstream calls `ban_peer` + `disconnect` inside the
+                // read callback *independently* of the trust-points
+                // penalize below — the downloader set is not narrowed.
+                let decision = self.smart_ban.on_piece_failed(
+                    piece,
+                    psize,
+                    &downloaders,
+                    &mut addr,
+                    &mut read_digest,
+                );
+                if let BanDecision::Ban(key, ip) = decision {
+                    self.apply_smart_ban(key, ip, counters, out);
+                }
+            }
             // `known_bad_peer` — lone downloader or a
             // block-precise culprit list.
-            let (set, known_bad) = if let BanDecision::Ban(key) = decision {
-                if let Some(peer) = self.conn_by_key(key) {
-                    out.push(TorrentEffect::DisconnectPeer {
-                        peer,
-                        reason: "smart_ban: corrupt block",
-                        // smart_ban.cpp `disconnect(errors::peer_banned)`
-                        // — default (normal) severity; the ban marks
-                        // the peer-list entry, no peer_error alert.
-                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                    });
-                }
-                (std::collections::BTreeSet::from([Some(key)]), true)
-            } else {
-                let known_bad = set.len() == 1 || !blocks.is_empty();
-                (set, known_bad)
-            };
+            let known_bad = set.len() == 1 || !blocks.is_empty();
             self.penalize_peers(&set, known_bad, s, counters, out);
         }
         // `lock_piece` + `async_clear_piece` — the piece is restored
@@ -5776,19 +6037,13 @@ impl Torrent {
             .files
             .as_ref()
             .map_or(self.piece_length, |f| i64::from(f.piece_size(piece)));
-        for d in self.smart_ban.on_piece_passed(piece, psize, read_digest) {
-            // `Ban` carries the picker's downloader key — map it
-            // back to a live conn before disconnecting.
-            if let BanDecision::Ban(key) = d
-                && let Some(peer) = self.conn_by_key(key)
-            {
-                out.push(TorrentEffect::DisconnectPeer {
-                    peer,
-                    reason: "smart_ban: corrupt block",
-                    // smart_ban.cpp —  at default
-                    // (normal) severity; the ban marks the entry.
-                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                });
+        // the smart_ban plugin is never created on v2 torrents
+        // (`has_v2 → nullptr`) — no CRC ledger to re-check.
+        if !self.ti.as_ref().is_some_and(|ti| ti.v2()) {
+            for d in self.smart_ban.on_piece_passed(piece, psize, read_digest) {
+                if let BanDecision::Ban(key, ip) = d {
+                    self.apply_smart_ban(key, ip, counters, out);
+                }
             }
         }
         // upstream `on_piece_pass` tail — once seeding, the whole
@@ -8570,6 +8825,9 @@ impl Torrent {
         for id in ids {
             self.remove_peer(id, counters, pool, out);
         }
+        // `on_clear_peers` — the whole CRC ledger dies with the
+        // peer set (upstream `smart_ban_notify_clear_peers`).
+        self.smart_ban.clear();
     }
 
     /// `torrent::need_picker` — true while metadata is present but the

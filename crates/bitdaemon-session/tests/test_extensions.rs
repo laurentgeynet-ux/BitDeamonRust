@@ -278,3 +278,358 @@ fn http_seed_handle_semantics_are_upstream_deprecated() {
     t.remove_http_seed("http://seed.example/files");
     assert!(t.http_seeds().is_empty());
 }
+
+// ---------- A02: extension-protocol wire fidelity ----------
+
+use bitdaemon_session::counters::{Counter, Counters};
+use bitdaemon_session::settings::SessionSettings;
+use bitdaemon_session::torrent::TorrentEffect;
+
+fn set() -> SessionSettings {
+    SessionSettings::default()
+}
+
+/// a conn that finished the handshake and announced `ut_metadata`.
+fn announced_conn() -> PeerConn {
+    let mut c = PeerConn::new(2, PeerPipeline::new(1000, 30, 250), 0);
+    c.remote = Some("10.0.0.2:6881".parse().unwrap());
+    c.handshake_done = true;
+    c.ext_ut_metadata = 2;
+    c
+}
+
+#[test]
+fn ut_metadata_requires_announced_extension() {
+    // upstream `on_extended` → plugin `m_message_index == 0` → falls
+    // through to `invalid_message` (peer_error).
+    let ih = Sha1Hash::from_bytes(&[11; 20]).unwrap();
+    let mut t = torrent(ih);
+    let mut c = announced_conn();
+    c.ext_ut_metadata = 0;
+    t.add_peer(9, c);
+    let mut out = Vec::new();
+    t.on_peer_message(
+        9,
+        &PeerMessage::Extended {
+            id: 2,
+            data: b"d8:msg_typei0e5:piecei0ee".to_vec().into(),
+        },
+        0,
+        &set(),
+        &Counters::default(),
+        &mut out,
+    );
+    assert!(out.iter().any(|e| matches!(
+        e,
+        TorrentEffect::DisconnectPeer { peer: 9, sev, .. }
+            if *sev == bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError
+    )));
+}
+
+#[test]
+fn ut_metadata_malformed_disconnects_peer_error() {
+    let ih = Sha1Hash::from_bytes(&[12; 20]).unwrap();
+    let mut t = torrent(ih);
+    t.add_peer(9, announced_conn());
+    let s = set();
+    let counters = Counters::default();
+    for body in [
+        // oversized — `length > 17*1024` upstream
+        {
+            let mut v = b"d8:msg_typei1e5:piecei0ee".to_vec();
+            v.extend(std::iter::repeat_n(0u8, 17 * 1024));
+            v
+        },
+        // non-dict
+        b"i42e".to_vec(),
+        // dict missing `piece`
+        b"d8:msg_typei1ee".to_vec(),
+    ] {
+        let mut out = Vec::new();
+        t.on_peer_message(
+            9,
+            &PeerMessage::Extended {
+                id: 2,
+                data: body.into(),
+            },
+            0,
+            &s,
+            &counters,
+            &mut out,
+        );
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                TorrentEffect::DisconnectPeer { peer: 9, sev, .. }
+                    if *sev == bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError
+            )),
+            "malformed packet must disconnect"
+        );
+    }
+}
+
+#[test]
+fn ut_metadata_request_serving_and_counter_timing() {
+    let ih = Sha1Hash::from_bytes(&[13; 20]).unwrap();
+    let mut t = torrent(ih);
+    t.metadata_raw = Some(vec![7u8; 32 * 1024]);
+    t.add_peer(9, announced_conn());
+    let s = set();
+    let counters = Counters::default();
+    let mut out = Vec::new();
+
+    // invalid piece index → `dont_have` reply, NO counter bump
+    // (upstream `return true` before the tail counter).
+    let req = bitdaemon_session::ut_metadata::metadata_packet(
+        bitdaemon_session::ut_metadata::MetadataMsg::Request,
+        99,
+        false,
+        b"",
+    );
+    t.on_peer_message(
+        9,
+        &PeerMessage::Extended {
+            id: 2,
+            data: req.into(),
+        },
+        0,
+        &s,
+        &counters,
+        &mut out,
+    );
+    let reject = out.iter().any(|e| {
+        matches!(
+            e,
+            TorrentEffect::SendTo {
+                peer: 9,
+                msg: PeerMessage::Extended { id: 2, data }
+            } if data.windows(13).any(|w| w == b"8:msg_typei2e")
+        )
+    });
+    assert!(reject, "expected a dont_have reply");
+    assert_eq!(counters.value(Counter::NumIncomingMetadata), 0);
+
+    // valid request → `piece` reply and the counter bumps.
+    out.clear();
+    let req = bitdaemon_session::ut_metadata::metadata_packet(
+        bitdaemon_session::ut_metadata::MetadataMsg::Request,
+        0,
+        false,
+        b"",
+    );
+    t.on_peer_message(
+        9,
+        &PeerMessage::Extended {
+            id: 2,
+            data: req.into(),
+        },
+        0,
+        &s,
+        &counters,
+        &mut out,
+    );
+    let piece = out.iter().any(|e| {
+        matches!(
+            e,
+            TorrentEffect::SendTo {
+                peer: 9,
+                msg: PeerMessage::Extended { id: 2, data }
+            } if data.windows(13).any(|w| w == b"8:msg_typei1e")
+                && data.len() > 16 * 1024
+        )
+    });
+    assert!(piece, "expected a piece reply carrying metadata");
+    assert_eq!(counters.value(Counter::NumIncomingMetadata), 1);
+}
+
+#[test]
+fn ut_metadata_piece_chains_next_request() {
+    // a magnet without metadata: the tracker asks piece-by-piece;
+    // upstream runs `maybe_send_request` right after a `piece` lands.
+    let ih = Sha1Hash::from_bytes(&[14; 20]).unwrap();
+    let mut t = Torrent::new(ih, 0, 128 * 1024, Bitfield::default(), StorageIndex(0));
+    let mut c = announced_conn();
+    c.ext_ut_metadata = 2;
+    c.metadata_size = Some(32 * 1024);
+    t.add_peer(9, c);
+    let s = set();
+    let counters = Counters::default();
+    let mut out = Vec::new();
+
+    // handshake arm: `metadata_size` sizes the tracker → the first
+    // request goes out immediately.
+    t.on_peer_message(
+        9,
+        &PeerMessage::Extended {
+            id: 0,
+            data: b"d1:md11:ut_metadatai2ee13:metadata_sizei32768ee"
+                .to_vec()
+                .into(),
+        },
+        0,
+        &s,
+        &counters,
+        &mut out,
+    );
+    let ask = |out: &[TorrentEffect]| -> Vec<i64> {
+        out.iter()
+            .filter_map(|e| match e {
+                TorrentEffect::SendTo {
+                    msg: PeerMessage::Extended { id: 2, data },
+                    ..
+                } => Some(data.clone()),
+                _ => None,
+            })
+            .filter(|d| d.windows(13).any(|w| w == b"8:msg_typei0e"))
+            .filter_map(|d| {
+                // piece index from the dict
+                let pos = d.windows(7).position(|w| w == b"5:piece")?;
+                let rest = &d[pos + 7..];
+                let end = rest.iter().position(|&b| b == b'e')?;
+                std::str::from_utf8(&rest[1..end]).ok()?.parse().ok()
+            })
+            .collect()
+    };
+    let asked = ask(&out);
+    assert_eq!(asked.len(), 1, "one request after the handshake");
+
+    // answer piece 0 → the next request is emitted in the SAME batch.
+    out.clear();
+    let metadata = vec![5u8; 32 * 1024];
+    let body = bitdaemon_session::ut_metadata::metadata_packet(
+        bitdaemon_session::ut_metadata::MetadataMsg::Piece,
+        asked[0] as i32,
+        true,
+        &metadata,
+    );
+    t.on_peer_message(
+        9,
+        &PeerMessage::Extended {
+            id: 2,
+            data: body.into(),
+        },
+        0,
+        &s,
+        &counters,
+        &mut out,
+    );
+    let asked2 = ask(&out);
+    assert_eq!(asked2.len(), 1, "the next piece request is chained");
+    assert_ne!(asked2[0], asked[0]);
+}
+
+#[test]
+fn allowed_fast_deferred_to_first_interested() {
+    // upstream `send_allowed_set` fires once inside `on_interested`,
+    // never at attach; the conn records `accept_fast` so choked
+    // peers can actually claim the offered pieces.
+    let ih = Sha1Hash::from_bytes(&[15; 20]).unwrap();
+    let mut t = torrent(ih);
+    let mut c = announced_conn();
+    c.supports_fast = true;
+    t.add_peer(9, c);
+    let s = set();
+    let counters = Counters::default();
+    let mut out = Vec::new();
+
+    t.on_peer_message(9, &PeerMessage::Interested, 0, &s, &counters, &mut out);
+    let n = out
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                TorrentEffect::SendTo {
+                    peer: 9,
+                    msg: PeerMessage::AllowedFast(_)
+                }
+            )
+        })
+        .count();
+    assert!(n > 0, "first Interested must emit the allowed-fast set");
+    assert!(!t.peers.get(&9).unwrap().accept_fast.is_empty());
+
+    // a second Interested must NOT resend (m_sent_allowed_fast).
+    out.clear();
+    t.on_peer_message(9, &PeerMessage::Interested, 0, &s, &counters, &mut out);
+    assert!(!out.iter().any(|e| matches!(
+        e,
+        TorrentEffect::SendTo {
+            msg: PeerMessage::AllowedFast(_),
+            ..
+        }
+    )));
+}
+
+#[test]
+fn suggest_negative_index_dropped() {
+    let ih = Sha1Hash::from_bytes(&[16; 20]).unwrap();
+    let mut t = torrent(ih);
+    let mut c = announced_conn();
+    c.supports_fast = true;
+    t.add_peer(9, c);
+    let mut out = Vec::new();
+    t.on_peer_message(
+        9,
+        &PeerMessage::SuggestPiece(PieceIndex(-1)),
+        0,
+        &set(),
+        &Counters::default(),
+        &mut out,
+    );
+    assert!(t.peers.get(&9).unwrap().suggested_pieces.is_empty());
+    assert!(
+        !out.iter()
+            .any(|e| matches!(e, TorrentEffect::DisconnectPeer { .. }))
+    );
+}
+
+#[test]
+fn ut_pex_severities() {
+    let ih = Sha1Hash::from_bytes(&[17; 20]).unwrap();
+    let mut t = torrent(ih);
+    let mut c = announced_conn();
+    c.ext_ut_pex = 1;
+    t.add_peer(9, c);
+    let s = set();
+    let counters = Counters::default();
+
+    // >500 KiB → `pex_message_too_large` (peer_error)
+    let mut out = Vec::new();
+    t.on_peer_message(
+        9,
+        &PeerMessage::Extended {
+            id: 1,
+            data: vec![0u8; 501 * 1024].into(),
+        },
+        0,
+        &s,
+        &counters,
+        &mut out,
+    );
+    assert!(out.iter().any(|e| matches!(
+        e,
+        TorrentEffect::DisconnectPeer { peer: 9, sev, .. }
+            if *sev == bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError
+    )));
+
+    // malformed body → `invalid_pex_message` (peer_error)
+    let mut out = Vec::new();
+    t.on_peer_message(
+        9,
+        &PeerMessage::Extended {
+            id: 1,
+            data: b"i7e".to_vec().into(),
+        },
+        0,
+        &s,
+        &counters,
+        &mut out,
+    );
+    assert!(out.iter().any(|e| matches!(
+        e,
+        TorrentEffect::DisconnectPeer { peer: 9, sev, .. }
+            if *sev == bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError
+    )));
+    // neither leg bumps `num_incoming_pex` (counter is at the tail).
+    assert_eq!(counters.value(Counter::NumIncomingPex), 0);
+}

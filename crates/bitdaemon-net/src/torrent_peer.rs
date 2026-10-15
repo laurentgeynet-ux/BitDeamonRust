@@ -144,6 +144,11 @@ pub struct TorrentPeer {
     pub confirmed_supports_utp: bool,
     /// `supports_holepunch:1`.
     pub supports_holepunch: bool,
+    /// pending holepunch dial — upstream flags the synchronously
+    /// created conn via `set_holepunch_mode` inside `on_holepunch`'s
+    /// connect arm; our dial is async, so the entry carries the flag
+    /// until the attach copies it onto `conn.holepunch_mode`.
+    pub holepunch: bool,
     /// `web_seed:1`.
     pub web_seed: bool,
     /// `protocol_v2:1`.
@@ -184,6 +189,7 @@ impl TorrentPeer {
             supports_utp: true,
             confirmed_supports_utp: false,
             supports_holepunch: false,
+            holepunch: false,
             web_seed: false,
             protocol_v2: false,
         }

@@ -5,23 +5,61 @@
 //! `test_ut_metadata.cpp` — BEP-9 wire format + tracker state.
 
 use bitdaemon_session::ut_metadata::{
-    MetadataMsg, MetadataResult, UtMetadataTracker, metadata_packet, parse_metadata_packet,
+    MetadataMsg, MetadataParse, MetadataResult, UtMetadataTracker, metadata_packet,
+    parse_metadata_packet,
 };
+
+/// unwrap the `Msg` variant — `(type, piece, total_size, payload)`.
+fn parse_msg(body: &[u8]) -> (MetadataMsg, i64, i64, &[u8]) {
+    match parse_metadata_packet(body) {
+        MetadataParse::Msg(ty, piece, ts, payload) => (ty, piece, ts, payload),
+        _ => panic!("expected a parsed message"),
+    }
+}
 
 #[test]
 fn packet_round_trip() {
     // request
     let body = metadata_packet(MetadataMsg::Request, 2, false, b"");
-    let (ty, piece, _ts, payload) = parse_metadata_packet(&body).expect("parse");
+    let (ty, piece, _ts, payload) = parse_msg(&body);
     assert_eq!(ty, MetadataMsg::Request);
     assert_eq!(piece, 2);
     assert!(payload.is_empty());
 
     // reject
     let body = metadata_packet(MetadataMsg::Reject, 0, false, b"");
-    let (ty, piece, _, _) = parse_metadata_packet(&body).expect("parse");
+    let (ty, piece, _, _) = parse_msg(&body);
     assert_eq!(ty, MetadataMsg::Reject);
     assert_eq!(piece, 0);
+}
+
+#[test]
+fn parse_verdicts() {
+    // non-dict → Malformed (upstream `invalid_metadata_message`)
+    assert!(matches!(
+        parse_metadata_packet(b"i42e"),
+        MetadataParse::Malformed
+    ));
+    // dict missing `piece` → Malformed
+    assert!(matches!(
+        parse_metadata_packet(b"d8:msg_typei1ee"),
+        MetadataParse::Malformed
+    ));
+    // out-of-range msg_type → UnknownType (consumed, counted)
+    assert!(matches!(
+        parse_metadata_packet(b"d8:msg_typei9e5:piecei0ee"),
+        MetadataParse::UnknownType
+    ));
+    // a `piece` packet's payload starts right after the dict
+    let body = metadata_packet(MetadataMsg::Piece, 0, true, &[9u8; 100]);
+    match parse_metadata_packet(&body) {
+        MetadataParse::Msg(ty, piece, _, payload) => {
+            assert_eq!(ty, MetadataMsg::Piece);
+            assert_eq!(piece, 0);
+            assert!(payload.iter().all(|&b| b == 9));
+        }
+        _ => panic!("expected piece"),
+    }
 }
 
 #[test]
@@ -30,7 +68,7 @@ fn piece_packet_carries_payload_and_total_size() {
     // remaining 4 KiB (upstream clips at metadata end).
     let metadata = vec![7u8; 20 * 1024];
     let body = metadata_packet(MetadataMsg::Piece, 0, true, &metadata);
-    let (ty, piece, ts, payload) = parse_metadata_packet(&body).expect("parse");
+    let (ty, piece, ts, payload) = parse_msg(&body);
     assert_eq!(ty, MetadataMsg::Piece);
     assert_eq!(piece, 0);
     assert_eq!(ts, 20 * 1024);
@@ -38,7 +76,7 @@ fn piece_packet_carries_payload_and_total_size() {
     assert_eq!(payload, &metadata[..16 * 1024]);
 
     let body = metadata_packet(MetadataMsg::Piece, 1, true, &metadata);
-    let (_, _, _, payload) = parse_metadata_packet(&body).expect("parse");
+    let (_, _, _, payload) = parse_msg(&body);
     assert_eq!(payload.len(), 4 * 1024);
 }
 
