@@ -6,6 +6,7 @@
 //! updates seed/leech counts + `scrape_*` fields and posts
 //! `scrape_reply`/`scrape_failed` alerts.
 
+use bitdaemon_common::info_hash::ProtocolVersion;
 use bitdaemon_common::types::StorageIndex;
 use bitdaemon_common::{Bitfield, Sha1Hash};
 use bitdaemon_net::http_tracker::TrackerResponse;
@@ -41,7 +42,7 @@ fn scrape_cycle() {
     let mut out = Vec::new();
     s.scrape_tracker(&ih, 0, &mut out);
     assert_eq!(out.len(), 1);
-    let SessionOut::TrackerScrape { ih: ai, url } = &out[0] else {
+    let SessionOut::TrackerScrape { ih: ai, url, .. } = &out[0] else {
         panic!("scrape effect")
     };
     assert_eq!(*ai, ih);
@@ -62,7 +63,7 @@ fn scrape_cycle() {
         external_ip: None,
         ..Default::default()
     };
-    s.on_scrape_response(&ih, "http://tr/announce", Ok(resp));
+    s.on_scrape_response(&ih, "http://tr/announce", ProtocolVersion::V1, Ok(resp));
 
     let t = s.torrents.get(&ih).unwrap();
     // upstream: scrape `complete` lands on `m_complete`; `m_num_seeds`
@@ -106,7 +107,11 @@ fn scrape_failure_posts_alert() {
     s.on_scrape_response(
         &ih,
         "http://tr/announce",
-        Err("scrape not available".into()),
+        ProtocolVersion::V1,
+        Err(bitdaemon_net::tracker_client::AnnounceError::Op {
+            op: "bittorrent",
+            message: "scrape not available".into(),
+        }),
     );
     let alerts = s.pop_alerts();
     assert!(alerts.iter().any(

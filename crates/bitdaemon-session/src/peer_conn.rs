@@ -63,6 +63,13 @@ pub struct PeerQuota {
     /// `m_recv_buffer.capacity()` — the staging buffer's size, for
     /// `peer_info::receive_buffer_size`.
     pub recv_capacity: std::sync::atomic::AtomicI64,
+    /// `downloading_piece_progress().bytes_downloaded` — staged
+    /// payload bytes of the in-flight `piece` message at the head
+    /// of the receive buffer (0 when the head isn't a piece
+    /// message). Written by the socket task next to `recv_pos`;
+    /// `build_tracker_request` folds it into `downloaded`/`redundant`
+    /// on seed torrents.
+    pub piece_recv_staged: std::sync::atomic::AtomicI64,
 }
 
 impl PeerQuota {
@@ -86,6 +93,7 @@ impl PeerQuota {
             disconnecting: std::sync::atomic::AtomicBool::new(false),
             recv_pos: std::sync::atomic::AtomicI64::new(0),
             recv_capacity: std::sync::atomic::AtomicI64::new(0),
+            piece_recv_staged: std::sync::atomic::AtomicI64::new(0),
         })
     }
 

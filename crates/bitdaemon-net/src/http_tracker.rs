@@ -27,9 +27,20 @@ pub enum HttpTrackerError {
     /// `errors::invalid_hash_entry` (scrape).
     #[error("invalid hash entry")]
     InvalidHashEntry,
-    /// `errors::tracker_failure` — `failure reason` was present.
-    #[error("tracker failure: {0}")]
-    Failure(String),
+    /// `errors::tracker_failure` — `failure reason` was present;
+    /// `interval`/`min interval` ride along as retry hints
+    /// (`http_tracker_connection::on_response` passes them to
+    /// `fail()` → `tracker_request_error` → `announce_infohash::
+    /// failed`).
+    #[error("tracker failure: {message}")]
+    Failure {
+        /// the `failure reason` string.
+        message: String,
+        /// `interval` seconds from the failed response.
+        interval: i32,
+        /// `min interval` seconds from the failed response.
+        min_interval: i32,
+    },
 }
 
 /// `extract_peer_info` input — one entry of a dict-style `peers` list.
@@ -273,9 +284,11 @@ pub fn parse_response(
     let failure = e.dict_find_string(b"failure reason");
     if failure.node_type() == NodeType::String {
         resp.failure_reason = Some(String::from_utf8_lossy(failure.string_value()).into_owned());
-        return Err(HttpTrackerError::Failure(
-            resp.failure_reason.clone().unwrap_or_default(),
-        ));
+        return Err(HttpTrackerError::Failure {
+            message: resp.failure_reason.clone().unwrap_or_default(),
+            interval: resp.interval,
+            min_interval: resp.min_interval,
+        });
     }
     let warning = e.dict_find_string(b"warning message");
     if warning.node_type() == NodeType::String {

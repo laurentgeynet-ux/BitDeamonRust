@@ -281,6 +281,27 @@ impl AnnounceEntry {
         }
     }
 
+    /// `aep->info_hashes[ih].failed` — a failed exchange only
+    /// touches the announced version's slot on every endpoint.
+    pub fn failed_version(
+        &mut self,
+        v: bitdaemon_common::info_hash::ProtocolVersion,
+        backoff_ratio: i32,
+        retry_interval: Duration,
+        now: Instant,
+    ) {
+        for e in &mut self.endpoints {
+            match v {
+                bitdaemon_common::info_hash::ProtocolVersion::V1 => {
+                    e.v1.failed(backoff_ratio, retry_interval, now);
+                }
+                bitdaemon_common::info_hash::ProtocolVersion::V2 => {
+                    e.v2.failed(backoff_ratio, retry_interval, now);
+                }
+            }
+        }
+    }
+
     /// `sent` on every endpoint slot — the entry's announce covers
     /// all slots in this port (one exchange per tracker URL).
     pub fn sent(&mut self, interval: Duration, min_interval: Duration, now: Instant) {
@@ -300,6 +321,29 @@ impl AnnounceEntry {
             }
             if ev == 2 {
                 e.v2.start_sent = true;
+            }
+        }
+    }
+
+    /// `aep->info_hashes[ih]`'s `sent` — a successful exchange
+    /// only updates the announced version's slots (upstream
+    /// announces each info-hash independently; each reply writes
+    /// back into its own `announce_infohash`).
+    pub fn sent_version(
+        &mut self,
+        v: bitdaemon_common::info_hash::ProtocolVersion,
+        interval: Duration,
+        min_interval: Duration,
+        now: Instant,
+    ) {
+        for e in &mut self.endpoints {
+            match v {
+                bitdaemon_common::info_hash::ProtocolVersion::V1 => {
+                    e.v1.sent(interval, min_interval, now);
+                }
+                bitdaemon_common::info_hash::ProtocolVersion::V2 => {
+                    e.v2.sent(interval, min_interval, now);
+                }
             }
         }
     }
@@ -366,17 +410,92 @@ impl TrackerList {
         self.trackers.iter().position(|t| t.url == url)
     }
 
+    /// Mutable access to the enabled endpoints of an entry — the
+    /// announce response handler writes into `v1`/`v2` keyed by the
+    /// announced hash version.
+    pub fn endpoints_mut(
+        &mut self,
+        idx: usize,
+    ) -> impl Iterator<Item = &mut AnnounceEndpoint> + '_ {
+        self.trackers
+            .get_mut(idx)
+            .into_iter()
+            .flat_map(|ae| ae.endpoints.iter_mut())
+            .filter(|e| e.enabled)
+    }
+
+    /// `tracker_list::deprioritize_tracker` — move the entry to the
+    /// last position inside its tier so sibling trackers are tried
+    /// first on the next failover (upstream `deprioritize_tracker`
+    /// on a non-working failure). `last_working_url` keys on the
+    /// URL so the reorder needs no bookkeeping.
+    pub fn deprioritize(&mut self, idx: usize) {
+        let Some(tier) = self.trackers.get(idx).map(|ae| ae.tier) else {
+            return;
+        };
+        // already last inside its tier → nothing to do
+        if self.trackers.iter().skip(idx + 1).all(|t| t.tier != tier) {
+            return;
+        }
+        let ae = self.trackers.remove(idx);
+        let pos = self
+            .trackers
+            .iter()
+            .rposition(|t| t.tier == tier)
+            .map_or(0, |p| p + 1);
+        self.trackers.insert(pos, ae);
+    }
+
+    /// `tracker_list::dont_try_again` — `fail_limit = 1`: the next
+    /// failure retires the entry for this session (upstream applies
+    /// it on HTTP 410 Gone — the tracker will never serve this
+    /// torrent again).
+    pub fn dont_try_again(&mut self, idx: usize) {
+        if let Some(ae) = self.trackers.get_mut(idx) {
+            ae.fail_limit = 1;
+        }
+    }
+
+    /// `tracker_list::prioritize_udp_trackers` — hoist each `udp:`
+    /// entry above the non-UDP entries of the same tier
+    /// (`prefer_udp_trackers` default true upstream). Stable inside
+    /// the tier; `last_working` follows its entry.
+    pub fn prioritize_udp_trackers(&mut self) {
+        let mut i = 0;
+        while i < self.trackers.len() {
+            if !self.trackers[i].url.starts_with("udp:") {
+                let Some(j) = self.trackers[i + 1..]
+                    .iter()
+                    .position(|t| t.tier == self.trackers[i].tier && t.url.starts_with("udp:"))
+                    .map(|p| p + i + 1)
+                else {
+                    i += 1;
+                    continue;
+                };
+                self.trackers[i..=j].rotate_right(1);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
     /// `announce_with_tracker`'s selection — the upstream
-    /// `announce_state` machine per listen socket (we have one
-    /// logical endpoint, driven by the v1 info-hash slot):
+    /// `announce_state` machine runs per (listen socket, info-hash
+    /// version). We have one synthetic endpoint, so the state is
+    /// per `ProtocolVersion`; a hybrid torrent picks per version
+    /// and may announce the same entry twice (once per hash).
+    /// Returns `(entry_index, version)` pairs in scan order.
     ///
     /// - a *working* entry lowers `state.tier` and resets
     ///   `sent_announce` — lowest-tier working tracker always wins;
     /// - a working-but-not-due entry counts as covered
-    ///   (`sent_announce = true`);
+    ///   (`sent_announce = true`, and `done` unless a `to_all_*`
+    ///   flag asks for more);
     /// - `announce_to_all_tiers` → at most one announce per tier;
-    /// - neither flag → stop after the first working announce
-    ///   (`state.done`).
+    /// - `event == stopped` skips slots that never sent `started`
+    ///   (`!a.start_sent && req.event == stopped → continue`);
+    /// - entries whose protocol we cannot dispatch are skipped,
+    ///   never attempted — they stay pristine (`e0716cf24`).
     #[must_use]
     pub fn due(
         &self,
@@ -384,55 +503,66 @@ impl TrackerList {
         is_seed: bool,
         to_all_tiers: bool,
         to_all_trackers: bool,
-    ) -> Vec<usize> {
+        supports: [bool; 2],
+        stopped: bool,
+    ) -> Vec<(usize, bitdaemon_common::info_hash::ProtocolVersion)> {
+        use bitdaemon_common::info_hash::{ALL_VERSIONS, ProtocolVersion as PV};
         let mut picked = Vec::new();
-        let mut state_tier = i32::MAX;
-        let mut sent_announce = false;
-        let mut done = false;
+        let mut state_tier = [i32::MAX; 2];
+        let mut sent_announce = [false; 2];
+        let mut done = [false; 2];
         for (i, ae) in self.trackers.iter().enumerate() {
-            if done {
+            // `if (all listen socket states' supported versions are
+            // done) break` — one synthetic socket here.
+            if ALL_VERSIONS
+                .iter()
+                .all(|v| !supports[*v as usize] || done[*v as usize])
+            {
                 break;
             }
-            // upstream `announce_with_tracker`: schemes we cannot
-            // dispatch are skipped, never attempted — they stay
-            // pristine (`fails == 0`, no error) (`e0716cf24`).
             if !tracker_protocol_supported(&ae.url) {
                 continue;
             }
             for ep in ae.endpoints.iter().filter(|e| e.enabled) {
-                let a = &ep.v1;
-                if to_all_tiers
-                    && !to_all_trackers
-                    && sent_announce
-                    && ae.tier <= state_tier
-                    && state_tier != i32::MAX
-                {
-                    continue;
-                }
-                if ae.tier > state_tier && sent_announce && !to_all_tiers {
-                    continue;
-                }
-                if a.is_working() {
-                    state_tier = ae.tier;
-                    sent_announce = false;
-                }
-                if !a.can_announce(now, is_seed, ae.fail_limit) {
-                    if a.is_working() {
-                        sent_announce = true;
-                        if !to_all_trackers && !to_all_tiers {
-                            done = true;
-                        }
+                for v in ALL_VERSIONS {
+                    let vi = v as usize;
+                    if !supports[vi] {
+                        continue;
                     }
-                    continue;
+                    let a = if v == PV::V1 { &ep.v1 } else { &ep.v2 };
+                    if done[vi] || (!a.start_sent && stopped) {
+                        continue;
+                    }
+                    if to_all_tiers
+                        && !to_all_trackers
+                        && sent_announce[vi]
+                        && ae.tier <= state_tier[vi]
+                        && state_tier[vi] != i32::MAX
+                    {
+                        continue;
+                    }
+                    if ae.tier > state_tier[vi] && sent_announce[vi] && !to_all_tiers {
+                        continue;
+                    }
+                    if a.is_working() {
+                        state_tier[vi] = ae.tier;
+                        sent_announce[vi] = false;
+                    }
+                    if !a.can_announce(now, is_seed, ae.fail_limit) {
+                        if a.is_working() {
+                            sent_announce[vi] = true;
+                            if !to_all_trackers && !to_all_tiers {
+                                done[vi] = true;
+                            }
+                        }
+                        continue;
+                    }
+                    picked.push((i, v));
+                    sent_announce[vi] = true;
+                    if a.is_working() && !to_all_trackers && !to_all_tiers {
+                        done[vi] = true;
+                    }
                 }
-                picked.push(i);
-                sent_announce = true;
-                if a.is_working() && !to_all_trackers && !to_all_tiers {
-                    done = true;
-                }
-                // one exchange covers the whole entry (v2 slot
-                // is held in-flight alongside v1)
-                break;
             }
         }
         picked
@@ -473,6 +603,25 @@ impl TrackerList {
             }
         }
         found
+    }
+
+    /// `tracker_list::completed` — arm every enabled slot that
+    /// hasn't acked `completed` for an immediate announce
+    /// (`next_announce = min_announce = now`); `torrent::completed`
+    /// calls this then runs the regular announce selection, so the
+    /// burst only reaches what `announce_state` picks.
+    pub fn completed(&mut self, now: Instant) {
+        for t in &mut self.trackers {
+            for e in t.endpoints.iter_mut().filter(|e| e.enabled) {
+                for a in [&mut e.v1, &mut e.v2] {
+                    if a.complete_sent {
+                        continue;
+                    }
+                    a.next_announce = Some(now);
+                    a.min_announce = Some(now);
+                }
+            }
+        }
     }
 
     /// `tracker_list::set_complete_sent` — latch `complete_sent` on

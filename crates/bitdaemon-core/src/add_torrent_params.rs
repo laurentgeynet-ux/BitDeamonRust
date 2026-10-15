@@ -99,6 +99,11 @@ pub struct AddTorrentParams {
     pub created_by: Vec<u8>,
     /// `comment`.
     pub comment: Vec<u8>,
+    /// `trackerid` — client-specified tracker id echoed on
+    /// announces until the tracker supplies its own
+    /// (`announce_entry::trackerid` overrides it per tracker).
+    /// Not persisted in resume data upstream.
+    pub trackerid: Vec<u8>,
     /// `num_complete` — scrape cache, `-1` unknown.
     pub num_complete: i64,
     /// `num_incomplete`.
@@ -155,6 +160,7 @@ impl Default for AddTorrentParams {
             creation_date: 0,
             created_by: Vec::new(),
             comment: Vec::new(),
+            trackerid: Vec::new(),
             num_complete: -1,
             num_incomplete: -1,
             num_downloaded: -1,

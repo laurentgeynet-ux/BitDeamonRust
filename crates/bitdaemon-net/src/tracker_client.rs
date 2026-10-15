@@ -41,9 +41,35 @@ type UdpReply = (SocketAddr, Vec<u8>);
 #[derive(Debug, Default)]
 pub struct UdpTrackerDemux {
     waiters: Mutex<HashMap<u32, mpsc::UnboundedSender<UdpReply>>>,
+    /// `m_connection_cache` — `udp_tracker_connection_manager`'s
+    /// per-address `connection_id` cache (`udp_tracker_connection.cpp`
+    /// skips the connect round-trip while a cached id is unexpired).
+    /// Keyed by tracker IP like upstream (`m_connection_cache.find(
+    /// m_target.address())`); expiry = `udp_tracker_token_expiry`.
+    conn_cache: Mutex<HashMap<std::net::IpAddr, (u64, std::time::Instant)>>,
 }
 
 impl UdpTrackerDemux {
+    /// cached `connection_id` for `ip` when still fresh.
+    #[must_use]
+    pub fn cached_conn_id(&self, ip: std::net::IpAddr) -> Option<u64> {
+        self.conn_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ip)
+            .filter(|(_, exp)| *exp > std::time::Instant::now())
+            .map(|(id, _)| *id)
+    }
+
+    /// record `id` for `ip`, expiring after `ttl`
+    /// (`udp_tracker_token_expiry`).
+    pub fn store_conn_id(&self, ip: std::net::IpAddr, id: u64, ttl: Duration) {
+        self.conn_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ip, (id, std::time::Instant::now() + ttl));
+    }
+
     /// Enregistre une attente pour `tid` ; la pompe appellera
     /// [`Self::route`] sur chaque datagramme.
     #[must_use]
@@ -171,6 +197,15 @@ pub struct AnnounceParams {
     pub ipv4: Vec<std::net::Ipv4Addr>,
     /// `req.ipv6` — repeated `&ipv6=` params.
     pub ipv6: Vec<std::net::Ipv6Addr>,
+    /// `tracker_request::private_torrent` — the torrent's metainfo
+    /// `private` flag; in `anonymous_mode` a private torrent still
+    /// sends the real user-agent (private trackers may require it).
+    pub private_torrent: bool,
+    /// `tracker_request::high_priority` — set by `force_reannounce`
+    /// and inherited by failover re-announces; the engine's HTTP
+    /// announce queue inserts these at the front like upstream's
+    /// `tracker_manager`.
+    pub high_priority: bool,
     /// `tracker_request_flags_t::i2p` — interpret `peers` as
     /// 32-byte destinations in HTTP responses.
     pub i2p: bool,
@@ -182,10 +217,15 @@ pub struct AnnounceParams {
     pub filter: Option<std::sync::Arc<crate::ip_filter::IpFilter>>,
 }
 
-/// announce errors (protocol or transport).
+/// announce errors (protocol or transport). Carries the metadata
+/// upstream's `tracker_connection::fail(ec, op, msg, interval,
+/// min_interval)` delivers to `tracker_request_error` — HTTP status
+/// codes (for the 410→`dont_try_again` rule), retry-interval hints
+/// from failure responses, and the `operation_t` phase for alerts.
 #[derive(Debug, thiserror::Error)]
 pub enum AnnounceError {
-    /// http layer.
+    /// http layer — `HttpError::Status(code)` keeps the status so
+    /// the session can apply the `410 Gone` rule.
     #[error("http: {0}")]
     Http(#[from] HttpError),
     /// http tracker protocol.
@@ -197,29 +237,92 @@ pub enum AnnounceError {
     /// transport.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    /// tracker refused (`failure_reason`).
-    #[error("failure: {0}")]
-    Failure(String),
+    /// `errors::timed_out` — the whole exchange exceeded
+    /// `tracker_completion_timeout`/`stop_tracker_timeout`.
+    #[error("timed out")]
+    TimedOut,
+    /// tracker refused (`failure_reason`) — `interval`/`min_interval`
+    /// are the tracker-provided retry hints upstream feeds
+    /// `announce_infohash::failed` (`tracker_manager.cpp:183`).
+    #[error("failure: {message}")]
+    Failure {
+        /// the `failure reason` string.
+        message: String,
+        /// `interval` from the failure response (seconds; 0 = absent).
+        interval: i32,
+        /// `min interval` from the failure response (seconds).
+        min_interval: i32,
+    },
     /// `errors::ssrf_mitigation` — the tracker URL already carried
-    /// tracker query args while `ssrf_mitigation` is enabled.
+    /// tracker query args while `ssrf_mitigation` is enabled, or the
+    /// endpoint filter dropped every resolved address.
     #[error("ssrf mitigation: tracker url contains announce arguments")]
     Ssrf,
+    /// engine-side setup/transport failure carrying an
+    /// `operation_t` label (`hostname_lookup`, `connect`,
+    /// `sock_read`…) for `tracker_error_alert::op`.
+    #[error("{op}: {message}")]
+    Op {
+        /// `operation_t` name.
+        op: &'static str,
+        /// error detail.
+        message: String,
+    },
 }
 
-/// `http_tracker_connection` — announce over an established stream
-/// (proxy/tunnel handshake already done by the caller). `p.url` is
-/// the full announce URL; our params are appended like upstream
-/// (`?`/`&` depending on a baked-in query string, with the
-/// `ssrf_mitigation` check).
-pub async fn announce_http(
-    s: &mut BoxedPeerStream,
+impl AnnounceError {
+    /// HTTP status code when the tracker answered with a non-200
+    /// status (`http_category` upstream — the `410` check).
+    #[must_use]
+    pub fn http_status(&self) -> Option<i32> {
+        match self {
+            Self::Http(HttpError::Status(c)) => Some(*c),
+            _ => None,
+        }
+    }
+
+    /// `tracker_connection::fail`'s `retry_interval` — the
+    /// failure response's `interval`, falling back to
+    /// `min interval` (`interval ?: min_interval` upstream).
+    #[must_use]
+    pub fn retry_interval(&self) -> Duration {
+        let (iv, min_iv) = match self {
+            Self::Failure {
+                interval,
+                min_interval,
+                ..
+            } => (*interval, *min_interval),
+            Self::HttpTracker(HttpTrackerError::Failure {
+                interval,
+                min_interval,
+                ..
+            }) => (*interval, *min_interval),
+            _ => (0, 0),
+        };
+        Duration::from_secs((if iv == 0 { min_iv } else { iv }).max(0) as u64)
+    }
+
+    /// `operation_t` — which announce phase failed (alert payload).
+    #[must_use]
+    pub fn operation(&self) -> &'static str {
+        match self {
+            Self::Op { op, .. } => op,
+            Self::Http(HttpError::TimedOut) | Self::TimedOut => "timed_out",
+            Self::Http(_) => "sock_read",
+            Self::HttpTracker(_) | Self::Failure { .. } | Self::Ssrf => "bittorrent",
+            Self::Udp(_) => "udp_tracker",
+            Self::Io(_) => "sock_read",
+        }
+    }
+}
+
+/// `http_tracker_connection::start` URL building — the full GET
+/// target: announce URL + query params (`?`/`&` join), with the
+/// `ssrf_mitigation` rejection for pre-baked tracker arguments.
+pub fn announce_url(
     p: &AnnounceParams,
     opts: &crate::http_tracker::AnnounceOptions,
-    extra_headers: &[(String, String)],
-    max_response: usize,
-) -> Result<TrackerResponse, AnnounceError> {
-    // upstream start(): a pre-baked `?` query means `&` join, and is
-    // rejected under ssrf_mitigation when it holds announce args.
+) -> Result<String, AnnounceError> {
     if let Some(i) = p.url.find('?') {
         if opts.ssrf_mitigation && crate::parse_url::has_tracker_query_string(&p.url[i + 1..]) {
             return Err(AnnounceError::Ssrf);
@@ -243,19 +346,73 @@ pub async fn announce_http(
         &p.ipv6,
     );
     let sep = if p.url.contains('?') { "&" } else { "?" };
-    let url = format!("{}{sep}{q}", p.url);
-    let resp = http_get(s, &url, extra_headers, max_response).await?;
-    // upstream on_response(): anything but 200 fails with
-    // http_category(status_code) + the reason phrase.
+    Ok(format!("{}{sep}{q}", p.url))
+}
+
+/// `http_tracker_connection::on_response` — GET `url` verbatim
+/// (for a redirect retry `url` is the resolved `Location`, matching
+/// upstream `http_connection::on_redirect` which re-GETs it as-is),
+/// non-200 → `HttpError::Status` (the session applies the 410 rule),
+/// then `parse_tracker_response`; the reply interval is floored at
+/// `min_announce_interval` like upstream.
+#[allow(clippy::too_many_arguments)]
+pub async fn announce_http_get(
+    s: &mut BoxedPeerStream,
+    url: &str,
+    i2p: bool,
+    min_announce_interval: i32,
+    extra_headers: &[(String, String)],
+    max_response: usize,
+    read_timeout: Option<Duration>,
+    stats: Option<&mut crate::http_conn::WireStats>,
+) -> Result<TrackerResponse, AnnounceError> {
+    let resp = http_get(s, url, extra_headers, max_response, read_timeout, stats).await?;
     if resp.status() != 200 {
         return Err(HttpError::Status(resp.status()).into());
     }
-    let mut r = parse_response(&resp.body(), false, None, p.i2p).map_err(|e| match e {
-        HttpTrackerError::Failure(m) => AnnounceError::Failure(m),
+    let mut r = parse_response(&resp.body(), false, None, i2p).map_err(|e| match e {
+        HttpTrackerError::Failure {
+            message,
+            interval,
+            min_interval,
+        } => AnnounceError::Failure {
+            message,
+            interval,
+            min_interval,
+        },
         other => AnnounceError::HttpTracker(other),
     })?;
-    r.interval = r.interval.max(opts.min_announce_interval);
+    r.interval = r.interval.max(min_announce_interval);
     Ok(r)
+}
+
+/// `http_tracker_connection` — announce over an established stream
+/// (proxy/tunnel handshake already done by the caller). `p.url` is
+/// the full announce URL; our params are appended like upstream
+/// (`?`/`&` depending on a baked-in query string, with the
+/// `ssrf_mitigation` check). `read_timeout` is the per-read
+/// `tracker_receive_timeout`; `stats` collects wire bytes.
+pub async fn announce_http(
+    s: &mut BoxedPeerStream,
+    p: &AnnounceParams,
+    opts: &crate::http_tracker::AnnounceOptions,
+    extra_headers: &[(String, String)],
+    max_response: usize,
+    read_timeout: Option<Duration>,
+    stats: Option<&mut crate::http_conn::WireStats>,
+) -> Result<TrackerResponse, AnnounceError> {
+    let url = announce_url(p, opts)?;
+    announce_http_get(
+        s,
+        &url,
+        p.i2p,
+        opts.min_announce_interval,
+        extra_headers,
+        max_response,
+        read_timeout,
+        stats,
+    )
+    .await
 }
 
 /// `update_transaction_id` — upstream draws `random(0xfffffffe) + 1`
@@ -264,8 +421,59 @@ fn new_tid() -> u32 {
     rand::random::<u32>() % 0xffff_fffe + 1
 }
 
-/// `udp_tracker_connection` — the BEP-15 exchange: connect then
-/// announce, one datagram each (upstream sends once — a receive
+/// `tracker_connection`-scale timeouts for one UDP exchange:
+/// `receive` bounds each datagram wait (`tracker_receive_timeout`);
+/// the caller wraps the whole call in the completion deadline
+/// (`tracker_completion_timeout`/`stop_tracker_timeout`).
+#[derive(Debug, Clone, Copy)]
+pub struct TrackerTimeouts {
+    /// per-datagram wait (`tracker_receive_timeout`, 10 s upstream).
+    pub receive: Duration,
+    /// `udp_tracker_token_expiry` — connection-id cache TTL (60 s).
+    pub conn_id_ttl: Duration,
+}
+
+/// BEP-15 connect phase — answered `connection_id`s are cached per
+/// tracker address (`udp_tracker_connection_manager::
+/// m_connection_cache` upstream) and reused while unexpired.
+async fn udp_connect(
+    dgram: &dyn DatagramSocket,
+    demux: &UdpTrackerDemux,
+    tracker: SocketAddr,
+    timeouts: &TrackerTimeouts,
+    stats: &mut crate::http_conn::WireStats,
+) -> Result<u64, AnnounceError> {
+    if let Some(id) = demux.cached_conn_id(tracker.ip()) {
+        return Ok(id);
+    }
+    let tid = new_tid();
+    let mut w = udp_waiter(demux, tid);
+    let pkt = build_connect(tid);
+    let _ = dgram.send_to(&pkt, tracker).await?;
+    stats.sent += pkt.len() as i64 + 28; // UDP/IP header estimate
+    loop {
+        let buf = wait_reply(&mut w, timeouts.receive).await?;
+        stats.recv += buf.len() as i64 + 28;
+        match parse_connect_response(&buf, tid) {
+            Ok(id) => {
+                demux.store_conn_id(tracker.ip(), id, timeouts.conn_id_ttl);
+                return Ok(id);
+            }
+            Err(UdpTrackerError::Tracker(m)) => {
+                return Err(AnnounceError::Failure {
+                    message: m,
+                    interval: 0,
+                    min_interval: 0,
+                });
+            }
+            Err(UdpTrackerError::UnexpectedReply | UdpTrackerError::Truncated) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// `udp_tracker_connection` — the BEP-15 exchange: (cached-)connect
+/// then announce, one datagram each (upstream sends once — a receive
 /// timeout fails the announce; `m_attempts` is just a counter).
 /// Stray packets failing the tid/length checks are ignored and
 /// rearm the `timeout` receive deadline like upstream's
@@ -278,23 +486,10 @@ pub async fn announce_udp(
     tracker: SocketAddr,
     p: &AnnounceParams,
     opts: &crate::http_tracker::AnnounceOptions,
-    timeout: Duration,
+    timeouts: TrackerTimeouts,
+    stats: &mut crate::http_conn::WireStats,
 ) -> Result<TrackerResponse, AnnounceError> {
-    // connect exchange
-    let conn_id = {
-        let tid = new_tid();
-        let mut w = udp_waiter(demux, tid);
-        let _ = dgram.send_to(&build_connect(tid), tracker).await?;
-        loop {
-            let buf = wait_reply(&mut w, timeout).await?;
-            match parse_connect_response(&buf, tid) {
-                Ok(id) => break id,
-                Err(UdpTrackerError::Tracker(m)) => return Err(AnnounceError::Failure(m)),
-                Err(UdpTrackerError::UnexpectedReply | UdpTrackerError::Truncated) => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-    };
+    let conn_id = udp_connect(dgram, demux, tracker, &timeouts, stats).await?;
 
     // the ip field: settings announce_ip when !anonymous_mode and it
     // parses as v4, else 0 (upstream udp_tracker_connection).
@@ -331,11 +526,12 @@ pub async fn announce_udp(
         request_string: request_string.clone(),
     };
     let mut w = udp_waiter(demux, tid);
-    let _ = dgram
-        .send_to(&build_announce(conn_id, tid, &req), tracker)
-        .await?;
+    let pkt = build_announce(conn_id, tid, &req);
+    let _ = dgram.send_to(&pkt, tracker).await?;
+    stats.sent += pkt.len() as i64 + 28;
     loop {
-        let buf = wait_reply(&mut w, timeout).await?;
+        let buf = wait_reply(&mut w, timeouts.receive).await?;
+        stats.recv += buf.len() as i64 + 28;
         match parse_announce_response(&buf, 1, tid, tracker.is_ipv6()) {
             Ok(r) => {
                 return Ok(TrackerResponse {
@@ -348,45 +544,39 @@ pub async fn announce_udp(
                     ..Default::default()
                 });
             }
-            Err(UdpTrackerError::Tracker(m)) => return Err(AnnounceError::Failure(m)),
+            Err(UdpTrackerError::Tracker(m)) => {
+                return Err(AnnounceError::Failure {
+                    message: m,
+                    interval: 0,
+                    min_interval: 0,
+                });
+            }
             Err(UdpTrackerError::UnexpectedReply | UdpTrackerError::Truncated) => continue,
             Err(e) => return Err(e.into()),
         }
     }
 }
 
-/// `scrape_udp` — connect then a single scrape datagram (BEP-15
-/// action 2); one send each, like `announce_udp` upstream.
+/// `scrape_udp` — (cached-)connect then a single scrape datagram
+/// (BEP-15 action 2); one send each, like `announce_udp` upstream.
 pub async fn scrape_udp(
     dgram: &dyn DatagramSocket,
     demux: &UdpTrackerDemux,
     tracker: SocketAddr,
     info_hash: &[u8; 20],
-    timeout: Duration,
+    timeouts: TrackerTimeouts,
+    stats: &mut crate::http_conn::WireStats,
 ) -> Result<crate::udp_tracker::ScrapeResponse, AnnounceError> {
-    use crate::udp_tracker::{
-        build_connect, build_scrape, parse_connect_response, parse_scrape_response,
-    };
-    let conn_id = {
-        let tid = new_tid();
-        let mut w = udp_waiter(demux, tid);
-        let _ = dgram.send_to(&build_connect(tid), tracker).await?;
-        loop {
-            let buf = wait_reply(&mut w, timeout).await?;
-            match parse_connect_response(&buf, tid) {
-                Ok(id) => break id,
-                Err(UdpTrackerError::Tracker(m)) => return Err(AnnounceError::Failure(m)),
-                Err(UdpTrackerError::UnexpectedReply | UdpTrackerError::Truncated) => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-    };
+    use crate::udp_tracker::{build_scrape, parse_scrape_response};
+    let conn_id = udp_connect(dgram, demux, tracker, &timeouts, stats).await?;
     let tid = new_tid();
     let pkt = build_scrape(conn_id, tid, &[*info_hash]);
     let mut w = udp_waiter(demux, tid);
     let _ = dgram.send_to(&pkt, tracker).await?;
+    stats.sent += pkt.len() as i64 + 28;
     loop {
-        let buf = wait_reply(&mut w, timeout).await?;
+        let buf = wait_reply(&mut w, timeouts.receive).await?;
+        stats.recv += buf.len() as i64 + 28;
         match parse_scrape_response(&buf, tid) {
             Ok(v) => {
                 return v
@@ -394,11 +584,57 @@ pub async fn scrape_udp(
                     .next()
                     .ok_or(AnnounceError::Udp(UdpTrackerError::BadLength));
             }
-            Err(UdpTrackerError::Tracker(m)) => return Err(AnnounceError::Failure(m)),
+            Err(UdpTrackerError::Tracker(m)) => {
+                return Err(AnnounceError::Failure {
+                    message: m,
+                    interval: 0,
+                    min_interval: 0,
+                });
+            }
             Err(UdpTrackerError::UnexpectedReply | UdpTrackerError::Truncated) => continue,
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// the full scrape GET URL — `url` + binary `info_hash` query arg
+/// (`?`/`&` join), verbatim for redirect retries.
+#[must_use]
+pub fn scrape_url_full(url: &str, info_hash: &[u8; 20]) -> String {
+    let q = crate::http_tracker::scrape_query(info_hash);
+    let sep = if url.contains('?') { "&" } else { "?" };
+    format!("{url}{sep}{q}")
+}
+
+/// `scrape` reply path — GET `url` verbatim, non-200 →
+/// `HttpError::Status`, then the `files`/`info_hash` dict parse
+/// (upstream maps it onto the same `tracker_response` fields).
+#[allow(clippy::too_many_arguments)]
+pub async fn scrape_http_get(
+    s: &mut BoxedPeerStream,
+    url: &str,
+    info_hash: &[u8; 20],
+    extra_headers: &[(String, String)],
+    max_response: usize,
+    read_timeout: Option<Duration>,
+    stats: Option<&mut crate::http_conn::WireStats>,
+) -> Result<TrackerResponse, AnnounceError> {
+    let resp = http_get(s, url, extra_headers, max_response, read_timeout, stats).await?;
+    if resp.status() != 200 {
+        return Err(HttpError::Status(resp.status()).into());
+    }
+    parse_response(&resp.body(), true, Some(info_hash), false).map_err(|e| match e {
+        HttpTrackerError::Failure {
+            message,
+            interval,
+            min_interval,
+        } => AnnounceError::Failure {
+            message,
+            interval,
+            min_interval,
+        },
+        other => AnnounceError::HttpTracker(other),
+    })
 }
 
 /// `scrape_http` — GET the scrape url with `info_hash`, parse the
@@ -412,16 +648,18 @@ pub async fn scrape_http(
     info_hash: &[u8; 20],
     extra_headers: &[(String, String)],
     max_response: usize,
+    read_timeout: Option<Duration>,
+    stats: Option<&mut crate::http_conn::WireStats>,
 ) -> Result<TrackerResponse, AnnounceError> {
-    let q = crate::http_tracker::scrape_query(info_hash);
-    let sep = if url.contains('?') { "&" } else { "?" };
-    let url = format!("{url}{sep}{q}");
-    let resp = http_get(s, &url, extra_headers, max_response).await?;
-    if resp.status() != 200 {
-        return Err(HttpError::Status(resp.status()).into());
-    }
-    parse_response(&resp.body(), true, Some(info_hash), false).map_err(|e| match e {
-        HttpTrackerError::Failure(m) => AnnounceError::Failure(m),
-        other => AnnounceError::HttpTracker(other),
-    })
+    let url = scrape_url_full(url, info_hash);
+    scrape_http_get(
+        s,
+        &url,
+        info_hash,
+        extra_headers,
+        max_response,
+        read_timeout,
+        stats,
+    )
+    .await
 }

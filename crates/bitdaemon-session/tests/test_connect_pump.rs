@@ -178,6 +178,7 @@ fn connect_boost_fires_on_tracker_response() {
     s.on_announce_response(
         &ih,
         "http://t/announce",
+        bitdaemon_common::info_hash::ProtocolVersion::V1,
         Ok(bitdaemon_net::http_tracker::TrackerResponse {
             interval: 1800,
             min_interval: -1,
@@ -194,6 +195,7 @@ fn connect_boost_fires_on_tracker_response() {
             i2p_peers: vec![],
             hostname_peers: vec![],
         }),
+        None,
         &mut out,
     );
     let dials = out
@@ -207,6 +209,7 @@ fn connect_boost_fires_on_tracker_response() {
     s.on_announce_response(
         &ih,
         "http://t/announce",
+        bitdaemon_common::info_hash::ProtocolVersion::V1,
         Ok(bitdaemon_net::http_tracker::TrackerResponse {
             interval: 1800,
             min_interval: -1,
@@ -223,6 +226,7 @@ fn connect_boost_fires_on_tracker_response() {
             i2p_peers: vec![],
             hostname_peers: vec![],
         }),
+        None,
         &mut out,
     );
     assert!(
