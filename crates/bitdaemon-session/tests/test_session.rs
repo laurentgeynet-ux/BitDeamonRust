@@ -1750,3 +1750,68 @@ fn read_complete_skips_disconnecting_conn() {
             .any(|a| matches!(a, bitdaemon_session::alerts::Alert::BlockUploaded { .. }))
     );
 }
+
+/// `on_disk_write_complete` — upstream calls `t->update_gauge()` at
+/// the end of the error leg for *both* aborted and real write
+/// failures (peer_connection.cpp:3255): a subscribed torrent must be
+/// flagged for the next `state_update_alert` either way.
+#[test]
+fn failed_write_marks_state_updated() {
+    use bitdaemon_common::types::{FileIndex, PeerRequest};
+    use bitdaemon_disk::storage_error::{Operation, StorageError};
+    use bitdaemon_session::session::DiskCompleted;
+
+    let mut s = Session::new();
+    let mut t = mk_torrent(2);
+    t.init_picker(true);
+    t.state_subscription = true;
+    let ih = s.add_torrent(t);
+
+    let req = PeerRequest {
+        piece: PieceIndex(0),
+        start: 0,
+        length: 0x4000,
+    };
+
+    // aborted write (`operation_aborted`) → mark_as_canceled only,
+    // update_gauge still runs.
+    s.disk_completions()
+        .send(DiskCompleted::Write {
+            ih,
+            peer: 7,
+            req,
+            picker_gen: s.torrents[&ih].picker_generation,
+            err: StorageError::new(
+                std::io::Error::new(std::io::ErrorKind::Interrupted, "aborted"),
+                FileIndex(0),
+                Operation::FileWrite,
+            ),
+        })
+        .unwrap();
+    s.drain_disk_completed(&mut Vec::new());
+    assert!(
+        s.torrents[&ih].needs_state_update,
+        "aborted write still runs update_gauge upstream"
+    );
+
+    // real failure → cancel/write_failed/clear_piece + update_gauge.
+    s.torrents.get_mut(&ih).unwrap().needs_state_update = false;
+    s.disk_completions()
+        .send(DiskCompleted::Write {
+            ih,
+            peer: 7,
+            req,
+            picker_gen: s.torrents[&ih].picker_generation,
+            err: StorageError::new(
+                std::io::Error::other("disk gone"),
+                FileIndex(0),
+                Operation::FileWrite,
+            ),
+        })
+        .unwrap();
+    s.drain_disk_completed(&mut Vec::new());
+    assert!(
+        s.torrents[&ih].needs_state_update,
+        "real write failure runs update_gauge"
+    );
+}

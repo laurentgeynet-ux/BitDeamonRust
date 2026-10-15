@@ -1817,6 +1817,13 @@ impl Session {
                             }
                             self.route(ih, eff, out);
                         }
+                        // `t->update_gauge()` upstream — a failed
+                        // write (aborted or real) still mutates the
+                        // pieces gauge; subscribed torrents must
+                        // observe it on the next `state_update_alert`.
+                        if let Some(t) = self.torrents.get_mut(&ih) {
+                            t.state_updated();
+                        }
                         self.on_disk_error(ih, &err, DiskJobClass::Write, Some(peer), out);
                         continue;
                     }
