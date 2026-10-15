@@ -4419,8 +4419,8 @@ impl Session {
         let torrent_i2p = t.ti.as_ref().is_some_and(|ti| ti.is_i2p());
         conn.local_ut_metadata = u8::from(!(is_priv && t.valid_metadata())) * 2;
         conn.local_ut_pex = u8::from(!is_priv && !torrent_i2p);
-        conn.local_i2p_pex = u8::from((!is_priv && torrent_i2p) || conn.i2p.is_some())
-            * crate::i2p_pex::I2P_PEX_ID;
+        conn.local_i2p_pex =
+            u8::from((!is_priv && torrent_i2p) || conn.i2p.is_some()) * crate::i2p_pex::I2P_PEX_ID;
         // `set_holepunch_mode` — upstream flags the conn right
         // after `connect_to_peer`; our dial is async so the
         // swarm entry carried the flag to this attach.
