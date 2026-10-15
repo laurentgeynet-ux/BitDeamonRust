@@ -116,6 +116,11 @@ pub enum TorrentEffect {
     /// `choke_peer` touches the shared `Counters` and must schedule
     /// an unchoke-slot recalculation (upstream `trigger_unchoke`).
     ChokePeer { peer: u64 },
+    /// `remove_peer` tail — the last conn under `graceful_pause`
+    /// just dropped: upstream re-enters `set_paused(true)` which
+    /// clears the graceful bit and posts `torrent_paused_alert`.
+    /// Session-side the handler completes `do_pause`.
+    GracefulPauseDone,
 }
 
 /// The `PipelineTorrent` view `send_block_requests` needs — the
@@ -308,6 +313,38 @@ pub struct Torrent {
     /// the session applies its delta to `num_peers_down_requests`
     /// (upstream incs/decs at every `m_download_queue` transition).
     pub down_request_peers: i64,
+    /// `m_peer_id` — the per-torrent peer-id we announce to
+    /// trackers (`aux::generate_peer_id` at the `torrent` ctor).
+    /// NOT the conn handshake pid — those are per-connection
+    /// (`PeerConn::our_peer_id`).
+    pub peer_id: bitdaemon_common::PeerId,
+    /// `m_outgoing_pids` — peer-ids we generated for OUTGOING conns
+    /// on this torrent; a remote handshake echoing one is a
+    /// self-connection (`is_self_connection`). Entries live for the
+    /// conn's lifetime (`remove_peer` erases; `peer_connect_failed`
+    /// erases a failed dial's).
+    pub outgoing_pids: std::collections::HashSet<bitdaemon_common::PeerId>,
+    /// local endpoints of our in-flight dials (`remote → local`) —
+    /// fills `i->connection->local_endpoint()` for pending dials in
+    /// `peer_list::new_connection`'s self-connection legs. The
+    /// engine registers an entry once the socket connects; attach
+    /// or `peer_connect_failed` drops it.
+    pub dial_locals: std::collections::HashMap<std::net::SocketAddr, std::net::SocketAddr>,
+    /// `remote → our_pid` for in-flight dials — the pid each dial
+    /// registered into `outgoing_pids`, so `peer_connected_outgoing`
+    /// can verify the mark is still live and `peer_connect_failed`/
+    /// teardown can erase it.
+    pub dial_pids: std::collections::HashMap<std::net::SocketAddr, bitdaemon_common::PeerId>,
+    /// `m_has_incoming` — sticky: set on the first INCOMING attach
+    /// (`st.has_incoming` keeps reporting true after the conn leaves).
+    pub has_incoming: bool,
+    /// a slot-consuming unchoked conn left since the last choker
+    /// pass — `trigger_unchoke` (upstream zeroes the time scaler so
+    /// the next tick re-runs instead of waiting out the interval).
+    pub triggered_unchoke: bool,
+    /// the optimistic-unchoked conn left since the last pass —
+    /// `trigger_optimistic_unchoke`.
+    pub triggered_optimistic: bool,
     /// `m_peer_list` — known swarm members (tracker/PEX/DHT/LSD/
     /// resume candidates). Upstream stores `torrent_peer`s owned by
     /// the list; ours are `TorrentPeer`s in `PeerList`.
@@ -861,6 +898,17 @@ impl Torrent {
             web_seed_refcounted: false,
             web_seed_state: std::collections::BTreeMap::new(),
             down_request_peers: 0,
+            // the session overwrites this at add time with
+            // `generate_peer_id(settings.peer_fingerprint)` —
+            // a bare `Torrent::new` (unit tests) gets the zero
+            // fingerprint like upstream's default settings.
+            peer_id: bitdaemon_common::peer_id::generate_peer_id(&[]),
+            outgoing_pids: std::collections::HashSet::new(),
+            dial_locals: std::collections::HashMap::new(),
+            dial_pids: std::collections::HashMap::new(),
+            has_incoming: false,
+            triggered_unchoke: false,
+            triggered_optimistic: false,
             peer_list: bitdaemon_net::peer_list::PeerList::default(),
             peer_list_state: bitdaemon_net::peer_list::PeerListState::default(),
             storage,
@@ -948,7 +996,10 @@ impl Torrent {
             ssl_cert: None,
             ssl_key: None,
             net_interface: None,
-            apply_ip_filter: false,
+            // `add_torrent_params::flags` defaults carry
+            // `apply_ip_filter` — the raw ctor mirrors that stance;
+            // `from_params` overrides from `atp.flags`.
+            apply_ip_filter: true,
             ip_filter: None,
             port_filter: None,
             peer_limits: std::collections::HashMap::new(),
@@ -1160,6 +1211,12 @@ impl Torrent {
         t.auto_managed = atp
             .flags
             .contains(bitdaemon_common::flags::TorrentFlags::AUTO_MANAGED);
+        // `m_apply_ip_filter(p.flags & apply_ip_filter)` — the flag
+        // rides `default_flags`, so a fresh `AddTorrentParams` opts
+        // the torrent INTO the session filter.
+        t.apply_ip_filter = atp
+            .flags
+            .contains(bitdaemon_common::flags::TorrentFlags::APPLY_IP_FILTER);
         t.state_subscription = atp
             .flags
             .contains(bitdaemon_common::flags::TorrentFlags::UPDATE_SUBSCRIBE);
@@ -2904,12 +2961,38 @@ impl Torrent {
     /// `None` = no usable candidate (`p->ip()` unresolvable — i2p
     /// — counts as a missed attempt, like upstream's failed
     /// `connect_to_peer`).
+    /// `bt_peer_connection` ctor's encryption pick under
+    /// `pe_enabled` — the `pe_support` self-toggle: a plain dial
+    /// pre-sets it (a failure retries encrypted), an MSE dial
+    /// clears it (success re-arms via `peer_connected`) AND flags
+    /// the conn `fast_reconnect` so a failed MSE leg isn't cooled
+    /// out for the plaintext retry. Returns `(encrypted, fast)`.
+    fn pick_dial_encryption(
+        p: &mut bitdaemon_net::torrent_peer::TorrentPeer,
+        out_policy: bitdaemon_net::pe_crypto::EncPolicy,
+    ) -> (bool, bool) {
+        match out_policy {
+            bitdaemon_net::pe_crypto::EncPolicy::Forced => (true, false),
+            bitdaemon_net::pe_crypto::EncPolicy::Disabled => (false, false),
+            bitdaemon_net::pe_crypto::EncPolicy::Enabled => {
+                if p.pe_support {
+                    p.pe_support = false;
+                    (true, true)
+                } else {
+                    p.pe_support = true;
+                    (false, false)
+                }
+            }
+        }
+    }
+
     pub fn try_connect_peer(
         &mut self,
         session_time: i32,
         state: &bitdaemon_net::peer_list::PeerListState,
         out_policy: bitdaemon_net::pe_crypto::EncPolicy,
-    ) -> Option<(std::net::SocketAddr, bool)> {
+        fingerprint: &[u8],
+    ) -> Option<(std::net::SocketAddr, bool, bool, bitdaemon_common::PeerId)> {
         // keep `finished` in sync so finished torrents skip
         // seed/upload-only candidates — upstream feeds
         // `torrent_state::is_finished` (`is_finished()`, which is
@@ -2938,30 +3021,35 @@ impl Torrent {
                 self.update_want_peers();
                 return None;
             };
-            // upstream `bt_peer_connection::start`: pe_forced →
-            // MSE always; pe_enabled → MSE iff `pi->pe_support`,
-            // with the self-toggling flag: a plain dial pre-sets
-            // it (a failure retries encrypted), an MSE dial
-            // clears it (success re-arms via peer_connected).
-            let encrypted = match out_policy {
-                bitdaemon_net::pe_crypto::EncPolicy::Forced => true,
-                bitdaemon_net::pe_crypto::EncPolicy::Disabled => false,
-                bitdaemon_net::pe_crypto::EncPolicy::Enabled => {
-                    if p.pe_support {
-                        p.pe_support = false;
-                        true
-                    } else {
-                        p.pe_support = true;
-                        false
-                    }
-                }
-            };
-            (ep, encrypted)
+            let (encrypted, fast_reconnect) = Self::pick_dial_encryption(p, out_policy);
+            (ep, encrypted, fast_reconnect)
         };
         // `set_connection` at dial start (upstream's peer_connection
         // ctor) — the entry stops being a candidate until
         // `peer_connect_failed`/`peer_disconnected` reports back.
-        self.peer_list.set_connected(i, session_time, false);
+        // `conn_key` 0 = no conn object yet (binds at attach).
+        let _ = self.peer_list.set_connected(i, session_time, false, 0);
+        // `create_peer_connection` — a per-conn peer-id is generated
+        // for the handshake and tracked in `m_outgoing_pids` (the
+        // `is_self_connection` probe); `dial_pids` keeps the remote →
+        // pid map until the conn attaches or fails.
+        let our_pid = bitdaemon_common::peer_id::generate_peer_id(fingerprint);
+        self.outgoing_pids.insert(our_pid);
+        self.dial_pids.insert(dial.0, our_pid);
+        // `fast_reconnect(true)` on the MSE-armed dial — rewind
+        // `last_connected` + credit `fast_reconnects` so a failed
+        // leg retries immediately (upstream runs it at the pe1
+        // write inside `start()`).
+        if dial.2 {
+            let st2 = self.peer_list_state.clone();
+            let _ = self.peer_list.fast_reconnect(i, session_time, &st2);
+        }
+        // `++m_num_seeds` at conn creation for a seed-flagged entry
+        // (upstream bumps it in `create_peer_connection`, before the
+        // dial completes).
+        if self.peer_list.peers()[i].seed {
+            self.num_seeds += 1;
+        }
         // `inc_num_connecting` — dial bookkeeping; a
         // seed-flagged candidate counts toward
         // `num_connecting_seeds` too (upstream counts them out
@@ -2971,7 +3059,7 @@ impl Torrent {
             self.num_connecting_seeds += 1;
         }
         self.update_want_peers();
-        Some(dial)
+        Some((dial.0, dial.1, dial.2, our_pid))
     }
 
     /// `torrent::do_connect_boost` — the first tracker response
@@ -2988,7 +3076,8 @@ impl Torrent {
         out_policy: bitdaemon_net::pe_crypto::EncPolicy,
         num_connections: i64,
         s: &crate::settings::SessionSettings,
-    ) -> Vec<(std::net::SocketAddr, bool)> {
+        fingerprint: &[u8],
+    ) -> Vec<(std::net::SocketAddr, bool, bool, bitdaemon_common::PeerId)> {
         if self.connect_boost_counter == 0 {
             return Vec::new();
         }
@@ -3001,7 +3090,7 @@ impl Torrent {
         while self.want_peers(s) && conns > 0 {
             conns -= 1;
             self.connect_boost_counter = self.connect_boost_counter.saturating_sub(1);
-            if let Some(d) = self.try_connect_peer(session_time, state, out_policy) {
+            if let Some(d) = self.try_connect_peer(session_time, state, out_policy, fingerprint) {
                 dials.push(d);
             }
             self.update_want_peers();
@@ -3009,80 +3098,210 @@ impl Torrent {
         dials
     }
 
-    /// `connection_closed` for a dial that never completed —
-    /// bumps `last_connected` and `failcount` so the peer isn't
-    /// retried immediately (`inc_failcount` + timestamp upstream).
-    /// `was_utp` mirrors upstream's uTP-failure leg: clear
-    /// `supports_utp` (next dial picks TCP) and fast-reconnect
-    /// (don't restamp `last_connected` — the TCP retry isn't
-    /// throttled by the cooldown).
+    /// `peer_connection::connect_failed` — a dial that never
+    /// completed. Two legs upstream:
+    ///
+    /// * **uTP fallback** (`is_utp` && `supports_utp`): clear
+    ///   `supports_utp`, `fast_reconnect(true)` (rewind
+    ///   `last_connected` + credit `fast_reconnects`), disconnect at
+    ///   **normal** severity (no `failcount`) and immediately re-dial
+    ///   the SAME entry over TCP (`connect_to_peer(pi, ignore_limit)`).
+    ///   The returned `(endpoint, encrypted)` is that retry — the
+    ///   caller dials it right away; `num_connecting` nets to zero
+    ///   (`dec` on the dead conn, `inc` on the new one).
+    /// * **any other failure**: `disconnect(e, connect, failure)` —
+    ///   `failcount++` via `connection_closed`.
+    ///
+    /// `conn_fast` is the failed dial conn's own `m_fast_reconnect`
+    /// (an MSE-retry conn skips the `last_connected` restamp).
+    /// Returns the immediate TCP retry for the uTP leg.
     pub fn peer_connect_failed(
         &mut self,
         remote: std::net::SocketAddr,
         session_time: i32,
         was_utp: bool,
-    ) {
-        if let Some(i) = self.peer_index(remote) {
-            // `dec_num_connecting` — the dial is over.
-            self.num_connecting = self.num_connecting.saturating_sub(1);
-            if self.peer_list.peers()[i].seed {
-                self.num_connecting_seeds = self.num_connecting_seeds.saturating_sub(1);
-            }
-            // upstream clears `supports_utp` on a failed uTP connect
-            // (`!m_holepunch_mode` conn flag — our outbound dials
-            // never run holepunch mode).
-            if was_utp {
-                self.peer_list.peers_mut()[i].supports_utp = false;
-            }
-            // `connection_closed` with `c.failed()` — upstream bumps
-            // `failcount` inside. `was_utp` fast-reconnects: the old
-            // `last_connected` stands so the TCP retry isn't cooled
-            // out.
-            let st = self.peer_list_state.clone();
-            self.peer_list
-                .connection_closed(i, session_time, was_utp, true, &st);
+        conn_fast: bool,
+        out_policy: bitdaemon_net::pe_crypto::EncPolicy,
+        fingerprint: &[u8],
+    ) -> Option<(std::net::SocketAddr, bool, bool, bitdaemon_common::PeerId)> {
+        let i = self.peer_index(remote)?;
+        // pending-dial bookkeeping — the conn never attached, so its
+        // pid leaves `outgoing_pids`/`dial_pids`/`dial_locals` here
+        // (upstream: conn dtor → `remove_peer` erases it).
+        self.dial_locals.remove(&remote);
+        if let Some(pid) = self.dial_pids.remove(&remote) {
+            self.outgoing_pids.remove(&pid);
         }
+        let st = self.peer_list_state.clone();
+        if was_utp && self.peer_list.peers()[i].supports_utp {
+            // `fast_reconnect(true)` rewinds before the close so
+            // `connection_closed` keeps the rewind (`!c.fast_reconnect()`
+            // gates the restamp); `connect_to_peer` restamps to now
+            // anyway for the retry.
+            let _ = self.peer_list.fast_reconnect(i, session_time, &st);
+            self.peer_list.peers_mut()[i].supports_utp = false;
+            // `disconnect(e, connect, normal)` — no failcount.
+            self.peer_list
+                .connection_closed(i, session_time, true, false, &st);
+            // `connect_to_peer(pi, true)` — same entry, TCP this
+            // time (`supports_utp` clear steers `instantiate` away
+            // from uTP); `set_connection` marks + restamps like the
+            // normal dial path. `num_connecting`/`num_connecting_seeds`
+            // net zero — upstream decs then incs.
+            let _ = self.peer_list.set_connected(i, session_time, false, 0);
+            let (encrypted, fast_reconnect) =
+                Self::pick_dial_encryption(&mut self.peer_list.peers_mut()[i], out_policy);
+            // `create_peer_connection` for the retry — fresh pid in
+            // `m_outgoing_pids`, MSE arm rewinds again under the
+            // `fast_reconnects` cap.
+            let our_pid = bitdaemon_common::peer_id::generate_peer_id(fingerprint);
+            self.outgoing_pids.insert(our_pid);
+            self.dial_pids.insert(remote, our_pid);
+            if fast_reconnect {
+                let _ = self.peer_list.fast_reconnect(i, session_time, &st);
+            }
+            self.update_want_peers();
+            return Some((remote, encrypted, fast_reconnect, our_pid));
+        }
+        // `dec_num_connecting` — the dial is over.
+        self.num_connecting = self.num_connecting.saturating_sub(1);
+        if self.peer_list.peers()[i].seed {
+            self.num_connecting_seeds = self.num_connecting_seeds.saturating_sub(1);
+            // `num_seeds` was bumped at `try_connect_peer` for the
+            // pending dial — the teardown decrements it like
+            // upstream's `remove_peer` on a conn that never
+            // completed.
+            self.num_seeds = self.num_seeds.saturating_sub(1);
+        }
+        // `disconnect(e, connect, failure)` — `connection_closed`
+        // bumps `failcount`; the conn's own `m_fast_reconnect` (an
+        // MSE retry) keeps the dial-time stamp so the plaintext
+        // retry isn't cooled out.
+        self.peer_list
+            .connection_closed(i, session_time, conn_fast, true, &st);
+        None
     }
 
-    /// `set_connection` — mark the swarm entry for `remote` as
-    /// connected (also covers inbound accepts). `encrypted` = the
-    /// conn negotiated MSE → upstream re-arms `pi->pe_support`.
-    /// Upstream `peer_list::connect_one_peer` creates the
-    /// `torrent_peer` on demand (source = `peer_info::incoming`) —
-    /// every connection has a `peer_info_struct`.
-    ///
-    /// Returns `false` when the peer list refused the insert
-    /// (`new_connection` returning false upstream →
-    /// `too_many_connections` disconnect in `connect_to_peer`).
-    pub fn peer_connected_addr(
+    /// `connect_to_peer` for a caller-specified endpoint (the
+    /// engine's `connect_peer` API / test dials): upstream resolves
+    /// `peerinfo` off the handle path; ours inserts a connectable
+    /// entry when missing, marks it pending-dial, and registers the
+    /// conn's generated peer-id in `outgoing_pids`/`dial_pids`.
+    /// `false` when the peer is already connected/dialing or banned —
+    /// upstream's `peerinfo->connection != nullptr` refuse leg.
+    pub fn register_manual_dial(
         &mut self,
         remote: std::net::SocketAddr,
-        encrypted: bool,
         session_time: i32,
-        was_utp: bool,
+        pid: bitdaemon_common::PeerId,
     ) -> bool {
-        // upstream `peer_list::new_connection` — an unseen incoming
-        // endpoint inserts `connectable = false` (no listen port is
-        // known yet); `None` = list full (`too_many_connections`).
         let st = self.peer_list_state.clone();
         let i = match self.peer_index(remote) {
             Some(i) => i,
-            None => match self.peer_list.add_incoming(remote, &st) {
-                Some(i) => i,
+            None => match self.peer_list.add_peer(
+                remote,
+                bitdaemon_common::flags::PeerSourceFlags::NONE,
+                bitdaemon_common::flags::PexFlags::NONE,
+                &st,
+            ) {
+                Some((i, _)) => i,
                 None => return false,
             },
         };
-        // `dec_num_connecting` — an entry already marked `connected`
-        // was our in-flight dial (`connect_candidates` set it).
-        // Incoming accepts create/touch entries without it.
-        if self.peer_list.peers()[i].connection.is_some() {
+        if self.peer_list.peers()[i].connection.is_some() || self.peer_list.peers()[i].banned {
+            return false;
+        }
+        let _ = self.peer_list.set_connected(i, session_time, false, 0);
+        self.outgoing_pids.insert(pid);
+        self.dial_pids.insert(remote, pid);
+        self.num_connecting += 1;
+        if self.peer_list.peers()[i].seed {
+            self.num_connecting_seeds += 1;
+            self.num_seeds += 1;
+        }
+        self.update_want_peers();
+        true
+    }
+
+    /// `peer_list::new_connection` for an INCOMING conn — the
+    /// upstream accept legs (banned / endpoint self-connection /
+    /// same-direction drop / cross-direction port rule) wrapped in
+    /// one call. `attached` resolves `entry.conn_key` through
+    /// `peers`; a `conn_key` of 0 resolves through `dial_locals`
+    /// (an in-flight dial's local endpoint for the self-conn check).
+    /// `coin` is the equal-port tiebreak bit (upstream `random(1)`).
+    #[must_use]
+    pub fn peer_connected_incoming(
+        &mut self,
+        remote: std::net::SocketAddr,
+        local: Option<std::net::SocketAddr>,
+        coin: bool,
+    ) -> bitdaemon_net::peer_list::NewConnVerdict {
+        let st = self.peer_list_state.clone();
+        let peers = &self.peers;
+        let dial_locals = &self.dial_locals;
+        self.peer_list.new_connection(
+            remote,
+            local,
+            &st,
+            &|p: &bitdaemon_net::torrent_peer::TorrentPeer| {
+                if p.conn_key != 0 {
+                    peers.get(&p.conn_key).and_then(|c| {
+                        c.remote.map(|r| bitdaemon_net::peer_list::AttachedConn {
+                            remote: r,
+                            local: c.local,
+                            outgoing: c.outgoing,
+                            failed: c.failed,
+                            key: p.conn_key,
+                        })
+                    })
+                } else {
+                    // pending outbound dial — its remote is the entry
+                    // endpoint, its local was registered by the engine.
+                    p.ip().map(|ep| bitdaemon_net::peer_list::AttachedConn {
+                        remote: ep,
+                        local: dial_locals.get(&ep).copied(),
+                        outgoing: true,
+                        failed: false,
+                        key: 0,
+                    })
+                }
+            },
+            coin,
+        )
+    }
+
+    /// `attach_peer`/`set_connection` tail — bind `conn_key` to the
+    /// swarm entry: prev-amount restore (returned for the caller to
+    /// fold into the conn's stats), `pe_support` re-arm on MSE
+    /// success, `confirmed_supports_utp` on a successful uTP leg,
+    /// `++m_num_seeds` for a seed-flagged entry.
+    ///
+    /// `was_pending` = the entry's mark was a dial placeholder
+    /// (`conn_key` 0) — the attach settles the `num_connecting`
+    /// bookkeeping upstream runs in `peer_connection::disconnect`'s
+    /// `m_connecting` leg / ctor's `inc_num_connecting`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn peer_connected_attach(
+        &mut self,
+        index: usize,
+        encrypted: bool,
+        session_time: i32,
+        conn_key: u64,
+        conn_fast_reconnect: bool,
+        was_utp: bool,
+        was_pending: bool,
+    ) -> (i64, i64) {
+        if was_pending {
             self.num_connecting = self.num_connecting.saturating_sub(1);
-            if self.peer_list.peers()[i].seed {
+            if self.peer_list.peers()[index].seed {
                 self.num_connecting_seeds = self.num_connecting_seeds.saturating_sub(1);
             }
         }
-        self.peer_list.set_connected(i, session_time, false);
-        if let Some(p) = self.peer_list.peers_mut().get_mut(i) {
+        let (dl, ul) =
+            self.peer_list
+                .set_connected(index, session_time, conn_fast_reconnect, conn_key);
+        if let Some(p) = self.peer_list.peers_mut().get_mut(index) {
             p.pe_support = encrypted;
             // a successful uTP dial confirms the transport —
             // upstream `peer_connection` on socket-connect.
@@ -3092,11 +3311,101 @@ impl Torrent {
             }
             // upstream `++m_num_seeds` on attach when the peer was
             // already seed-flagged (e.g. a re-dial to a known seed).
-            if p.seed {
+            // `++m_num_seeds` on attach — outgoing dials bumped it
+            // at `try_connect_peer` (conn-creation time upstream),
+            // incoming attaches bump here (`attach_peer` tail).
+            if p.seed && !was_pending {
                 self.num_seeds += 1;
             }
         }
-        true
+        (dl, ul)
+    }
+
+    /// the OUTGOING half of attach — the entry was marked by
+    /// `try_connect_peer` (`conn_key` 0): find it, settle the dial
+    /// bookkeeping, bind. Returns the index + restored prev bytes;
+    /// `None` when the entry vanished or was stolen by an incoming
+    /// conn (`new_connection` killed the pending dial — upstream
+    /// `i->connection->disconnect()` tore the conn object down, so
+    /// its attach is a no-op).
+    #[allow(clippy::too_many_arguments)]
+    pub fn peer_connected_outgoing(
+        &mut self,
+        remote: std::net::SocketAddr,
+        encrypted: bool,
+        session_time: i32,
+        conn_key: u64,
+        conn_fast_reconnect: bool,
+        was_utp: bool,
+        our_pid: Option<bitdaemon_common::PeerId>,
+    ) -> Option<(usize, i64, i64)> {
+        // `Some(pid)` = a marked dial (`try_connect_peer` /
+        // `register_manual_dial` registered `dial_pids[remote]`): the
+        // mapping must still be OURS — a missing or foreign mapping
+        // means the mark was consumed while the dial was in flight
+        // (`new_connection` dup-resolution winner, `peer_connect_failed`,
+        // an ip_filter/ban sweep). Upstream destructed that conn
+        // object — ours is a zombie, dropped at attach.
+        match our_pid {
+            Some(pid) => {
+                if self.dial_pids.get(&remote) == Some(&pid) {
+                    self.dial_pids.remove(&remote);
+                } else {
+                    return None;
+                }
+            }
+            // unmarked conns (`spawn_dial` without a mark — tests)
+            // just consume whatever stale mapping exists.
+            None => {
+                self.dial_pids.remove(&remote);
+            }
+        }
+        self.dial_locals.remove(&remote);
+        let i = match self.peer_index(remote) {
+            // `self_connection` banned + cleared the entry while the
+            // dial was in flight — the conn was destructed upstream.
+            Some(i) if self.peer_list.peers()[i].banned => return None,
+            Some(i) => i,
+            // unmarked conn with no entry — a direct caller-driven
+            // dial never ran `try_connect_peer`; upstream
+            // `connect_to_peer` resolves `peerinfo` off the handle
+            // path, ours inserts a connectable entry at attach.
+            // (Marked dials always have an entry — `None` here is a
+            // zombie.)
+            None if our_pid.is_none() => {
+                let st = self.peer_list_state.clone();
+                self.peer_list
+                    .add_peer(
+                        remote,
+                        bitdaemon_common::flags::PeerSourceFlags::NONE,
+                        bitdaemon_common::flags::PexFlags::NONE,
+                        &st,
+                    )?
+                    .0
+            }
+            None => return None,
+        };
+        let bound = self.peer_list.peers()[i].conn_key;
+        // a nonzero key that isn't ours means `new_connection`
+        // resolved a duplicate by keeping the OTHER conn — this
+        // dial's conn is the one upstream's `disconnect()` killed.
+        if bound != 0 && bound != conn_key {
+            return None;
+        }
+        // `was_pending` = the entry carried a dial mark
+        // (`connection` set with `conn_key` 0) — a fresh manual-dial
+        // entry has neither and must not decrement `num_connecting`.
+        let was_pending = bound == 0 && self.peer_list.peers()[i].connection.is_some();
+        let (dl, ul) = self.peer_connected_attach(
+            i,
+            encrypted,
+            session_time,
+            conn_key,
+            conn_fast_reconnect,
+            was_utp,
+            was_pending,
+        );
+        Some((i, dl, ul))
     }
 
     /// `peer_connection::peer_rank` of a live conn — its swarm
@@ -3136,21 +3445,77 @@ impl Torrent {
     }
 
     /// `connection_closed` — clear the connection flag + stamp
-    /// `last_connected` for the dial backoff.
+    /// `last_connected` for the dial backoff. `key` is the conn's
+    /// `conn_key` binding (upstream `c.peer_info_struct()` — the
+    /// entry survives an `update_peer_port` port rewrite, which a
+    /// bare endpoint lookup would miss); `0` falls back to the
+    /// endpoint match for call sites without a bound conn (dial
+    /// marks, user bans).
     pub fn peer_disconnected_addr(
         &mut self,
         remote: std::net::SocketAddr,
         session_time: i32,
         failed: bool,
+        conn_fast_reconnect: bool,
+        key: u64,
     ) {
-        if let Some(i) = self.peer_index(remote) {
-            // `fast_reconnect = false` — we have no uTP-fallback
-            // retry that would want the stamp kept. `failed` is the
-            // conn's `m_failed` (severity > normal at disconnect).
+        let i = if key != 0 {
+            self.peer_list
+                .peers()
+                .iter()
+                .position(|p| p.conn_key == key)
+                .or_else(|| self.peer_index(remote))
+        } else {
+            self.peer_index(remote)
+        };
+        if let Some(i) = i {
+            // a pending dial mark dies here — its dial tables leave
+            // too (the conn object owning them is gone upstream).
+            if self.peer_list.peers()[i].conn_key == 0
+                && self.peer_list.peers()[i].connection.is_some()
+            {
+                // dial tables key on the dialed endpoint — the
+                // entry's own `ip()` (== `remote` while marked, but
+                // `update_peer_port` can't have touched a marked
+                // entry).
+                let ep = self.peer_list.peers()[i].ip().unwrap_or(remote);
+                self.dial_locals.remove(&ep);
+                if let Some(pid) = self.dial_pids.remove(&ep) {
+                    self.outgoing_pids.remove(&pid);
+                }
+                // `dec_num_connecting` — the pending dial's conn
+                // object dies here (upstream `remove_peer` on a
+                // conn that never completed). `peer_connect_failed`
+                // has its own copy of this leg (it runs before the
+                // mark could be re-bound).
+                self.num_connecting = self.num_connecting.saturating_sub(1);
+                if self.peer_list.peers()[i].seed {
+                    self.num_connecting_seeds = self.num_connecting_seeds.saturating_sub(1);
+                    self.num_seeds = self.num_seeds.saturating_sub(1);
+                }
+            }
+            // `failed` is the conn's `m_failed` (severity > normal at
+            // disconnect); `conn_fast_reconnect` is its
+            // `m_fast_reconnect` (MSE-retry conns keep the dial
+            // stamp so the plaintext fallback isn't cooled out).
             let st = self.peer_list_state.clone();
             self.peer_list
-                .connection_closed(i, session_time, false, failed, &st);
+                .connection_closed(i, session_time, conn_fast_reconnect, failed, &st);
         }
+    }
+
+    /// `peer_info_struct()` by `conn_key` — the bound-connection
+    /// lookup (`update_peer_port`, disconnect bookkeeping) that
+    /// survives endpoint rewrites.
+    #[must_use]
+    pub fn entry_index_by_conn(&self, key: u64) -> Option<usize> {
+        if key == 0 {
+            return None;
+        }
+        self.peer_list
+            .peers()
+            .iter()
+            .position(|p| p.conn_key == key)
     }
 
     pub(crate) fn peer_index(&self, remote: std::net::SocketAddr) -> Option<usize> {
@@ -3255,11 +3620,16 @@ impl Torrent {
         }
         // abort this conn's in-flight + unsent blocks back into the
         // picker (`remove_peer` runs before the queues are torn down
-        // upstream).
+        // upstream). Only `!timed_out && !not_wanted` entries release
+        // picker state — a timed-out or unwanted block already gave
+        // its refcount back (the double-abort would free a block
+        // another peer re-picked).
         if let Some(p) = self.picker.as_mut() {
             let key = c.peer_key();
-            for b in c.outstanding() {
-                p.abort_download(b, key);
+            for b in c.outstanding_entries() {
+                if !b.timed_out && !b.not_wanted {
+                    p.abort_download(b.block, key);
+                }
             }
         }
         // `~peer_connection` — transition gauges drop with the conn
@@ -3299,8 +3669,12 @@ impl Torrent {
             counters.add(crate::counters::Counter::NumPeersUpDisk, -1);
         }
         // an unchoked conn vacates an upload slot — `m_num_uploads`
-        // derives per-call here so the removal is enough; the re-pick
-        // runs on the next choker pass (`trigger_unchoke`).
+        // derives per-call here so the removal is enough; upstream
+        // `trigger_unchoke`/`trigger_optimistic_unchoke` zero the
+        // scalers so the next choker tick re-picks immediately.
+        if !c.choked && !c.ignores_unchoke_slots(pool) && !t_ignores_unchoke {
+            self.triggered_unchoke = true;
+        }
         // `optimistically_unchoked` on the swarm entry drops with the
         // conn and re-arms the optimistic slot rotation.
         if let Some(i) = c.remote.and_then(|r| self.peer_index(r)) {
@@ -3308,6 +3682,7 @@ impl Torrent {
             if p.optimistically_unchoked {
                 p.optimistically_unchoked = false;
                 counters.add(crate::counters::Counter::NumPeersUpUnchokedOptimistic, -1);
+                self.triggered_optimistic = true;
             }
             if p.seed {
                 self.num_seeds = self.num_seeds.saturating_sub(1);
@@ -3320,6 +3695,15 @@ impl Torrent {
             p.prev_amount_upload = p
                 .prev_amount_upload
                 .saturating_add((c.stat_up_total / 1024).max(0) as u32);
+        }
+        // `~peer_connection` — an outgoing conn's `our_pid` leaves
+        // `m_outgoing_pids` (upstream `remove_peer` erases it — a
+        // pid never reported means a later remote claiming it is
+        // no longer a self-connection).
+        if c.outgoing
+            && let Some(pid) = c.our_peer_id
+        {
+            self.outgoing_pids.remove(&pid);
         }
         // `m_stat` payload channels are session-lifetime — the
         // conn's transfer folds into the torrent accumulators so
@@ -3334,7 +3718,12 @@ impl Torrent {
         self.update_want_peers();
         // `update_want_tick` — our `want_tick` is a computed
         // predicate, so removing the conn is the update.
-        let _ = eff;
+        // `remove_peer` tail — the last conn under graceful pause
+        // completes the pause (`set_paused(true)` → `do_pause`
+        // posts `torrent_paused_alert` and clears the mode).
+        if self.graceful_pause && self.is_paused() && self.peers.is_empty() {
+            eff.push(TorrentEffect::GracefulPauseDone);
+        }
     }
 
     /// resolve a picker's downloader key (`block_info.peer`,
@@ -4018,6 +4407,38 @@ impl Torrent {
                 }
                 PeerEffect::YourIp(ip) => {
                     out.push(TorrentEffect::YourIp(ip));
+                }
+                PeerEffect::ListenPort(port) => {
+                    // `peer_connection::on_extended` →
+                    // `peer_list::update_peer_port` — resolve the
+                    // entry by `conn_key` so a peer whose source port
+                    // is being rewritten still matches. `false`
+                    // means the new endpoint collides with a live
+                    // conn → drop this one.
+                    let idx = self
+                        .peer_list
+                        .peers()
+                        .iter()
+                        .position(|p| p.conn_key == peer_id)
+                        .or_else(|| {
+                            self.peers
+                                .get(&peer_id)
+                                .and_then(|c| c.remote)
+                                .and_then(|r| self.peer_index(r))
+                        });
+                    if let Some(i) = idx {
+                        let src = self.peer_list.peers()[i].source;
+                        if !self
+                            .peer_list
+                            .update_peer_port(port, i, src, &self.peer_list_state)
+                        {
+                            out.push(TorrentEffect::DisconnectPeer {
+                                peer: peer_id,
+                                reason: "duplicate peer id",
+                                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                            });
+                        }
+                    }
                 }
                 PeerEffect::PeerSeed(seed) => {
                     self.set_seed(peer_id, seed, s);
@@ -9803,14 +10224,64 @@ impl Torrent {
     }
 
     /// `set_apply_ip_filter` — `m_apply_ip_filter` flag (upstream
-    /// `apply_ip_filter` marks `state_updated` + resume dirty).
-    pub fn set_apply_ip_filter(&mut self, yes: bool) {
+    /// `apply_ip_filter` marks `state_updated` + resume dirty and
+    /// runs `ip_filter_updated` — the torrent-level sweep of
+    /// now-blocked live conns rides `out`).
+    /// `non_filter_torrents` delta: `false → +1`, `true → -1`.
+    pub fn set_apply_ip_filter(
+        &mut self,
+        yes: bool,
+        counters: &crate::counters::Counters,
+        out: &mut Vec<TorrentEffect>,
+    ) {
         if yes == self.apply_ip_filter {
             return;
         }
+        counters.add(
+            crate::counters::Counter::NonFilterTorrents,
+            if yes { -1 } else { 1 },
+        );
         self.apply_ip_filter = yes;
         self.need_save_resume = true;
         self.state_updated();
+        // `ip_filter_updated` — turning the flag ON applies the
+        // current filter to live conns and swarm entries right now
+        // (same shape as `privileged_port_updated`): conn teardown
+        // rides `DisconnectPeer`, blocked list entries drop via
+        // `apply_ip_filter`, each endpoint is reported.
+        if !yes {
+            return;
+        }
+        let Some(f) = self.ip_filter.clone() else {
+            return;
+        };
+        let ids: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|(_, c)| {
+                c.remote
+                    .is_some_and(|r| f.access(r.ip()) == bitdaemon_net::ip_filter::BLOCKED)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            if let Some(c) = self.peers.get(&id)
+                && let Some(remote) = c.remote
+            {
+                out.push(TorrentEffect::Alert(crate::alerts::Alert::PeerBlocked {
+                    ih: self.info_hash,
+                    remote: remote.to_string(),
+                    reason: "ip_filter".into(),
+                }));
+                out.push(TorrentEffect::DisconnectPeer {
+                    peer: id,
+                    reason: "banned_by_ip_filter",
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                });
+            }
+        }
+        self.peer_list
+            .apply_ip_filter(|a| f.access(a) == bitdaemon_net::ip_filter::BLOCKED);
     }
 
     /// `torrent::set_file_priority` — bounds-checked single-slot

@@ -107,6 +107,16 @@ struct DialDone {
     /// `socket_type_idx` — the transport's `socket_type_t` index
     /// (feeds `PeerConn::sock_type` → `set_peer_classes`).
     kind: u8,
+    /// OUR peer-id used on this conn's handshake
+    /// (`generate_peer_id` per conn — the dial mark registered it in
+    /// `outgoing_pids`; attach verifies the pairing).
+    our_pid: Option<bitdaemon_common::PeerId>,
+    /// the dial conn's `m_fast_reconnect` (pe_enabled/uTP retry
+    /// arm) — `connection_closed` keeps the dial-time stamp.
+    conn_fast_reconnect: bool,
+    /// `local_endpoint()` — the bound socket address (drives
+    /// `new_connection`'s self-connection legs for pending dials).
+    local: Option<SocketAddr>,
 }
 
 /// `socket_type_idx` — `TransportKind` → `socket_type_t` index
@@ -188,6 +198,10 @@ pub struct Engine {
     next_peer: u64,
     /// peer writers: `(ih, peer)` → outbound message channel.
     writers: HashMap<(Sha1Hash, u64), mpsc::UnboundedSender<PeerMessage>>,
+    /// `peer` conn id → remote endpoint — needed at teardown to
+    /// stamp the uTP `close_reason` (`set_close_reason(m_socket,…)`
+    /// upstream) since `disconnect_writer` only gets the conn id.
+    peer_remote: HashMap<u64, SocketAddr>,
     /// inbound message queue from reader tasks.
     inbound_rx: mpsc::UnboundedReceiver<InboundPeerMsg>,
     inbound_tx: mpsc::UnboundedSender<InboundPeerMsg>,
@@ -333,6 +347,7 @@ impl Engine {
             resolver: None,
             next_peer: 1,
             writers: HashMap::new(),
+            peer_remote: HashMap::new(),
             inbound_rx,
             inbound_tx,
             announce_rx,
@@ -768,8 +783,13 @@ impl Engine {
             match e {
                 SessionOut::ToPeer { ih, peer, msg } => self.send_to_peer(ih, peer, msg),
                 SessionOut::Torrent(
-                    bitdaemon_session::torrent::TorrentEffect::DisconnectPeer { peer, .. },
-                ) => self.disconnect_writer(peer),
+                    bitdaemon_session::torrent::TorrentEffect::DisconnectPeer {
+                        peer, reason, ..
+                    },
+                ) => self.disconnect_writer(
+                    peer,
+                    bitdaemon_net::close_reason::reason_to_close_reason(reason),
+                ),
                 _ => {}
             }
         }
@@ -779,10 +799,20 @@ impl Engine {
     /// the pump's `rx.recv()` then returns `None`, the task exits and
     /// the socket closes (`gone_tx` reaps whatever session state
     /// remains — usually none, since the emitting torrent already ran
-    /// `remove_peer`).
-    fn disconnect_writer(&mut self, peer: u64) {
+    /// `remove_peer`). `reason` stamps the uTP `close_reason`
+    /// extension (`set_close_reason(m_socket, …)` upstream — the peer
+    /// reads our cause off the FIN).
+    fn disconnect_writer(&mut self, peer: u64, reason: bitdaemon_net::close_reason::CloseReason) {
+        if let (Some(mgr), Some(remote)) = (
+            self.utp_manager.as_ref(),
+            self.peer_remote.get(&peer).copied(),
+        ) && reason != bitdaemon_net::close_reason::CloseReason::None
+        {
+            mgr.set_close_reason(remote, reason as u16);
+        }
         if let Some(key) = self.writers.keys().find(|(_, p)| *p == peer).copied() {
             self.writers.remove(&key);
+            self.peer_remote.remove(&peer);
         }
     }
 
@@ -900,8 +930,12 @@ impl Engine {
                     {
                         warn!(peer = peer, reason = reason, "peer disconnect");
                         // `m_ses.close_connection` — actually close the
-                        // socket (the torrent already ran remove_peer).
-                        self.disconnect_writer(*peer);
+                        // socket (the torrent already ran remove_peer);
+                        // stamp the uTP close_reason on the way out.
+                        self.disconnect_writer(
+                            *peer,
+                            bitdaemon_net::close_reason::reason_to_close_reason(reason),
+                        );
                     }
                 }
                 SessionOut::Alert(_) => {}
@@ -925,11 +959,17 @@ impl Engine {
                     // the engine re-binds at the transport level.
                     info!("network interfaces changed");
                 }
-                SessionOut::ConnectPeer { ih, ep, encrypted } => {
+                SessionOut::ConnectPeer {
+                    ih,
+                    ep,
+                    encrypted,
+                    fast_reconnect,
+                    our_pid,
+                } => {
                     // `session_impl::connect_to_peer` — the session
                     // handed out a dial (connect-boost/tracker
                     // response outside the pump cadence).
-                    self.spawn_dial(ih, ep, encrypted);
+                    self.spawn_dial(ih, ep, encrypted, fast_reconnect, Some(our_pid));
                 }
             }
         }
@@ -2095,21 +2135,41 @@ impl Engine {
         slock(&self.session)
             .counters
             .inc(bitdaemon_session::counters::Counter::NumPeersHalfOpen);
-        let s_res = self.connector.clone().connect(remote).await;
-        let mut s = match s_res {
-            Ok(s) => s,
+        let (s_res, our_pid) = {
+            // per-conn `generate_peer_id` + the dial mark — same
+            // bookkeeping `try_connect_peer` runs for pump dials.
+            let fp = slock(&self.session).settings.peer_fingerprint.clone();
+            let pid = bitdaemon_common::peer_id::generate_peer_id(&fp);
+            (
+                self.connector
+                    .clone()
+                    .connect_with_bind_report(remote, None),
+                pid,
+            )
+        };
+        if !slock(&self.session).register_dial(ih, remote, our_pid) {
+            slock(&self.session)
+                .counters
+                .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+            return Err(std::io::Error::other("peer already connected"));
+        }
+        let (s, local) = match s_res.await {
+            Ok(r) => r,
             Err(e) => {
                 let mut ses = slock(&self.session);
                 ses.counters
                     .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
-                ses.peer_connect_failed(ih, remote, false);
+                ses.peer_connect_failed(ih, remote, false, false);
                 return Err(std::io::Error::other(e));
             }
         };
-        let (pid, dht, enc_level) = {
+        let mut s = s;
+        if let Some(l) = local {
+            slock(&self.session).register_dial_local(ih, remote, l);
+        }
+        let (dht, enc_level) = {
             let ses = slock(&self.session);
             (
-                ses.peer_id,
                 ses.settings.enable_dht,
                 u32::from(ses.pe_settings.allowed_enc_level),
             )
@@ -2126,7 +2186,7 @@ impl Engine {
         let remote_pid;
         if encrypted {
             match bitdaemon_net::bt_peer_conn::run_handshake_encrypted_initiator(
-                &mut s, ih, &pid, dht, fast, enc_level, 0,
+                &mut s, ih, &our_pid, dht, fast, enc_level, 0,
             )
             .await
             {
@@ -2140,18 +2200,18 @@ impl Engine {
                     let mut ses = slock(&self.session);
                     ses.counters
                         .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
-                    ses.peer_connect_failed(ih, remote, false);
+                    ses.peer_connect_failed(ih, remote, false, false);
                     return Err(std::io::Error::other(e));
                 }
             }
         } else {
-            match run_handshake(&mut s, ih, &pid, dht, fast).await {
+            match run_handshake(&mut s, ih, &our_pid, dht, fast).await {
                 Ok(hs) => remote_pid = Some(hs.peer_id),
                 Err(e) => {
                     let mut ses = slock(&self.session);
                     ses.counters
                         .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
-                    ses.peer_connect_failed(ih, remote, false);
+                    ses.peer_connect_failed(ih, remote, false, false);
                     return Err(std::io::Error::other(e));
                 }
             }
@@ -2189,6 +2249,9 @@ impl Engine {
         conn.handshake_done = true;
         conn.supports_encryption = encrypted;
         conn.peer_id = remote_pid;
+        // `m_our_peer_id` — the dial-mark identity `register_dial`
+        // recorded; attach validates it.
+        conn.our_peer_id = Some(our_pid);
         let mut out = Vec::new();
         slock(&self.session).peer_connected(ih, peer, conn, remote, &mut out);
         self.attach_stream(*ih, peer, remote, s, mse_rc4);
@@ -2231,7 +2294,12 @@ impl Engine {
                 warn!(remote = ?d.remote, err = e, "dial failed");
                 if d.outbound {
                     if let Some(r) = d.remote {
-                        slock(&self.session).peer_connect_failed(&d.ih, r, matches!(d.kind, 3 | 9));
+                        slock(&self.session).peer_connect_failed(
+                            &d.ih,
+                            r,
+                            matches!(d.kind, 3 | 9),
+                            d.conn_fast_reconnect,
+                        );
                     }
                 }
                 return;
@@ -2267,6 +2335,13 @@ impl Engine {
         // `pex_encryption` flag + `pi->pe_support` re-arm).
         conn.supports_encryption = d.encrypted;
         conn.peer_id = d.pid;
+        // `m_our_peer_id`/`m_fast_reconnect`/`local_endpoint` — the
+        // conn's own handshake identity (per-conn `generate_peer_id`
+        // for outgoing, per-accept for incoming), the retry arm, and
+        // the bound endpoint the `new_connection` legs read.
+        conn.our_peer_id = d.our_pid;
+        conn.fast_reconnect = d.conn_fast_reconnect;
+        conn.local = d.local;
         // `peer_exceeds_limit` — slack-admitted conns owe an eviction
         // at attach; `sock_type` feeds `set_peer_classes`.
         conn.exceeded_limit = d.exceeded;
@@ -2280,8 +2355,18 @@ impl Engine {
     /// `torrent::connect_to_peer` (async form) — spawn the dial +
     /// handshake job; the result lands in `connect_rx` and is
     /// applied by the next `tick`. `max_out_request_queue`+ext ids
-    /// are snapshotted now.
-    pub fn spawn_dial(&mut self, ih: Sha1Hash, remote: SocketAddr, encrypted: bool) {
+    /// are snapshotted now. `fast_reconnect`/`our_pid` come from the
+    /// session's dial mark (`try_connect_peer`): the conn carries
+    /// `m_fast_reconnect` and shakes hands with its own generated
+    /// `peer_id` (`create_peer_connection`).
+    pub fn spawn_dial(
+        &mut self,
+        ih: Sha1Hash,
+        remote: SocketAddr,
+        encrypted: bool,
+        fast_reconnect: bool,
+        our_pid: Option<bitdaemon_common::PeerId>,
+    ) {
         // `ip_filter` gate on outbound too (upstream filters at
         // `connect_to_peer` → `peer_blocked_alert`). A refused dial
         // reports `peer_connect_failed` so the candidate mark +
@@ -2292,13 +2377,22 @@ impl Engine {
                 remote: remote.to_string(),
                 reason: "ip_filter".into(),
             });
-            slock(&self.session).peer_connect_failed(&ih, remote, false);
+            slock(&self.session).peer_connect_failed(&ih, remote, false, fast_reconnect);
             return;
         }
         let connector = self.connector.clone();
         let tx = self.connect_tx.clone();
-        let (pid, dht, ssl_params, peer_proxy, enc_level, utp_wanted, tcp_ok, hs_timeout) = {
+        // `our_pid` Option semantics: `Some` = the dial-mark identity
+        // registered by `try_connect_peer`/`register_manual_dial`
+        // (attach validates it); `None` = an unmarked caller-driven
+        // dial (tests) — the handshake still gets a fresh per-conn
+        // pid, `conn.our_peer_id` just stays empty.
+        let marked_pid = our_pid;
+        let (dht, ssl_params, peer_proxy, enc_level, utp_wanted, tcp_ok, hs_timeout, our_pid) = {
             let ses = slock(&self.session);
+            let our_pid = our_pid.unwrap_or_else(|| {
+                bitdaemon_common::peer_id::generate_peer_id(&ses.settings.peer_fingerprint)
+            });
             let t = ses.torrents.get(&ih);
             let ssl = t.and_then(|t| {
                 if !t.is_ssl_torrent() {
@@ -2324,7 +2418,6 @@ impl Engine {
                 .is_some_and(|p| p.supports_utp || p.confirmed_supports_utp);
             let utp_wanted = self.utp_enabled && (!ses.settings.enable_outgoing_tcp || peer_utp);
             (
-                ses.peer_id,
                 ses.settings.enable_dht,
                 ssl,
                 ses.proxies.peer.clone(),
@@ -2332,6 +2425,7 @@ impl Engine {
                 utp_wanted,
                 ses.settings.enable_outgoing_tcp,
                 ses.settings.handshake_timeout,
+                our_pid,
             )
         };
         let utp = if self.utp_enabled {
@@ -2344,7 +2438,7 @@ impl Engine {
         // upstream refuses the dial when TCP is disabled and the
         // peer didn't get a uTP socket.
         if !utp_wanted && !tcp_ok {
-            slock(&self.session).peer_connect_failed(&ih, remote, false);
+            slock(&self.session).peer_connect_failed(&ih, remote, false, fast_reconnect);
             return;
         }
         // `instantiate_connection` — upstream's transport decision
@@ -2362,7 +2456,7 @@ impl Engine {
         ) {
             Some(k) => k,
             None => {
-                slock(&self.session).peer_connect_failed(&ih, remote, false);
+                slock(&self.session).peer_connect_failed(&ih, remote, false, fast_reconnect);
                 return;
             }
         };
@@ -2412,6 +2506,9 @@ impl Engine {
                     rc4: None,
                     exceeded: false,
                     kind: transport_socket_type(&kind),
+                    our_pid: marked_pid,
+                    conn_fast_reconnect: fast_reconnect,
+                    local: None,
                 });
             };
             // `instantiate` resolved the socket type — map it back to
@@ -2478,25 +2575,26 @@ impl Engine {
                     return;
                 }
             };
-            // `enable_outgoing_utp` — upstream prefers uTP when both
-            // transports are available; on dial failure fall back to
-            // the TCP connector (with the same bind — upstream runs
-            // `bind_outgoing_socket` for every socket_type).
-            let s = match if matches!(kind, TK::Utp | TK::SslUtp) {
-                match conn.connect(remote).await {
-                    Ok(s) => Ok(s),
-                    Err(_) => connector.connect_with_bind(remote, bind).await,
-                }
-            } else {
-                conn.connect_with_bind(remote, bind).await
-            } {
-                Ok(s) => s,
+            // `connect_with_bind` — every socket_type binds
+            // (`bind_outgoing_socket`). A uTP dial failure does NOT
+            // fall back inline: upstream's `connect_failed` clears
+            // `supports_utp` and `fast_reconnect`s the entry, then
+            // the session's `peer_connect_failed` re-dials it over
+            // TCP (`connect_to_peer(pi, ignore_limit)`).
+            let (s, local) = match conn.connect_with_bind_report(remote, bind).await {
+                Ok(r) => r,
                 Err(e) => {
                     check_ports(&e);
                     send_err(e.to_string());
                     return;
                 }
             };
+            // `local_endpoint()` on the half-open conn — visible to
+            // `new_connection`'s self-connection legs while the
+            // handshake is in flight.
+            if let Some(l) = local {
+                slock(&session).register_dial_local(&ih, remote, l);
+            }
             // SSL torrent: every peer connection is TLS-wrapped
             // (upstream `is_ssl_torrent()` → `ssl_stream<T>`) — SNI
             // carries the hex info-hash for the server-side dispatch.
@@ -2537,7 +2635,7 @@ impl Engine {
                 match tokio::time::timeout(
                     hs_timeout,
                     bitdaemon_net::bt_peer_conn::run_handshake_encrypted_initiator(
-                        &mut s, &ih, &pid, dht, fast, enc_level, 0,
+                        &mut s, &ih, &our_pid, dht, fast, enc_level, 0,
                     ),
                 )
                 .await
@@ -2560,11 +2658,14 @@ impl Engine {
                 }
             } else {
                 (
-                    tokio::time::timeout(hs_timeout, run_handshake(&mut s, &ih, &pid, dht, fast))
-                        .await
-                        .unwrap_or(Err(bitdaemon_net::bt_peer_conn::PeerConnError::Protocol(
-                            "handshake timeout",
-                        ))),
+                    tokio::time::timeout(
+                        hs_timeout,
+                        run_handshake(&mut s, &ih, &our_pid, dht, fast),
+                    )
+                    .await
+                    .unwrap_or(Err(
+                        bitdaemon_net::bt_peer_conn::PeerConnError::Protocol("handshake timeout"),
+                    )),
                     None,
                 )
             };
@@ -2594,6 +2695,9 @@ impl Engine {
                 rc4: mse_rc4,
                 exceeded: false,
                 kind: transport_socket_type(&kind),
+                our_pid: marked_pid,
+                conn_fast_reconnect: fast_reconnect,
+                local,
             });
         });
         self.tasks.push(h);
@@ -2618,9 +2722,12 @@ impl Engine {
         let fd_tx = self.fd_exhausted_tx.clone();
         let known = self.known_ihs.clone();
         let session = self.session.clone();
-        let (pid, dht) = {
+        let (fp, dht) = {
             let ses = slock(&self.session);
-            (ses.peer_id, ses.settings.enable_dht)
+            (
+                ses.settings.peer_fingerprint.clone(),
+                ses.settings.enable_dht,
+            )
         };
         let h = tokio::spawn(async move {
             loop {
@@ -2652,11 +2759,14 @@ impl Engine {
                 slock(&session)
                     .counters
                     .inc(bitdaemon_session::counters::Counter::NumPeersHalfOpen);
-                // `on_incoming_connection` — session conn-cap gates:
-                // past `limit + slack` the socket drops, inside slack
-                // it attaches flagged `m_exceeded_limit`.
+                // `on_incoming_connection` — session gates: paused,
+                // transport enablement, interface verify, ip_filter,
+                // conn-cap + slack, active-torrents. Past `limit +
+                // slack` the socket drops; inside slack it attaches
+                // flagged `m_exceeded_limit`.
                 let verdict = slock(&session).on_incoming_connection(
                     remote.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
+                    local,
                     kind,
                 );
                 let exceeded = match verdict {
@@ -2683,6 +2793,11 @@ impl Engine {
                             .collect::<std::collections::HashMap<_, _>>(),
                     )
                 };
+                // `peer_connection_args` — every accepted conn gets
+                // its own generated peer-id upstream (`generate_peer_id`
+                // in `incoming_connection`); it drives the pid-dedup
+                // ordering in `read_peer_id`.
+                let our_pid = bitdaemon_common::peer_id::generate_peer_id(&fp);
                 // upstream bounds the accept-side handshake by
                 // `settings_pack::handshake_timeout` — a silent peer
                 // must not wedge the accept loop for everyone else.
@@ -2690,7 +2805,7 @@ impl Engine {
                     hs_timeout,
                     bitdaemon_net::bt_peer_conn::run_handshake_responder_auto(
                         &mut s,
-                        &pid,
+                        &our_pid,
                         dht,
                         true,
                         |ih| known.lock().unwrap_or_else(|e| e.into_inner()).contains(ih),
@@ -2719,6 +2834,9 @@ impl Engine {
                             rc4,
                             exceeded,
                             kind,
+                            our_pid: Some(our_pid),
+                            conn_fast_reconnect: false,
+                            local,
                         });
                     }
                     Err(e) => {
@@ -2792,9 +2910,12 @@ impl Engine {
         let fd_tx = self.fd_exhausted_tx.clone();
         let known = self.known_ihs.clone();
         let session = self.session.clone();
-        let (pid, dht) = {
+        let (fp, dht) = {
             let ses = slock(&self.session);
-            (ses.peer_id, ses.settings.enable_dht)
+            (
+                ses.settings.peer_fingerprint.clone(),
+                ses.settings.enable_dht,
+            )
         };
         let h = tokio::spawn(async move {
             loop {
@@ -2822,7 +2943,7 @@ impl Engine {
                 slock(&session)
                     .counters
                     .inc(bitdaemon_session::counters::Counter::NumPeersHalfOpen);
-                let exceeded = match slock(&session).on_incoming_connection(remote, kind) {
+                let exceeded = match slock(&session).on_incoming_connection(remote, local, kind) {
                     bitdaemon_session::session::IncomingVerdict::Accept => false,
                     bitdaemon_session::session::IncomingVerdict::AcceptExceeded => true,
                     bitdaemon_session::session::IncomingVerdict::Reject => {
@@ -2844,9 +2965,12 @@ impl Engine {
                     }
                 };
                 let mut s = Box::new(tls) as bitdaemon_net::transport::BoxedPeerStream;
+                // per-conn peer-id (`generate_peer_id`) for the
+                // responder handshake — same as the plain acceptor.
+                let our_pid = bitdaemon_common::peer_id::generate_peer_id(&fp);
                 let hs = bitdaemon_net::bt_peer_conn::run_handshake_responder(
                     &mut s,
-                    &pid,
+                    &our_pid,
                     dht,
                     true,
                     |ih| known.lock().unwrap_or_else(|e| e.into_inner()).contains(ih),
@@ -2867,6 +2991,9 @@ impl Engine {
                             rc4: None,
                             exceeded,
                             kind,
+                            our_pid: Some(our_pid),
+                            conn_fast_reconnect: false,
+                            local,
                         });
                     }
                     Err(e) => {
@@ -3135,9 +3262,12 @@ impl Engine {
             });
             return Ok(None);
         }
-        let (pid, dht) = {
+        let (fp, dht) = {
             let ses = slock(&self.session);
-            (ses.peer_id, ses.settings.enable_dht)
+            (
+                ses.settings.peer_fingerprint.clone(),
+                ses.settings.enable_dht,
+            )
         };
         // `num_peers_half_open` — the accepted conn exists from here
         // until attach or handshake failure (`peer_connection` ctor).
@@ -3145,8 +3275,9 @@ impl Engine {
             .counters
             .inc(bitdaemon_session::counters::Counter::NumPeersHalfOpen);
         // `on_incoming_connection` gates — conn cap + slack; the
-        // injected-transport entry point has no socket type (tcp = 0).
-        let exceeded = match slock(&self.session).on_incoming_connection(remote, 0) {
+        // injected-transport entry point has no socket type (tcp = 0)
+        // and no bound local endpoint.
+        let exceeded = match slock(&self.session).on_incoming_connection(remote, None, 0) {
             bitdaemon_session::session::IncomingVerdict::Accept => false,
             bitdaemon_session::session::IncomingVerdict::AcceptExceeded => true,
             bitdaemon_session::session::IncomingVerdict::Reject => {
@@ -3166,9 +3297,12 @@ impl Engine {
                 .collect::<std::collections::HashMap<_, _>>();
             (set, ses.pe_settings.in_enc_policy, skeys, ses.pe_settings)
         };
+        // per-conn peer-id (`generate_peer_id` in upstream's
+        // `incoming_connection` pack) — pid dedup ordering reads it.
+        let our_pid = bitdaemon_common::peer_id::generate_peer_id(&fp);
         let hs = match bitdaemon_net::bt_peer_conn::run_handshake_responder_auto(
             &mut s,
-            &pid,
+            &our_pid,
             dht,
             true,
             |ih| ih_known.contains(ih),
@@ -3222,6 +3356,7 @@ impl Engine {
         conn.handshake_done = true;
         conn.supports_encryption = encrypted;
         conn.peer_id = Some(hs.peer_id);
+        conn.our_peer_id = Some(our_pid);
         conn.exceeded_limit = exceeded;
         conn.sock_type = 0;
         // upstream `write_handshake` sends our BEP-10 handshake on
@@ -3637,7 +3772,13 @@ impl Engine {
         let out_policy = ses.pe_settings.out_enc_policy;
         let speed_override = (max_peers > 0)
             .then(|| i32::try_from(max_peers.min(i32::MAX as usize)).unwrap_or(i32::MAX));
+        // the conn-level dial state (`fast_reconnect`, per-conn
+        // `our_pid`) rides `SessionOut::ConnectPeer` in production;
+        // this harness shim keeps the `(ih, ep, encrypted)` shape.
         ses.try_connect_more_peers(session_time, out_policy, speed_override)
+            .into_iter()
+            .map(|(ih, ep, enc, _fast, _pid)| (ih, ep, enc))
+            .collect()
     }
 
     /// number of live peer writers.

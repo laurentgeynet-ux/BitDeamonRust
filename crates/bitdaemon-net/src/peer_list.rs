@@ -170,6 +170,66 @@ impl Default for PeerList {
     }
 }
 
+/// What `new_connection` needs to know about the conn currently
+/// attached to a peer-list entry (upstream dereferences
+/// `i->connection` — our entries carry `conn_key` which the
+/// caller resolves through `torrent::peers`; a `key` of 0 is an
+/// in-flight outbound dial with no conn object yet).
+#[derive(Clone, Copy, Debug)]
+pub struct AttachedConn {
+    /// `c.remote()` of the existing conn (for a pending dial,
+    /// the entry endpoint).
+    pub remote: SocketAddr,
+    /// `c.local_endpoint()` — `None` when the transport can't
+    /// report one (treated as non-matching in the self-conn legs).
+    pub local: Option<SocketAddr>,
+    /// `c.is_outgoing()`.
+    pub outgoing: bool,
+    /// `c.failed()` — a conn that already failed wins the dup
+    /// resolution (`disconnect1 &= !i->connection->failed()`).
+    pub failed: bool,
+    /// the bound `conn_key` — `0` for a pending dial.
+    pub key: u64,
+}
+
+/// `peer_list::new_connection` verdict — the peer list can't own
+/// conn teardown (upstream runs `disconnect()` inline), so the
+/// caller performs the kill before the attach tail.
+#[derive(Clone, Copy, Debug)]
+pub enum NewConnVerdict {
+    /// attach to this entry index.
+    Attach(usize),
+    /// `errors::peer_banned` — normal severity; drop this conn.
+    Banned,
+    /// `errors::self_connection` — **failure** severity on BOTH
+    /// this conn and the attached one (`other_key` is its
+    /// `conn_key`, `0` = pending dial); the entry gets banned.
+    SelfConnect {
+        /// the found entry index (ban + `connection_closed`).
+        index: usize,
+        /// `conn_key` of the attached conn (`0` = in-flight dial).
+        other_key: u64,
+        /// the attached conn's remote endpoint.
+        other_remote: SocketAddr,
+    },
+    /// `errors::duplicate_peer_id` — normal severity; drop this
+    /// conn, keep the attached one.
+    KillSelf,
+    /// `errors::duplicate_peer_id` — normal severity; drop the
+    /// attached conn (synchronously, under `m_locked_peer`) and
+    /// attach this conn to the entry.
+    KillOther {
+        /// the found entry index (attach target after teardown).
+        index: usize,
+        /// `conn_key` of the attached conn (`0` = in-flight dial).
+        other_key: u64,
+        /// the attached conn's remote endpoint.
+        other_remote: SocketAddr,
+    },
+    /// `errors::too_many_connections` — the list is full.
+    Full,
+}
+
 impl PeerList {
     /// `peer_list()` — `max_failcount` comes from `state`.
     #[must_use]
@@ -445,6 +505,138 @@ impl PeerList {
         self.insert_peer(p, key, PexFlags::NONE, state, true)
     }
 
+    /// `peer_list::new_connection` — the full upstream accept legs:
+    /// endpoint/address lookup, banned rejection, endpoint-level
+    /// self-connection, same-direction drop, cross-direction
+    /// port-ordered resolution (deterministic between the two
+    /// clients), then the attach tail (the caller binds `conn_key`,
+    /// restores `prev_amount`, stamps `last_connected` via
+    /// [`Self::set_connected`]).
+    ///
+    /// `local` is this conn's `local_endpoint()`; `attached` resolves
+    /// the conn bound to `entry.conn_key` (the torrent's `peers` map
+    /// or the pending-dial table). `coin` is the equal-port tiebreak
+    /// (`random(1)` — session supplies the bit).
+    pub fn new_connection(
+        &mut self,
+        remote: SocketAddr,
+        local: Option<SocketAddr>,
+        state: &PeerListState,
+        attached: &dyn Fn(&TorrentPeer) -> Option<AttachedConn>,
+        coin: bool,
+    ) -> NewConnVerdict {
+        let found = if state.allow_multiple_connections_per_ip {
+            self.peers
+                .iter()
+                .position(|p| p.addr.address() == Some(remote.ip()) && p.port == remote.port())
+        } else {
+            self.find_peer(remote.ip())
+        };
+
+        let Some(i) = found else {
+            // we don't have any info about this peer — insert
+            // `connectable = false`/`source = incoming` (`add_incoming`
+            // runs the same cap + force-erase path).
+            return match self.add_incoming(remote, state) {
+                Some(i) => NewConnVerdict::Attach(i),
+                None => NewConnVerdict::Full,
+            };
+        };
+
+        if self.peers[i].banned {
+            return NewConnVerdict::Banned;
+        }
+
+        if self.peers[i].connection.is_some() {
+            let Some(oc) = attached(&self.peers[i]) else {
+                // the mark is stale (no live conn and no pending
+                // dial) — treat like upstream's cleared pointer.
+                // Clearing `connection` restores candidacy the mark
+                // had removed (`set_connected` deducted it) — the
+                // attach-side `set_connected` re-deducts it, so the
+                // counter nets out at marked-again.
+                self.peers[i].connection = None;
+                self.peers[i].conn_key = 0;
+                if self.is_connect_candidate(&self.peers[i]) {
+                    self.num_connect_candidates += 1;
+                }
+                return NewConnVerdict::Attach(i);
+            };
+            // `is_self_connection` — either end's endpoint identity:
+            // the other conn dialed FROM the endpoint this conn
+            // claims, or this conn's remote IS the other's local.
+            if Some(oc.remote) == local || oc.local == Some(remote) {
+                return NewConnVerdict::SelfConnect {
+                    index: i,
+                    other_key: oc.key,
+                    other_remote: oc.remote,
+                };
+            }
+            if !oc.outgoing {
+                // the existing conn is incoming too — drop the
+                // second one (upstream only runs `new_connection`
+                // for accepts, so `c` is always incoming).
+                return NewConnVerdict::KillSelf;
+            }
+            // cross-direction duplicate — the deterministic rule:
+            // `our_port` = this conn's local port (our listen port),
+            // `other_port` = the existing conn's remote port. Whichever
+            // side has the lower port keeps its OUTGOING conn — since
+            // `c` is incoming, `our_port < other_port` drops `c`.
+            let our_port = local.map_or(0, |a| i32::from(a.port()));
+            let other_port = i32::from(oc.remote.port());
+            let mut disconnect1 = our_port < other_port || (our_port == other_port && coin);
+            disconnect1 &= !oc.failed;
+            if disconnect1 {
+                return NewConnVerdict::KillSelf;
+            }
+            // `m_locked_peer` — the caller disconnects the existing
+            // conn synchronously; the pin stops `connection_closed`
+            // bookkeeping from touching the entry we're about to take.
+            return NewConnVerdict::KillOther {
+                index: i,
+                other_key: oc.key,
+                other_remote: oc.remote,
+            };
+        }
+
+        // found, unconnected — the attach tail (`set_connected`)
+        // removes it from the candidate count; decrementing here too
+        // would double-count (upstream `connect_one_peer` deducts at
+        // the mark, not `set_connection`).
+        NewConnVerdict::Attach(i)
+    }
+
+    /// `peer_connection::fast_reconnect` — a failed-uTP/encrypted
+    /// retry skips the `min_reconnect_time` cooldown: stamp
+    /// `last_connected` at now, rewind it by `min_reconnect_time *
+    /// max_failcount` (the retry bypasses the candidate scan), and
+    /// credit one `fast_reconnects` (capped at 15). Upstream ignores
+    /// further fast reconnects once `fast_reconnects > 1` — returns
+    /// whether the rewind ran so the caller flags the retry conn.
+    pub fn fast_reconnect(
+        &mut self,
+        index: usize,
+        session_time: i32,
+        state: &PeerListState,
+    ) -> bool {
+        let p = &mut self.peers[index];
+        if p.fast_reconnects > 1 {
+            return false;
+        }
+        p.last_connected = session_time.max(0) as u16;
+        let rewind = i64::from(state.min_reconnect_time) * i64::from(state.max_failcount);
+        if i64::from(p.last_connected) < rewind {
+            p.last_connected = 0;
+        } else {
+            p.last_connected = (i64::from(p.last_connected) - rewind) as u16;
+        }
+        if p.fast_reconnects < 15 {
+            p.fast_reconnects += 1;
+        }
+        true
+    }
+
     /// `update_peer_port` — a peer announces a new listen port
     /// (NAT-PMP/DHT port message). Returns `false` when the update
     /// would collide with an existing connected peer (the caller
@@ -562,21 +754,46 @@ impl PeerList {
     }
 
     /// `new_connection`'s attach tail + `set_connection` — mark the
-    /// entry connected: clears `maybe_upload_only` (a live conn tells
-    /// us the real seed state), stamps `last_connected` unless this
-    /// is a fast reconnect (upstream leaves the initiate-time stamp).
-    /// Upstream stores the `peer_connection*`; we track the flag and
-    /// re-resolve by endpoint on disconnect.
-    pub fn set_connected(&mut self, index: usize, session_time: i32, fast_reconnect: bool) {
+    /// entry connected: binds `conn_key` (upstream stores the
+    /// `peer_connection*`), clears `maybe_upload_only` (a live conn
+    /// tells us the real seed state), stamps `last_connected` unless
+    /// this is a fast reconnect, and transfers the entry's
+    /// `prev_amount_*` KiB totals back into the conn's stat
+    /// accumulators (upstream `c.add_stat(prev * 1024)` — the
+    /// returned `(download, upload)` byte counts land on the conn;
+    /// the entry's fields are zeroed).
+    pub fn set_connected(
+        &mut self,
+        index: usize,
+        session_time: i32,
+        fast_reconnect: bool,
+        conn_key: u64,
+    ) -> (i64, i64) {
         let was = self.is_connect_candidate(&self.peers[index]);
         let p = &mut self.peers[index];
         p.connection = Some(std::sync::Arc::new(crate::torrent_peer::NullStats));
+        p.conn_key = conn_key;
         p.maybe_upload_only = false;
         if !fast_reconnect {
             p.last_connected = session_time.max(0) as u16;
         }
+        // `prev_amount` transfers only when a real conn binds —
+        // a `conn_key` of 0 is the dial-pending mark (no conn
+        // object yet), the totals stay parked for the attach.
+        let (dl, ul) = if conn_key == 0 {
+            (0, 0)
+        } else {
+            let b = (
+                i64::from(p.prev_amount_download) * 1024,
+                i64::from(p.prev_amount_upload) * 1024,
+            );
+            p.prev_amount_download = 0;
+            p.prev_amount_upload = 0;
+            b
+        };
         let is = self.is_connect_candidate(&self.peers[index]);
         self.update_candidates(was, is);
+        (dl, ul)
     }
 
     /// `connection_closed` — clears the connection, `optimistically_
@@ -598,6 +815,7 @@ impl PeerList {
         {
             let p = &mut self.peers[index];
             p.connection = None;
+            p.conn_key = 0;
             p.optimistically_unchoked = false;
             if !fast_reconnect {
                 p.last_connected = session_time.max(0) as u16;

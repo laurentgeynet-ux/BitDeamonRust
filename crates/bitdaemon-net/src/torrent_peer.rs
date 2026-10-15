@@ -96,6 +96,15 @@ pub struct TorrentPeer {
     /// `connection` — live connection stats while connected.
     pub connection: Option<Arc<dyn PeerStats>>,
 
+    /// which live connection `connection` refers to — the engine's
+    /// conn id (`peer` key in `torrent::peers`), `0` while an
+    /// outbound dial is still pending (the conn object doesn't
+    /// exist yet upstream either — `m_peer_info` is bound at the
+    /// `peer_connection` ctor). Upstream dereferences
+    /// `c.peer_info_struct()`; we re-resolve by this key so a port
+    /// rewrite via `update_peer_port` can't break the link.
+    pub conn_key: u64,
+
     /// `peer_rank` — lazily computed BEP-40 priority (0 = not set).
     /// `Cell`: upstream's `rank()` is `const` but memoizes into the
     /// `mutable` bitfield member, and `compare_peer` only holds `&`.
@@ -160,6 +169,7 @@ impl TorrentPeer {
             prev_amount_upload: 0,
             prev_amount_download: 0,
             connection: None,
+            conn_key: 0,
             peer_rank: std::cell::Cell::new(0),
             last_optimistically_unchoked: 0,
             last_connected: 0,

@@ -322,7 +322,7 @@ async fn spawn_dial_connects_peer() {
         StorageIndex(0),
     ));
     let ep = ep();
-    eng.spawn_dial(ih, ep, false);
+    eng.spawn_dial(ih, ep, false, false, None);
 
     // scripted remote: answer our handshake + drain the ext handshake
     let remote = tokio::spawn(async move {

@@ -127,14 +127,19 @@ fn portmap_error_and_log_alerts() {
 #[test]
 fn listen_and_incoming_alerts() {
     let mut s = session();
-    // upstream drops inbound conns on an idle session unless
-    // `incoming_starts_queued_torrents` is on — enable it so the
-    // accept leg (and its alert) runs.
-    s.settings.incoming_starts_queued_torrents = true;
+    // upstream `m_torrents.empty()` rejects inbound conns before the
+    // alert leg — park a torrent so the accept path runs.
+    s.add_torrent(bitdaemon_session::torrent::Torrent::new(
+        Sha1Hash::from_bytes(&[9; 20]).unwrap(),
+        4,
+        0x40000,
+        bitdaemon_common::Bitfield::with_size(4),
+        bitdaemon_common::types::StorageIndex(0),
+    ));
     s.on_listen_succeeded("0.0.0.0:6881".into(), 0);
     s.on_listen_failed("0.0.0.0:6882".into(), "bind".into(), "in use".into(), 0);
     assert_eq!(
-        s.on_incoming_connection("1.2.3.4:5".parse().unwrap(), 0),
+        s.on_incoming_connection("1.2.3.4:5".parse().unwrap(), None, 0),
         bitdaemon_session::session::IncomingVerdict::Accept
     );
     let alerts = s.pop_alerts();

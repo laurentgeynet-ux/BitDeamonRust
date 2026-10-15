@@ -37,11 +37,16 @@ fn addr(port: u16) -> SocketAddr {
 }
 
 fn add_conn(s: &mut Session, ih: &Sha1Hash, id: u64, out: &mut Vec<SessionOut>) {
+    // distinct IP per conn — upstream `new_connection` drops a
+    // second incoming conn from the same IP unless
+    // `allow_multiple_connections_per_ip` is on.
+    let mut a = addr(6881 + id as u16);
+    a.set_ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, id as u8)));
     s.peer_connected(
         ih,
         id,
         PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
-        addr(6881 + id as u16),
+        a,
         out,
     );
 }

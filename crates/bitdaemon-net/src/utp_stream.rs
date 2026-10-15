@@ -42,6 +42,13 @@ type Inbound = (Vec<u8>, SocketAddr);
 #[derive(Debug)]
 pub struct UtpManager {
     inner: Arc<Mutex<ManagerInner>>,
+    /// `remote` → live socket's close-reason slot. The session
+    /// stamps `close_reason_t` here at `disconnect()` (upstream
+    /// `set_close_reason(m_socket, …)`) — sync storage so a conn
+    /// teardown can stamp it without awaiting. The socket pump
+    /// applies it to `m_close_reason`, so the next FIN/data packet
+    /// carries the extension header.
+    close_slots: Arc<std::sync::Mutex<HashMap<SocketAddr, Arc<std::sync::atomic::AtomicU16>>>>,
 }
 
 #[derive(Debug)]
@@ -90,6 +97,7 @@ impl UtpManager {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(ManagerInner::default())),
+            close_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -190,6 +198,13 @@ impl UtpManager {
         // bounded mpsc here deadlocked the pump on the first
         // post-Connected transition nobody read.
         let (st_tx, st_rx) = tokio::sync::watch::channel(UtpState::None);
+        // `close_reason` extension — the slot shared with the pump;
+        // `UtpManager::set_close_reason` reaches it by remote.
+        let close_slot = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        self.close_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(from, close_slot.clone());
 
         let dg2 = dg.clone();
         let pump = tokio::spawn(socket_pump(
@@ -199,6 +214,7 @@ impl UtpManager {
             wr_rx,
             rd_tx,
             st_tx,
+            close_slot.clone(),
             (from, recv_id),
             self.clone(),
         ));
@@ -207,6 +223,7 @@ impl UtpManager {
             rd_rx,
             wr_tx,
             st_rx: Arc::new(Mutex::new(st_rx)),
+            close_slot,
             read_buf: std::collections::VecDeque::new(),
         })
     }
@@ -232,6 +249,21 @@ impl UtpManager {
 
     async fn unregister(&self, key: (SocketAddr, u16)) {
         self.inner.lock().await.sockets.remove(&key);
+        self.close_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key.0);
+    }
+
+    /// `set_close_reason(m_socket, r)` — the session's disconnect
+    /// cause stamped on the socket belonging to `remote`; the pump
+    /// stamps it on the wire (uTP `close_reason` extension header).
+    /// No-op when the remote has no live uTP socket here.
+    pub fn set_close_reason(&self, remote: SocketAddr, reason: u16) {
+        let map = self.close_slots.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = map.get(&remote) {
+            slot.store(reason, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// dial `remote` — create the socket + pump, return the stream
@@ -253,6 +285,11 @@ impl UtpManager {
         let (rd_tx, rd_rx) = mpsc::channel::<Vec<u8>>(64);
         let (wr_tx, wr_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (st_tx, st_rx) = tokio::sync::watch::channel(UtpState::None);
+        let close_slot = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        self.close_slots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(remote, close_slot.clone());
 
         let dg2 = dg.clone();
         let pump = tokio::spawn(socket_pump(
@@ -262,6 +299,7 @@ impl UtpManager {
             wr_rx,
             rd_tx,
             st_tx,
+            close_slot.clone(),
             (remote, recv_id),
             self.clone(),
         ));
@@ -271,6 +309,7 @@ impl UtpManager {
             rd_rx,
             wr_tx,
             st_rx: Arc::new(Mutex::new(st_rx)),
+            close_slot,
             read_buf: std::collections::VecDeque::new(),
         })
     }
@@ -292,6 +331,7 @@ async fn socket_pump(
     mut wr_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     rd_tx: mpsc::Sender<Vec<u8>>,
     st_tx: tokio::sync::watch::Sender<UtpState>,
+    close_slot: Arc<std::sync::atomic::AtomicU16>,
     key: (SocketAddr, u16),
     mgr: Arc<UtpManager>,
 ) {
@@ -299,6 +339,13 @@ async fn socket_pump(
     let mut readbuf = vec![0u8; 16 * 1024];
     let mut last_state = UtpState::None;
     loop {
+        // `set_close_reason` — a stamped reason rides every
+        // subsequent packet until close (upstream mirrors it on
+        // `m_close_reason`).
+        let cr = close_slot.load(std::sync::atomic::Ordering::Relaxed);
+        if cr != 0 {
+            sock.set_close_reason(cr);
+        }
         // drain outgoing datagrams
         for d in sock.drain_outbox() {
             tracing::trace!(
@@ -356,10 +403,18 @@ pub struct UtpStream {
     rd_rx: mpsc::Receiver<Vec<u8>>,
     wr_tx: mpsc::UnboundedSender<Vec<u8>>,
     st_rx: Arc<Mutex<tokio::sync::watch::Receiver<UtpState>>>,
+    close_slot: Arc<std::sync::atomic::AtomicU16>,
     read_buf: std::collections::VecDeque<u8>,
 }
 
 impl UtpStream {
+    /// `utp_stream::set_close_reason` — stamp the `close_reason_t`
+    /// discriminant sent on the wire when this stream tears down.
+    pub fn set_close_reason(&self, reason: u16) {
+        self.close_slot
+            .store(reason, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// wait until the socket reports `Connected` (or error).
     pub async fn wait_connected(&mut self) -> io::Result<()> {
         let mut rx = self.st_rx.lock().await;
@@ -491,14 +546,32 @@ impl PeerConnector for UtpConnector {
         addr: SocketAddr,
     ) -> Pin<Box<dyn std::future::Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>>
     {
+        Box::pin(async move { self.connect_with_bind_report(addr, None).await.map(|r| r.0) })
+    }
+
+    fn connect_with_bind_report(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        bind: Option<SocketAddr>,
+    ) -> Pin<
+        Box<
+            dyn std::future::Future<Output = crate::Result<(BoxedPeerStream, Option<SocketAddr>)>>
+                + Send
+                + Sync,
+        >,
+    > {
         let me = self.clone();
         Box::pin(async move {
+            let _ = bind; // uTP shares the datagram socket — no per-connect bind
             let mut s = me
                 .manager
                 .connect(me.datagram.clone(), addr, me.cfg.clone())
                 .await?;
             s.wait_connected().await?;
-            Ok(Box::new(s) as BoxedPeerStream)
+            // the conn's `local_endpoint()` is the shared datagram
+            // socket's bound address upstream.
+            let local = Some(me.datagram.local_addr());
+            Ok((Box::new(s) as BoxedPeerStream, local))
         })
     }
 }

@@ -1596,6 +1596,14 @@ impl UtpSocket {
         true
     }
 
+    /// `utp_stream::set_close_reason` — stamp the `close_reason`
+    /// extension (`close_reason_t` discriminant) onto the next
+    /// outgoing packet; the socket keeps sending it until close
+    /// (the peer reads it via `their_close_reason`).
+    pub fn set_close_reason(&mut self, reason: u16) {
+        self.m_close_reason = reason;
+    }
+
     /// `init_mtu` — called with `mtu_for_dest(remote)` when the
     /// socket is created (outgoing or accepted).
     pub fn init_mtu(&mut self, mtu: u16) {

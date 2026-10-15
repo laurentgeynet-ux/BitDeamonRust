@@ -1673,9 +1673,10 @@ impl TorrentHandle {
     /// goes through `Torrent::set_apply_ip_filter` so the change
     /// marks `state_updated` + resume-dirty like upstream.
     pub fn apply_ip_filter(&self, on: bool) {
-        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.set_apply_ip_filter(on);
-        }
+        let mut s = lock(&self.session);
+        let mut out = Vec::new();
+        s.apply_ip_filter(&self.info_hash, on, &mut out);
+        s.pending_out.append(&mut out);
     }
 
     /// `web_seed_statuses` — the per-URL runtime snapshot for every
