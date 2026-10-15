@@ -156,14 +156,18 @@ pub enum Alert {
         /// `file_index`.
         index: i32,
     },
-    /// `file_renamed_alert` (7).
+    /// `file_renamed_alert` (7) — upstream carries
+    /// `(new_name, old_name, index)`.
     FileRenamed {
         /// torrent.
         ih: Sha1Hash,
         /// `index`.
         index: i32,
-        /// new name.
+        /// `new_name` — the requested name.
         name: String,
+        /// `old_name` — the previous path (upstream
+        /// `m_renamed_files.file_path` before the rename lands).
+        old_name: String,
     },
     /// `file_rename_failed_alert` (8).
     FileRenameFailed {
@@ -380,19 +384,28 @@ pub enum Alert {
         /// block.
         block: u32,
     },
-    /// `storage_moved_alert` (33).
+    /// `storage_moved_alert` (33) — upstream carries
+    /// `(storage_path /*new*/, old_path)`.
     StorageMoved {
         /// torrent.
         ih: Sha1Hash,
         /// new save path.
         path: String,
+        /// previous save path.
+        old_path: String,
     },
-    /// `storage_moved_failed_alert` (34).
+    /// `storage_moved_failed_alert` (34) — upstream carries
+    /// `(error, file_path, operation)` — the file that failed +
+    /// the op, not the target directory.
     StorageMovedFailed {
         /// torrent.
         ih: Sha1Hash,
-        /// target path.
-        path: String,
+        /// `file_path` — resolved path of the file the move failed
+        /// on (empty when the failure isn't file-scoped).
+        file: String,
+        /// `operation()` name (`file_stat`, `mkdir`, `file_rename`,
+        /// `partfile_move`…).
+        op: String,
         /// error.
         error: String,
     },

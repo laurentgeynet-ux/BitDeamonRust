@@ -1833,8 +1833,9 @@ impl TorrentHandle {
     }
 
     /// `torrent_handle::file_priority` — set one file's priority.
-    /// `file_prio_alert` reports the apply verdict (empty error =
-    /// success, like upstream's async `on_file_priority`).
+    /// Upstream defers to the `async_set_file_priority` completion;
+    /// `file_prio_alert`/`file_error_alert` arrive via
+    /// `on_file_priority`, not synchronously here.
     pub fn file_priority(
         &self,
         index: bitdaemon_common::types::FileIndex,
@@ -1844,19 +1845,7 @@ impl TorrentHandle {
         let ses = &mut *guard;
         let mut eff = Vec::new();
         if let Some(t) = ses.torrents.get_mut(&self.info_hash) {
-            let mut prios = t.file_priorities.clone();
-            let err = if let Some(p) = prios.get_mut(index.0 as usize) {
-                *p = prio;
-                t.prioritize_files(&prios, &ses.settings, &ses.counters, &mut eff);
-                String::new()
-            } else {
-                format!("file index {} out of range", index.0)
-            };
-            ses.alerts.post(crate::alerts::Alert::FilePrio {
-                ih: self.info_hash,
-                op: "file_priority".into(),
-                error: err,
-            });
+            t.set_file_priority(index, prio, &ses.settings, &ses.counters, &mut eff);
         }
         ses.route_into_pending(self.info_hash, eff);
     }

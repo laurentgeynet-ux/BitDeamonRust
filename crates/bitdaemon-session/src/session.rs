@@ -783,6 +783,20 @@ pub enum DiskCompleted {
         ih: Sha1Hash,
         /// new `save_path`.
         path: std::path::PathBuf,
+        /// the job's `status_t` (`disk_status` bits) — `file_exist`
+        /// and `fatal_disk_error` mark failure; `need_full_check`
+        /// triggers a recheck on success.
+        status: i32,
+        /// job result.
+        err: StorageError,
+    },
+    /// `async_set_file_priority` verdict — `prios` is the storage's
+    /// adjusted vector (upstream writes it back into the job).
+    SetFilePriority {
+        /// torrent.
+        ih: Sha1Hash,
+        /// storage-adjusted priorities.
+        prios: Vec<bitdaemon_common::types::DownloadPriority>,
         /// job result.
         err: StorageError,
     },
@@ -1845,20 +1859,55 @@ impl Session {
                         }
                     }
                 }
-                DiskCompleted::MoveStorage { ih, path, err } => {
-                    // `storage_moved{,_failed}_alert`
-                    if err.is_ok() {
-                        if let Some(t) = self.torrents.get_mut(&ih) {
-                            t.save_path = path.to_string_lossy().into_owned();
-                        }
+                DiskCompleted::MoveStorage {
+                    ih,
+                    path,
+                    status,
+                    err,
+                } => {
+                    // `on_storage_moved` — `m_moving_storage` clears
+                    // first; `fatal_disk_error`/`file_exist` status
+                    // bits mark failure.
+                    use bitdaemon_disk::storage::disk_status;
+                    let has_error = status & i32::from(disk_status::FATAL_DISK_ERROR) != 0
+                        || status & i32::from(disk_status::FILE_EXIST) != 0;
+                    if let Some(t) = self.torrents.get_mut(&ih) {
+                        t.moving_storage = false;
+                    }
+                    if !has_error {
+                        let old = self
+                            .torrents
+                            .get_mut(&ih)
+                            .map(|t| {
+                                let old = std::mem::replace(
+                                    &mut t.save_path,
+                                    path.to_string_lossy().into_owned(),
+                                );
+                                // `need_save_resume(if_config_changed)`
+                                t.need_save_resume = true;
+                                old
+                            })
+                            .unwrap_or_default();
                         self.alerts.post(Alert::StorageMoved {
                             ih,
                             path: path.to_string_lossy().into_owned(),
+                            old_path: old,
                         });
+                        // `need_full_check` — `dont_replace` skipped
+                        // existing files / `reset_save_path` adopted
+                        // unverified data: upstream `force_recheck`es.
+                        if status & i32::from(disk_status::NEED_FULL_CHECK) != 0 {
+                            self.force_recheck(&ih, out);
+                        }
                     } else {
                         self.alerts.post(Alert::StorageMovedFailed {
                             ih,
-                            path: path.to_string_lossy().into_owned(),
+                            file: self
+                                .torrents
+                                .get(&ih)
+                                .map(|t| t.resolve_filename(err.file.0))
+                                .unwrap_or_default(),
+                            op: err.operation.name().to_string(),
                             error: err.to_string(),
                         });
                     }
@@ -1871,16 +1920,33 @@ impl Session {
                 } => {
                     // `file_renamed{,_failed}_alert`
                     if err.is_ok() {
-                        // upstream `m_renamed_files` — persist the
-                        // mapping for `get_renamed_files`/resume data.
-                        if let Some(t) = self.torrents.get_mut(&ih) {
-                            t.renamed_files
-                                .insert(index.0, name.to_string_lossy().into_owned());
-                        }
+                        // upstream `file_renamed_alert(handle,
+                        // new_name, old_name, index)` — old resolves
+                        // from `m_renamed_files`/layout *before* the
+                        // rename lands; then `m_renamed_files` records
+                        // the mapping and resume/state are dirtied in
+                        // the completion.
+                        let old_name = self
+                            .torrents
+                            .get_mut(&ih)
+                            .map(|t| {
+                                let old = t
+                                    .renamed_files
+                                    .get(&index.0)
+                                    .cloned()
+                                    .unwrap_or_else(|| t.resolve_filename(index.0));
+                                t.renamed_files
+                                    .insert(index.0, name.to_string_lossy().into_owned());
+                                t.need_save_resume = true;
+                                t.state_updated();
+                                old
+                            })
+                            .unwrap_or_default();
                         self.alerts.post(Alert::FileRenamed {
                             ih,
                             index: index.0,
                             name: name.to_string_lossy().into_owned(),
+                            old_name,
                         });
                     } else {
                         self.alerts.post(Alert::FileRenameFailed {
@@ -1930,6 +1996,25 @@ impl Session {
                             error: err.to_string(),
                         });
                     }
+                }
+                DiskCompleted::SetFilePriority { ih, prios, err } => {
+                    // `on_file_priority` — clears
+                    // `outstanding_file_priority`, applies the
+                    // storage-adjusted vector (piece priorities +
+                    // `m_file_priority` + save-resume), posts
+                    // `file_prio`/`file_error`, drains deferred
+                    // updates.
+                    let mut eff = Vec::new();
+                    if let Some(t) = self.torrents.get_mut(&ih) {
+                        t.on_file_priority(
+                            prios,
+                            Some(&err).filter(|e| e.is_err()),
+                            &self.settings,
+                            &self.counters,
+                            &mut eff,
+                        );
+                    }
+                    self.route(ih, eff, out);
                 }
                 DiskCompleted::CheckFiles {
                     ih,
@@ -4248,10 +4333,50 @@ impl Session {
         path: std::path::PathBuf,
         flags: bitdaemon_disk::storage::MoveFlags,
     ) {
-        let (Some(disk), Some(t)) = (self.disk.clone(), self.torrents.get(ih)) else {
+        let Some(t) = self.torrents.get_mut(ih) else {
+            return;
+        };
+        // upstream `m_abort` — a torn-down torrent rejects with
+        // `storage_moved_failed(operation_aborted)`.
+        if t.aborted {
+            self.alerts.post(Alert::StorageMovedFailed {
+                ih: *ih,
+                file: String::new(),
+                op: "unknown".into(),
+                error: "operation aborted".into(),
+            });
+            return;
+        }
+        // `!valid_metadata()` — no file structure known; upstream
+        // adopts the path and posts `storage_moved` without a job.
+        if t.files.is_none() {
+            let newp = bitdaemon_disk::fs::complete(&path);
+            let old = t.save_path.clone();
+            t.save_path = newp.to_string_lossy().into_owned();
+            t.need_save_resume = true;
+            self.alerts.post(Alert::StorageMoved {
+                ih: *ih,
+                path: newp.to_string_lossy().into_owned(),
+                old_path: old,
+            });
+            return;
+        }
+        // `!m_storage` — adopt the path + `need_save_resume` +
+        // `storage_moved`, no disk work.
+        let Some(disk) = self.disk.clone() else {
+            let old = t.save_path.clone();
+            t.save_path = path.to_string_lossy().into_owned();
+            t.need_save_resume = true;
+            self.alerts.post(Alert::StorageMoved {
+                ih: *ih,
+                path: path.to_string_lossy().into_owned(),
+                old_path: old,
+            });
             return;
         };
         let storage = t.storage;
+        // `m_moving_storage` — cleared in `on_storage_moved`.
+        t.moving_storage = true;
         let tx = self.disk_tx.clone();
         let ih = *ih;
         let path2 = path.clone();
@@ -4259,7 +4384,7 @@ impl Session {
             storage,
             path,
             flags,
-            Box::new(move |_status, path, err| {
+            Box::new(move |status, path, err| {
                 let _ = tx.send(DiskCompleted::MoveStorage {
                     ih,
                     path: if path.as_os_str().is_empty() {
@@ -4267,6 +4392,7 @@ impl Session {
                     } else {
                         path
                     },
+                    status,
                     err,
                 });
             }),
@@ -4274,19 +4400,38 @@ impl Session {
     }
 
     /// `rename_file` — `async_rename_file` → `file_renamed{,_failed}`.
+    /// Upstream marks `need_save_resume(if_state_changed)` +
+    /// `state_updated` in the *completion* on success — a failed
+    /// rename leaves resume state clean.
     pub fn rename_file(
         &mut self,
         ih: &Sha1Hash,
         index: bitdaemon_common::types::FileIndex,
         name: std::path::PathBuf,
     ) {
-        let (Some(disk), Some(t)) = (self.disk.clone(), self.torrents.get_mut(ih)) else {
+        let Some(t) = self.torrents.get_mut(ih) else {
             return;
         };
-        // upstream `torrent::rename_file` marks `state_updated()` +
-        // `need_save_resume(if_state_changed)` at the call site.
-        t.need_save_resume = true;
-        t.state_updated();
+        // upstream precondition — `index` out of bounds returns
+        // silently; a metadata-less torrent's empty layout bounds
+        // every index the same way.
+        if index.0 < 0
+            || t.files
+                .as_ref()
+                .is_none_or(|fs| index.0 >= fs.num_files())
+        {
+            return;
+        }
+        let Some(disk) = self.disk.clone() else {
+            // `!m_storage` upstream → `file_rename_failed_alert`
+            // (`session_is_closing`).
+            self.alerts.post(Alert::FileRenameFailed {
+                ih: *ih,
+                index: index.0,
+                error: "session is closing".into(),
+            });
+            return;
+        };
         let storage = t.storage;
         let tx = self.disk_tx.clone();
         let ih = *ih;
@@ -4313,13 +4458,16 @@ impl Session {
             return;
         };
         let storage = t.storage;
-        if self.disk.is_none() {
-            // no disk → just remove (upstream only schedules the job
-            // when a disk thread exists)
-            self.remove_torrent(ih, out);
-            return;
-        }
         let Some(disk) = self.disk.clone() else {
+            // upstream `torrent::delete_files` returns false without
+            // storage → `remove_torrent_impl` posts
+            // `torrent_delete_failed_alert` (empty ec) *before* the
+            // removal alert.
+            self.alerts.post(Alert::TorrentDeleteFailed {
+                ih: *ih,
+                error: String::new(),
+            });
+            self.remove_torrent(ih, out);
             return;
         };
         let tx = self.disk_tx.clone();
@@ -7671,6 +7819,51 @@ impl Session {
                                 );
                             }
                             self.route(ih, eff, out);
+                        }
+                    }
+                }
+                TorrentEffect::SetFilePriority { prios } => {
+                    // upstream `async_set_file_priority` — fenced
+                    // storage job; the completion returns the
+                    // storage's adjusted vector to
+                    // `on_file_priority`. No storage → apply
+                    // directly, like the `!m_storage` leg.
+                    let storage = self.torrents.get(&ih).map(|t| t.storage);
+                    match (self.disk.clone(), storage) {
+                        (Some(disk), Some(storage)) if storage.is_valid() => {
+                            let tx = self.disk_tx.clone();
+                            disk.async_set_file_priority(
+                                storage,
+                                prios,
+                                Box::new(move |err, prios| {
+                                    let _ =
+                                        tx.send(DiskCompleted::SetFilePriority { ih, prios, err });
+                                }),
+                            );
+                        }
+                        _ => {
+                            // `!m_storage` upstream — assign
+                            // `m_file_priority` + save-resume only;
+                            // no picker work, no `file_prio` alert.
+                            // The torrent set `outstanding` on
+                            // dispatch — release it and drain any
+                            // deferred updates through the same leg.
+                            if let Some(t) = self.torrents.get_mut(&ih) {
+                                t.outstanding_file_priority = false;
+                                if t.file_priorities != prios {
+                                    t.file_priorities = prios;
+                                    t.need_save_resume = true;
+                                }
+                                if !t.deferred_file_priorities.is_empty() {
+                                    let deferred = std::mem::take(&mut t.deferred_file_priorities);
+                                    for (idx, prio) in deferred {
+                                        if let Some(slot) = t.file_priorities.get_mut(idx as usize)
+                                        {
+                                            *slot = prio;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

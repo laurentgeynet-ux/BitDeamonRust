@@ -79,6 +79,13 @@ pub enum TorrentEffect {
         /// v2 known-bad block indices (empty = whole piece).
         blocks: Vec<i32>,
     },
+    /// `async_set_file_priority` — the session dispatches the disk
+    /// job; the storage-side vector returns in the completion
+    /// (`DiskCompleted::SetFilePriority` → `on_file_priority`).
+    SetFilePriority {
+        /// `fix_priorities`'d request.
+        prios: Vec<bitdaemon_common::types::DownloadPriority>,
+    },
     /// file finished — alert upstream `file_completed`.
     FileCompleted(FileIndex),
     /// the torrent just became a seed.
@@ -428,7 +435,20 @@ pub struct Torrent {
     pub inactivity_deadline: Option<std::time::Instant>,
     /// `m_file_priority` — per-file `DownloadPriority` (empty =
     /// all default). Drives `piece_priority` upstream-style.
+    /// Upstream only mutates this *after* the storage job lands
+    /// (`on_file_priority`) — the vector mirrors the storage's
+    /// actual priority state.
     pub file_priorities: Vec<bitdaemon_common::types::DownloadPriority>,
+    /// `m_outstanding_file_priority` — an `async_set_file_priority`
+    /// job is in flight; further updates merge into
+    /// `deferred_file_priorities` instead of queueing a second job
+    /// (upstream: concurrent jobs can complete out of order and
+    /// silently clobber each other).
+    pub outstanding_file_priority: bool,
+    /// `m_deferred_file_priorities` — per-index overrides applied
+    /// by `on_file_priority` once the outstanding job returns.
+    pub deferred_file_priorities:
+        std::collections::BTreeMap<i32, bitdaemon_common::types::DownloadPriority>,
     /// `torrent_flags::default_dont_download` — kept from
     /// `m_add_torrent_params` until `init` runs (metadata arrives):
     /// sizes `file_priorities` to all-`dont_download` unless a
@@ -871,6 +891,8 @@ impl Torrent {
             pending_active_change: false,
             inactivity_deadline: None,
             file_priorities: Vec::new(),
+            outstanding_file_priority: false,
+            deferred_file_priorities: std::collections::BTreeMap::new(),
             default_dont_download: false,
             pending_piece_priorities: Vec::new(),
             renamed_files: std::collections::BTreeMap::new(),
@@ -1033,10 +1055,14 @@ impl Torrent {
                 }
                 // upstream `check_resume` order: file priorities
                 // first, explicit `piece_priorities` override after
-                // (applied inside `apply_resume_data`).
+                // (applied inside `apply_resume_data`). `init` runs
+                // `update_piece_priorities(m_file_priority)` — the
+                // storage itself already got `atp.file_priorities`
+                // through `StorageParams::priorities` at
+                // `initialize()`, no `set_file_priority` job.
                 if !t.file_priorities.is_empty() {
                     let fp = t.file_priorities.clone();
-                    t.prioritize_files(&fp, s, counters, out);
+                    t.update_piece_priorities(&fp, s, counters, out);
                 }
                 t.apply_resume_data(atp, s, counters, out);
                 t
@@ -6771,11 +6797,44 @@ impl Torrent {
     }
 
     /// `prioritize_files` (upstream `torrent::prioritize_files`) —
-    /// merge `new` into `m_file_priority`, then
-    /// `update_piece_priorities`: every piece's priority becomes
-    /// the max of the files overlapping it. Ends in upstream's
-    /// `update_peer_interest` — interest recompute plus the
-    /// finished↔downloading transition when the wanted set moved.
+    /// `fix_priorities` — size the vector to `num_files` (default
+    /// fill), force pad files to `dont_download`, clamp at
+    /// `top_priority`. Without metadata upstream only clamps.
+    fn fix_priorities(
+        &self,
+        new: &[bitdaemon_common::types::DownloadPriority],
+    ) -> Vec<bitdaemon_common::types::DownloadPriority> {
+        use bitdaemon_common::types::DownloadPriority;
+        let mut v: Vec<DownloadPriority> = if let Some(fs) = &self.files {
+            let n = fs.num_files().max(0) as usize;
+            let mut v = vec![DownloadPriority::DEFAULT; n];
+            for (i, p) in new.iter().enumerate().take(n) {
+                v[i] = *p;
+            }
+            v
+        } else {
+            new.to_vec()
+        };
+        for (i, p) in v.iter_mut().enumerate() {
+            let is_pad = self.files.as_ref().is_some_and(|fs| {
+                i32::try_from(i)
+                    .ok()
+                    .is_some_and(|fi| fs.pad_file_at(FileIndex(fi)))
+            });
+            if *p > DownloadPriority::DONT_DOWNLOAD && is_pad {
+                *p = DownloadPriority::DONT_DOWNLOAD;
+            } else if *p > DownloadPriority::TOP {
+                *p = DownloadPriority::TOP;
+            }
+        }
+        v
+    }
+
+    /// `prioritize_files` — upstream defers to `on_file_priority`
+    /// when an `async_set_file_priority` job is in flight (out-of-
+    /// order completions would silently clobber), dispatches the
+    /// disk job otherwise; `m_file_priority` is updated only by the
+    /// completion. Without storage the vector is stored directly.
     pub fn prioritize_files(
         &mut self,
         new: &[bitdaemon_common::types::DownloadPriority],
@@ -6783,47 +6842,124 @@ impl Torrent {
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
-        let was_finished = self.is_finished();
-        self.need_save_resume = true;
-        // upstream `prioritize_files`/`update_piece_priority` →
-        // `state_updated()` (wanted-piece set may change).
-        self.state_updated();
-        use bitdaemon_common::types::DownloadPriority;
-        if let Some(fs) = self.files.clone() {
-            let n = fs.num_files() as usize;
-            self.file_priorities.resize(n, DownloadPriority::DEFAULT);
-            for (i, prio) in new.iter().enumerate().take(n) {
-                self.file_priorities[i] = *prio;
+        let fixed = self.fix_priorities(new);
+        self.deferred_file_priorities.clear();
+        if self.outstanding_file_priority {
+            for (i, p) in fixed.iter().enumerate() {
+                self.deferred_file_priorities
+                    .insert(i32::try_from(i).unwrap_or(i32::MAX), *p);
             }
-            if let Some(picker) = self.picker.as_mut() {
-                for p in 0..self.num_pieces {
-                    let piece = PieceIndex(p);
-                    let prio = fs
-                        .map_block(piece, 0, i64::from(fs.piece_size(piece)))
-                        .iter()
-                        .map(|sl| {
-                            self.file_priorities
-                                .get(sl.file_index.0 as usize)
-                                .copied()
-                                .unwrap_or(DownloadPriority::DEFAULT)
-                        })
-                        .max()
-                        .unwrap_or(DownloadPriority::DEFAULT);
-                    picker.set_piece_priority(piece, prio);
-                }
+            return;
+        }
+        if self.storage != StorageIndex::INVALID {
+            self.outstanding_file_priority = true;
+            out.push(TorrentEffect::SetFilePriority { prios: fixed });
+        } else {
+            // `!m_storage` upstream (shutdown leg): store, no disk
+            // job, no picker touch.
+            if self.file_priorities != fixed {
+                self.file_priorities = fixed;
+                self.need_save_resume = true;
             }
-            // upstream `update_piece_priorities` tail — share mode
-            // rebalances piece priorities against the swarm.
+        }
+        let _ = (s, counters);
+    }
+
+    /// `on_file_priority` — the `async_set_file_priority`
+    /// completion: `prios` is the storage's *adjusted* vector
+    /// (partial failure writes back the on-disk truth). Applies
+    /// piece priorities + `m_file_priority`, reports
+    /// `file_prio`/`file_error`, then drains deferred updates.
+    pub fn on_file_priority(
+        &mut self,
+        prios: Vec<bitdaemon_common::types::DownloadPriority>,
+        err: Option<&bitdaemon_disk::storage_error::StorageError>,
+        s: &crate::settings::SessionSettings,
+        counters: &crate::counters::Counters,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        self.outstanding_file_priority = false;
+        if self.file_priorities != prios {
+            self.update_piece_priorities(&prios, s, counters, out);
+            self.file_priorities = prios;
+            // `need_save_resume(if_config_changed)`.
+            self.need_save_resume = true;
             if self.share_mode {
                 self.recalc_share_mode(s, counters, out);
             }
+        }
+        if let Some(e) = err.filter(|e| e.is_err()) {
+            // `file_error_alert` + `set_error` + `pause()` — the
+            // storage could not apply the priorities.
+            let file = e.file;
+            out.push(TorrentEffect::Alert(crate::alerts::Alert::FileError {
+                ih: self.info_hash,
+                path: self.resolve_filename(file.0),
+                error: e.to_string(),
+            }));
+            self.set_error(&e.to_string(), file.0);
+            // `pause()` — hard pause (upstream calls it on any
+            // file-priority failure).
+            self.paused = true;
+            self.state_updated();
         } else {
-            // `m_file_priority` exists metadata-less too — upstream
-            // stores whatever the caller sized it to.
-            self.file_priorities
-                .resize(new.len(), DownloadPriority::DEFAULT);
-            for (i, prio) in new.iter().enumerate() {
-                self.file_priorities[i] = *prio;
+            out.push(TorrentEffect::Alert(crate::alerts::Alert::FilePrio {
+                ih: self.info_hash,
+                op: "file_priority".into(),
+                error: String::new(),
+            }));
+        }
+        // apply queued priorities even on failure — `m_file_priority`
+        // reflects the storage's actual state.
+        if !self.deferred_file_priorities.is_empty() && !self.aborted {
+            let deferred = std::mem::take(&mut self.deferred_file_priorities);
+            let mut new_priority = self.file_priorities.clone();
+            let max_idx = deferred.keys().next_back().copied().unwrap_or(-1);
+            if max_idx >= 0 {
+                let need = max_idx as usize + 1;
+                if new_priority.len() < need {
+                    new_priority.resize(need, bitdaemon_common::types::DownloadPriority::DEFAULT);
+                }
+                for (idx, prio) in deferred {
+                    if let Some(slot) = new_priority.get_mut(idx as usize) {
+                        *slot = prio;
+                    }
+                }
+            }
+            self.prioritize_files(&new_priority, s, counters, out);
+        }
+    }
+
+    /// `update_piece_priorities` — every piece's priority becomes
+    /// the max of the files overlapping it (`file_to_piece_prio`
+    /// → `prioritize_pieces`), then `update_peer_interest`.
+    fn update_piece_priorities(
+        &mut self,
+        prios: &[bitdaemon_common::types::DownloadPriority],
+        _s: &crate::settings::SessionSettings,
+        counters: &crate::counters::Counters,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        use bitdaemon_common::types::DownloadPriority;
+        let was_finished = self.is_finished();
+        // `update_piece_priority` → `state_updated()` — the wanted
+        // set may have changed.
+        self.state_updated();
+        if let (Some(fs), Some(picker)) = (self.files.clone(), self.picker.as_mut()) {
+            for p in 0..self.num_pieces {
+                let piece = PieceIndex(p);
+                let prio = fs
+                    .map_block(piece, 0, i64::from(fs.piece_size(piece)))
+                    .iter()
+                    .map(|sl| {
+                        prios
+                            .get(sl.file_index.0 as usize)
+                            .copied()
+                            .unwrap_or(DownloadPriority::DEFAULT)
+                    })
+                    .max()
+                    .unwrap_or(DownloadPriority::DEFAULT);
+                picker.set_piece_priority(piece, prio);
             }
         }
         self.update_peer_interest(was_finished, counters, out);
@@ -9572,8 +9708,10 @@ impl Torrent {
         self.state_updated();
     }
 
-    /// `torrent::set_file_priority` — `prioritize_files` on one slot
-    /// (upstream resizes `m_file_priority` to `num_files` first).
+    /// `torrent::set_file_priority` — bounds-checked single-slot
+    /// update: rejected out-of-range (metadata present) or negative
+    /// indexes, clamped to `dont_download..=top_priority`; defers to
+    /// `m_deferred_file_priorities` while a disk job is outstanding.
     pub fn set_file_priority(
         &mut self,
         index: bitdaemon_common::types::FileIndex,
@@ -9582,13 +9720,38 @@ impl Torrent {
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
+        use bitdaemon_common::types::DownloadPriority;
+        // upstream precondition: `index >= 0 && (!valid_metadata() ||
+        // index < end_file())`.
+        if index.0 < 0
+            || self
+                .files
+                .as_ref()
+                .is_some_and(|fs| index.0 >= fs.num_files())
+        {
+            return;
+        }
+        let prio = prio.clamp(DownloadPriority::DONT_DOWNLOAD, DownloadPriority::TOP);
+        if self.outstanding_file_priority {
+            self.deferred_file_priorities.insert(index.0, prio);
+            return;
+        }
         let mut v = self.file_priorities.clone();
         let i = index.0 as usize;
         if v.len() <= i {
-            v.resize(i + 1, bitdaemon_common::types::DownloadPriority::default());
+            v.resize(i + 1, DownloadPriority::DEFAULT);
         }
         v[i] = prio;
-        self.prioritize_files(&v, s, counters, out);
+        if self.storage != StorageIndex::INVALID {
+            self.outstanding_file_priority = true;
+            out.push(TorrentEffect::SetFilePriority { prios: v });
+        } else {
+            if self.file_priorities != v {
+                self.file_priorities = v;
+                self.need_save_resume = true;
+            }
+        }
+        let _ = (s, counters);
     }
 
     /// `torrent::set_state` — upstream `set_state(torrent_status::

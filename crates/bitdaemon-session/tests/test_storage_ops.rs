@@ -38,6 +38,7 @@ fn move_storage_done_updates_path_and_alerts() {
         .send(DiskCompleted::MoveStorage {
             ih,
             path: PathBuf::from("/new/spot"),
+            status: 0,
             err: StorageError::default(),
         })
         .unwrap();
@@ -92,9 +93,14 @@ fn delete_files_without_disk_just_removes() {
     let mut s = mk(ih);
     s.delete_files(&ih, 0, &mut Vec::new());
     assert!(!s.torrents.contains_key(&ih));
+    let alerts = s.pop_alerts();
+    // upstream `remove_torrent_impl`: `!m_storage` makes
+    // `delete_files` return false → `torrent_delete_failed` (empty
+    // error) posts *before* the removal alert.
     assert!(
-        s.pop_alerts()
+        alerts
             .iter()
-            .any(|a| matches!(a, Alert::TorrentRemoved(_)))
+            .any(|a| matches!(a, Alert::TorrentDeleteFailed { error, .. } if error.is_empty()))
     );
+    assert!(alerts.iter().any(|a| matches!(a, Alert::TorrentRemoved(_))));
 }

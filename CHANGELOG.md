@@ -9,6 +9,30 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- **File-priority / storage-ops parity**: `prioritize_files` and
+  `file_priority` now dispatch `async_set_file_priority` through the
+  disk queue and apply priorities in the completion
+  (`on_file_priority`), matching upstream. Concurrent updates
+  serialize through `outstanding_file_priority` +
+  `deferred_file_priorities` (per-index merge, last-writer-wins,
+  replayed by the in-flight job's completion) instead of issuing
+  concurrent disk jobs. The storage-*adjusted* priority vector feeds
+  piece priorities and `m_file_priority`; `file_prio_alert` posts on
+  completion only (never on error), failures post `file_error_alert`
+  and `set_error`+`pause` the torrent. Pad files are forced to
+  `dont_download` before dispatch (`fix_priorities`). Add-time
+  `file_priorities` and the magnet `init` path apply directly to the
+  fresh picker — no spurious disk job or `file_prio` alert.
+  `move_storage` propagates the `move_storage` status bits
+  (`need_full_check` → `force_recheck`, `fatal_disk_error` /
+  `file_exist` → `storage_moved_failed_alert` carrying `file`/`op`),
+  and `storage_moved_alert` reports `old_path`. `rename_file`
+  bounds-checks the file index against the layout (metadata-less
+  torrents return silently like upstream), resolves `old_name`
+  before updating `m_renamed_files`, and marks resume/state dirty in
+  the completion — a failed rename leaves resume state clean.
+  `delete_files` keeps the disk fence ordering and posts
+  `torrent_deleted{,_failed}` from the completion.
 - **Piece-lifecycle parity (write/hash verification)**: in-flight
   disk write/hash completions now carry `picker_generation` and are
   dropped when a `force_recheck`/`handle_inconsistent_hashes`

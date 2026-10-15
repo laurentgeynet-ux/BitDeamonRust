@@ -95,6 +95,7 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
                 ih: ih(),
                 index: 0,
                 name: "n".into(),
+                old_name: "o".into(),
             },
             7,
             C,
@@ -335,6 +336,7 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
             Alert::StorageMoved {
                 ih: ih(),
                 path: "p".into(),
+                old_path: "q".into(),
             },
             33,
             C,
@@ -343,7 +345,8 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
         (
             Alert::StorageMovedFailed {
                 ih: ih(),
-                path: "p".into(),
+                file: "f".into(),
+                op: "file_rename".into(),
                 error: "e".into(),
             },
             34,
