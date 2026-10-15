@@ -18,8 +18,8 @@ use bitdaemon_net::http_tracker::TrackerResponse;
 use bitdaemon_net::tracker_client::AnnounceError;
 use bitdaemon_session::alerts::{Alert, AlertCategory, TrackerOp};
 use bitdaemon_session::session::{Session, SessionOut};
-use bitdaemon_session::tracker_list::{AnnounceEntry, SOURCE_CLIENT, TrackerList};
 use bitdaemon_session::torrent::Torrent;
+use bitdaemon_session::tracker_list::{AnnounceEntry, SOURCE_CLIENT, TrackerList};
 
 fn session() -> Session {
     let mut s = Session::new();
@@ -155,10 +155,13 @@ fn http_410_dont_try_again() {
     assert!(out.is_empty(), "410 must retire the tracker");
     let t = s.torrents.get(&t_ih(3)).unwrap();
     assert_eq!(t.trackers.trackers[0].fail_limit, 1);
-    assert!(s
-        .pop_alerts()
-        .iter()
-        .any(|a| matches!(a, Alert::TrackerError { status_code: 410, .. })));
+    assert!(s.pop_alerts().iter().any(|a| matches!(
+        a,
+        Alert::TrackerError {
+            status_code: 410,
+            ..
+        }
+    )));
 }
 
 /// `tracker_error_alert` carries `times_in_row`, `status_code` and
@@ -257,7 +260,10 @@ fn deprioritize_moves_to_tier_tail() {
     l.add(AnnounceEntry::new("http://c", 0));
     l.deprioritize(0);
     assert_eq!(
-        l.trackers.iter().map(|t| t.url.as_str()).collect::<Vec<_>>(),
+        l.trackers
+            .iter()
+            .map(|t| t.url.as_str())
+            .collect::<Vec<_>>(),
         ["http://b", "http://c", "http://a"]
     );
 }
@@ -396,17 +402,14 @@ fn trackerid_echo_and_fallback() {
         s.torrents.get(&t_ih(8)).unwrap().trackers.trackers[0].tracker_id,
         "from-tracker"
     );
-    assert!(s
-        .pop_alerts()
-        .iter()
-        .any(|a| matches!(a, Alert::Trackerid { trackerid, .. } if trackerid == "from-tracker")));
+    assert!(
+        s.pop_alerts().iter().any(
+            |a| matches!(a, Alert::Trackerid { trackerid, .. } if trackerid == "from-tracker")
+        )
+    );
     // and the entry's id wins over `m_trackerid` on later requests.
     let mut out = Vec::new();
-    s.tracker_announce_due(
-        Instant::now() + Duration::from_secs(3601),
-        0,
-        &mut out,
-    );
+    s.tracker_announce_due(Instant::now() + Duration::from_secs(3601), 0, &mut out);
     let SessionOut::TrackerAnnounce { tracker_id, .. } = &out[0] else {
         panic!("announce effect")
     };
