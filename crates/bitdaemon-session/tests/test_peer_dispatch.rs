@@ -655,3 +655,217 @@ fn request_counters() {
     );
     assert_eq!(counters.value(Counter::CancelledPieceRequests), 1);
 }
+
+#[test]
+fn reject_aborts_and_frees_inflight_block() {
+    let mut c = conn();
+    let b = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    c.pipeline
+        .download_queue
+        .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b));
+    c.pipeline.outstanding_bytes = 0x4000;
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::RejectRequest(PeerRequest {
+            piece: PieceIndex(3),
+            start: 0,
+            length: 0x4000,
+        }),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, PeerEffect::AbortDownload(bb) if *bb == b)),
+        "valid reject frees the picker mark: {eff:?}"
+    );
+    assert!(c.pipeline.download_queue.is_empty());
+    assert_eq!(c.pipeline.outstanding_bytes, 0);
+    assert!(eff.iter().any(|e| matches!(e, PeerEffect::GracefulCheck)));
+}
+
+/// `incoming_reject_request` validates the reject shape first — a
+/// misaligned start / wrong length is a log line upstream, not a
+/// state change (no queue mutation, no picker abort, no re-pick).
+#[test]
+fn malformed_reject_is_a_noop() {
+    let mut c = conn();
+    let b = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    c.pipeline
+        .download_queue
+        .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b));
+    c.pipeline.outstanding_bytes = 0x4000;
+    let mut eff = Vec::new();
+    // sub-block length — `min(piece_sz - start, block_size)` is
+    // 0x4000 here, so 0x2000 fails validation.
+    c.dispatch(
+        &PeerMessage::RejectRequest(PeerRequest {
+            piece: PieceIndex(3),
+            start: 0,
+            length: 0x2000,
+        }),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(eff.is_empty(), "malformed reject touches nothing: {eff:?}");
+    assert_eq!(c.pipeline.download_queue.len(), 1);
+    assert_eq!(c.pipeline.outstanding_bytes, 0x4000);
+
+    // out-of-range piece — same early return.
+    c.dispatch(
+        &PeerMessage::RejectRequest(PeerRequest {
+            piece: PieceIndex(99),
+            start: 0,
+            length: 0x4000,
+        }),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(eff.is_empty());
+    assert_eq!(c.pipeline.download_queue.len(), 1);
+}
+
+/// BitComet quirk: a zero-length `piece` message routes to
+/// `incoming_reject_request` upstream, whose validation always fails
+/// on length 0 — the whole thing is a `peer_error` alert with no
+/// state change (no abort, no re-pick).
+#[test]
+fn empty_piece_is_peer_error_only() {
+    let mut c = conn();
+    let b = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    c.pipeline
+        .download_queue
+        .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b));
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Piece {
+            piece: PieceIndex(3),
+            offset: 0,
+            data: bytes::Bytes::new(),
+        },
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert_eq!(eff.len(), 1);
+    assert!(matches!(eff[0], PeerEffect::PeerError(_)));
+    assert_eq!(c.pipeline.download_queue.len(), 1);
+}
+
+/// `remove_from_picker = !timed_out && !not_wanted` — a block that
+/// already timed out keeps its picker state (it was already freed
+/// when it timed out); the reject just drops the queue entry.
+#[test]
+fn reject_of_timed_out_block_does_not_reabort() {
+    let mut c = conn();
+    let b = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    let mut pb = bitdaemon_session::peer_pipeline::PendingBlock::new(b);
+    pb.timed_out = true;
+    c.pipeline.download_queue.push(pb);
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::RejectRequest(PeerRequest {
+            piece: PieceIndex(3),
+            start: 0,
+            length: 0x4000,
+        }),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(
+        !eff.iter()
+            .any(|e| matches!(e, PeerEffect::AbortDownload(_))),
+        "timed-out entry is not re-aborted upstream: {eff:?}"
+    );
+    assert!(c.pipeline.download_queue.is_empty());
+    assert!(eff.iter().any(|e| matches!(e, PeerEffect::GracefulCheck)));
+}
+
+/// Parole peers keep the request on reject — upstream re-inserts the
+/// pending block at the head of `m_request_queue` instead of
+/// aborting the picker mark.
+#[test]
+fn parole_reject_requeues_request() {
+    let mut c = conn();
+    c.on_parole = true;
+    let b = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    c.pipeline
+        .download_queue
+        .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b));
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::RejectRequest(PeerRequest {
+            piece: PieceIndex(3),
+            start: 0,
+            length: 0x4000,
+        }),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(
+        !eff.iter()
+            .any(|e| matches!(e, PeerEffect::AbortDownload(_)))
+    );
+    assert!(c.pipeline.download_queue.is_empty());
+    assert_eq!(
+        c.pipeline.request_queue.first().map(|e| e.block),
+        Some(b),
+        "parole reject requeues at the front"
+    );
+}

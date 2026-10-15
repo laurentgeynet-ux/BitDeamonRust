@@ -847,14 +847,64 @@ impl PeerConn {
         ok
     }
 
-    /// `incoming_reject_request` — the block is freed; the caller
-    /// `abort_download`s it in the picker and re-picks. `block_size`
-    /// is the torrent's request block size (`t->block_size()`).
-    pub fn on_reject(&mut self, r: &PeerRequest, block_size: i32) -> PieceBlock {
+    /// `incoming_reject_request` — validates the reject against the
+    /// request shape upstream accepts (in-range piece, aligned start,
+    /// exact block length) and returns `Some(block)` only when the
+    /// picker mark should be aborted: a *non*-parole conn on a
+    /// non-seed torrent whose dlq entry wasn't already timed out or
+    /// cancelled. `piece_sz` is `t->piece_size_for_req(r.piece)` (0
+    /// when out of range — validation fails the same way upstream).
+    /// Returns `(valid, abort)`: `valid` = the reject passed the
+    /// shape checks (callers run the graceful-pause/re-pick tail only
+    /// then — malformed rejects are a log line upstream, not a state
+    /// change); `abort` = the picker mark to free.
+    pub fn on_reject(
+        &mut self,
+        r: &PeerRequest,
+        block_size: i32,
+        piece_sz: i32,
+        is_seed: bool,
+    ) -> (bool, Option<PieceBlock>) {
+        // upstream validates the reject shape first — a malformed
+        // reject is a log line, not a state change. This also makes
+        // BitComet's zero-length `piece` quirk a pure `peer_error`
+        // alert: `length != min(piece_sz - start, block_size)` always
+        // holds for length 0.
+        if piece_sz <= 0
+            || r.start < 0
+            || r.start >= piece_sz
+            || (r.start % block_size) != 0
+            || r.length != (piece_sz - r.start).min(block_size)
+        {
+            return (false, None);
+        }
         let block = PieceBlock {
             piece_index: r.piece,
             block_index: r.start / block_size,
         };
+        let mut abort = None;
+        if let Some(pos) = self
+            .pipeline
+            .download_queue
+            .iter()
+            .position(|b| b.block == block)
+        {
+            let entry = self.pipeline.download_queue.remove(pos);
+            self.pipeline.outstanding_bytes =
+                (self.pipeline.outstanding_bytes - i64::from(r.length)).max(0);
+            // `remove_from_picker` — a block already timed out or
+            // cancelled keeps its picker state; a parole peer keeps
+            // the request (requeued at the head) instead of freeing
+            // the block.
+            let remove_from_picker = !entry.timed_out && !entry.not_wanted;
+            if self.on_parole {
+                if remove_from_picker {
+                    self.pipeline.request_queue.insert(0, entry);
+                }
+            } else if !is_seed && remove_from_picker {
+                abort = Some(block);
+            }
+        }
         // upstream `incoming_reject`: a rejected allowed-fast piece
         // (while choked) leaves that set; unchoked, the rejected
         // piece leaves our suggested set instead.
@@ -863,8 +913,7 @@ impl PeerConn {
         } else {
             self.suggested_pieces.retain(|&p| p != r.piece);
         }
-        let _ = self.cancel_request(block);
-        block
+        (true, abort)
     }
 
     /// `incoming_piece` bookkeeping for a *requested* block — queue
@@ -1290,24 +1339,14 @@ impl PeerConn {
                     block_size,
                 );
                 // BitComet quirk upstream: a zero-length `piece`
-                // message is used as a reject-request — process it as
-                // one (and report `peer_sent_empty_piece`).
+                // message is used as a reject-request — upstream
+                // routes it to `incoming_reject_request`, whose
+                // validation always rejects `length == 0`
+                // (`r.length != min(piece_sz - start, block_size)`),
+                // so the whole thing is a `peer_error` alert with no
+                // queue/picker state change.
                 if r.length == 0 {
                     eff.push(PeerEffect::PeerError("peer sent empty piece"));
-                    let b = self.on_reject(&r, block_size);
-                    eff.push(PeerEffect::AbortDownload(b));
-                    eff.push(PeerEffect::GracefulCheck);
-                    // `incoming_reject` tail — the retry pick only
-                    // runs when the conn is nearly drained
-                    // (`request_queue.empty() && download_queue < 2`
-                    // upstream).
-                    if self.pipeline.request_queue.is_empty()
-                        && self.pipeline.download_queue.len() < 2
-                    {
-                        eff.push(PeerEffect::MaybePick(Some(
-                            crate::counters::Counter::RejectPiecePicks,
-                        )));
-                    }
                     return;
                 }
                 // `incoming_piece` is_seed leg — a `piece` received
@@ -1383,8 +1422,23 @@ impl PeerConn {
                 )));
             }
             M::RejectRequest(r) => {
-                let b = self.on_reject(&r, block_size);
-                eff.push(PeerEffect::AbortDownload(b));
+                // `piece_size_for_req` — 0 when the piece is out of
+                // range, which fails validation upstream-style.
+                let piece_sz = if r.piece.0 >= 0 && r.piece.0 < num_pieces {
+                    files.map_or_else(
+                        || i32::try_from(piece_length).unwrap_or(i32::MAX),
+                        |f| f.piece_size(r.piece),
+                    )
+                } else {
+                    0
+                };
+                let (valid, abort) = self.on_reject(&r, block_size, piece_sz, is_seed);
+                if !valid {
+                    return;
+                }
+                if let Some(b) = abort {
+                    eff.push(PeerEffect::AbortDownload(b));
+                }
                 // `incoming_reject` — `check_graceful_pause` before
                 // the retry pick (upstream order).
                 eff.push(PeerEffect::GracefulCheck);

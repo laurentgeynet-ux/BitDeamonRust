@@ -9,6 +9,28 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- **rustls crypto provider ambiguity**: HTTPS tracker announces and
+  SSL torrent configs no longer panic with "no process-level
+  `CryptoProvider` available" when the embedding application
+  compiles in a second provider (e.g. `ring` next to `aws_lc_rs`).
+  All rustls `ClientConfig`/`ServerConfig` now build through
+  `builder_with_provider` on an explicit shared `aws_lc_rs`
+  provider instead of the ambient process default — the daemon
+  stays self-sufficient and never pre-empts the app's own
+  provider choice. `peer_client_config`/`tracker_client_config`
+  now return `io::Result`.
+- **Reject-request parity (download path)**: `incoming_reject_request`
+  now validates the reject shape first (in-range piece, aligned
+  start, exact block length) — a malformed reject is a no-op
+  upstream, and so is BitComet's zero-length `piece` quirk (the
+  `peer_error` alert still posts, but no queue/picker state moves and
+  no re-pick runs). Valid rejects drop the download-queue entry and
+  `outstanding_bytes` by the rejected length; `abort_download` now
+  honors `!timed_out && !not_wanted` (a timed-out block keeps its
+  picker state), parole peers requeue the block at the front of the
+  request queue instead of freeing it, and seeds never abort. The
+  graceful-pause check and conditional re-pick run only for
+  well-formed rejects.
 - **File-priority / storage-ops parity**: `prioritize_files` and
   `file_priority` now dispatch `async_set_file_priority` through the
   disk queue and apply priorities in the completion
