@@ -100,18 +100,20 @@ fn piece_marks_download_and_requests_more() {
         piece_index: PieceIndex(3),
         block_index: 0,
     };
-    c.add_request(b, false, false);
     // simulate the block was sent (moved to download queue by
-    // send_block_requests) — push it directly
+    // send_block_requests) — push it directly. The payload is a
+    // full block: `validate_piece_request` requires an exact
+    // `to_req` length match upstream.
     c.pipeline
         .download_queue
         .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b));
+    c.pipeline.outstanding_bytes = 0x4000;
     let mut eff = Vec::new();
     c.dispatch(
         &PeerMessage::Piece {
             piece: PieceIndex(3),
             offset: 0,
-            data: bytes::Bytes::from_static(&[1u8; 16]),
+            data: bytes::Bytes::from(vec![1u8; 0x4000]),
         },
         10,
         0x4000,
@@ -413,11 +415,12 @@ fn oversized_piece_disconnects() {
 }
 
 #[test]
-fn piece_matching_only_request_queue_is_unwanted() {
-    // `incoming_piece` looks up `m_download_queue` only — a block
-    // that matches a still-unsent `request_queue` entry is dropped
-    // as `piece_unknown`; the request stays queued and goes out on
-    // the wire later.
+fn piece_matching_request_queue_migrates() {
+    // `start_receive_piece` — a block still sitting in `request_queue`
+    // (its wire request never went out) migrates into
+    // `download_queue` when the payload arrives first: no
+    // `unwanted_block_alert`, the entry is not `not_wanted`, and the
+    // block follows the normal write path.
     let mut c = conn();
     let b = PieceBlock {
         piece_index: PieceIndex(3),
@@ -431,7 +434,7 @@ fn piece_matching_only_request_queue_is_unwanted() {
         &PeerMessage::Piece {
             piece: PieceIndex(3),
             offset: 0,
-            data: bytes::Bytes::from_static(&[1u8; 16]),
+            data: bytes::Bytes::from(vec![1u8; 0x4000]),
         },
         10,
         0x4000,
@@ -443,10 +446,66 @@ fn piece_matching_only_request_queue_is_unwanted() {
         &bitdaemon_session::counters::Counters::default(),
         &mut eff,
     );
-    assert_eq!(eff.len(), 1, "expected only UnwantedBlock: {eff:?}");
-    assert!(matches!(eff[0], PeerEffect::UnwantedBlock(b2, 16) if b2 == b));
-    // the unsent request survives — it will hit the wire later
-    assert_eq!(c.pipeline.request_queue.len(), 1);
+    assert!(
+        !eff.iter().any(|e| matches!(
+            e,
+            PeerEffect::UnwantedBlock(..) | PeerEffect::UnwantedBlockAlert(_)
+        )),
+        "a migrated block is wanted: {eff:?}"
+    );
+    assert!(eff.iter().any(|e| matches!(e, PeerEffect::DiskWrite(..))));
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, PeerEffect::MarkDownloaded(_)))
+    );
+    // the migrated entry was consumed by `incoming_piece` — both
+    // queues drain and the byte ledger nets to zero.
+    assert!(c.pipeline.request_queue.is_empty());
+    assert!(c.pipeline.download_queue.is_empty());
+    assert_eq!(c.pipeline.outstanding_bytes, 0);
+}
+
+#[test]
+fn unsolicited_piece_inserts_not_wanted_and_writes() {
+    // `start_receive_piece` — a block unknown to *both* queues is
+    // inserted `not_wanted` at the head of `download_queue`: the
+    // `unwanted_block_alert` fires at insert time and the payload
+    // still goes through the normal write path (upstream writes it —
+    // only a picker-side `is_downloaded` consult skips the write).
+    let mut c = conn();
+    let b = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Piece {
+            piece: PieceIndex(3),
+            offset: 0,
+            data: bytes::Bytes::from(vec![1u8; 0x4000]),
+        },
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(
+        matches!(eff[0], PeerEffect::UnwantedBlockAlert(b2) if b2 == b),
+        "alert at insert time: {eff:?}"
+    );
+    assert!(eff.iter().any(|e| matches!(e, PeerEffect::DiskWrite(..))));
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, PeerEffect::MarkDownloaded(_)))
+    );
+    // the transient not_wanted entry was consumed by `incoming_piece`.
+    assert!(c.pipeline.download_queue.is_empty());
+    assert_eq!(c.pipeline.outstanding_bytes, 0);
 }
 
 #[test]
@@ -454,7 +513,11 @@ fn seed_drops_piece_as_seed_waste() {
     // `incoming_piece` is_seed leg — payload received while we hold
     // every piece is `piece_seed` waste; one stale download-queue
     // front entry drops per message and nothing reaches disk, the
-    // picker or the alert stream.
+    // picker or the alert stream. `num_peers_down_requests` is NOT
+    // touched here: the gauge reconciles once per batch through
+    // `sync_down_requests`.
+    use bitdaemon_session::counters::{Counter, Counters};
+    let counters = Counters::default();
     let mut c = conn();
     let b = PieceBlock {
         piece_index: PieceIndex(3),
@@ -463,12 +526,13 @@ fn seed_drops_piece_as_seed_waste() {
     c.pipeline
         .download_queue
         .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b));
+    c.pipeline.outstanding_bytes = 0x4000;
     let mut eff = Vec::new();
     c.dispatch(
         &PeerMessage::Piece {
             piece: PieceIndex(3),
             offset: 0,
-            data: bytes::Bytes::from_static(&[1u8; 16]),
+            data: bytes::Bytes::from(vec![1u8; 0x4000]),
         },
         10,
         0x4000,
@@ -477,19 +541,29 @@ fn seed_drops_piece_as_seed_waste() {
         true,
         0x200000,
         2000,
-        &bitdaemon_session::counters::Counters::default(),
+        &counters,
         &mut eff,
     );
     assert_eq!(eff.len(), 1, "expected only SeedWaste: {eff:?}");
-    assert!(matches!(eff[0], PeerEffect::SeedWaste(16)));
+    assert!(matches!(eff[0], PeerEffect::SeedWaste(0x4000)));
     assert!(c.pipeline.download_queue.is_empty());
+    assert_eq!(c.pipeline.outstanding_bytes, 0);
+    assert_eq!(
+        counters.value(Counter::NumPeersDownRequests),
+        0,
+        "no inline decrement — `sync_down_requests` reconciles"
+    );
 }
 
 #[test]
-fn empty_piece_still_bumps_slow_start() {
-    // upstream order: the slow-start bump + `update_desired_queue_
-    // size` run *before* the zero-length piece is treated as a
-    // reject — a BitComet-style reject still grows the queue target.
+fn empty_piece_disconnects_invalid_piece() {
+    // `validate_piece_request` runs inside `start_receive_piece`
+    // upstream — a zero-length `piece` fails the `to_req` match for
+    // a BitTorrent peer and disconnects `invalid_piece` BEFORE
+    // `incoming_piece` runs (no bitfield inference, no slow-start
+    // bump). The `length == 0` BitComet reject quirk inside
+    // `incoming_piece` is only reachable from `web_peer_connection`,
+    // which bypasses `start_receive_piece`.
     let mut c = conn();
     let mut eff = Vec::new();
     c.dispatch(
@@ -508,8 +582,16 @@ fn empty_piece_still_bumps_slow_start() {
         &bitdaemon_session::counters::Counters::default(),
         &mut eff,
     );
-    assert_eq!(c.pipeline.desired_queue_size, 5, "4 + 1 slow-start");
-    assert!(matches!(eff[0], PeerEffect::PeerError(_)));
+    assert_eq!(eff.len(), 1, "expected only the disconnect: {eff:?}");
+    assert!(matches!(
+        eff[0],
+        PeerEffect::Disconnect(
+            "invalid_piece",
+            bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError
+        )
+    ));
+    assert_eq!(c.pipeline.desired_queue_size, 4, "no slow-start bump");
+    assert!(!c.bitfield_received);
 }
 
 #[test]
@@ -530,7 +612,7 @@ fn piece_before_bitfield_runs_have_none() {
         &PeerMessage::Piece {
             piece: PieceIndex(3),
             offset: 0,
-            data: bytes::Bytes::from_static(&[1u8; 16]),
+            data: bytes::Bytes::from(vec![1u8; 0x4000]),
         },
         10,
         0x4000,
@@ -697,6 +779,12 @@ fn reject_aborts_and_frees_inflight_block() {
     assert!(c.pipeline.download_queue.is_empty());
     assert_eq!(c.pipeline.outstanding_bytes, 0);
     assert!(eff.iter().any(|e| matches!(e, PeerEffect::GracefulCheck)));
+    // `incoming_reject_request` ends with an unconditional
+    // `send_block_requests` — queued entries go on the wire now.
+    assert!(
+        eff.iter().any(|e| matches!(e, PeerEffect::FlushRequests)),
+        "valid reject flushes the request queue: {eff:?}"
+    );
 }
 
 /// `incoming_reject_request` validates the reject shape first — a
@@ -759,42 +847,68 @@ fn malformed_reject_is_a_noop() {
     assert_eq!(c.pipeline.download_queue.len(), 1);
 }
 
-/// BitComet quirk: a zero-length `piece` message routes to
-/// `incoming_reject_request` upstream, whose validation always fails
-/// on length 0 — the whole thing is a `peer_error` alert with no
-/// state change (no abort, no re-pick).
+/// `validate_piece_request` (inside `start_receive_piece` upstream):
+/// out-of-range piece, misaligned start, or a length that isn't the
+/// exact `to_req` tail-clamp all disconnect `invalid_piece` before
+/// any queue/picker/disk state moves. Zero-length included — the
+/// BitComet reject quirk inside `incoming_piece` is only reachable
+/// from `web_peer_connection`, which bypasses the validator.
 #[test]
-fn empty_piece_is_peer_error_only() {
-    let mut c = conn();
-    // reject/allowed-fast are FAST-extension messages.
-    c.supports_fast = true;
-    let b = PieceBlock {
-        piece_index: PieceIndex(3),
-        block_index: 0,
-    };
-    c.pipeline
-        .download_queue
-        .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b));
-    let mut eff = Vec::new();
-    c.dispatch(
-        &PeerMessage::Piece {
-            piece: PieceIndex(3),
-            offset: 0,
-            data: bytes::Bytes::new(),
-        },
-        10,
-        0x4000,
-        0x40000,
-        None,
-        false,
-        0x200000,
-        2000,
-        &bitdaemon_session::counters::Counters::default(),
-        &mut eff,
-    );
-    assert_eq!(eff.len(), 1);
-    assert!(matches!(eff[0], PeerEffect::PeerError(_)));
-    assert_eq!(c.pipeline.download_queue.len(), 1);
+fn invalid_piece_shapes_disconnect() {
+    use bitdaemon_net::bt_peer_conn::DisconnectSeverity;
+    for (piece, offset, len) in [
+        (PieceIndex(99), 0, 0x4000usize), // out-of-range piece index
+        (PieceIndex(3), 1, 0x4000),       // start not block-aligned
+        (PieceIndex(3), 0x40000, 0x4000), // start past end of piece
+        (PieceIndex(3), 0, 0x2000),       // sub-block length
+        (PieceIndex(3), 0x4000, 0x2000),  // tail-clamped mismatch
+        (PieceIndex(3), 0, 0),            // empty payload
+    ] {
+        let mut c = conn();
+        c.supports_fast = true;
+        let b = PieceBlock {
+            piece_index: PieceIndex(3),
+            block_index: 0,
+        };
+        c.pipeline
+            .download_queue
+            .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b));
+        c.pipeline.outstanding_bytes = 0x4000;
+        let mut eff = Vec::new();
+        c.dispatch(
+            &PeerMessage::Piece {
+                piece,
+                offset,
+                data: bytes::Bytes::from(vec![1u8; len]),
+            },
+            10,
+            0x4000,
+            0x40000,
+            None,
+            false,
+            0x200000,
+            2000,
+            &bitdaemon_session::counters::Counters::default(),
+            &mut eff,
+        );
+        assert_eq!(
+            eff.len(),
+            1,
+            "piece={piece:?} offset={offset:#x} len={len:#x}: {eff:?}"
+        );
+        assert!(
+            matches!(
+                eff[0],
+                PeerEffect::Disconnect("invalid_piece", DisconnectSeverity::PeerError)
+            ),
+            "piece={piece:?} offset={offset:#x} len={len:#x}: {eff:?}"
+        );
+        assert_eq!(
+            c.pipeline.download_queue.len(),
+            1,
+            "queue untouched on invalid piece"
+        );
+    }
 }
 
 /// `remove_from_picker = !timed_out && !not_wanted` — a block that
@@ -1024,6 +1138,25 @@ fn choke_without_fast_rejects_download_queue() {
         eff.iter()
             .any(|e| matches!(e, PeerEffect::AbortDownload(bb) if *bb == b2)),
         "the implicit reject frees the picker mark: {eff:?}"
+    );
+    // each implicit `incoming_reject_request` carries its own tail:
+    // graceful check, the gated re-pick (`dlq < 2` — true once the
+    // single entry drained), and the batch ends with the
+    // unconditional `send_block_requests` flush.
+    assert!(
+        eff.iter().any(|e| matches!(e, PeerEffect::GracefulCheck)),
+        "implicit reject runs check_graceful_pause: {eff:?}"
+    );
+    assert!(
+        eff.iter().any(|e| matches!(
+            e,
+            PeerEffect::MaybePick(Some(bitdaemon_session::counters::Counter::RejectPiecePicks))
+        )),
+        "implicit reject re-picks when nearly drained: {eff:?}"
+    );
+    assert!(
+        eff.iter().any(|e| matches!(e, PeerEffect::FlushRequests)),
+        "implicit reject flushes the request queue: {eff:?}"
     );
     assert_eq!(c.pipeline.outstanding_bytes, 0);
 }

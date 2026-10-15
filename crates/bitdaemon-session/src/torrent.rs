@@ -3868,6 +3868,11 @@ impl Torrent {
         // the post-block pick when the payload was waste — set by the
         // `DiskWrite` arm, consumed by the next `MaybePick`.
         let mut waste_pick = false;
+        // `incoming_piece` clears `m_snubbed` only on the write path
+        // (the `is_downloaded` arm returns before the check) — the
+        // `Unsnub` effect arms this flag, the `DiskWrite` arm applies
+        // or drops it.
+        let mut pending_unsnub = false;
         // `incoming_piece` returns before `mark_as_writing` when a
         // block is redundant or we're seeding — the `DiskWrite` arm
         // classifies it (it runs first in the batch) and records the
@@ -3900,12 +3905,14 @@ impl Torrent {
                     // block the picker already finished is redundant
                     // (the queue-entry flags pick timed_out /
                     // cancelled / end_game / unknown); neither
-                    // reaches disk.
+                    // reaches disk — and neither clears a snub
+                    // (upstream returns before the unsnub check).
                     let block = PieceBlock {
                         piece_index: req.piece,
                         block_index: req.start / self.block_size().max(1),
                     };
                     if self.is_seed() {
+                        pending_unsnub = false;
                         self.add_redundant_bytes(
                             i64::from(req.length),
                             crate::peer_conn::WasteReason::Seed,
@@ -3919,6 +3926,7 @@ impl Torrent {
                     // `MarkDownloaded` in the batch for exactly that
                     // reason.
                     if self.picker.as_ref().is_some_and(|p| p.is_downloaded(block)) {
+                        pending_unsnub = false;
                         self.add_redundant_bytes(i64::from(req.length), waste, counters);
                         // upstream re-picks on the freed slot
                         // (`request_a_block` + `send_block_requests`)
@@ -3928,6 +3936,20 @@ impl Torrent {
                         waste_pick = true;
                         skipped_writes.push(block);
                         continue;
+                    }
+                    // `incoming_piece` — the block is going to disk:
+                    // a timely arrival un-snubs the peer here
+                    // (upstream's `m_snubbed = false` +
+                    // `peer_unsnubbed_alert` on the write path only).
+                    if pending_unsnub {
+                        pending_unsnub = false;
+                        if let Some(c) = self.peers.get_mut(&peer_id) {
+                            c.pipeline.snubbed = false;
+                        }
+                        out.push(TorrentEffect::Alert(crate::alerts::Alert::PeerUnsnubbed {
+                            ih: self.info_hash,
+                            remote: remote.clone(),
+                        }));
                     }
                     out.push(TorrentEffect::DiskWrite {
                         peer: peer_id,
@@ -4059,6 +4081,18 @@ impl Torrent {
                         msg: PeerMessage::Choke,
                     });
                 }
+                PeerEffect::UnwantedBlockAlert(b) => {
+                    // `start_receive_piece` — the alert fires when
+                    // the unsolicited block enters the queue, before
+                    // `incoming_piece` writes it; waste attribution
+                    // stays downstream (the `is_downloaded` consult).
+                    out.push(TorrentEffect::Alert(crate::alerts::Alert::UnwantedBlock {
+                        ih: self.info_hash,
+                        remote: remote.clone(),
+                        piece: b.piece_index,
+                        block: b.block_index as u32,
+                    }));
+                }
                 PeerEffect::UnwantedBlock(b, len) => {
                     // `incoming_piece` — the payload was never
                     // requested: `unwanted_block_alert` +
@@ -4093,10 +4127,11 @@ impl Torrent {
                     }));
                 }
                 PeerEffect::Unsnub => {
-                    out.push(TorrentEffect::Alert(crate::alerts::Alert::PeerUnsnubbed {
-                        ih: self.info_hash,
-                        remote: remote.clone(),
-                    }));
+                    // Deferred — upstream clears `m_snubbed` only on
+                    // the write path (`incoming_piece` returns
+                    // earlier for `is_downloaded` payloads). The
+                    // `DiskWrite` arm next in the batch applies it.
+                    pending_unsnub = true;
                 }
                 PeerEffect::PeerError(msg) => {
                     // `peer_error_alert` without the disconnect —
@@ -4192,12 +4227,25 @@ impl Torrent {
                     // conn whose `m_outstanding_bytes` has drained is
                     // disconnected (`errors::torrent_paused`); the
                     // torrent flag itself stays set until resume.
-                    if self.graceful_pause
+                    // `peer_connection::disconnect` sets
+                    // `m_disconnecting` *immediately* upstream, so the
+                    // rest of the effect batch (re-pick, request
+                    // flush) must observe it too. Upstream calls this
+                    // only on `incoming_piece`'s *write* path — a
+                    // block the `DiskWrite` arm just classified
+                    // redundant takes the early return instead.
+                    if skipped_writes.is_empty()
+                        && self.graceful_pause
                         && self
                             .peers
                             .get(&peer_id)
-                            .is_some_and(|c| c.pipeline.outstanding_bytes <= 0)
+                            .is_some_and(|c| !c.disconnecting && c.pipeline.outstanding_bytes <= 0)
                     {
+                        if let Some(c) = self.peers.get_mut(&peer_id) {
+                            c.disconnecting = true;
+                            c.bw.disconnecting
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         out.push(TorrentEffect::DisconnectPeer {
                             peer: peer_id,
                             reason: "torrent_paused",
@@ -4218,6 +4266,15 @@ impl Torrent {
                         counters.inc(ctr);
                     }
                     waste_pick = false;
+                }
+                PeerEffect::FlushRequests => {
+                    // `incoming_reject_request` / non-FAST
+                    // `incoming_choke` tail — upstream ends both with
+                    // an unconditional `send_block_requests` (no
+                    // pick): queued entries — including a parole
+                    // block just requeued at the head — go on the
+                    // wire immediately.
+                    self.flush_requests(peer_id, out);
                 }
                 PeerEffect::ExtHandshake => {
                     // `metadata_size` advertised → pre-size the
@@ -5386,6 +5443,53 @@ impl Torrent {
             });
         }
         invoked
+    }
+
+    /// `peer_connection::send_block_requests` standalone — upstream
+    /// ends `incoming_reject_request` (and the non-FAST choke
+    /// rejection loop) with an unconditional flush: whatever still
+    /// sits in `request_queue` goes on the wire without a pick.
+    /// Same gates as the `drive_peer` send half — `send_block_requests`
+    /// itself early-outs on `disconnecting`/`graceful_pause`/
+    /// `data_requests_blocked`.
+    pub fn flush_requests(&mut self, peer_id: u64, out: &mut Vec<TorrentEffect>) {
+        let block_size = self.block_size();
+        let view = PipelineView {
+            piece_length: self.piece_length,
+            block_size,
+            files: self.files.as_deref(),
+            graceful_pause: self.graceful_pause,
+            upload_mode: self.upload_mode,
+            data_requests_blocked: self.checking,
+            has_picker: self.picker.is_some(),
+        };
+        let mut picker = self.picker.as_mut();
+        let Some(c) = self.peers.get_mut(&peer_id) else {
+            return;
+        };
+        let disconnecting = c.disconnecting;
+        let send_buffer = c.send_buffer;
+        let now = c.now_ms;
+        let key = c.peer_key();
+        let reqs = c
+            .pipeline
+            .send_block_requests(&view, send_buffer, now, disconnecting, |b| {
+                // a block finished meanwhile frees its picker mark
+                // and is not re-requested (`is_downloaded` consult).
+                match picker.as_deref_mut() {
+                    Some(p) if p.is_downloaded(b) => {
+                        p.abort_download(b, key);
+                        true
+                    }
+                    _ => false,
+                }
+            });
+        for req in reqs {
+            out.push(TorrentEffect::SendTo {
+                peer: peer_id,
+                msg: PeerMessage::Request(req),
+            });
+        }
     }
 
     /// `web_seed_peer` pseudo-identity in the picker — a web seed
@@ -8304,7 +8408,19 @@ impl Torrent {
             {
                 continue;
             }
-            let request_timed_out = c.pipeline.requested_ms != 0
+            // `second_tick` — the *request* timeout only applies
+            // while a socket read is in flight (`reading_socket` =
+            // `m_channel_state[download_channel] & bw_network`): a
+            // conn blocked on disk (`bw_disk`) or on quota
+            // (`bw_limit`) isn't reading and can't be blamed for
+            // the silence. The *piece* timeout leg carries no such
+            // gate upstream.
+            let reading_socket = c.bw.channel_state[crate::peer_conn::DOWNLOAD_CHANNEL]
+                .load(std::sync::atomic::Ordering::Relaxed)
+                & crate::peer_info::BandwidthState::NETWORK.0
+                != 0;
+            let request_timed_out = reading_socket
+                && c.pipeline.requested_ms != 0
                 && now_ms - c.pipeline.requested_ms > c.pipeline.request_timeout() * 1000;
             let piece_timed_out = now_ms - c.pipeline.last_piece_ms > piece_timeout_ms;
             if !request_timed_out && !piece_timed_out {

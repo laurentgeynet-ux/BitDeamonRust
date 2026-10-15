@@ -257,12 +257,21 @@ impl PeerPipeline {
         self.last_piece_ms = now_ms;
     }
 
+    /// `now - m_requested < request_timeout()` — the un-snub window
+    /// upstream evaluates in `incoming_piece` *before* `m_requested`
+    /// is re-armed. Pure predicate: the flag itself clears where the
+    /// effect is applied (a redundant block must not clear it).
+    #[must_use]
+    pub fn unsnub_window_open(&self, now_ms: i64) -> bool {
+        self.snubbed && now_ms - self.requested_ms < self.request_timeout() * 1000
+    }
+
     /// `if (now - m_requested < request_timeout() && m_snubbed)
     /// m_snubbed = false` — a *timely* block un-snubs the peer; a
     /// late one keeps it snubbed. Returns whether this call cleared
     /// the flag (drives `peer_unsnubbed_alert`).
     pub fn maybe_unsnub(&mut self, now_ms: i64) -> bool {
-        if self.snubbed && now_ms - self.requested_ms < self.request_timeout() * 1000 {
+        if self.unsnub_window_open(now_ms) {
             self.snubbed = false;
             true
         } else {
