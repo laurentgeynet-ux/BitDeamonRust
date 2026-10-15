@@ -334,6 +334,23 @@ pub enum WebSeedBackoff {
     Remove,
 }
 
+/// `time_critical_piece` — one `set_piece_deadline` entry
+/// (`torrent.hpp`). Upstream's `peers`/`timed_out` fields are
+/// debug-only and omitted.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeCriticalPiece {
+    /// `deadline` — the instant by which the piece is wanted.
+    pub deadline: Instant,
+    /// `flags & torrent_handle::alert_when_available`.
+    pub alert_when_available: bool,
+    /// `first_requested` — first pick as a critical piece;
+    /// `None` stands for upstream's `min_time()` sentinel.
+    pub first_requested: Option<Instant>,
+    /// `last_requested` — last pick stamp; drives the stall-based
+    /// `timed_out` re-pick in `request_time_critical_pieces`.
+    pub last_requested: Option<Instant>,
+}
+
 /// `torrent` — one swarm.
 pub struct Torrent {
     /// `m_torrent_file->info_hash()` — the session-map key (v1, or
@@ -688,10 +705,20 @@ pub struct Torrent {
     pub max_connections: i32,
     /// `max_uploads` per-torrent (-1 = use session limit).
     pub max_uploads: i32,
-    /// `m_time_critical_pieces` — `set_piece_deadline` entries:
-    /// piece → (deadline, alert_when_available). Sorted list
-    /// upstream; BTreeMap + deadline ordering when consumed.
-    pub time_critical: std::collections::BTreeMap<PieceIndex, (std::time::Instant, bool)>,
+    /// `m_time_critical_pieces` — `set_piece_deadline` entries,
+    /// keyed by piece (deadline ordering is applied at consumption,
+    /// matching upstream's deadline-sorted list).
+    pub time_critical: std::collections::BTreeMap<PieceIndex, TimeCriticalPiece>,
+    /// `m_average_piece_time` (ms) — EWMA of time-critical piece
+    /// download times, drives the deadline horizon + stall re-pick.
+    pub average_piece_time_ms: i64,
+    /// `m_piece_time_deviation` (ms) — EWMA deviation of the above.
+    pub piece_time_deviation_ms: i64,
+    /// Deferred `cancel_non_critical` — upstream `post()`s the sweep
+    /// so consecutive `set_piece_deadline` calls register before the
+    /// cancel pass runs (`torrent.cpp:5671-5678`). Drained at the
+    /// next tick.
+    pub pending_cancel_non_critical: bool,
     /// monotonic ms since the torrent's first `update_rates` —
     /// the clock every peer pipeline timestamp is measured against.
     pub now_ms: i64,
@@ -1058,6 +1085,9 @@ impl Torrent {
             last_saved_resume: None,
             queue_seq: 0,
             time_critical: std::collections::BTreeMap::new(),
+            average_piece_time_ms: 0,
+            piece_time_deviation_ms: 0,
+            pending_cancel_non_critical: false,
             now_ms: 0,
             last_rates_instant: None,
             disk_back_pressure: false,
@@ -7290,15 +7320,11 @@ impl Torrent {
         // `m_file_progress.update` — a file whose last piece just
         // landed gets `file_completed_alert`.
         self.file_completed_edges(piece, out);
-        // `remove_time_critical_piece` — the piece just verified;
-        // `alert_when_available` → read it back.
-        if self
-            .time_critical
-            .remove(&piece)
-            .is_some_and(|(_, alert)| alert)
-        {
-            out.push(TorrentEffect::ReadPiece { piece });
-        }
+        // `remove_time_critical_piece(piece, finished=true)` — the
+        // piece just verified: `alert_when_available` → read it back,
+        // download-time EWMA feeds the deadline horizon, priority
+        // falls back to `low_priority`.
+        self.remove_time_critical_piece(piece, true, out);
         // `is_downloading_state(m_state)` gate upstream — the
         // finished transition, `m_last_download` and share-mode
         // rebalance don't run in `checking_files` /
@@ -8057,12 +8083,18 @@ impl Torrent {
         out: &mut Vec<TorrentEffect>,
     ) {
         let was_finished = self.is_finished();
+        let mut filter_updated = false;
         if let Some(picker) = self.picker.as_mut() {
             for (i, prio) in prios.iter().enumerate().take(self.num_pieces as usize) {
-                picker.set_piece_priority(PieceIndex(i as i32), *prio);
+                filter_updated |= picker.set_piece_priority(PieceIndex(i as i32), *prio);
             }
         }
         self.need_save_resume = true;
+        // `remove_time_critical_pieces` — a piece filtered to
+        // `dont_download` loses its deadline (canceled alerts post).
+        if filter_updated {
+            self.remove_filtered_time_critical_pieces(out);
+        }
         self.update_peer_interest(was_finished, counters, out);
     }
 
@@ -8562,6 +8594,7 @@ impl Torrent {
         // `update_piece_priority` → `state_updated()` — the wanted
         // set may have changed.
         self.state_updated();
+        let mut filter_updated = false;
         if let (Some(fs), Some(picker)) = (self.files.clone(), self.picker.as_mut()) {
             for p in 0..self.num_pieces {
                 let piece = PieceIndex(p);
@@ -8576,8 +8609,11 @@ impl Torrent {
                     })
                     .max()
                     .unwrap_or(DownloadPriority::DEFAULT);
-                picker.set_piece_priority(piece, prio);
+                filter_updated |= picker.set_piece_priority(piece, prio);
             }
+        }
+        if filter_updated {
+            self.remove_filtered_time_critical_pieces(out);
         }
         self.update_peer_interest(was_finished, counters, out);
     }
@@ -8753,11 +8789,24 @@ impl Torrent {
             + std::time::Duration::from_millis(
                 u64::try_from(deadline_ms.max(0)).unwrap_or(u64::MAX),
             );
-        let first = self.time_critical.is_empty();
-        let existed = self
-            .time_critical
-            .insert(piece, (deadline, alert_when_available))
-            .is_some();
+        let existed = if let Some(entry) = self.time_critical.get_mut(&piece) {
+            // re-deadline: update + (upstream resorts the deadline
+            // list — our ordering is recomputed at consumption).
+            entry.deadline = deadline;
+            entry.alert_when_available = alert_when_available;
+            true
+        } else {
+            self.time_critical.insert(
+                piece,
+                TimeCriticalPiece {
+                    deadline,
+                    alert_when_available,
+                    first_requested: None,
+                    last_requested: None,
+                },
+            );
+            false
+        };
         // upstream bumps to `top_priority` unconditionally; a piece
         // that was `dont_download` re-enters the wanted set →
         // interest + finished↔downloading re-eval.
@@ -8777,8 +8826,11 @@ impl Torrent {
             // upstream (update + resort only).
             return;
         }
-        if first {
-            self.cancel_non_critical(out);
+        if self.time_critical.len() == 1 {
+            // upstream `post()`s `cancel_non_critical` so a batch of
+            // `set_piece_deadline` calls all register before the
+            // sweep — defer it to the next tick here.
+            self.pending_cancel_non_critical = true;
         }
         // upstream promotes outstanding blocks of the piece into the
         // conns' critical prefixes (`make_time_critical` per
@@ -8808,16 +8860,91 @@ impl Torrent {
     /// canceled `read_piece_alert` when `alert_when_available` was
     /// set (upstream posts `operation_canceled`).
     pub fn reset_piece_deadline(&mut self, piece: PieceIndex, out: &mut Vec<TorrentEffect>) {
-        if let Some((_, alert)) = self.time_critical.remove(&piece) {
-            if alert {
-                out.push(TorrentEffect::ReadPieceFailed {
-                    piece,
-                    error: "operation canceled".into(),
-                });
+        self.remove_time_critical_piece(piece, false, out);
+    }
+
+    /// `remove_time_critical_piece` — shared erase path
+    /// (`torrent.cpp:5758-5803`). `finished` = the piece verified:
+    /// `alert_when_available` reads it back (`read_piece`) and the
+    /// download-time stats feed the deadline horizon; a canceled
+    /// entry instead posts `operation_canceled`. Either way the
+    /// piece priority falls back to `low_priority`.
+    pub fn remove_time_critical_piece(
+        &mut self,
+        piece: PieceIndex,
+        finished: bool,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        let Some(entry) = self.time_critical.remove(&piece) else {
+            return;
+        };
+        if finished {
+            if entry.alert_when_available {
+                out.push(TorrentEffect::ReadPiece { piece });
             }
-            if let Some(p) = self.picker.as_mut() {
-                p.set_piece_priority(piece, bitdaemon_common::types::DownloadPriority::LOW);
+            // `first_requested == min_time()` upstream means the piece
+            // was never picked as critical — skip the stats update.
+            if let Some(first) = entry.first_requested {
+                let dl_time = Instant::now().duration_since(first).as_millis() as i64;
+                if self.average_piece_time_ms == 0 {
+                    self.average_piece_time_ms = dl_time;
+                } else {
+                    let diff = (dl_time - self.average_piece_time_ms).abs();
+                    if self.piece_time_deviation_ms == 0 {
+                        self.piece_time_deviation_ms = diff;
+                    } else {
+                        self.piece_time_deviation_ms =
+                            (self.piece_time_deviation_ms * 9 + diff) / 10;
+                    }
+                    self.average_piece_time_ms = (self.average_piece_time_ms * 9 + dl_time) / 10;
+                }
             }
+        } else if entry.alert_when_available {
+            out.push(TorrentEffect::ReadPieceFailed {
+                piece,
+                error: "operation canceled".into(),
+            });
+        }
+        if let Some(p) = self.picker.as_mut() {
+            p.set_piece_priority(piece, bitdaemon_common::types::DownloadPriority::LOW);
+        }
+    }
+
+    /// `clear_time_critical` — every deadline erased as canceled
+    /// (`torrent.cpp:5805-5818`): flagged entries post
+    /// `operation_canceled`, priorities drop back to `low_priority`.
+    pub fn clear_time_critical(&mut self, out: &mut Vec<TorrentEffect>) {
+        let pieces: Vec<PieceIndex> = self.time_critical.keys().copied().collect();
+        for piece in pieces {
+            self.remove_time_critical_piece(piece, false, out);
+        }
+    }
+
+    /// `remove_time_critical_pieces` — deadlines whose piece just
+    /// fell to `dont_download` are dropped as canceled
+    /// (`torrent.cpp:5821-5838`): no priority restore (the piece
+    /// stays unwanted).
+    fn remove_filtered_time_critical_pieces(&mut self, out: &mut Vec<TorrentEffect>) {
+        if self.time_critical.is_empty() {
+            return;
+        }
+        let mut dropped = Vec::new();
+        for (&piece, entry) in &self.time_critical {
+            let filtered = self.picker.as_ref().is_some_and(|p| {
+                p.piece_priority(piece) == bitdaemon_common::types::DownloadPriority::DONT_DOWNLOAD
+            });
+            if filtered {
+                if entry.alert_when_available {
+                    out.push(TorrentEffect::ReadPieceFailed {
+                        piece,
+                        error: "operation canceled".into(),
+                    });
+                }
+                dropped.push(piece);
+            }
+        }
+        for piece in dropped {
+            self.time_critical.remove(&piece);
         }
     }
 
@@ -9293,6 +9420,16 @@ impl Torrent {
                 if critical.contains(&b.block.piece_index) || b.not_wanted || b.timed_out {
                     continue;
                 }
+                // `cancel_request`'s head gate: a block the picker no
+                // longer tracks (arrived via another peer) is left
+                // alone — no `not_wanted`, no Cancel.
+                if self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|p| !p.is_requested(b.block))
+                {
+                    continue;
+                }
                 b.not_wanted = true;
                 aborted.push(b.block);
                 let start = i64::from(b.block.block_index) * block_size;
@@ -9310,15 +9447,18 @@ impl Torrent {
             // the critical prefix, no `Cancel` message.
             let mut i = 0;
             while i < c.pipeline.request_queue.len() {
-                if critical.contains(&c.pipeline.request_queue[i].block.piece_index) {
+                let block = c.pipeline.request_queue[i].block;
+                if critical.contains(&block.piece_index)
+                    || self.picker.as_ref().is_some_and(|p| !p.is_requested(block))
+                {
                     i += 1;
                     continue;
                 }
-                let b = c.pipeline.request_queue.remove(i).block;
+                c.pipeline.request_queue.remove(i);
                 if i < c.pipeline.queued_time_critical as usize {
                     c.pipeline.queued_time_critical -= 1;
                 }
-                aborted.push(b);
+                aborted.push(block);
             }
             let key = c.peer_key();
             for b in aborted {
@@ -10294,12 +10434,14 @@ impl Torrent {
         self.save_path.clone()
     }
 
-    /// `on_torrent_paused` — pause bookkeeping: time-critical
-    /// deadlines are dropped (upstream clears
-    /// `m_time_critical_pieces` on pause). Per-conn suggest state
-    /// dies with the conns; the read-cache set persists.
+    /// `on_torrent_paused` — pause bookkeeping. Time-critical
+    /// deadlines survive the pause upstream (`do_pause` never
+    /// touches `m_time_critical_pieces` — only
+    /// `torrent_handle::clear_piece_deadlines` erases them); elapsed
+    /// deadlines simply re-pick aggressively on resume.
+    /// Per-conn suggest state dies with the conns; the read-cache
+    /// set persists.
     pub fn on_torrent_paused(&mut self) {
-        self.time_critical.clear();
         self.stop_when_ready = false;
     }
 
@@ -10978,22 +11120,348 @@ impl Torrent {
         self.update_want_peers();
     }
 
-    /// `request_time_critical_pieces` — re-issue deadlines:
-    /// upstream refreshes `m_time_critical_pieces` into peer requests
-    /// every tick for deadline pieces; we nudge every connected peer
-    /// (the request pipeline prioritizes deadline blocks already).
+    /// `request_time_critical_pieces` — re-issue deadlines
+    /// (`torrent.cpp:11550-11720`): every tick the critical pieces
+    /// are picked *in deadline order* from the peers sorted by
+    /// `download_queue_time` (bottom decile trimmed), with a
+    /// stall-based busy re-pick once every block is in flight.
+    /// Requests batch and go on the wire at the end.
     pub fn request_time_critical_pieces(
         &mut self,
-        s: &crate::settings::SessionSettings,
-        counters: &crate::counters::Counters,
+        _s: &crate::settings::SessionSettings,
+        _counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
-        if self.time_critical.is_empty() {
+        // the deferred first-deadline sweep — upstream `post()`s
+        // `cancel_non_critical` so it runs after the client has
+        // finished declaring its critical set.
+        if self.pending_cancel_non_critical {
+            self.pending_cancel_non_critical = false;
+            self.cancel_non_critical(out);
+        }
+        if self.time_critical.is_empty() || self.picker.is_none() {
             return;
         }
-        let ids: Vec<u64> = self.peers.keys().copied().collect();
-        for id in ids {
-            self.drive_peer(id, s, counters, out);
+        let block_size = i64::from(self.block_size());
+        let rate = self.down_payload_rate;
+        let npeers = self.down_request_peers;
+        let upload_mode = self.upload_mode;
+        // candidates: `can_request_time_critical()` — unchoked,
+        // interesting, shallow queues, not parole/snubbed/
+        // disconnecting, no upload_mode (`peer_connection.cpp:3572`).
+        let mut peers: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|(_, c)| c.can_request_time_critical(upload_mode))
+            .map(|(id, _)| *id)
+            .collect();
+        // fastest-draining pipelines first; drop the bottom decile
+        // (outliers that would stall the deadline).
+        peers.sort_by_key(|&id| {
+            self.peers[&id].download_queue_time(16 * 1024, rate, npeers, block_size)
+        });
+        let new_size = (peers.len() * 9).div_ceil(10);
+        peers.truncate(new_size);
+
+        // deadline-sorted iteration — upstream keeps
+        // `m_time_critical_pieces` sorted at insert.
+        let mut order: Vec<PieceIndex> = self.time_critical.keys().copied().collect();
+        order.sort_by_key(|p| self.time_critical[p].deadline);
+
+        let now = Instant::now();
+        // conns that got new/!promoted requests — their queues drain
+        // together at the end (`peers_with_requests`).
+        let mut touched: Vec<u64> = Vec::new();
+        let mut ignore_peers: Vec<u64> = Vec::new();
+        let mut first_piece = true;
+        for piece in order {
+            if peers.is_empty() {
+                break;
+            }
+            // deadline horizon: only the most urgent piece bypasses
+            // `avg + 4σ + 1 s` (the +1 s covers the 1 s tick cadence).
+            let deadline = self.time_critical[&piece].deadline;
+            let horizon_ms = self.average_piece_time_ms + self.piece_time_deviation_ms * 4 + 1000;
+            if !first_piece && deadline > now + Duration::from_millis(horizon_ms.max(0) as u64) {
+                break;
+            }
+            first_piece = false;
+
+            let Some(p) = self.picker.as_ref() else {
+                break;
+            };
+            let pi = p.piece_info(piece);
+            let blocks_in_piece = p.blocks_in_piece(piece);
+            let mut timed_out = 0i64;
+            let free_to_request = blocks_in_piece
+                - i32::from(pi.finished)
+                - i32::from(pi.writing)
+                - i32::from(pi.requested);
+            if free_to_request == 0 {
+                let entry = self.time_critical.get_mut(&piece);
+                if let Some(entry) = entry {
+                    if entry.last_requested.is_none() {
+                        entry.last_requested = Some(now);
+                    }
+                    // stalled: allow one extra request per block per
+                    // elapsed `(avg + dev/2)` window.
+                    if self.average_piece_time_ms > 0 {
+                        let elapsed = entry
+                            .last_requested
+                            .map_or(0, |t| now.duration_since(t).as_millis() as i64);
+                        timed_out = elapsed
+                            / (self.average_piece_time_ms + self.piece_time_deviation_ms / 2)
+                                .max(1);
+                    }
+                    if pi.requested == 0 || timed_out == 0 {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            self.pick_time_critical_block(
+                &mut peers,
+                &mut ignore_peers,
+                &mut touched,
+                piece,
+                &pi,
+                timed_out,
+                now,
+                rate,
+                npeers,
+                block_size,
+            );
+            // ignored peers rejoin the candidate set for the next
+            // piece — reinserted at the front, then re-sorted.
+            if !ignore_peers.is_empty() {
+                let mut restored = std::mem::take(&mut ignore_peers);
+                restored.extend_from_slice(&peers);
+                peers = restored;
+                peers.sort_by_key(|&id| {
+                    self.peers[&id].download_queue_time(16 * 1024, rate, npeers, block_size)
+                });
+            }
+            if peers.is_empty() {
+                break;
+            }
+            if self.peers[&peers[0]].download_queue_time(0, rate, npeers, block_size) > 2000 {
+                break;
+            }
+        }
+
+        // commit — batch the wire requests for every conn that got
+        // new critical work (`send_block_requests` drain).
+        let view = PipelineView {
+            piece_length: self.piece_length,
+            block_size: self.block_size(),
+            files: self.files.as_deref(),
+            graceful_pause: self.graceful_pause,
+            upload_mode: self.upload_mode,
+            data_requests_blocked: self.checking,
+            has_picker: self.picker.is_some(),
+        };
+        for id in touched {
+            let (send_buffer, now_ms, key) = match self.peers.get(&id) {
+                Some(c) => (c.send_buffer, c.now_ms, c.peer_key()),
+                None => continue,
+            };
+            let disconnecting = self.peers[&id].disconnecting;
+            let (Some(p), Some(c)) = (self.picker.as_mut(), self.peers.get_mut(&id)) else {
+                continue;
+            };
+            let reqs =
+                c.pipeline
+                    .send_block_requests(&view, send_buffer, now_ms, disconnecting, |b| {
+                        if p.is_downloaded(b) {
+                            p.abort_download(b, key);
+                            true
+                        } else {
+                            false
+                        }
+                    });
+            for req in reqs {
+                out.push(TorrentEffect::SendTo {
+                    peer: id,
+                    msg: PeerMessage::Request(req),
+                });
+            }
+        }
+    }
+
+    /// `pick_time_critical_block` (`torrent.cpp:11360-11546`) — fill
+    /// one critical piece from the fastest peers. `peers` is the
+    /// `download_queue_time`-sorted candidate list; ignored peers are
+    /// parked in `ignore_peers` for this piece only; `touched` gets
+    /// the conns that need a `send_block_requests` commit.
+    #[allow(clippy::too_many_arguments)]
+    fn pick_time_critical_block(
+        &mut self,
+        peers: &mut Vec<u64>,
+        ignore_peers: &mut Vec<u64>,
+        touched: &mut Vec<u64>,
+        piece: PieceIndex,
+        pi: &crate::piece_picker::DownloadingPiece,
+        timed_out: i64,
+        now: Instant,
+        rate: i64,
+        npeers: i64,
+        block_size: i64,
+    ) {
+        loop {
+            let mut busy_mode = false;
+            if peers.is_empty() {
+                break;
+            }
+            // don't build request queues deeper than ~2 s of work.
+            if self.peers[&peers[0]].download_queue_time(0, rate, npeers, block_size) > 2000 {
+                break;
+            }
+            // the fastest candidate that actually has this piece.
+            let Some(idx) = peers
+                .iter()
+                .position(|&id| self.peers[&id].peer_pieces.get_bit(piece.0.max(0) as usize))
+            else {
+                break;
+            };
+            let id = peers[idx];
+
+            // free (never-requested) blocks of the piece — upstream
+            // `picker.add_blocks` with `prefer_contiguous_blocks = 0`
+            // lists every `state_none` block, open piece included.
+            let mut interesting: Vec<PieceBlock> = Vec::new();
+            if let Some(p) = self.picker.as_ref() {
+                if p.is_downloading(piece) {
+                    for (i, info) in p.blocks_for_piece(pi).iter().enumerate() {
+                        if info.state == BlockState::None {
+                            interesting.push(PieceBlock {
+                                piece_index: piece,
+                                block_index: i as i32,
+                            });
+                        }
+                    }
+                } else {
+                    for i in 0..p.payload_blocks_in_piece(piece) {
+                        interesting.push(PieceBlock {
+                            piece_index: piece,
+                            block_index: i,
+                        });
+                    }
+                }
+            }
+
+            if interesting.is_empty() {
+                // not stalled long enough to re-pick busy blocks —
+                // done with this piece.
+                if timed_out == 0 {
+                    break;
+                }
+                busy_mode = true;
+                // `pick_busy_blocks` — `state_requested` blocks whose
+                // request count is still within the timeout budget,
+                // fewest requesters first.
+                if let Some(p) = self.picker.as_ref() {
+                    let mut busy: Vec<(u16, i32)> = Vec::new();
+                    for (i, info) in p.blocks_for_piece(pi).iter().enumerate() {
+                        if info.state != BlockState::Requested {
+                            continue;
+                        }
+                        if i64::from(info.num_peers) > timed_out {
+                            continue;
+                        }
+                        busy.push((info.num_peers, i as i32));
+                    }
+                    busy.sort();
+                    interesting = busy
+                        .into_iter()
+                        .map(|(_, i)| PieceBlock {
+                            piece_index: piece,
+                            block_index: i,
+                        })
+                        .collect();
+                }
+            }
+            if interesting.is_empty() {
+                break;
+            }
+            let b = interesting[0];
+            let c = &self.peers[&id];
+            // already in flight from this peer → it's likely the
+            // stall cause; try the next peer for this piece.
+            if c.pipeline.download_queue.iter().any(|pb| pb.block == b) {
+                ignore_peers.push(id);
+                peers.remove(idx);
+                continue;
+            }
+            if c.pipeline.request_queue.iter().any(|pb| pb.block == b) {
+                // already queued unsent — promote into the
+                // time-critical prefix; a failure means it's already
+                // critical → next peer.
+                if !self
+                    .peers
+                    .get_mut(&id)
+                    .is_some_and(|c| c.make_time_critical(b))
+                {
+                    ignore_peers.push(id);
+                    peers.remove(idx);
+                    continue;
+                }
+                if let Some(entry) = self.time_critical.get_mut(&piece) {
+                    entry.last_requested = Some(now);
+                }
+                if !touched.contains(&id) {
+                    touched.push(id);
+                }
+            } else {
+                // new critical request — mark in the picker, then
+                // front-insert (`add_request(b, busy, true)`).
+                let key = self.peers[&id].peer_key();
+                let marked = self
+                    .picker
+                    .as_mut()
+                    .is_some_and(|p| p.mark_as_downloading(b, key, PickerOptions::RAREST_FIRST));
+                if !marked
+                    || !self
+                        .peers
+                        .get_mut(&id)
+                        .is_some_and(|c| c.add_request(b, busy_mode, true))
+                {
+                    if let Some(p) = self.picker.as_mut() {
+                        p.abort_download(b, key);
+                    }
+                    ignore_peers.push(id);
+                    peers.remove(idx);
+                    continue;
+                }
+                if !touched.contains(&id) {
+                    touched.push(id);
+                }
+            }
+            {
+                let entry = self.time_critical.get_mut(&piece);
+                if let Some(entry) = entry {
+                    if !busy_mode {
+                        entry.last_requested = Some(now);
+                    }
+                    if entry.first_requested.is_none() {
+                        entry.first_requested = Some(now);
+                    }
+                }
+            }
+            // peers that can't take more critical work leave the set;
+            // the rest bubble down the queue-time order.
+            if !self.peers[&id].can_request_time_critical(self.upload_mode) {
+                peers.remove(idx);
+                continue;
+            }
+            let mut i = idx;
+            while i + 1 < peers.len()
+                && self.peers[&peers[i]].download_queue_time(0, rate, npeers, block_size)
+                    > self.peers[&peers[i + 1]].download_queue_time(0, rate, npeers, block_size)
+            {
+                peers.swap(i, i + 1);
+                i += 1;
+            }
         }
     }
 

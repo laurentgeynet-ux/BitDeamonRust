@@ -1401,11 +1401,15 @@ impl TorrentHandle {
     }
 
     /// `torrent_handle::clear_piece_deadlines` — drop every
-    /// `set_piece_deadline` entry (upstream iterates the map).
-    pub fn clear_piece_deadlines(&self) {
+    /// `set_piece_deadline` entry: flagged pieces post a canceled
+    /// `read_piece_alert` and fall back to `low_priority`
+    /// (`torrent::clear_time_critical`).
+    pub fn clear_piece_deadlines(&self, out: &mut SessionOutVec) {
         let mut s = lock(&self.session);
         if let Some(t) = s.torrents.get_mut(&self.info_hash) {
-            t.time_critical.clear();
+            let mut eff = Vec::new();
+            t.clear_time_critical(&mut eff);
+            out.extend(eff.into_iter().map(crate::session::SessionOut::Torrent));
         }
     }
 
