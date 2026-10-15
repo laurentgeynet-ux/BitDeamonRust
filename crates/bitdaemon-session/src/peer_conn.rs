@@ -690,6 +690,21 @@ impl PeerConn {
         ignore
     }
 
+    /// `peer_connection::get_priority(upload_channel)` — the conn
+    /// leg: max of `priority[UPLOAD]` over the conn's class set,
+    /// base 1. The torrent leg lives on `Torrent::upload_priority`;
+    /// upstream takes the max of both.
+    #[must_use]
+    pub fn upload_priority(&self, pool: &bitdaemon_net::peer_class::PeerClassPool) -> i32 {
+        let mut prio = 1;
+        self.peer_classes.for_each(|c| {
+            if let Some(pc) = pool.at(c) {
+                prio = prio.max(pc.priority[bitdaemon_net::peer_class::UPLOAD]);
+            }
+        });
+        prio
+    }
+
     /// `incoming_have_none` — the peer sent no bitfield (means
     /// empty). Upstream also drops its refcount share
     /// (`peer_lost(m_have_piece)`) and unflags the seed — the caller
@@ -1189,6 +1204,15 @@ impl PeerConn {
                     counters.add(crate::counters::Counter::NumPeersUpInterested, 1);
                 }
                 self.on_interested();
+                // `incoming_interested` tail — upstream re-runs
+                // `maybe_unchoke_this_peer` (or sends a redundant
+                // `Unchoke` when already unchoked), skipped while
+                // disconnecting. Routed to the torrent: the
+                // graceful-pause gate and the choke-state branch
+                // need its state.
+                if !self.disconnecting {
+                    eff.push(PeerEffect::MaybeUnchoke);
+                }
             }
             M::NotInterested => {
                 if self.peer_interested {
@@ -2448,6 +2472,11 @@ pub enum PeerEffect {
     /// runs `choke_peer` (which clears optimistic state and re-runs
     /// the unchoke pick on the next choker pass).
     PeerNotInterested,
+    /// `incoming_interested` tail — `maybe_unchoke_this_peer` on a
+    /// choked conn, or the redundant `Unchoke` re-send upstream emits
+    /// on an already-unchoked one (peers that missed the handshake
+    /// unchoke). The `graceful_pause` gate lives on the torrent.
+    MaybeUnchoke,
     /// `peer_error_alert` — a non-fatal peer protocol complaint
     /// (e.g. `peer_sent_empty_piece`); posted, no disconnect.
     PeerError(&'static str),

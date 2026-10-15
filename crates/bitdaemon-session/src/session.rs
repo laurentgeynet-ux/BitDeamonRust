@@ -509,6 +509,17 @@ pub struct Session {
     /// `m_session_time` — seconds since session start, bumped once
     /// per `tick` (peer_list reconnect backoff epoch).
     pub session_time: i32,
+    /// `m_last_choke` — timestamp of the last
+    /// `recalculate_unchoke_slots`; the rate-based choker measures
+    /// the real interval between rounds (`unchoke_sort` divides
+    /// `uploaded_in_last_round` by it).
+    last_choke: Option<Instant>,
+    /// `m_unchoke_time_scaler = 0` sites that fire mid-recalc —
+    /// `recalculate_optimistic_unchoke_slots` re-arms the regular
+    /// choker when optimistic unchokes push
+    /// `num_peers_up_unchoked_all` past `num_unchoke_slots`
+    /// (upstream `session_impl.cpp:4478`). Consumed by `unchoke_tick`.
+    pending_unchoke: bool,
     /// `m_ip_filter` — access filter applied to new + existing peers.
     /// Shared (`Arc`) so each torrent can hold the same instance —
     /// upstream passes `shared_ptr<ip_filter>` into `torrent::
@@ -1009,6 +1020,8 @@ impl Default for Session {
             next_queue_seq: 0,
             last_disk_reap: None,
             session_time: 0,
+            last_choke: None,
+            pending_unchoke: false,
             ip_filter: std::sync::Arc::new(bitdaemon_net::ip_filter::IpFilter::new()),
             settings: crate::settings::SessionSettings::default(),
             ip_voter: bitdaemon_net::ip_voter::IpVoter::new(),
@@ -4479,15 +4492,20 @@ impl Session {
             t.maybe_send_hash_request(peer, &mut eff);
             // `maybe_unchoke_this_peer` — exempt conns unchoke
             // on the spot; normal ones do when the fixed-slots
-            // choker has free slots (`preemptive_unchoke`).
-            t.maybe_unchoke_this_peer(
-                peer,
-                &self.settings,
-                &self.counters,
-                &self.peer_class_pool,
-                Instant::now(),
-                &mut eff,
-            );
+            // choker has free slots (`preemptive_unchoke`). Upstream
+            // gates the handshake leg on `num_have > 0`
+            // (`bt_peer_connection.cpp` — the `incoming_interested`
+            // re-run carries no such gate).
+            if t.have.count() > 0 {
+                t.maybe_unchoke_this_peer(
+                    peer,
+                    &self.settings,
+                    &self.counters,
+                    &self.peer_class_pool,
+                    Instant::now(),
+                    &mut eff,
+                );
+            }
             self.route(*ih, eff, out);
         }
         self.sync_connected_peers();
@@ -8027,7 +8045,9 @@ impl Session {
             t.triggered_unchoke = false;
             t.triggered_optimistic = false;
         }
-        let run_unchoke = self.session_time % unchoke_every == 0 || trigger_unchoke;
+        let run_unchoke = self.session_time % unchoke_every == 0
+            || trigger_unchoke
+            || std::mem::take(&mut self.pending_unchoke);
         let run_optimistic = self.session_time % opt_every == 0 || trigger_optimistic;
         if !run_unchoke && !run_optimistic {
             return;
@@ -8056,6 +8076,14 @@ impl Session {
     /// `recalculate_unchoke_slots` — eligibility sweep, `unchoke_sort`
     /// once over the whole swarm, then choke/unchoke the tail.
     fn recalculate_unchoke_slots(&mut self, fixed: bool, now: Instant, out: &mut Vec<SessionOut>) {
+        // upstream measures the real interval since the last round
+        // (`now - m_last_choke`) — the rate-based choker divides
+        // `uploaded_in_last_round` by it; a triggered early round
+        // must not pretend a full interval elapsed.
+        let unchoke_interval = self
+            .last_choke
+            .map_or(self.settings.unchoke_interval, |t0| now.duration_since(t0));
+        self.last_choke = Some(now);
         let mut list: Vec<crate::choker::ChokePeer> = Vec::new();
         let mut ih_of: std::collections::HashMap<u64, Sha1Hash> = std::collections::HashMap::new();
         let ihs: Vec<Sha1Hash> = self.torrents.keys().copied().collect();
@@ -8063,12 +8091,17 @@ impl Session {
             let Some(t) = self.torrents.get_mut(&ih) else {
                 continue;
             };
+            let pool = &self.peer_class_pool;
+            let t_ign = t.ignores_unchoke_slots(pool);
+            let t_prio = t.upload_priority(pool);
             let paused = t.is_paused();
             let seeding = t.is_seed();
             let total_size = t.files.as_ref().map_or(0, |f| f.total_size());
             let piece_length = t.piece_length;
             let mut eff = Vec::new();
-            let mut to_choke = Vec::new();
+            // `(id, was_optimistic)` — the optimistic bit is read
+            // before `choke_peer` clears it.
+            let mut to_choke: Vec<(u64, bool)> = Vec::new();
             // peer-list index resolution needs `&t` — do it in an
             // immutable pass before the mutable one below.
             let pi_of: Vec<(u64, Option<usize>)> = t
@@ -8077,19 +8110,23 @@ impl Session {
                 .map(|(id, c)| (*id, c.remote.and_then(|r| t.peer_index(r))))
                 .collect();
             for (id, c) in &mut t.peers {
-                // upstream skips `pi == nullptr`, web seeds and paused
-                // torrents outright; uninterested/disconnecting/
-                // connecting peers get choked if they aren't already.
+                // upstream skips `ignore_unchoke_slots` conns,
+                // `pi == nullptr`, web seeds and paused torrents
+                // outright (round counters reset); uninterested/
+                // disconnecting/connecting peers get choked if they
+                // aren't already.
                 let pi = pi_of.iter().find(|(i, _)| i == id).and_then(|(_, p)| *p);
                 let web_seed = pi.is_some_and(|i| t.peer_list.peers()[i].web_seed);
-                if paused || web_seed || pi.is_none() {
+                if c.ignores_unchoke_slots(pool) || t_ign || paused || web_seed || pi.is_none() {
                     c.stat_up_round = 0;
                     c.stat_down_round = 0;
                     continue;
                 }
                 if !c.peer_interested || c.disconnecting || c.connecting {
                     if !c.choked {
-                        to_choke.push(*id);
+                        let was_opt =
+                            pi.is_some_and(|i| t.peer_list.peers()[i].optimistically_unchoked);
+                        to_choke.push((*id, was_opt));
                     }
                     c.stat_up_round = 0;
                     c.stat_down_round = 0;
@@ -8109,18 +8146,23 @@ impl Session {
                     uploaded_total: c.stat_up_total,
                     total_size,
                     piece_length,
-                    priority: 1,
+                    priority: c.upload_priority(pool).max(t_prio),
                 });
             }
-            for id in to_choke {
-                t.choke_peer(id, &self.counters, &self.peer_class_pool, &mut eff);
+            for (id, was_opt) in to_choke {
+                if t.choke_peer(id, &self.counters, pool, &mut eff) && was_opt {
+                    // upstream zeroes the optimistic scaler when it
+                    // chokes an optimistic peer out of the eligible
+                    // set — the slot refills next tick.
+                    t.triggered_optimistic = true;
+                }
             }
             self.route(ih, eff, out);
         }
 
         let allowed = crate::choker::unchoke_sort(
             &mut list,
-            self.settings.unchoke_interval,
+            unchoke_interval,
             &crate::choker::ChokerSettings {
                 slots_limit: self.settings.unchoke_slots_limit,
                 algorithm: self.settings.choking_algorithm,
@@ -8185,6 +8227,9 @@ impl Session {
                         pi.optimistically_unchoked = false;
                         self.counters
                             .add(crate::counters::Counter::NumPeersUpUnchokedOptimistic, -1);
+                        // upstream `m_optimistic_unchoke_time_scaler = 0`
+                        // — the vacated optimistic slot refills next tick.
+                        t.triggered_optimistic = true;
                     }
                 }
             } else {
@@ -8219,11 +8264,19 @@ impl Session {
         let mut cands: Vec<(u64, Sha1Hash, u16)> = Vec::new();
         let mut prev_opt: Vec<(u64, Sha1Hash)> = Vec::new();
         for (ih, t) in &self.torrents {
-            if t.is_paused() || t.ti.is_none() || !t.free_upload_slots() {
+            if t.is_paused() || t.ti.is_none() || !t.free_upload_slots(&self.peer_class_pool) {
                 continue;
             }
+            let t_ign = t.ignores_unchoke_slots(&self.peer_class_pool);
             for (id, c) in &t.peers {
-                if c.connecting || c.disconnecting || !c.peer_interested {
+                if c.connecting
+                    || c.disconnecting
+                    || !c.peer_interested
+                    // upstream `!p->ignore_unchoke_slots()` — exempt
+                    // conns never take optimistic slots either.
+                    || c.ignores_unchoke_slots(&self.peer_class_pool)
+                    || t_ign
+                {
                     continue;
                 }
                 let Some(i) = c.remote.and_then(|r| t.peer_index(r)) else {
@@ -8302,6 +8355,18 @@ impl Session {
                 }
             }
             self.route(ih, eff, out);
+        }
+        // upstream tail — optimistic unchokes can push the unchoked
+        // total past the slot budget; zero the unchoke scaler so the
+        // regular choker trims the surplus on the next tick.
+        if self
+            .counters
+            .value(crate::counters::Counter::NumUnchokeSlots)
+            < self
+                .counters
+                .value(crate::counters::Counter::NumPeersUpUnchokedAll)
+        {
+            self.pending_unchoke = true;
         }
     }
 
@@ -8527,9 +8592,61 @@ impl Session {
                 TorrentEffect::ChokePeer { peer } => {
                     // `choke_this_peer` — free the upload slot; the
                     // SendTo::Choke it emits re-enters this route.
+                    // Upstream re-arms both scalers: `trigger_unchoke`
+                    // refills the freed slot next tick, and a dropped
+                    // optimistic peer re-arms the optimistic rotation.
                     let mut te = Vec::new();
                     if let Some(t) = self.torrents.get_mut(&ih) {
-                        t.choke_peer(peer, &self.counters, &self.peer_class_pool, &mut te);
+                        let was_opt = t
+                            .peers
+                            .get(&peer)
+                            .and_then(|c| c.remote)
+                            .and_then(|r| t.peer_index(r))
+                            .is_some_and(|i| t.peer_list.peers()[i].optimistically_unchoked);
+                        let slot_consumer = t.peers.get(&peer).is_some_and(|c| {
+                            !c.choked
+                                && !c.ignores_unchoke_slots(&self.peer_class_pool)
+                                && !t.ignores_unchoke_slots(&self.peer_class_pool)
+                        });
+                        if t.choke_peer(peer, &self.counters, &self.peer_class_pool, &mut te) {
+                            if was_opt {
+                                t.triggered_optimistic = true;
+                            }
+                            if slot_consumer {
+                                t.triggered_unchoke = true;
+                            }
+                        }
+                    }
+                    self.route(ih, te, out);
+                }
+                TorrentEffect::MaybeUnchoke { peer } => {
+                    // `incoming_interested` tail — `graceful_pause`
+                    // skips; already-unchoked conns get the redundant
+                    // `Unchoke` re-send upstream emits for clients
+                    // that missed the handshake unchoke.
+                    let mut te = Vec::new();
+                    if let Some(t) = self.torrents.get_mut(&ih)
+                        && !t.graceful_pause
+                    {
+                        match t.peers.get(&peer).map(|c| c.choked) {
+                            Some(true) => {
+                                t.maybe_unchoke_this_peer(
+                                    peer,
+                                    &self.settings,
+                                    &self.counters,
+                                    &self.peer_class_pool,
+                                    Instant::now(),
+                                    &mut te,
+                                );
+                            }
+                            Some(false) => {
+                                te.push(TorrentEffect::SendTo {
+                                    peer,
+                                    msg: PeerMessage::Unchoke,
+                                });
+                            }
+                            None => {}
+                        }
                     }
                     self.route(ih, te, out);
                 }
