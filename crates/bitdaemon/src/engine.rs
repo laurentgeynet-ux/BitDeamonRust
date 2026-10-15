@@ -715,7 +715,12 @@ impl Engine {
             // `settings_pack::max_out_request_queue` default.
             max_out_request_queue: 500,
             last_quota_tick: Instant::now(),
-            last_second_tick: Instant::now(),
+            // upstream `m_last_second_tick(m_created - 900ms)` —
+            // primed so the first heavy `second_tick` fires ~100 ms
+            // after start, not a full second in.
+            last_second_tick: Instant::now()
+                .checked_sub(std::time::Duration::from_millis(900))
+                .unwrap_or_else(Instant::now),
             utp_manager: None,
             utp_connector: None,
             utp_enabled: false,
@@ -982,22 +987,23 @@ impl Engine {
         }
     }
 
-    /// `on_tick` — pump inbound messages, announce completions,
-    /// disconnects, then the session's own `tick` +
-    /// `tracker_announce_due`, and fan every effect out.
-    /// Returns surfaced `Alert`s.
-    pub async fn tick(&mut self, now: Instant) -> Vec<Alert> {
-        let mut out = Vec::new();
-        // effects queued by `dispatch_out` from sync contexts
-        if !self.pending_out.is_empty() {
-            let pending = std::mem::take(&mut self.pending_out);
-            self.dispatch(pending).await;
-        }
-
+    /// one inbound peer message → session.
+    fn drain_inbound(&mut self, out: &mut Vec<SessionOut>) {
         while let Ok(m) = self.inbound_rx.try_recv() {
-            slock(&self.session).on_peer_message(&m.packet, m.wire_bytes, &mut out);
+            slock(&self.session).on_peer_message(&m.packet, m.wire_bytes, out);
         }
-        while let Ok((ih, peer, gone)) = self.gone_rx.try_recv() {
+    }
+
+    /// peer death events → `peer_disconnected`. `first` is the item
+    /// a `select!` arm already consumed; `None` when called as a
+    /// tick sweep.
+    fn drain_gone(
+        &mut self,
+        first: Option<(Sha1Hash, u64, Option<bitdaemon_net::bt_peer_conn::PeerGone>)>,
+        out: &mut Vec<SessionOut>,
+    ) {
+        let mut first = first;
+        while let Some((ih, peer, gone)) = first.take().or_else(|| self.gone_rx.try_recv().ok()) {
             self.writers.remove(&(ih, peer));
             // `peer_disconnected` applies the upstream severity
             // semantics — transport deaths classify by io kind,
@@ -1005,12 +1011,23 @@ impl Engine {
             // initiated `DisconnectPeer` already ran through it when
             // the effect routed, so this second pass is a no-op
             // (`had == false`, no duplicate alert).
-            slock(&self.session).peer_disconnected(&ih, peer, gone, &mut out);
+            slock(&self.session).peer_disconnected(&ih, peer, gone, out);
         }
+    }
+
+    /// `on_sent` events → send-buffer re-fill.
+    fn drain_sent(&mut self, out: &mut Vec<SessionOut>) {
         while let Ok((ih, peer, bytes, payload)) = self.sent_rx.try_recv() {
-            slock(&self.session).on_peer_sent(&ih, peer, bytes, payload, &mut out);
+            slock(&self.session).on_peer_sent(&ih, peer, bytes, payload, out);
         }
-        while let Ok(a) = self.announce_rx.try_recv() {
+    }
+
+    /// announce/scrape completions → session response handlers +
+    /// `m_queued` dequeue (`remove_request`). `first` = the item a
+    /// `select!` arm already consumed.
+    fn drain_announces(&mut self, first: Option<AnnounceDone>, out: &mut Vec<SessionOut>) {
+        let mut first = first;
+        while let Some(a) = first.take().or_else(|| self.announce_rx.try_recv().ok()) {
             if a.scrape {
                 slock(&self.session).on_scrape_response(&a.ih, &a.url, a.v, a.result);
             } else {
@@ -1020,7 +1037,7 @@ impl Engine {
                     a.v,
                     a.result,
                     a.source_ip,
-                    &mut out,
+                    out,
                 );
             }
             if a.http {
@@ -1037,7 +1054,15 @@ impl Engine {
                 }
             }
         }
-        while let Ok((from, buf)) = self.udp_rx.try_recv() {
+    }
+
+    /// datagram demux → UDP trackers / NAT-PMP / uTP / SSDP / DHT+LSD
+    /// (`session.on_udp`). Upstream runs this in the socket's read
+    /// handler — `run` calls it on every datagram, `tick` sweeps the
+    /// rest.
+    fn drain_udp(&mut self, first: Option<(SocketAddr, Vec<u8>)>, out: &mut Vec<SessionOut>) {
+        let mut first = first;
+        while let Some((from, buf)) = first.take().or_else(|| self.udp_rx.try_recv().ok()) {
             // demux: NAT-PMP replies come from the gateway :5351 —
             // upstream binds a separate socket; injected transports
             // multiplex on one, so dispatch by sender.
@@ -1078,17 +1103,29 @@ impl Engine {
                 }
             } else {
                 trace!(%from, len = buf.len(), "udp recv -> session");
-                slock(&self.session).on_udp(from, &buf, &mut out);
+                slock(&self.session).on_udp(from, &buf, out);
             }
         }
-        while let Ok(d) = self.connect_rx.try_recv() {
+    }
+
+    /// dial/accept completions → attach or dial-failure bookkeeping.
+    /// `first` = the item a `select!` arm already consumed.
+    fn drain_connects(&mut self, first: Option<DialDone>) {
+        let mut first = first;
+        while let Some(d) = first.take().or_else(|| self.connect_rx.try_recv().ok()) {
             self.on_dial_done(d);
         }
-        while let Ok(w) = self.webseed_rx.try_recv() {
+    }
+
+    /// web-seed fetch completions → `on_web_seed_block`/`_error`/
+    /// `_done`.
+    fn drain_webseeds(&mut self, first: Option<WebSeedDone>, out: &mut Vec<SessionOut>) {
+        let mut first = first;
+        while let Some(w) = first.take().or_else(|| self.webseed_rx.try_recv().ok()) {
             match w.result {
                 Ok(blocks) => {
                     for (req, data) in blocks {
-                        slock(&self.session).on_web_seed_block(&w.ih, &w.url, req, data, &mut out);
+                        slock(&self.session).on_web_seed_block(&w.ih, &w.url, req, data, out);
                     }
                 }
                 Err(f) => {
@@ -1100,6 +1137,11 @@ impl Engine {
             // in the keep-alive verdict.
             slock(&self.session).on_web_seed_done(&w.ih, &w.url, w.saw_close);
         }
+    }
+
+    /// `.torrent` `nodes` resolutions → `dht_add_router`; UPnP SOAP
+    /// replies + fetched device descriptions → their handlers.
+    fn drain_discovery(&mut self) {
         while let Ok(a) = self.dhtnode_rx.try_recv() {
             // upstream resolves `dht_bootstrap_nodes` through the
             // *router* path (`m_dht_router_nodes`) — they seed the
@@ -1114,6 +1156,29 @@ impl Engine {
             let port = slock(&self.session).listen_port;
             self.portmap_add_device(dev, port, "bitdaemon".to_string());
         }
+    }
+
+    /// `on_tick` — pump inbound messages, announce completions,
+    /// disconnects, then the session's own `tick` +
+    /// `tracker_announce_due`, and fan every effect out.
+    /// Alerts stay queued for `pop_alerts`/`wait_for_alert` — this
+    /// never drains the alert queue.
+    pub async fn tick(&mut self, now: Instant) {
+        let mut out = Vec::new();
+        // effects queued by `dispatch_out` from sync contexts
+        if !self.pending_out.is_empty() {
+            let pending = std::mem::take(&mut self.pending_out);
+            self.dispatch(pending).await;
+        }
+
+        self.drain_inbound(&mut out);
+        self.drain_gone(None, &mut out);
+        self.drain_sent(&mut out);
+        self.drain_announces(None, &mut out);
+        self.drain_udp(None, &mut out);
+        self.drain_connects(None);
+        self.drain_webseeds(None, &mut out);
+        self.drain_discovery();
 
         // `session_impl::update_quotas` — distribute quota to queued
         // bandwidth requests with the elapsed time (upstream runs it
@@ -1153,7 +1218,6 @@ impl Engine {
         }
         self.natpmp_renew().await;
         self.upnp_ssdp_tick(now).await;
-        slock(&self.session).pop_alerts()
     }
 
     /// `ToPeer`-only fan-out for sync call sites (connect paths —
@@ -4221,91 +4285,102 @@ impl Engine {
                 // `torrent_list` indexes every torrent under its v1
                 // hash, its truncated v2 hash, and both `req2`
                 // obfuscated keys.
-                let (pe, hs_timeout) = {
-                    let ses = slock(&session);
-                    (ses.pe_settings, ses.settings.handshake_timeout)
-                };
-                // `peer_connection_args` — every accepted conn gets
-                // its own generated peer-id upstream (`generate_peer_id`
-                // in `incoming_connection`); it drives the pid-dedup
-                // ordering in `read_peer_id`.
-                let our_pid = bitdaemon_common::peer_id::generate_peer_id(&fp);
-                let ses_known = session.clone();
-                let ses_skey = session.clone();
-                let mut st = bitdaemon_net::bt_peer_conn::HandshakeState::default();
-                // upstream bounds the accept-side handshake by
-                // `settings_pack::handshake_timeout` — a silent peer
-                // must not wedge the accept loop for everyone else.
-                let hs = tokio::time::timeout(
-                    hs_timeout,
-                    bitdaemon_net::bt_peer_conn::run_handshake_responder_auto(
-                        &mut s,
-                        &our_pid,
-                        dht,
-                        true,
-                        move |ih| slock(&ses_known).known_torrent(ih),
-                        pe.in_enc_policy,
-                        move |sk| slock(&ses_skey).known_torrent_by_skey(sk),
-                        |provide| crypto_select(provide, pe),
-                        &mut st,
-                    ),
-                )
-                .await
-                .unwrap_or(Err(
-                    bitdaemon_net::bt_peer_conn::PeerConnError::Protocol("handshake timeout"),
-                ));
-                match hs {
-                    Ok((hs, rc4)) => {
-                        // `st.torrent` is set on any success — its
-                        // `ih` is the *canonical* map key (a v2 wire
-                        // hash on a hybrid torrent attaches to the
-                        // v1-keyed entry).
-                        let kt = st
-                            .torrent
-                            .unwrap_or(bitdaemon_net::bt_peer_conn::KnownTorrent {
-                                ih: hs.info_hash,
-                                wire_ih: hs.info_hash,
-                                protocol_v2: false,
-                                has_v2: false,
-                                v2_ih: None,
-                                valid_metadata: false,
+                //
+                // The handshake runs on its own task — upstream's
+                // `on_accept` builds a `peer_connection` that drives
+                // its own async read, so a silent peer can only eat
+                // `handshake_timeout`, never block the accepts queued
+                // behind it.
+                let ses_hs = session.clone();
+                let tx_hs = tx.clone();
+                let fp_hs = fp.clone();
+                tokio::spawn(async move {
+                    let (pe, hs_timeout) = {
+                        let ses = slock(&ses_hs);
+                        (ses.pe_settings, ses.settings.handshake_timeout)
+                    };
+                    // `peer_connection_args` — every accepted conn gets
+                    // its own generated peer-id upstream (`generate_peer_id`
+                    // in `incoming_connection`); it drives the pid-dedup
+                    // ordering in `read_peer_id`.
+                    let our_pid = bitdaemon_common::peer_id::generate_peer_id(&fp_hs);
+                    let ses_known = ses_hs.clone();
+                    let ses_skey = ses_hs.clone();
+                    let mut st = bitdaemon_net::bt_peer_conn::HandshakeState::default();
+                    // upstream bounds the accept-side handshake by
+                    // `settings_pack::handshake_timeout` — a silent peer
+                    // must not wedge the accept loop for everyone else.
+                    let hs = tokio::time::timeout(
+                        hs_timeout,
+                        bitdaemon_net::bt_peer_conn::run_handshake_responder_auto(
+                            &mut s,
+                            &our_pid,
+                            dht,
+                            true,
+                            move |ih| slock(&ses_known).known_torrent(ih),
+                            pe.in_enc_policy,
+                            move |sk| slock(&ses_skey).known_torrent_by_skey(sk),
+                            |provide| crypto_select(provide, pe),
+                            &mut st,
+                        ),
+                    )
+                    .await
+                    .unwrap_or(Err(
+                        bitdaemon_net::bt_peer_conn::PeerConnError::Protocol("handshake timeout"),
+                    ));
+                    match hs {
+                        Ok((hs, rc4)) => {
+                            // `st.torrent` is set on any success — its
+                            // `ih` is the *canonical* map key (a v2 wire
+                            // hash on a hybrid torrent attaches to the
+                            // v1-keyed entry).
+                            let kt =
+                                st.torrent
+                                    .unwrap_or(bitdaemon_net::bt_peer_conn::KnownTorrent {
+                                        ih: hs.info_hash,
+                                        wire_ih: hs.info_hash,
+                                        protocol_v2: false,
+                                        has_v2: false,
+                                        v2_ih: None,
+                                        valid_metadata: false,
+                                    });
+                            let _ = tx_hs.send(DialDone {
+                                ih: kt.ih,
+                                // the accepted source endpoint — needed for
+                                // ut_pex advertising and alert accuracy
+                                remote,
+                                stream: Ok(s),
+                                outbound: false,
+                                fast: hs.supports_fast(),
+                                dht: hs.supports_dht(),
+                                encrypted: st.encrypted,
+                                proto_v2: kt.protocol_v2,
+                                pid: Some(hs.peer_id),
+                                rc4,
+                                exceeded,
+                                kind,
+                                our_pid: Some(our_pid),
+                                conn_fast_reconnect: false,
+                                local,
+                                sni_ih: None,
                             });
-                        let _ = tx.send(DialDone {
-                            ih: kt.ih,
-                            // the accepted source endpoint — needed for
-                            // ut_pex advertising and alert accuracy
-                            remote,
-                            stream: Ok(s),
-                            outbound: false,
-                            fast: hs.supports_fast(),
-                            dht: hs.supports_dht(),
-                            encrypted: st.encrypted,
-                            proto_v2: kt.protocol_v2,
-                            pid: Some(hs.peer_id),
-                            rc4,
-                            exceeded,
-                            kind,
-                            our_pid: Some(our_pid),
-                            conn_fast_reconnect: false,
-                            local,
-                            sni_ih: None,
-                        });
+                        }
+                        Err(e) => {
+                            warn!(err = %e, "inbound handshake failed");
+                            // upstream `disconnect()` runs its counter
+                            // block + alert on any failed conn, attached
+                            // or not — severity/op come from the error's
+                            // `disconnect(errors::…)` site.
+                            let fail = e.dial_fail(false, &st, matches!(kind, 3 | 9));
+                            let ih = st.torrent.map(|k| k.ih);
+                            slock(&ses_hs).peer_conn_failed_inbound(
+                                ih,
+                                remote.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
+                                &fail,
+                            );
+                        }
                     }
-                    Err(e) => {
-                        warn!(err = %e, "inbound handshake failed");
-                        // upstream `disconnect()` runs its counter
-                        // block + alert on any failed conn, attached
-                        // or not — severity/op come from the error's
-                        // `disconnect(errors::…)` site.
-                        let fail = e.dial_fail(false, &st, matches!(kind, 3 | 9));
-                        let ih = st.torrent.map(|k| k.ih);
-                        slock(&session).peer_conn_failed_inbound(
-                            ih,
-                            remote.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0))),
-                            &fail,
-                        );
-                    }
-                }
+                });
             }
         });
         self.tasks.push(h);
@@ -4392,80 +4467,115 @@ impl Engine {
                         continue;
                     }
                 };
-                let (tls, sni) = match bitdaemon_net::ssl_stream::ssl_accept_torrent(
-                    s0,
-                    remote,
-                    ssl_resolver.clone(),
-                    ssl_roots.clone(),
-                )
-                .await
-                {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        warn!(err = %e, "ssl handshake failed");
-                        // `session_impl::ssl_handshake` error leg —
-                        // `peer_error_alert` op `ssl_handshake`
-                        // (empty torrent handle — the ih isn't known
-                        // until the bt handshake).
-                        slock(&session).alerts.post(Alert::PeerError {
-                            ih: Sha1Hash::default(),
-                            remote: remote.to_string(),
-                            op: "ssl_handshake".into(),
-                            error: e.to_string(),
-                        });
-                        slock(&session)
-                            .counters
-                            .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
-                        continue;
+                // per-conn handshake task — same rationale as the
+                // plain acceptor: a silent TLS/BBT peer must not
+                // head-of-line block the accept loop (upstream's
+                // `peer_connection` self-drives).
+                let session_hs = session.clone();
+                let tx_hs = tx.clone();
+                let resolver_hs = ssl_resolver.clone();
+                let roots_hs = ssl_roots.clone();
+                let fp_hs = fp.clone();
+                tokio::spawn(async move {
+                    let hs_timeout = slock(&session_hs).settings.handshake_timeout;
+                    let tls = match tokio::time::timeout(
+                        hs_timeout,
+                        bitdaemon_net::ssl_stream::ssl_accept_torrent(
+                            s0,
+                            remote,
+                            resolver_hs,
+                            roots_hs,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(pair)) => pair,
+                        Ok(Err(e)) => {
+                            warn!(err = %e, "ssl handshake failed");
+                            // `session_impl::ssl_handshake` error leg —
+                            // `peer_error_alert` op `ssl_handshake`
+                            // (empty torrent handle — the ih isn't known
+                            // until the bt handshake).
+                            slock(&session_hs).alerts.post(Alert::PeerError {
+                                ih: Sha1Hash::default(),
+                                remote: remote.to_string(),
+                                op: "ssl_handshake".into(),
+                                error: e.to_string(),
+                            });
+                            slock(&session_hs)
+                                .counters
+                                .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+                            return;
+                        }
+                        Err(_) => {
+                            // `handshake_timeout` on the TLS leg —
+                            // upstream's on_tick drops torrent-less
+                            // conns past it.
+                            warn!("ssl handshake timeout");
+                            slock(&session_hs)
+                                .counters
+                                .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+                            return;
+                        }
+                    };
+                    let (tls, sni) = tls;
+                    // the SNI carries the hex info-hash — kept on the
+                    // conn for the `has_context` attach leg (a conn
+                    // TLS-pinned to a different torrent is refused
+                    // `invalid_ssl_cert` upstream).
+                    let sni_ih = Sha1Hash::from_hex(sni.as_bytes()).ok();
+                    let mut s = Box::new(tls) as bitdaemon_net::transport::BoxedPeerStream;
+                    // per-conn peer-id (`generate_peer_id`) for the
+                    // responder handshake — same as the plain acceptor.
+                    let our_pid = bitdaemon_common::peer_id::generate_peer_id(&fp_hs);
+                    let ses_known = session_hs.clone();
+                    let hs = tokio::time::timeout(
+                        hs_timeout,
+                        bitdaemon_net::bt_peer_conn::run_handshake_responder(
+                            &mut s,
+                            &our_pid,
+                            dht,
+                            true,
+                            move |ih| slock(&ses_known).known_torrent(ih),
+                        ),
+                    )
+                    .await;
+                    match hs {
+                        Ok(Ok((hs, kt))) => {
+                            let _ = tx_hs.send(DialDone {
+                                ih: kt.ih,
+                                remote: Some(remote),
+                                stream: Ok(s),
+                                outbound: false,
+                                fast: hs.supports_fast(),
+                                dht: hs.supports_dht(),
+                                // upstream: SSL sockets never run MSE.
+                                encrypted: false,
+                                proto_v2: kt.protocol_v2,
+                                pid: Some(hs.peer_id),
+                                rc4: None,
+                                exceeded,
+                                kind,
+                                our_pid: Some(our_pid),
+                                conn_fast_reconnect: false,
+                                local,
+                                sni_ih,
+                            });
+                        }
+                        Ok(Err(e)) => {
+                            warn!(err = %e, "inbound ssl handshake failed");
+                            slock(&session_hs)
+                                .counters
+                                .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+                        }
+                        Err(_) => {
+                            warn!("inbound ssl bittorrent handshake timeout");
+                            slock(&session_hs)
+                                .counters
+                                .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
+                        }
                     }
-                };
-                // the SNI carries the hex info-hash — kept on the
-                // conn for the `has_context` attach leg (a conn
-                // TLS-pinned to a different torrent is refused
-                // `invalid_ssl_cert` upstream).
-                let sni_ih = Sha1Hash::from_hex(sni.as_bytes()).ok();
-                let mut s = Box::new(tls) as bitdaemon_net::transport::BoxedPeerStream;
-                // per-conn peer-id (`generate_peer_id`) for the
-                // responder handshake — same as the plain acceptor.
-                let our_pid = bitdaemon_common::peer_id::generate_peer_id(&fp);
-                let ses_known = session.clone();
-                let hs = bitdaemon_net::bt_peer_conn::run_handshake_responder(
-                    &mut s,
-                    &our_pid,
-                    dht,
-                    true,
-                    move |ih| slock(&ses_known).known_torrent(ih),
-                )
-                .await;
-                match hs {
-                    Ok((hs, kt)) => {
-                        let _ = tx.send(DialDone {
-                            ih: kt.ih,
-                            remote: Some(remote),
-                            stream: Ok(s),
-                            outbound: false,
-                            fast: hs.supports_fast(),
-                            dht: hs.supports_dht(),
-                            // upstream: SSL sockets never run MSE.
-                            encrypted: false,
-                            proto_v2: kt.protocol_v2,
-                            pid: Some(hs.peer_id),
-                            rc4: None,
-                            exceeded,
-                            kind,
-                            our_pid: Some(our_pid),
-                            conn_fast_reconnect: false,
-                            local,
-                            sni_ih,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(err = %e, "inbound ssl handshake failed");
-                        slock(&session)
-                            .counters
-                            .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
-                    }
-                }
+                });
             }
         });
         self.tasks.push(h);
@@ -4630,6 +4740,71 @@ impl Engine {
                         }
                     }
                     self.dispatch(out).await;
+                    continue;
+                }
+                first = self.gone_rx.recv() => {
+                    // socket EOF/error handlers run straight off the
+                    // io_context upstream — a dead peer's block refund
+                    // and counter/alert teardown can't wait for the
+                    // next tick. The consumed `first` rides into the
+                    // drain — a bare `recv()` pattern would drop it.
+                    let mut out = Vec::new();
+                    self.drain_gone(first, &mut out);
+                    self.dispatch(out).await;
+                    continue;
+                }
+                first = self.connect_rx.recv() => {
+                    // `on_connection_attempt`/accept attach — the
+                    // handshake finished; delay here directly stalls
+                    // the peer pipeline (bitfield, first requests).
+                    self.drain_connects(first);
+                    continue;
+                }
+                first = self.udp_rx.recv() => {
+                    // `udp_socket::on_read` — DHT, tracker and LSD
+                    // replies are handled at receive upstream; the
+                    // demux is the same as the tick sweep.
+                    let mut out = Vec::new();
+                    self.drain_udp(first, &mut out);
+                    self.dispatch(out).await;
+                    continue;
+                }
+                first = self.announce_rx.recv() => {
+                    // `tracker_manager` completion handler — upstream
+                    // applies replies on the io_context as they land.
+                    let mut out = Vec::new();
+                    self.drain_announces(first, &mut out);
+                    self.dispatch(out).await;
+                    continue;
+                }
+                first = self.webseed_rx.recv() => {
+                    // `web_peer_connection` completions — each batch
+                    // frees the seed slot for the next fetch.
+                    let mut out = Vec::new();
+                    self.drain_webseeds(first, &mut out);
+                    self.dispatch(out).await;
+                    continue;
+                }
+                a = self.dhtnode_rx.recv() => {
+                    if let Some(a) = a {
+                        slock(&self.session).dht_add_router(a);
+                    }
+                    self.drain_discovery();
+                    continue;
+                }
+                r = self.upnp_rx.recv() => {
+                    if let Some(r) = r {
+                        self.on_upnp_reply(r);
+                    }
+                    self.drain_discovery();
+                    continue;
+                }
+                dev = self.upnp_dev_rx.recv() => {
+                    if let Some(dev) = dev {
+                        let port = slock(&self.session).listen_port;
+                        self.portmap_add_device(dev, port, "bitdaemon".to_string());
+                    }
+                    self.drain_discovery();
                     continue;
                 }
                 _ = &mut stop => break,

@@ -233,3 +233,52 @@ io_context) — baseline `e7381c7bc`.
   tout le modèle de pacing du port (dht/lsd budget ms) — cohérent
   avec les choix d'architecture, précision ≤500 ms sur l'heure
   d'annonce effective.
+
+## Résultat
+
+Appliqué sur la branche `audit/27-engine-glue`, commit
+`4ab62e2` (`fix(bitdaemon): engine-glue parity — alert retention,
+off-tick completions, acceptor HoL`), rebasé sur `main`.
+
+### Déviations corrigées
+
+- **Alertes perdues** : `Engine::tick` ne termine plus par
+  `pop_alerts()` — la queue reste disponible pour
+  `SessionHandle::pop_alerts`/`wait_for_alert` (signature
+  `tick() -> ()`).
+- **Latence tick-only** : bras `select!` dédiés dans `run()` pour
+  `gone`, `connect`, `udp`, `announce`, `web-seed` et la découverte
+  (dht-node/UPnP) — chaque complétion est appliquée immédiatement
+  comme sur l'io_context upstream, puis les drains communs finissent
+  la file (FIFO conservé ; l'item consommé par le `select!` est passé
+  en `first` au drain).
+- **Head-of-line acceptor** : handshake responder spawné par
+  connexion sur l'accepteur plain **et** SSL (ce dernier gagne aussi
+  le `handshake_timeout` qui manquait). `NumPeersHalfOpen`, verdict
+  `exceeded`, sélection MSE/PE, lookup skey, routage `DialDone` et
+  classification `peer_conn_failed_inbound` préservés ; la boucle
+  d'accept survit aux timeouts/échecs.
+- **`add_torrent_params` drop `out`** : les effets sont versés dans
+  `Session::pending_out` (`DhtAddNode` des `nodes` du .torrent
+  notamment).
+- **`last_second_tick` non primé** : `now − 900ms` via
+  `checked_sub` (`m_last_second_tick(m_created − 900ms)`).
+
+### Tests de régression ajoutés
+
+`crates/bitdaemon/tests/test_engine_glue.rs` :
+
+- `run_leaves_alerts_queued` — une alerte émise sous `run()` reste
+  consommable par le handle ;
+- `dial_completion_attaches_off_tick` — un `DialDone` attaché sans
+  attendre `tick_interval` ;
+- `acceptor_handshakes_dont_head_of_line` — un pair muet n'empêche
+  pas l'accept/handshake d'un second ;
+- `add_torrent_params_routes_effects` — les `SessionOut` de l'atp
+  atterrissent dans `pending_out`.
+
+### Gates
+
+`cargo fmt --all`, `cargo clippy --workspace --all-targets --
+-D warnings`, `cargo test --workspace`, `cargo doc --workspace
+--no-deps` : tous verts.
