@@ -266,4 +266,4 @@ Appliqué sur `audit/24-proxies` (worktree `C:/Projet/wt/LibtorrentRust-a24`).
 `cargo test --workspace` (115 suites, 0 échec), `cargo doc --workspace
 --no-deps` — tous verts.
 
-Commit : _à compléter au merge_.
+Commit : `6329d0a` (`audit/24-proxies`, rebasée sur `main` `3e73574`).
