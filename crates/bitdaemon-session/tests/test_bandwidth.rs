@@ -224,3 +224,138 @@ fn overhead_drains_channels_and_alerts() {
             > 0
     );
 }
+
+#[test]
+fn web_seed_request_queues_grants_and_registers() {
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let mut st = s.settings.clone();
+    st.download_rate_limit = 1000;
+    s.apply_settings(st);
+    let ih = s.add_torrent(t);
+
+    // `web_peer_connection::request_bandwidth` — upstream the seed
+    // conn sits in `m_connections` and pulls `download_channel`
+    // quota through the same manager; ours passes a standalone
+    // handle plus the dial's resolved address (public IP →
+    // global|tcp classes, both throttled by `download_rate_limit`).
+    let bw = bitdaemon_session::peer_conn::PeerQuota::new();
+    let ip = addr(443).ip();
+    assert_eq!(
+        s.request_bandwidth_web(&ih, Some(ip), &bw, DOWNLOAD_CHANNEL, 1),
+        Some(0)
+    );
+    assert_ne!(
+        bw.channel_state[DOWNLOAD_CHANNEL].load(Relaxed) & BandwidthState::LIMIT.0,
+        0
+    );
+    assert_eq!(s.download_rate.queue_size(), 1);
+
+    // the handle registered itself for the per-tick overhead drain
+    assert_eq!(s.torrents.get(&ih).unwrap().web_seed_bw.len(), 1);
+    // a second request on the same handle does not duplicate it
+    let _ = s.request_bandwidth_web(&ih, Some(ip), &bw, UPLOAD_CHANNEL, 1);
+    assert_eq!(s.torrents.get(&ih).unwrap().web_seed_bw.len(), 1);
+
+    s.update_quotas(1000);
+    assert!(bw.quota[DOWNLOAD_CHANNEL].load(Relaxed) > 0);
+    assert_eq!(
+        bw.channel_state[DOWNLOAD_CHANNEL].load(Relaxed) & BandwidthState::LIMIT.0,
+        0
+    );
+    assert_eq!(s.download_rate.queue_size(), 0);
+}
+
+#[test]
+fn web_seed_overhead_drains_and_alerts() {
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    // same shape as `overhead_drains_channels_and_alerts` — the
+    // web-seed leg drains through `use_quota_overhead` on both the
+    // conn-side class mask and the torrent's class set.
+    let mut st = s.settings.clone();
+    st.download_rate_limit = 30;
+    st.rate_limit_ip_overhead = true;
+    st.alert_mask = bitdaemon_session::alerts::AlertCategory(
+        bitdaemon_session::alerts::AlertCategory::ERROR.0
+            | bitdaemon_session::alerts::AlertCategory::PERFORMANCE.0,
+    );
+    s.apply_settings(st);
+    let ih = s.add_torrent(t);
+
+    let bw = bitdaemon_session::peer_conn::PeerQuota::new();
+    let ip = addr(443).ip();
+    let _ = s.request_bandwidth_web(&ih, Some(ip), &bw, DOWNLOAD_CHANNEL, 1);
+    let oh = bitdaemon_session::peer_conn::PeerConn::ip_overhead_bytes(1460, false);
+    bw.ip_overhead[DOWNLOAD_CHANNEL].fetch_add(oh, Relaxed);
+
+    s.torrents.get_mut(&ih).unwrap().now_ms = 1000;
+    let mut eff = Vec::new();
+    s.torrents.get_mut(&ih).unwrap().check_request_timeouts(
+        &s.settings,
+        1,
+        &s.counters,
+        &s.peer_class_pool,
+        s.alerts.mask(),
+        &mut eff,
+    );
+    assert!(
+        eff.iter().any(|e| matches!(
+            e,
+            bitdaemon_session::torrent::TorrentEffect::Alert(Alert::Performance {
+                warning,
+            }) if warning == "download_limit_too_low"
+        )),
+        "expected download_limit_too_low alert, got: {eff:?}"
+    );
+    assert!(
+        s.counters
+            .value(bitdaemon_session::counters::Counter::RecvIpOverheadBytes)
+            > 0
+    );
+}
+
+#[test]
+fn web_seed_disconnect_drops_queued_request() {
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let mut st = s.settings.clone();
+    st.download_rate_limit = 100;
+    s.apply_settings(st);
+    let ih = s.add_torrent(t);
+
+    let bw = bitdaemon_session::peer_conn::PeerQuota::new();
+    let ip = addr(443).ip();
+    assert_eq!(
+        s.request_bandwidth_web(&ih, Some(ip), &bw, DOWNLOAD_CHANNEL, 4096),
+        Some(0)
+    );
+    assert_eq!(s.download_rate.queue_size(), 1);
+
+    // fetch task torn down — `peer_connection::disconnect` marks the
+    // handle; the next distribution pass drops the request and
+    // returns its assigned quota instead of stranding it.
+    bw.disconnecting.store(true, Relaxed);
+    s.update_quotas(1000);
+    assert_eq!(s.download_rate.queue_size(), 0);
+    // and a dead handle refuses new requests (orphan → `None`)
+    assert_eq!(
+        s.request_bandwidth_web(&ih, Some(ip), &bw, DOWNLOAD_CHANNEL, 1),
+        None
+    );
+    // the torrent's registry drops the dead entry on the next tick
+    s.torrents.get_mut(&ih).unwrap().now_ms = 1000;
+    let mut eff = Vec::new();
+    s.torrents.get_mut(&ih).unwrap().check_request_timeouts(
+        &s.settings,
+        1,
+        &s.counters,
+        &s.peer_class_pool,
+        s.alerts.mask(),
+        &mut eff,
+    );
+    assert!(s.torrents.get(&ih).unwrap().web_seed_bw.is_empty());
+}

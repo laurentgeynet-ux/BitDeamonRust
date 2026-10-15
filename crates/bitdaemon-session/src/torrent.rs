@@ -689,6 +689,13 @@ pub struct Torrent {
     /// attaches; `ignore_unchoke_slots()` and the connection-limit
     /// factor scan it alongside the conn's set.
     pub peer_classes: bitdaemon_net::peer_class::PeerClassSet,
+    /// live web-seed fetch quota handles — `web_peer_connection`s
+    /// are `peer_connection`s upstream, so their class channels get
+    /// the per-tick `use_quota_overhead` drain; here the fetch task
+    /// owns the `PeerQuota` and the torrent keeps a `Weak` + the
+    /// conn-side class mask (resolved per dial by
+    /// `request_bandwidth_web`).
+    pub web_seed_bw: Vec<(std::sync::Weak<crate::peer_conn::PeerQuota>, u32)>,
     /// `m_need_save_resume_data` — dirty bitmask set by state
     /// changes (verified piece, priorities, metadata, check
     /// verdict); each site records the `resume_data_flags_t`
@@ -1133,6 +1140,7 @@ impl Torrent {
             error_file: crate::status::ERROR_FILE_NONE,
             peer_class: 0,
             peer_classes: bitdaemon_net::peer_class::PeerClassSet::default(),
+            web_seed_bw: Vec::new(),
             need_save_resume: bitdaemon_common::flags::ResumeDataFlags::NONE,
             last_saved_resume: None,
             queue_seq: 0,
@@ -8638,6 +8646,15 @@ impl Torrent {
             pool.decref(self.peer_class);
             self.peer_class = 0;
         }
+        // torrent teardown — mark live web-seed quota handles so a
+        // queued `bw_request` drops on the next `update_quotas` pass
+        // (upstream the conn's `m_disconnecting` does this).
+        for (w, _) in self.web_seed_bw.drain(..) {
+            if let Some(bw) = w.upgrade() {
+                bw.disconnecting
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     /// `torrent::set_max_uploads` — `limit <= 0` normalizes to the
@@ -9784,6 +9801,68 @@ impl Torrent {
                     msg: PeerMessage::Request(req),
                 });
             }
+        }
+        // `peer_connection::second_tick` for web-seed fetch handles —
+        // upstream `web_peer_connection` sits in `m_connections`, so
+        // its IP-overhead drains into its class channels and the
+        // torrent's like any peer. Dead entries (fetch task gone)
+        // drop out here.
+        if !self.web_seed_bw.is_empty() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut keep = Vec::with_capacity(self.web_seed_bw.len());
+            for (w, mask) in std::mem::take(&mut self.web_seed_bw) {
+                let Some(bw) = w.upgrade() else { continue };
+                // `m_connections` erases the conn at `disconnect` —
+                // a torn-down fetch stops draining immediately (its
+                // queued request may still hold the `Arc`; the
+                // manager returns that quota independently).
+                if bw.disconnecting.load(Relaxed) {
+                    continue;
+                }
+                let amount_down =
+                    bw.ip_overhead[crate::peer_conn::DOWNLOAD_CHANNEL].swap(0, Relaxed);
+                let amount_up = bw.ip_overhead[crate::peer_conn::UPLOAD_CHANNEL].swap(0, Relaxed);
+                if amount_down != 0 || amount_up != 0 {
+                    self.ip_overhead_downloaded += amount_down;
+                    self.ip_overhead_uploaded += amount_up;
+                    tick_oh_down += amount_down;
+                    tick_oh_up += amount_up;
+                    counters.add(crate::counters::Counter::RecvIpOverheadBytes, amount_down);
+                    counters.add(crate::counters::Counter::SentIpOverheadBytes, amount_up);
+                }
+                let mut warning = 0u8;
+                if rate_limit_overhead && (amount_down != 0 || amount_up != 0) {
+                    warning |= crate::session::Session::quota_overhead_mask(
+                        pool,
+                        mask,
+                        amount_down,
+                        amount_up,
+                    );
+                    warning |= crate::session::Session::quota_overhead(
+                        pool,
+                        &self.peer_classes,
+                        amount_down,
+                        amount_up,
+                    );
+                }
+                if warning != 0 && (alert_mask.0 & crate::alerts::AlertCategory::PERFORMANCE.0) != 0
+                {
+                    for channel in 0..2 {
+                        if (warning >> channel) & 1 == 0 {
+                            continue;
+                        }
+                        out.push(TorrentEffect::Alert(crate::alerts::Alert::Performance {
+                            warning: if channel == crate::peer_conn::DOWNLOAD_CHANNEL {
+                                "download_limit_too_low".into()
+                            } else {
+                                "upload_limit_too_low".into()
+                            },
+                        }));
+                    }
+                }
+                keep.push((w, mask));
+            }
+            self.web_seed_bw = keep;
         }
         // `torrent::second_tick` — the *torrent-level* overhead check
         // (distinct from the per-conn class debit above): this tick's

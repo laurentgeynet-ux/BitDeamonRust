@@ -6843,6 +6843,147 @@ impl Session {
         Some(ret)
     }
 
+    /// `peer_connection::request_bandwidth` for a web-seed fetch —
+    /// upstream `web_peer_connection` is a `peer_connection` and pulls
+    /// `download_channel`/`upload_channel` quota through the same
+    /// path; our pull-model fetch is not a `PeerConn`, so its classes
+    /// are recomputed from the resolved endpoint on each request
+    /// (mask → throttled channels, no `peer_class_set` to refcount).
+    /// `addr` is the dial's resolved peer; `None` (proxy-held name)
+    /// falls back to `global|tcp` — the set a public TCP conn gets.
+    /// Registers the handle on the torrent for the per-second
+    /// `use_quota_overhead` drain and teardown marking.
+    pub fn request_bandwidth_web(
+        &mut self,
+        ih: &Sha1Hash,
+        addr: Option<std::net::IpAddr>,
+        handle: &std::sync::Arc<crate::peer_conn::PeerQuota>,
+        channel: usize,
+        mut bytes: i64,
+    ) -> Option<i64> {
+        use crate::peer_info::BandwidthState as Bw;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // an orphan fetch tears down rather than waiting on grants —
+        // same `None` contract as `request_bandwidth` for a dead conn.
+        if !self.torrents.contains_key(ih) {
+            return None;
+        }
+        if handle.disconnecting.load(Relaxed) {
+            return None;
+        }
+
+        // one outstanding request per channel upstream
+        if handle.channel_state[channel].load(Relaxed) & Bw::LIMIT.0 != 0 {
+            return Some(0);
+        }
+        let quota = handle.quota[channel].load(Relaxed);
+        if quota >= bytes {
+            return Some(0);
+        }
+        bytes -= quota;
+
+        let mask = match addr {
+            Some(ip) => self.peer_class_mask(ip, bitdaemon_net::peer_class::FilterSocketType::Tcp),
+            None => (1 << self.global_peer_class) | (1 << self.tcp_peer_class),
+        };
+        let mut channels = Vec::new();
+        let cap = bitdaemon_net::bandwidth::MAX_BANDWIDTH_CHANNELS;
+        let (mut m, mut i) = (mask, 0u32);
+        while m != 0 && channels.len() < cap {
+            if m & 1 != 0
+                && let Some(pc) = self.peer_class_pool.at(i)
+                && pc.channel[channel].throttle_value() != 0
+            {
+                channels.push(std::sync::Arc::clone(&pc.channel[channel]));
+            }
+            m >>= 1;
+            i += 1;
+        }
+        let tset = self.torrents.get(ih).map(|t| t.peer_classes.clone())?;
+        self.copy_pertinent_channels(&tset, channel, &mut channels, cap);
+
+        // `get_priority` — max over the conn's classes (mask legs)
+        // and the torrent's class set.
+        let mut priority = 1i64;
+        let (mut m, mut i) = (mask, 0u32);
+        while m != 0 {
+            if m & 1 != 0
+                && let Some(pc) = self.peer_class_pool.at(i)
+            {
+                priority = priority.max(i64::from(pc.priority[channel]));
+            }
+            m >>= 1;
+            i += 1;
+        }
+        for k in 0..tset.num_classes() {
+            if let Some(pc) = self.peer_class_pool.at(tset.class_at(k)) {
+                priority = priority.max(i64::from(pc.priority[channel]));
+            }
+        }
+
+        let mgr = if channel == crate::peer_conn::DOWNLOAD_CHANNEL {
+            &mut self.download_rate
+        } else {
+            &mut self.upload_rate
+        };
+        let sock: std::sync::Arc<dyn bitdaemon_net::bandwidth::BandwidthSocket> = handle.clone();
+        let ret = mgr.request_bandwidth(sock, bytes, priority, &channels);
+        if ret == 0 {
+            handle.channel_state[channel].fetch_or(Bw::LIMIT.0, Relaxed);
+        } else {
+            handle.quota[channel].fetch_add(ret, Relaxed);
+        }
+
+        // `web_peer_connection` sits in `m_connections` upstream — its
+        // `peer_class_set` is drained by `use_quota_overhead` each
+        // `second_tick` and dropped on teardown. Ours is registered
+        // per-torrent so the tick sees it and torrent removal can
+        // mark `disconnecting` (queued requests then drop normally).
+        let weak = std::sync::Arc::downgrade(handle);
+        if !self
+            .torrents
+            .get(ih)
+            .is_some_and(|t| t.web_seed_bw.iter().any(|(w, _)| w.ptr_eq(&weak)))
+            && let Some(t) = self.torrents.get_mut(ih)
+        {
+            t.web_seed_bw.push((weak, mask));
+        }
+        Some(ret)
+    }
+
+    /// `session_impl::use_quota_overhead` over a class *mask* — the
+    /// web-seed leg of the per-tick overhead drain (conn-side masks
+    /// aren't stored in a `peer_class_set`, unlike attached conns).
+    pub(crate) fn quota_overhead_mask(
+        pool: &bitdaemon_net::peer_class::PeerClassPool,
+        mask: u32,
+        amount_down: i64,
+        amount_up: i64,
+    ) -> u8 {
+        let mut ret = 0u8;
+        let (mut m, mut i) = (mask, 0u32);
+        while m != 0 {
+            if m & 1 != 0
+                && let Some(pc) = pool.at(i)
+            {
+                let ch = &pc.channel[crate::peer_conn::DOWNLOAD_CHANNEL];
+                ch.use_quota(amount_down);
+                if ch.throttle_value() > 0 && ch.throttle_value() < amount_down {
+                    ret |= 1 << crate::peer_conn::DOWNLOAD_CHANNEL;
+                }
+                let ch = &pc.channel[crate::peer_conn::UPLOAD_CHANNEL];
+                ch.use_quota(amount_up);
+                if ch.throttle_value() > 0 && ch.throttle_value() < amount_up {
+                    ret |= 1 << crate::peer_conn::UPLOAD_CHANNEL;
+                }
+            }
+            m >>= 1;
+            i += 1;
+        }
+        ret
+    }
+
     /// `session_impl::use_quota_overhead` — debit `amount_down`/
     /// `amount_up` from every channel of every class in `set`
     /// (IP/TCP overhead consumes quota too). Returns a bitmask of

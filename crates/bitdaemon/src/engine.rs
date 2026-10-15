@@ -463,6 +463,195 @@ pub struct Engine {
     ssl_roots: Arc<bitdaemon_net::ssl_stream::SslTorrentRoots>,
 }
 
+/// `web_peer_connection`'s bandwidth side — a fetch stream wrapper
+/// whose reads/writes consume `download_channel`/`upload_channel`
+/// quota exactly like a peer socket (`setup_receive`/`setup_send`):
+/// the op is clamped to the available quota, an exhausted bucket
+/// queues a `request_bandwidth_web` and parks on the manager's grant
+/// (`bw_limit`), and each transferred chunk accrues IP/TCP overhead
+/// on both directions (`trancieve_ip_packet`).
+struct ThrottledWs<'a> {
+    inner: &'a mut BoxedPeerStream,
+    session: &'a Arc<std::sync::Mutex<Session>>,
+    ih: Sha1Hash,
+    /// the dial's resolved peer address — `set_peer_classes`
+    /// resolves classes from it; `None` (proxy-held hostname)
+    /// gets the public-TCP classes in `request_bandwidth_web`.
+    addr: Option<std::net::IpAddr>,
+    bw: Arc<bitdaemon_session::peer_conn::PeerQuota>,
+    ipv6: bool,
+}
+
+impl std::fmt::Debug for ThrottledWs<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThrottledWs")
+            .field("ih", &self.ih)
+            .field("addr", &self.addr)
+            .finish()
+    }
+}
+
+impl ThrottledWs<'_> {
+    /// `request_bandwidth` + grant wait shared by both directions —
+    /// mirrors the socket-task gate loops in the peer pump. Returns
+    /// `Ready(false)` when the fetch should tear down (torrent/conn
+    /// gone).
+    fn gate(
+        &mut self,
+        channel: usize,
+        want: usize,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<bool> {
+        use bitdaemon_session::peer_info::BandwidthState;
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::task::Poll;
+        loop {
+            if self.bw.quota[channel].load(Relaxed) > 0 {
+                return Poll::Ready(true);
+            }
+            let gone = slock(self.session)
+                .request_bandwidth_web(
+                    &self.ih,
+                    self.addr,
+                    &self.bw,
+                    channel,
+                    i64::try_from(want.max(1)).unwrap_or(i64::MAX),
+                )
+                .is_none();
+            if gone || self.bw.disconnecting.load(Relaxed) {
+                return Poll::Ready(false);
+            }
+            if self.bw.quota[channel].load(Relaxed) > 0 {
+                continue;
+            }
+            if self.bw.channel_state[channel].load(Relaxed) & BandwidthState::LIMIT.0 != 0 {
+                // a queued request — park on the grant; the
+                // manager's `assign_bandwidth` wakes us.
+                let mut f = Box::pin(self.bw.wait_grant(channel));
+                match f.as_mut().poll(cx) {
+                    Poll::Ready(()) => continue,
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            // transient — neither quota nor a queued request;
+            // re-poll once (the next pass queues the request).
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for ThrottledWs<'_> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use bitdaemon_session::peer_conn::{DOWNLOAD_CHANNEL, PeerConn, UPLOAD_CHANNEL};
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::task::Poll;
+        let this = self.as_mut().get_mut();
+        match this.gate(DOWNLOAD_CHANNEL, buf.remaining(), cx) {
+            Poll::Ready(true) => {}
+            Poll::Ready(false) => return Poll::Ready(Ok(())), // EOF → teardown
+            Poll::Pending => return Poll::Pending,
+        }
+        // `min(recv room, quota)` — the read only takes what the
+        // limiter granted (upstream `setup_receive`'s clamp).
+        let cap = this.bw.quota[DOWNLOAD_CHANNEL]
+            .load(Relaxed)
+            .clamp(1, buf.remaining() as i64) as usize;
+        let (r, n) = {
+            let mut sub = buf.take(cap);
+            let r = std::pin::Pin::new(&mut *this.inner).poll_read(cx, &mut sub);
+            (r, sub.filled().len())
+        };
+        if let Poll::Ready(Ok(())) = &r {
+            if n > 0 {
+                this.bw.quota[DOWNLOAD_CHANNEL].fetch_sub(n as i64, Relaxed);
+                let oh = PeerConn::ip_overhead_bytes(n as i64, this.ipv6);
+                this.bw.ip_overhead[DOWNLOAD_CHANNEL].fetch_add(oh, Relaxed);
+                this.bw.ip_overhead[UPLOAD_CHANNEL].fetch_add(oh, Relaxed);
+            }
+        }
+        r
+    }
+}
+
+impl tokio::io::AsyncWrite for ThrottledWs<'_> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use bitdaemon_session::peer_conn::{DOWNLOAD_CHANNEL, PeerConn, UPLOAD_CHANNEL};
+        use std::sync::atomic::Ordering::Relaxed;
+        use std::task::Poll;
+        let this = self.as_mut().get_mut();
+        match this.gate(UPLOAD_CHANNEL, buf.len(), cx) {
+            Poll::Ready(true) => {}
+            Poll::Ready(false) => {
+                return Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
+            }
+            Poll::Pending => return Poll::Pending,
+        }
+        let cap = this.bw.quota[UPLOAD_CHANNEL]
+            .load(Relaxed)
+            .clamp(1, buf.len() as i64) as usize;
+        match std::pin::Pin::new(&mut *this.inner).poll_write(cx, &buf[..cap]) {
+            Poll::Ready(Ok(n)) => {
+                this.bw.quota[UPLOAD_CHANNEL].fetch_sub(n as i64, Relaxed);
+                let oh = PeerConn::ip_overhead_bytes(n as i64, this.ipv6);
+                this.bw.ip_overhead[UPLOAD_CHANNEL].fetch_add(oh, Relaxed);
+                this.bw.ip_overhead[DOWNLOAD_CHANNEL].fetch_add(oh, Relaxed);
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
+/// `peer_connection::disconnect` for the pull-model fetch task —
+/// on every exit path (incl. `report!; return` and panics) the
+/// handle is marked `disconnecting` so the managers drop its queued
+/// requests and return their assigned quota on the next
+/// `update_quotas` pass.
+struct WsQuotaGuard(Arc<bitdaemon_session::peer_conn::PeerQuota>);
+
+impl Drop for WsQuotaGuard {
+    fn drop(&mut self) {
+        self.0
+            .disconnecting
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl Engine {
     /// `session_impl` ctor — inject transports.
     pub fn new(
@@ -1893,6 +2082,13 @@ impl Engine {
             }
             let mut saw_close = false;
             let mut done: Vec<(PeerRequest, Vec<u8>)> = Vec::with_capacity(reqs.len());
+            // `web_peer_connection::m_peer_info`'s bw handle —
+            // upstream the seed sits in `m_connections` and shares
+            // the quota machinery (`request_bandwidth`,
+            // `use_quota_overhead`); the guard marks teardown so a
+            // queued grant can never strand.
+            let ws_bw = bitdaemon_session::peer_conn::PeerQuota::new();
+            let _ws_bw_guard = WsQuotaGuard(Arc::clone(&ws_bw));
             // `connect_to_url_seed` — upstream gate order: idna →
             // default port → parse error → protocol → hostname →
             // port 0 → port filter.
@@ -2235,8 +2431,22 @@ impl Engine {
                         );
                         return;
                     };
+                    // `setup_receive`/`setup_send` — the fetch stream
+                    // consumes `download_channel`/`upload_channel`
+                    // quota and accrues IP overhead like a peer conn.
+                    let resolved = base_addrs.get(&g.base).copied().flatten();
+                    let mut ts = ThrottledWs {
+                        inner: s,
+                        session: &session,
+                        ih,
+                        addr: resolved.map(|a| a.ip()),
+                        bw: Arc::clone(&ws_bw),
+                        ipv6: resolved.is_some_and(|a| a.is_ipv6()),
+                    };
                     let fetched =
-                        match timeout_fut(timeout, fetch_block(s, &wreq, 4 * 1024 * 1024)).await {
+                        match timeout_fut(timeout, fetch_block(&mut ts, &wreq, 4 * 1024 * 1024))
+                            .await
+                        {
                             Ok(r) => r,
                             Err(()) => {
                                 report!(

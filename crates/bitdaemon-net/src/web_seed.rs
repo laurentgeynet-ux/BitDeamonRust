@@ -447,8 +447,12 @@ pub enum WebSeedError {
 /// close` flag of the last response (upstream
 /// `m_received_disconnect` → the connection must be rebuilt before
 /// the next request, as required by HTTP/1.0-only seeds).
-pub async fn fetch_block(
-    s: &mut crate::transport::BoxedPeerStream,
+/// `S` is generic so the caller can interpose a rate-limiting
+/// wrapper stream (`web_peer_connection` consumes its class'
+/// `download_channel` quota upstream — the session-side throttle
+/// needs to sit under the read path).
+pub async fn fetch_block<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    s: &mut S,
     req: &WebSeedRequest,
     max_response: usize,
 ) -> Result<(Vec<(usize, i64, Vec<u8>)>, bool), WebSeedError> {
