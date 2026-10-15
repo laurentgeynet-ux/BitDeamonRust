@@ -391,3 +391,76 @@ ADR-0008/0018/0019).
   dans le flux normal (un vote résiduel d'un datagramme précédent
   non drainé serait attribué au `from` courant — fenêtre
   théorique seulement).
+
+## Résultat
+
+Mode `apply` exécuté dans le worktree dédié
+(`audit/25-nat-traversal`). Commit
+`fix(net,session): nat-traversal parity — PCP-first + LSD lifecycle`.
+
+### Déviations corrigées
+
+**NAT-PMP/PCP** (`engine.rs`, `natpmp.rs`)
+- PCP-first au `start_natpmp` (requêtes MAP 60 B, nonce par slot) ;
+  fallback NAT-PMP sur `pcp_unsupp_version` **uniquement** en socket
+  non-v6, avec resend des requêtes en vol + requête IP opcode 0
+  différée à ce moment.
+- Slot `NatpmpMapping` complet : `act` (add/delete), `outstanding`,
+  `retry_count`, deadline, nonce, `external_address`. Retransmission
+  linéaire `250 ms × retry` abandonnée à 9 ; renouvellement à
+  `lifetime × 3/4` ; park 2 h sur erreur ; matching des réponses par
+  proto + port privé + nonce + outstanding.
+- `stop_natpmp` envoie les datagrammes ttl-0 ; `stop_natpmp` et
+  `stop_upnp` déclenchés au tick quand le service est désactivé.
+- Le vote `source_router` est différé au succès du mapping
+  (`external_address` PCP ou `m_external_ip` NAT-PMP), plus émis à la
+  réception de la réponse IP.
+- `natpmp_lease_duration` honoré (ttl=0 → setting).
+
+**UPnP** (`engine.rs`, `upnp.rs`)
+- `renew_due` balayé chaque tick (re-add à `expires`).
+- `upnp_lease_duration` passé au `UpnpDriver`.
+- `upnp_ignore_nonrouters` filtre les réponses SSDP hors sous-réseau
+  (approximation /24 v4, /64 v6 depuis l'adresse liée du socket
+  injecté — pas d'énumération d'interfaces sous ADR-0008).
+- `NewInternalClient` rempli pour les mappings utilisateur.
+- `close()` ignore les devices sans `control_url` résolu.
+
+**LSD** (`lsd.rs`, `session.rs`)
+- Filtre `match_addr_mask` entrant contre `(addr, netmask)` du socket
+  d'écoute de même famille.
+- Resend à +2 s puis +4 s (`LsdResend`, drainé par le tick 1 s).
+- Annonce de tous les hashes présents (`info_hashes().for_each` —
+  v1 + v2 tronqué pour hybrides).
+- `Port:` = `tcp_external_port()` du socket `accept_incoming` (socket
+  SSL pour torrents SSL), plus le port bindé.
+- `do_connect_boost` sur peer découvert ; gate i2p/private sur
+  l'inbound.
+
+**External IP** (`session.rs`)
+- `vote_external` cible le voter par socket
+  (`ListenSocket.external_address`, même famille, `accept_incoming`
+  préféré ; voter global en fallback) + agrégat `external_ip_agg`
+  `[local|global] × [v4|v6]`.
+- Changement d'élu → `clear_peer_prio` sur tous les torrents +
+  `dht.update_node_id` (BEP-42) en plus de `external_ip_alert`.
+
+### Tests
+
+- `test_engine::natpmp_map_and_ip_vote` — réécrit pour le cycle
+  PCP → `pcp_unsupp_version` → resend NAT-PMP + ip query → map
+  success → vote différé.
+- `test_engine::upnp_map_cycle` — assertion migrée vers
+  `external_ip_agg` (voter par socket).
+- `test_socks.rs` — gate netmask LSD (in-subnet accepté, hors-subnet
+  rejeté).
+- `test_session::dht_ip_key_votes_external_ip` — assertion via
+  l'agrégat `external_ip_agg`.
+- `test_session::lsd_emit_and_receive`,
+  `anonymous_mode_suppresses_lsd` — non régressés.
+
+### Gates
+
+`cargo fmt --all`, `cargo clippy --workspace --all-targets --
+-D warnings`, `cargo test --workspace`, `cargo doc --workspace
+--no-deps` — tous verts.

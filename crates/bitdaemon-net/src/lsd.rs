@@ -92,9 +92,23 @@ fn strtoul_hex(s: &str) -> u64 {
 /// our own cookie.
 ///
 /// `from` is the sender; `our_cookie` is `m_cookie` (ours are
-/// echoed back by multicast loopback). Returns the announce on the
-/// peer's listen port.
-pub fn process_packet(buf: &[u8], _from: SocketAddr, our_cookie: u32) -> Option<LsdAnnounce> {
+/// echoed back by multicast loopback). `listen_net` carries the
+/// `(m_listen_address, m_netmask)` pair of the socket the datagram
+/// arrived on — packets from outside that subnet are ignored like
+/// upstream's `match_addr_mask` gate. `None` disables the gate.
+/// Returns the announce on the peer's listen port.
+pub fn process_packet(
+    buf: &[u8],
+    from: SocketAddr,
+    our_cookie: u32,
+    listen_net: Option<(std::net::IpAddr, std::net::IpAddr)>,
+) -> Option<LsdAnnounce> {
+    if let Some((listen_addr, netmask)) = listen_net
+        && !crate::enum_net::match_addr_mask(&from.ip(), &listen_addr, &netmask)
+    {
+        // out of our network — upstream drops the packet
+        return None;
+    }
     let (method, headers) = parse_request_head(buf)?;
     // upstream's http_parser already lowercases the method
     if !method.eq_ignore_ascii_case("bt-search") {

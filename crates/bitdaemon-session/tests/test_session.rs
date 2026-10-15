@@ -1264,9 +1264,13 @@ fn dht_ip_key_votes_external_ip() {
     let from: std::net::SocketAddr = "8.8.8.8:6881".parse().unwrap();
     let mut out = Vec::new();
     s.on_udp(from, &pkt, &mut out);
+    // votes land on the per-listen-socket voter upstream
+    // (`listen_socket_t::external_address`) — assert via the
+    // session aggregate `external_ip_agg`.
     assert_eq!(
-        s.ip_voter.external_address(),
-        Some(std::net::IpAddr::from([203, 0, 113, 7]))
+        s.external_ip_agg()
+            .external_address(&std::net::IpAddr::from([8, 8, 8, 8])),
+        std::net::IpAddr::from([203, 0, 113, 7])
     );
 }
 

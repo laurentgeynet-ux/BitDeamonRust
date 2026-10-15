@@ -247,16 +247,57 @@ struct WebSeedDone {
     result: WebSeedResult,
 }
 
-/// `natpmp` per-protocol mapping state — the 12-byte request +
-/// the expiry of the last successful map.
+/// `mapping_t` — one NAT-PMP/PCP mapping slot (upstream's
+/// per-slot state in `natpmp::m_mappings`).
+#[derive(Debug)]
+pub struct NatpmpMapping {
+    /// `portmap_protocol`.
+    pub protocol: bitdaemon_net::natpmp::PortmapProtocol,
+    /// private (listen) port.
+    pub local_port: u16,
+    /// external port granted by the gateway (0 until mapped).
+    pub external_port: u16,
+    /// `portmap_action` — an add or delete is wanted.
+    pub act: bitdaemon_net::natpmp::PortmapAction,
+    /// `m_retry_count` — linear-backoff resends of an unanswered
+    /// request (upstream gives up at 9).
+    pub retry_count: u8,
+    /// `m.outstanding_request` — a request awaits its reply.
+    pub outstanding: bool,
+    /// `m.expires` — while `outstanding`, the resend deadline
+    /// (upstream `m_send_timer`); once mapped, the lease renew
+    /// deadline (`now + lifetime*3/4`); on error/timeout, the 2 h
+    /// cool-off (`natpmp.cpp` `expires = now + hours(2)`).
+    pub deadline: Instant,
+    /// PCP MAP nonce — echoed back by the gateway
+    /// (`crypto_random_bytes` upstream, per `add_mapping`).
+    pub nonce: [u8; 12],
+    /// `m.external_address` — PCP-assigned external address for
+    /// this mapping (NAT-PMP uses the state-level `external_ip`).
+    pub external_address: Option<std::net::IpAddr>,
+}
+
+/// `natpmp` driver state — upstream's class minus io_context: the
+/// wire codec lives in `bitdaemon_net::natpmp`, timers are driven
+/// by the engine tick.
 #[derive(Debug)]
 pub struct NatpmpState {
     /// gateway address the map datagrams go to (`:5351`).
     pub gateway: SocketAddr,
-    /// `(proto, local_port, external_port, expires)` per mapping.
-    pub mappings: Vec<(bitdaemon_net::natpmp::PortmapProtocol, u16, u16, Instant)>,
-    /// lease TTL we asked for (`settings_pack::natpmp_lease_time`-like).
+    /// `m_mappings`.
+    pub mappings: Vec<NatpmpMapping>,
+    /// `natpmp_lease_duration` requested TTL (upstream falls back
+    /// to 3600 when ≤ 0).
     pub ttl: u32,
+    /// `m_version` — starts `Pcp`, falls back to `NatPmp` on
+    /// `pcp_unsupp_version` (upstream `natpmp::start` assumes PCP).
+    pub version: bitdaemon_net::natpmp::ProtocolVersion,
+    /// `m_external_ip` — opcode-0 public-IP reply, reported to the
+    /// session when a mapping succeeds.
+    pub external_ip: Option<std::net::IpAddr>,
+    /// local socket address toward the gateway — PCP requests
+    /// embed it (v4-mapped); learned from the injected datagram.
+    pub local_addr: std::net::IpAddr,
 }
 
 /// A UPnP SOAP response back to the engine loop — `kind` routes to
@@ -825,7 +866,25 @@ impl Engine {
             } else if let Some(loc) = bitdaemon_net::upnp::parse_ssdp_location(&buf) {
                 // ADR-0018 — SSDP reply: fetch the device description
                 // once, then run the driver chain.
-                if slock(&self.session).services.upnp && self.ssdp_seen.insert(loc.clone()) {
+                // `upnp_ignore_nonrouters` drops replies from hosts
+                // outside the local network (upstream `upnp::on_reply`
+                // → `in_local_network`); with injected transports we
+                // approximate the local subnet from the datagram's
+                // bound address (v4 /24, v6 /64).
+                let nonrouter = {
+                    let ses = slock(&self.session);
+                    ses.settings.upnp_ignore_nonrouters
+                        && self.datagram.as_ref().is_some_and(|dg| {
+                            !bitdaemon_net::ip_helpers::same_subnet(
+                                &dg.local_addr().ip(),
+                                &from.ip(),
+                            )
+                        })
+                };
+                if slock(&self.session).services.upnp
+                    && !nonrouter
+                    && self.ssdp_seen.insert(loc.clone())
+                {
                     self.spawn_ssdp_fetch(loc);
                 }
             } else {
@@ -888,6 +947,21 @@ impl Engine {
         }
         slock(&self.session).tracker_announce_due(now, 0, &mut out);
         self.dispatch(out).await;
+        // `stop_*` on service disable — the ttl-0/DeletePortMapping
+        // teardown rides the tick like upstream's
+        // `session_impl::stop_natpmp`/`stop_upnp` calls.
+        {
+            let (natpmp_on, upnp_on) = {
+                let ses = slock(&self.session);
+                (ses.services.natpmp, ses.services.upnp)
+            };
+            if self.natpmp.is_some() && !natpmp_on {
+                self.stop_natpmp().await;
+            }
+            if !self.upnp_devices.is_empty() && !upnp_on {
+                self.stop_upnp();
+            }
+        }
         self.natpmp_renew().await;
         self.upnp_ssdp_tick(now).await;
         slock(&self.session).pop_alerts()
@@ -2332,31 +2406,146 @@ impl Engine {
     /// `natpmp` start — map `local` (the listen port) UDP+TCP
     /// through the gateway over the injected datagram transport.
     /// Upstream queries the default gateway from the routing
-    /// table; injected transports pass it in.
+    /// table; injected transports pass it in. Requests go out as
+    /// PCP first like `natpmp::start` (`m_version = version_pcp`).
     pub async fn start_natpmp(&mut self, gateway: SocketAddr, local_port: u16, ttl: u32) {
-        use bitdaemon_net::natpmp::{PortmapProtocol, build_map_request};
+        use bitdaemon_net::natpmp::{PortmapAction, PortmapProtocol, ProtocolVersion};
         if slock(&self.session).settings.anonymous_mode {
             return; // upstream: no port mapping under anonymity
         }
         let Some(dg) = self.datagram.clone() else {
             return;
         };
+        // `natpmp_lease_duration` wins over the caller's ttl when
+        // the caller passes 0 (upstream reads the setting).
+        let ttl = if ttl == 0 {
+            u32::try_from(
+                slock(&self.session)
+                    .settings
+                    .natpmp_lease_duration
+                    .as_secs(),
+            )
+            .unwrap_or(3600)
+        } else {
+            ttl
+        };
+        let local_addr = dg.local_addr().ip();
+        let now = Instant::now();
         self.natpmp = Some(NatpmpState {
             gateway,
-            mappings: vec![
-                (PortmapProtocol::Tcp, local_port, 0, Instant::now()),
-                (PortmapProtocol::Udp, local_port, 0, Instant::now()),
-            ],
+            mappings: [PortmapProtocol::Tcp, PortmapProtocol::Udp]
+                .into_iter()
+                .map(|protocol| NatpmpMapping {
+                    protocol,
+                    local_port,
+                    external_port: 0,
+                    act: PortmapAction::Add,
+                    retry_count: 0,
+                    outstanding: false,
+                    deadline: now,
+                    nonce: rand::random::<[u8; 12]>(),
+                    external_address: None,
+                })
+                .collect(),
             ttl,
+            version: ProtocolVersion::Pcp,
+            external_ip: None,
+            local_addr,
         });
-        for proto in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
-            let _ = dg
-                .send_to(&build_map_request(proto, local_port, 0, ttl), gateway)
-                .await;
+        // `send_map_request` per slot (upstream `update_mapping`
+        // walks the table); the opcode-0 public-IP query only goes
+        // out once we're known to speak NAT-PMP.
+        for i in 0..2 {
+            self.natpmp_send_map(i).await;
         }
-        let _ = dg
-            .send_to(&bitdaemon_net::natpmp::build_ip_request(), gateway)
-            .await;
+    }
+
+    /// `natpmp::send_map_request` — emit the map datagram for slot
+    /// `i` in the current `version`, then arm the linear-backoff
+    /// resend (`m_send_timer` upstream: `250ms * retry_count`,
+    /// abandoned at 9).
+    async fn natpmp_send_map(&mut self, i: usize) {
+        use bitdaemon_net::natpmp::{PortmapAction, ProtocolVersion};
+        let Some(dg) = self.datagram.clone() else {
+            return;
+        };
+        let Some(n) = self.natpmp.as_mut() else {
+            return;
+        };
+        let Some(m) = n.mappings.get_mut(i) else {
+            return;
+        };
+        // `configured_ttl > 0 ? configured : 3600`, 0 on delete
+        let ttl = match m.act {
+            PortmapAction::Add => {
+                if n.ttl > 0 {
+                    n.ttl
+                } else {
+                    3600
+                }
+            }
+            PortmapAction::Delete => 0,
+        };
+        let req: Vec<u8> = match n.version {
+            ProtocolVersion::NatPmp => bitdaemon_net::natpmp::build_map_request(
+                m.protocol,
+                m.local_port,
+                m.external_port,
+                ttl,
+            )
+            .to_vec(),
+            ProtocolVersion::Pcp => bitdaemon_net::natpmp::build_pcp_map_request(
+                m.protocol,
+                m.local_port,
+                m.external_port,
+                ttl,
+                n.local_addr,
+                m.external_address,
+                &m.nonce,
+            )
+            .to_vec(),
+        };
+        let gw = n.gateway;
+        m.outstanding = true;
+        m.retry_count = m.retry_count.saturating_add(1);
+        m.deadline =
+            Instant::now() + std::time::Duration::from_millis(250 * u64::from(m.retry_count));
+        let _ = dg.send_to(&req, gw).await;
+    }
+
+    /// `natpmp::close` — ttl-0 datagram per mapped slot, then drop
+    /// the state (upstream `stop_natpmp` → `close_impl`).
+    pub async fn stop_natpmp(&mut self) {
+        let Some(n) = self.natpmp.take() else {
+            return;
+        };
+        let Some(dg) = self.datagram.clone() else {
+            return;
+        };
+        for m in &n.mappings {
+            if m.external_port == 0 && !m.outstanding {
+                continue;
+            }
+            let req = match n.version {
+                bitdaemon_net::natpmp::ProtocolVersion::Pcp => {
+                    bitdaemon_net::natpmp::build_pcp_map_request(
+                        m.protocol,
+                        m.local_port,
+                        0,
+                        0,
+                        n.local_addr,
+                        m.external_address,
+                        &m.nonce,
+                    )
+                    .to_vec()
+                }
+                bitdaemon_net::natpmp::ProtocolVersion::NatPmp => {
+                    bitdaemon_net::natpmp::build_map_request(m.protocol, m.local_port, 0, 0)
+                        .to_vec()
+                }
+            };
+            let _ = dg.send_to(&req, n.gateway).await;
+        }
     }
 
     /// `natpmp` auto-start (ADR-0019): discover the default IPv4
@@ -2377,40 +2566,66 @@ impl Engine {
             .await;
     }
 
-    /// `natpmp::on_reply` — update mapping state, feed `ip_voter`
-    /// with the router's view of our public IP.
+    /// the `local_address` portmap alerts carry — upstream stamps
+    /// `listen_socket->local_endpoint.address()`.
+    fn listen_addr_str(&self) -> String {
+        slock(&self.session)
+            .listen_sockets
+            .first()
+            .map(|s| s.local_endpoint.ip().to_string())
+            .unwrap_or_default()
+    }
+
+    /// `natpmp::on_reply` — match the reply to the outstanding
+    /// request (proto + private port + PCP nonce), update the slot,
+    /// and drive the portmap alert / router vote the same way
+    /// upstream's `on_port_mapping` does.
     fn on_natpmp_response(&mut self, buf: &[u8]) {
-        use bitdaemon_net::natpmp::NatPmpResponse;
+        use bitdaemon_net::natpmp::{NatPmpResponse, PortmapAction};
         let Some(r) = bitdaemon_net::natpmp::parse_response(buf) else {
             return;
         };
         let now = Instant::now();
         match r {
             NatPmpResponse::PublicIp(ip) => {
-                slock(&self.session).vote_external(
-                    std::net::IpAddr::V4(ip),
-                    bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_ROUTER,
-                    &std::net::IpAddr::V4(ip),
-                );
+                // `m_external_ip` — stored, reported to the ip_voter
+                // when a mapping actually succeeds upstream
+                // (`on_port_mapping` source_router).
+                if let Some(n) = &mut self.natpmp {
+                    n.external_ip = Some(std::net::IpAddr::V4(ip));
+                }
             }
             NatPmpResponse::UnsupportedVersion => {
-                // `pcp_unsupp_version` → upstream resends the
-                // outstanding requests as NAT-PMP on a v4 socket.
-                // We only ever send NAT-PMP, so the fallback is a
-                // plain re-send of the pending mappings.
-                if let Some(n) = &self.natpmp
-                    && let Some(dg) = self.datagram.clone()
+                // `pcp_unsupp_version` → NAT-PMP fallback only on a
+                // v4 socket (upstream leaves a v6 socket stranded).
+                // The outstanding requests resend as NAT-PMP and the
+                // opcode-0 public-IP query goes out now.
+                let fallback = self
+                    .natpmp
+                    .as_ref()
+                    .is_some_and(|n| !n.local_addr.is_ipv6());
+                if !fallback {
+                    return;
+                }
+                if let Some(n) = &mut self.natpmp {
+                    n.version = bitdaemon_net::natpmp::ProtocolVersion::NatPmp;
+                    for m in &mut n.mappings {
+                        if m.outstanding {
+                            m.retry_count = 0;
+                            m.deadline = now;
+                        }
+                    }
+                }
+                if let Some(dg) = self.datagram.clone()
+                    && let Some(n) = &self.natpmp
                 {
                     let gw = n.gateway;
-                    let ttl = n.ttl;
-                    let resends: Vec<_> = n.mappings.iter().map(|m| (m.0, m.1, m.2)).collect();
-                    for (proto, local, ext) in resends {
-                        let req = bitdaemon_net::natpmp::build_map_request(proto, local, ext, ttl);
-                        let dg = dg.clone();
-                        self.tasks.push(tokio::spawn(async move {
-                            let _ = dg.send_to(&req, gw).await;
-                        }));
-                    }
+                    let dg = dg.clone();
+                    self.tasks.push(tokio::spawn(async move {
+                        let _ = dg
+                            .send_to(&bitdaemon_net::natpmp::build_ip_request(), gw)
+                            .await;
+                    }));
                 }
             }
             NatPmpResponse::Map {
@@ -2419,50 +2634,87 @@ impl Engine {
                 public_port,
                 lifetime,
                 result,
-                ..
+                nonce,
+                external_address,
             } => {
-                if let Some(n) = &mut self.natpmp {
-                    // upstream matches the reply to the outstanding
-                    // request by opcode-derived proto + private port
-                    // (PCP adds a nonce match — we only send NAT-PMP)
-                    if let Some(m) = n
-                        .mappings
-                        .iter_mut()
-                        .find(|m| m.0 == protocol && m.1 == private_port)
-                    {
-                        if result == 0 {
-                            m.2 = public_port;
-                            // renew at half the lease (upstream
-                            // `mapping.expires` semantics)
-                            m.3 = now + std::time::Duration::from_secs(u64::from(lifetime / 2));
-                        }
+                let local_addr = self.listen_addr_str();
+                let Some(n) = &mut self.natpmp else {
+                    return;
+                };
+                // upstream's reply-match: private port + protocol +
+                // `map_sent` + `outstanding_request` (+ nonce under
+                // PCP) — replies for stale slots are dropped.
+                let Some(i) = n.mappings.iter().position(|m| {
+                    m.local_port == private_port
+                        && m.protocol == protocol
+                        && m.outstanding
+                        && nonce.is_none_or(|nn| nn == m.nonce)
+                }) else {
+                    return;
+                };
+                let was_add = n.mappings[i].act == PortmapAction::Add;
+                {
+                    let m = &mut n.mappings[i];
+                    m.outstanding = false;
+                    if public_port == 0 || lifetime == 0 {
+                        // mapping closed — slot freed like upstream's
+                        // `protocol = none` (any reply, not just del).
+                        n.mappings.remove(i);
+                        return;
                     }
-                    let local_addr = n.gateway.ip().to_string();
-                    // `on_port_mapping`/`return_error` upstream —
-                    // surface the result as portmap alerts + a
-                    // `port_mapping_t` handle.
-                    let proto_u8 = match protocol {
-                        bitdaemon_net::natpmp::PortmapProtocol::Tcp => 1,
-                        bitdaemon_net::natpmp::PortmapProtocol::Udp => 2,
-                    };
-                    if result == 0 {
-                        slock(&self.session).on_portmap_success(
-                            0,
-                            proto_u8,
-                            private_port,
-                            public_port,
-                            local_addr,
-                            0,
-                        );
+                    if let Some(a) = external_address {
+                        m.external_address = Some(a);
+                    }
+                    if result != 0 {
+                        // upstream: `expires = now + hours(2)` before
+                        // the error callback — no retry storm. The
+                        // callback fires for add *and* del replies.
+                        m.deadline = now + std::time::Duration::from_secs(2 * 3600);
+                        m.act = PortmapAction::Add;
                     } else {
-                        slock(&self.session).on_portmap_error(
-                            0,
-                            -1,
-                            local_addr,
-                            format!("nat-pmp map failed (code {result})"),
-                        );
+                        m.external_port = public_port;
+                        // renew at 3/4 of the granted lease
+                        // (`m.expires = now + lifetime * 3 / 4`).
+                        m.deadline =
+                            now + std::time::Duration::from_secs(u64::from(lifetime) * 3 / 4);
+                        m.act = PortmapAction::Add;
                     }
                 }
+                let proto_u8 = match protocol {
+                    bitdaemon_net::natpmp::PortmapProtocol::Tcp => 1,
+                    bitdaemon_net::natpmp::PortmapProtocol::Udp => 2,
+                };
+                if result != 0 {
+                    slock(&self.session).on_portmap_error(
+                        0,
+                        -1,
+                        local_addr,
+                        format!("nat-pmp map failed (code {result})"),
+                    );
+                    return;
+                }
+                if !was_add {
+                    return;
+                }
+                // `on_port_mapping` success — the router vote rides
+                // the mapping's external address (PCP reply field,
+                // or the opcode-0 `m_external_ip` for NAT-PMP).
+                let ext_ip = external_address.or(n.external_ip);
+                if let Some(ip) = ext_ip {
+                    slock(&self.session).vote_external(
+                        ip,
+                        bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_ROUTER,
+                        &ip,
+                    );
+                }
+                slock(&self.session).on_portmap_success(
+                    0,
+                    proto_u8,
+                    private_port,
+                    public_port,
+                    local_addr,
+                    0,
+                );
             }
         }
     }
@@ -2524,6 +2776,20 @@ impl Engine {
             // upstream `disable(errors::no_router)` when nothing
             // ever answered
             self.ssdp_next = None;
+        }
+        // `upnp::on_expire` sweep — slots past their `expires`
+        // re-map (3/4-lease deadline set on the add reply).
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        for dev in 0..self.upnp_devices.len() {
+            for i in 0..self.upnp_devices[dev].mappings.len() {
+                let outs = self.upnp_devices[dev].renew_due(i, now_s);
+                if !outs.is_empty() {
+                    self.drive_upnp_outs(dev, outs);
+                }
+            }
         }
     }
 
@@ -2606,7 +2872,11 @@ impl Engine {
             return;
         }
         let local_addr = dev.local_addr.map(|a| a.to_string()).unwrap_or_default();
-        let d = UpnpDriver::new(dev, 3600, description);
+        // `upnp_lease_duration` from the session settings
+        // (upstream `upnp::upnp` reads it once at construction).
+        let lease = u32::try_from(slock(&self.session).settings.upnp_lease_duration.as_secs())
+            .unwrap_or(3600);
+        let d = UpnpDriver::new(dev, lease, description);
         self.upnp_devices.push(d);
         let idx = self.upnp_devices.len() - 1;
         // ask for the router's external address first (upstream
@@ -2826,22 +3096,22 @@ impl Engine {
             2 => Np::Udp,
             _ => Np::Tcp,
         };
-        if let Some(n) = &mut self.natpmp
-            && let Some(dg) = self.datagram.clone()
-        {
-            n.mappings
-                .push((proto_np, local_port, external_port, Instant::now()));
-            let _ = dg
-                .send_to(
-                    &bitdaemon_net::natpmp::build_map_request(
-                        proto_np,
-                        local_port,
-                        external_port,
-                        n.ttl,
-                    ),
-                    n.gateway,
-                )
-                .await;
+        if let Some(n) = &mut self.natpmp {
+            // `natpmp::add_mapping` — slot with the caller's
+            // requested external port, sent on the next update pass.
+            n.mappings.push(NatpmpMapping {
+                protocol: proto_np,
+                local_port,
+                external_port,
+                act: bitdaemon_net::natpmp::PortmapAction::Add,
+                retry_count: 0,
+                outstanding: false,
+                deadline: Instant::now(),
+                nonce: rand::random::<[u8; 12]>(),
+                external_address: None,
+            });
+            let i = n.mappings.len() - 1;
+            self.natpmp_send_map(i).await;
         }
         for dev in 0..self.upnp_devices.len() {
             let proto_up = match protocol {
@@ -2849,13 +3119,17 @@ impl Engine {
                 _ => bitdaemon_net::upnp::PortmapProtocol::Tcp,
             };
             // `add_mapping` → Option: None when the slot table is
-            // full (upstream returns -1) or the device is disabled
-            if let Some((_idx, outs)) = self.upnp_devices[dev].add_mapping(
-                proto_up,
-                external_port,
-                local_port,
-                String::new(),
-            ) {
+            // full (upstream returns -1) or the device is disabled.
+            // `NewInternalClient` is the device's local_addr like
+            // upstream's `map_port` (not empty).
+            let client = self.upnp_devices[dev]
+                .dev
+                .local_addr
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            if let Some((_idx, outs)) =
+                self.upnp_devices[dev].add_mapping(proto_up, external_port, local_port, client)
+            {
                 self.drive_upnp_outs(dev, outs);
             }
         }
@@ -2872,21 +3146,19 @@ impl Engine {
                     2 => Np::Udp,
                     _ => Np::Tcp,
                 };
+                // `natpmp::delete_mapping` upstream flips the slot
+                // to `act = del` — the ttl-0 datagram leaves on the
+                // next update pass and the slot frees on its reply.
                 if let Some(n) = &mut self.natpmp
-                    && let Some(dg) = self.datagram.clone()
                     && let Some(pos) = n
                         .mappings
                         .iter()
-                        .position(|m| m.0 == proto && m.2 == external_port)
+                        .position(|m| m.protocol == proto && m.external_port == external_port)
                 {
-                    let local = n.mappings[pos].1;
-                    let _ = dg
-                        .send_to(
-                            &bitdaemon_net::natpmp::build_map_request(proto, local, 0, 0),
-                            n.gateway,
-                        )
-                        .await;
-                    n.mappings.remove(pos);
+                    n.mappings[pos].act = bitdaemon_net::natpmp::PortmapAction::Delete;
+                    if !n.mappings[pos].outstanding {
+                        self.natpmp_send_map(pos).await;
+                    }
                 }
             }
             _ => {
@@ -2907,26 +3179,43 @@ impl Engine {
         }
     }
 
-    /// `natpmp` renew — upstream remaps at half the lease. Called
-    /// from `tick`; resends the 12-byte map request per proto.
+    /// `natpmp::update_mapping` — walk the slots: retransmit a due
+    /// outstanding request (linear `250ms * retry` backoff, capped
+    /// at 9 retries like `m_send_timer`), or renew a mapped slot
+    /// whose 3/4-lease deadline passed.
     async fn natpmp_renew(&mut self) {
-        use bitdaemon_net::natpmp::build_map_request;
+        use bitdaemon_net::natpmp::PortmapAction;
         let Some(n) = &self.natpmp else {
             return;
         };
-        let Some(dg) = self.datagram.clone() else {
-            return;
-        };
         let now = Instant::now();
-        let gw = n.gateway;
-        let ttl = n.ttl;
-        // upstream renews at half the lease — the stored deadline
-        // already encodes it (set to `lifetime/2` on response).
-        let due: Vec<_> = n.mappings.iter().filter(|m| m.3 <= now).copied().collect();
-        for (proto, local, _ext, _exp) in due {
-            let _ = dg
-                .send_to(&build_map_request(proto, local, 0, ttl), gw)
-                .await;
+        let due: Vec<usize> = n
+            .mappings
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| (m.deadline <= now).then_some(i))
+            .collect();
+        for i in due {
+            let Some(n) = &mut self.natpmp else {
+                return;
+            };
+            let Some(m) = n.mappings.get_mut(i) else {
+                continue;
+            };
+            if m.outstanding {
+                // upstream abandons a request after 9 retransmits —
+                // park the slot 2h like an error reply does.
+                if m.retry_count > 9 {
+                    m.outstanding = false;
+                    m.deadline = now + std::time::Duration::from_secs(2 * 3600);
+                    continue;
+                }
+            } else {
+                // expired lease → remap (act flips back to `add`,
+                // matching upstream's `m.act = add` on expiry).
+                m.act = PortmapAction::Add;
+            }
+            self.natpmp_send_map(i).await;
         }
     }
 
