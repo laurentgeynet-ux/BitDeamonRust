@@ -2,6 +2,7 @@
 
 Baseline upstream : `v2.1.2-62-ge7381c7bc` (`D:\Projet\libtorrent\libtorrent`, lecture seule).
 Chaque audit = un skill `.devin/skills/audit-NN-<slug>/` lançable via `/audit-NN-<slug>`.
+**Mode d'emploi complet : [`GUIDE.md`](GUIDE.md).**
 
 | # | Audit | Périmètre | Statut |
 |---|---|---|---|
