@@ -1906,6 +1906,13 @@ pub trait PeerPlugin: Send + Sync + std::fmt::Debug {
 
     /// `peer_plugin::tick` — driven once per session tick.
     fn on_tick(&self) {}
+
+    /// `peer_plugin::can_disconnect` — consulted by
+    /// `disconnect_if_redundant` before a redundant-conn cutoff;
+    /// `false` vetoes the disconnect (upstream's extension veto).
+    fn can_disconnect(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

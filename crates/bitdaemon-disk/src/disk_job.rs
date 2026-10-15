@@ -144,16 +144,28 @@ pub struct WriteJob {
     pub volatile: bool,
 }
 
+/// `job::hash` handler — `(piece, sha1, block_hashes, block_digests,
+/// error)`.
+pub type HashHandler =
+    Box<dyn FnOnce(PieceIndex, Sha1Hash, Vec<Sha256Hash>, Vec<Sha1Hash>, StorageError) + Send>;
+
 /// `job::hash` — SHA-1 over a whole piece (+ block SHA-256s).
 pub struct HashJob {
-    /// handler — `(piece, sha1, block_hashes, error)`.
-    pub handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, Vec<Sha256Hash>, StorageError) + Send>,
+    /// handler — `(piece, sha1, block_hashes, block_digests, error)`.
+    pub handler: HashHandler,
     /// `piece`.
     pub piece: PieceIndex,
     /// `block_hashes` — out: per-16KiB-block SHA-256 (v2). Zero entries
     /// mean "unknown" — they're filled from precomputed storage or
     /// hashed (upstream's caller clears the span before submit).
     pub block_hashes: Vec<Sha256Hash>,
+    /// out: per-16KiB-block SHA-1 digests — the job already reads
+    /// every byte of the piece, so the `smart_ban` plugin's block CRC
+    /// record (upstream re-reads each block from disk) rides along
+    /// for free. Only filled when `v1_hash` is set and the read
+    /// succeeded — the caller treats an empty vec like upstream's
+    /// `on_read_failed_block` error leg (entry skipped).
+    pub block_digests: Vec<Sha1Hash>,
     /// `piece_hash` — out. Only set when `v1_hash` is set (upstream
     /// skips the SHA-1 pass entirely for v2-only hashes).
     pub piece_hash: Sha1Hash,
@@ -395,6 +407,7 @@ impl DiskJob {
                 j.piece,
                 j.piece_hash,
                 std::mem::take(&mut j.block_hashes),
+                std::mem::take(&mut j.block_digests),
                 std::mem::take(&mut self.error),
             ),
             JobKind::Hash2(j) => {

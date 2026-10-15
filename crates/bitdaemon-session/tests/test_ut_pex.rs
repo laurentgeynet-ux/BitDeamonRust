@@ -77,6 +77,38 @@ fn max_peers_cap() {
 }
 
 #[test]
+fn cap_tripper_marked_seen_not_readded() {
+    // A02/N3 — upstream `m_old_peers.insert(remote)` precedes the
+    // `max_peer_entries` break (ut_pex.cpp:121→127): every visited
+    // eligible conn enters the sent set, including the peer that
+    // trips the cap. A skipped peer is therefore never re-emitted
+    // as `added` later and never oscillates added↔dropped.
+    let peers: Vec<(SocketAddr, u8)> = (0..110).map(|i| (ep("10.0.0.1", 2000 + i), 0u8)).collect();
+    let (_body, sent, in_msg) = build_pex_message(&peers, &BTreeSet::new());
+    assert_eq!(in_msg, 100, "MAX_PEER_ENTRIES");
+    // 100 listed + the cap-tripper — all 101 visited conns are seen.
+    assert_eq!(sent.len(), 101);
+
+    // tick 2 over the same swarm: the cap-tripper stays known
+    // (not re-added); the 9 never-visited peers fill the freed
+    // added slots.
+    let (body, sent2, _in_msg) = build_pex_message(&peers, &sent);
+    let (added, dropped) = parse_pex_message(&body, usize::MAX, 0).expect("parse");
+    assert_eq!(added.len(), 9);
+    assert!(added.iter().all(|p| p.addr != peers[100].0));
+    assert!(dropped.is_empty());
+    assert_eq!(sent2.len(), 110);
+
+    // if the cap-tripper disconnects instead, it comes out as a
+    // real `dropped` — it was legitimately in the sent set.
+    let still_up: Vec<(SocketAddr, u8)> = peers[..100].to_vec();
+    let (body, _sent3, _in_msg) = build_pex_message(&still_up, &sent2);
+    let (_added, dropped) = parse_pex_message(&body, usize::MAX, 0).expect("parse");
+    assert_eq!(dropped.len(), 10);
+    assert!(dropped.contains(&peers[100].0));
+}
+
+#[test]
 fn garbage_rejected() {
     assert!(parse_pex_message(b"not bencode!!!", 50, 0).is_none());
     assert!(parse_pex_message(b"i42e", 50, 0).is_none());

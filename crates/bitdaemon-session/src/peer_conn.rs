@@ -436,8 +436,11 @@ pub struct PeerConn {
     pub pex_sent: std::collections::BTreeSet<std::net::SocketAddr>,
     /// `m_peers`/`m_peers6` — endpoints this peer has told us about
     /// and not yet dropped (upstream dedups `added` against this and
-    /// erases on `dropped`).
+    /// erases on `dropped`). Upstream bounds each family separately
+    /// at `max_pex_peers`.
     pub pex_known: std::collections::BTreeSet<std::net::SocketAddr>,
+    /// `m_peers6` — the IPv6 half of `pex_known`.
+    pub pex_known6: std::collections::BTreeSet<std::net::SocketAddr>,
     /// `m_last_pex[6]` — receive timestamps of the last ≤6 pex
     /// messages from this peer; a 7th inside 60s is a flood and
     /// upstream disconnects (`too_frequent_pex`).
@@ -445,6 +448,12 @@ pub struct PeerConn {
     /// `m_first_time` — this peer's first pex tick sends the full
     /// peer list; later ticks send the diff (skipped when empty).
     pub pex_first_time: bool,
+    /// `m_last_msg` (peer plugin) — when this conn last sent a ut_pex
+    /// update. `None` is upstream's `min_time()` init: the first
+    /// plugin tick (~1 s after attach) sends the full list once
+    /// `num_peers() > 1`, instead of waiting out a torrent-global
+    /// 60 s cadence.
+    pub pex_last_msg: Option<std::time::Instant>,
     /// transport is uTP — feeds the `pex_utp` flag on advertise.
     pub is_utp: bool,
     /// `socket_type_idx(m_socket)` — the conn's `socket_type_t`
@@ -584,8 +593,10 @@ impl PeerConn {
             fast_reconnect: false,
             pex_sent: std::collections::BTreeSet::new(),
             pex_known: std::collections::BTreeSet::new(),
+            pex_known6: std::collections::BTreeSet::new(),
             pex_rx_times: std::collections::VecDeque::new(),
             pex_first_time: true,
+            pex_last_msg: None,
             is_utp: false,
             sock_type: 0,
             ssl_sni: None,
@@ -1216,15 +1227,21 @@ impl PeerConn {
                     counters.add(crate::counters::Counter::NumPeersUpInterested, 1);
                 }
                 self.on_interested();
-                // `incoming_interested` tail — upstream re-runs
-                // `maybe_unchoke_this_peer` (or sends a redundant
-                // `Unchoke` when already unchoked), skipped while
-                // disconnecting. Routed to the torrent: the
-                // graceful-pause gate and the choke-state branch
-                // need its state.
-                if !self.disconnecting {
-                    eff.push(PeerEffect::MaybeUnchoke);
+                // `incoming_interested` — a conn mid-teardown stops
+                // before the metadata/redundancy legs.
+                if self.disconnecting {
+                    return;
                 }
+                // "if the peer is ready to download stuff, it must
+                // have metadata" — upstream sets `m_has_metadata`
+                // here, before `disconnect_if_redundant`.
+                self.has_metadata = true;
+                // `incoming_interested` tail — `disconnect_if_redundant`
+                // first, then `maybe_unchoke_this_peer` (or the
+                // redundant `Unchoke` re-send) only while still
+                // alive. Routed to the torrent: the graceful-pause
+                // gate and the choke-state branch need its state.
+                eff.push(PeerEffect::MaybeUnchoke);
             }
             M::NotInterested => {
                 if self.peer_interested {
@@ -1351,6 +1368,12 @@ impl PeerConn {
                 if i.0 < 0 || i.0 >= num_pieces.max(0) {
                     return;
                 }
+                // upstream `is_disconnecting` early-out — a conn
+                // mid-teardown ignores the message before the
+                // bitfield-bound check.
+                if self.disconnecting {
+                    return;
+                }
                 if i.0 as usize >= self.peer_pieces.size() {
                     eff.push(PeerEffect::Disconnect(
                         "invalid dont_have index",
@@ -1358,9 +1381,6 @@ impl PeerConn {
                     ));
                     return;
                 }
-                // piece-level message — the peer has metadata
-                // (upstream `incoming_dont_have` → `m_has_metadata`).
-                self.has_metadata = true;
                 if self.on_dont_have(i) {
                     eff.push(PeerEffect::RefcountDec(i));
                     eff.push(PeerEffect::PeerSeed(false));
@@ -1974,6 +1994,11 @@ impl PeerConn {
                     // (same validation as the wire `dont_have` arm).
                     let i = PieceIndex(i32::from_be_bytes([data[0], data[1], data[2], data[3]]));
                     if i.0 < 0 || i.0 >= num_pieces.max(0) {
+                        return;
+                    }
+                    // upstream `is_disconnecting` early-out — before
+                    // the `invalid_dont_have` bound check.
+                    if self.disconnecting {
                         return;
                     }
                     if i.0 as usize >= self.peer_pieces.size() {

@@ -89,7 +89,7 @@ fn piece_verified_sends_not_interested() {
         }
     }
     // we gain the only piece they had → NotInterested
-    s.on_piece_verified(&ih, PieceIndex(0), true, &mut out);
+    s.on_piece_verified(&ih, PieceIndex(0), true, &[], &mut out);
     assert!(
         out.iter().any(|o| matches!(
             o,
