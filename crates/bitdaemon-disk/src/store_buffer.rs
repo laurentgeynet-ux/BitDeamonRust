@@ -89,7 +89,10 @@ impl StoreBuffer {
         observer: Option<Arc<dyn DiskObserver>>,
     ) -> bool {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.map.insert(loc, buf);
+        // upstream `unordered_map::insert` keeps the existing entry on
+        // a duplicate key — the level (and so the watermark check) is
+        // unchanged when the insert is a no-op.
+        g.map.entry(loc).or_insert(buf);
         let level = g.map.len() as i64;
         g.back_pressure.has_back_pressure(level, observer)
     }

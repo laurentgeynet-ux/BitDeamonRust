@@ -1993,3 +1993,60 @@ fn set_file_pool_size_resizes_live_pool() {
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+/// A16 D2 — a duplicate write on a cached block supersedes the parked
+/// writer; its `write_blocks` back-pressure slot must be released
+/// (previously the CACHED flag suppressed the decrement and every
+/// duplicate leaked one slot forever).
+#[test]
+fn duplicate_write_releases_back_pressure_slot() {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::DiskIo;
+
+    let d = dir("dup_write_bp");
+    let (io, _drained) = make_io(0);
+    io.insert_storage(StorageIndex(0), Box::new(storage(&make_fs(), &d)));
+    io.set_max_queued_bytes(100 * 0x4000);
+
+    let done = Arc::new(AtomicUsize::new(0));
+    let req = PeerRequest {
+        piece: PieceIndex(0),
+        start: 0,
+        length: 1024,
+    };
+    let mk = |done: &Arc<AtomicUsize>| {
+        let d2 = Arc::clone(done);
+        Box::new(move |_: bitdaemon_disk::storage_error::StorageError| {
+            d2.fetch_add(1, Ordering::Relaxed);
+        }) as Box<dyn FnOnce(bitdaemon_disk::storage_error::StorageError) + Send>
+    };
+    io.async_write(
+        StorageIndex(0),
+        req,
+        DiskBufferHolder::from_owned(vec![0x5a; 1024]),
+        None,
+        mk(&done),
+        0,
+    );
+    io.async_write(
+        StorageIndex(0),
+        req,
+        DiskBufferHolder::from_owned(vec![0x5a; 1024]),
+        None,
+        mk(&done),
+        0,
+    );
+    io.completed().call_job_handlers();
+    // the piece is a single block here, so the surviving write
+    // flushed inline and released its slot; the superseded writer's
+    // slot is gone too — nothing leaks.
+    assert_eq!(
+        io.queue_stats().write_blocks,
+        0,
+        "duplicate write must not leak a back-pressure slot"
+    );
+    // both handlers ran (the superseded one aborted).
+    assert_eq!(done.load(Ordering::Relaxed), 2);
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}

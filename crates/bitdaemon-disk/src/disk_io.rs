@@ -505,10 +505,18 @@ impl PreadDiskIo {
             // writers still parked on cache blocks — their data never
             // flushed; abort them so their handlers still run
             // (upstream `abort_jobs` fails every outstanding job).
-            e.cache
+            // The buffers die with the cache: release their
+            // `write_blocks` slots here — the orphaned writers keep
+            // `CACHED` and skip their own decrement in `job_done`.
+            let released = e
+                .cache
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .abort_all_writers();
+            if released > 0 {
+                let level = self.write_blocks.fetch_sub(released, Ordering::Relaxed) - released;
+                self.back_pressure.check_buffer_level(level);
+            }
             for w in e
                 .cache
                 .lock()
@@ -955,6 +963,7 @@ impl PreadDiskIo {
         inserted: impl IntoIterator<Item = crate::disk_cache::PieceLocation>,
     ) {
         let mut runs = Vec::new();
+        let mut needs_global_flush = false;
         {
             let mut cache = entry.cache.lock().unwrap_or_else(|e| e.into_inner());
             for loc in inserted {
@@ -980,9 +989,48 @@ impl PreadDiskIo {
             // upstream `check_buffer_level`/`try_flush_blocks`: above
             // the high watermark (or while the exceeded flag is
             // sticky) keep flushing runs until the cache drains to the
-            // low watermark.
-            while let Some(low) = self.back_pressure.should_flush(cache.num_cached_blocks) {
-                if cache.num_cached_blocks <= low {
+            // low watermark. Upstream's `buffer_level()` is *global*
+            // (`m_blocks` over all storages + pending writes,
+            // `disk_cache.hpp:691`) and its passes re-test the real
+            // level because `f()` writes synchronously; our flushes
+            // are async jobs, so the exit test uses the *predicted*
+            // post-completion level: `write_blocks` (the global
+            // charged count) minus every buffer already taken into a
+            // Flush job (`in_flight_blocks`, incremented at take).
+            if self
+                .back_pressure
+                .should_flush(self.write_blocks.load(Ordering::Relaxed))
+                .is_some()
+            {
+                needs_global_flush = true;
+            }
+        }
+        if needs_global_flush {
+            // snapshot the storage list without holding `storages`
+            // across cache locks (RemoveTorrent takes cache →
+            // storages in that order).
+            let entries: Vec<Arc<StorageEntry>> = self
+                .storages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .cloned()
+                .collect();
+            loop {
+                let inflight: i64 = entries
+                    .iter()
+                    .map(|e| {
+                        e.cache
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .in_flight_blocks
+                    })
+                    .sum();
+                let level = self.write_blocks.load(Ordering::Relaxed);
+                let Some(low) = self.back_pressure.should_flush(level) else {
+                    break;
+                };
+                if level - inflight <= low {
                     break;
                 }
                 // upstream `flush_to_disk` order under a whole-piece
@@ -994,10 +1042,22 @@ impl PreadDiskIo {
                 // job runs. `coalesce_writes` extends each run across
                 // piece boundaries so write-through writes stay
                 // large.
-                let Some(run) = cache.take_coalesced(128) else {
+                let mut took = false;
+                for e in &entries {
+                    let run = e
+                        .cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take_coalesced(128);
+                    if let Some(run) = run {
+                        runs.push(run);
+                        took = true;
+                        break;
+                    }
+                }
+                if !took {
                     break;
-                };
-                runs.push(run);
+                }
             }
         }
         for (run_loc, first, spans, bufs, writers) in runs {
@@ -1622,10 +1682,21 @@ impl PreadDiskIo {
                 // Writers still parked in the cache are aborted first
                 // — their handlers complete through the normal queue
                 // (upstream `abort_jobs` on the storage's entries).
-                {
+                // The buffers die with the entry: release their
+                // `write_blocks` slots; the writers keep `CACHED` so
+                // `job_done` doesn't double-release them.
+                let released = {
                     let mut cache = e.cache.lock().unwrap_or_else(|p| p.into_inner());
-                    cache.abort_all_writers();
+                    cache.abort_all_writers()
+                };
+                if released > 0 {
+                    let level = self.write_blocks.fetch_sub(released, Ordering::Relaxed) - released;
+                    self.back_pressure.check_buffer_level(level);
                 }
+                // complete the aborted writers through the normal
+                // path before the entry drops — a job left in the
+                // queue would never run its handler.
+                self.drain_cache_orphans(e);
                 self.storages
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())

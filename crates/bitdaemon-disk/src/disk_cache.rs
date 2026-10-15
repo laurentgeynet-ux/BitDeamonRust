@@ -91,6 +91,10 @@ pub mod piece_flags {
     pub const PIECE_HASH_RETURNED: u16 = 1 << 3;
     /// `v1_hashes_flag` — v1 hashes available for this piece.
     pub const V1_HASHES: u16 = 1 << 4;
+    /// `needs_hasher_kick_flag` — a `need_hasher_kick` was already
+    /// emitted for the current `hasher_cursor`; cleared when the
+    /// hasher consumes the block (`hashed_block`).
+    pub const NEEDS_HASHER_KICK: u16 = 1 << 5;
 }
 
 /// `compute_force_flush` — a piece that hashed or completed its
@@ -158,8 +162,6 @@ pub struct CachedPieceEntry {
     pub hasher_cursor: u16,
     /// `num_jobs` — outstanding jobs referencing this piece.
     pub num_jobs: i32,
-    /// `v2_pending` — blocks sitting in the v2 hash queue.
-    pub v2_pending: u16,
     /// `cached_piece_flags`.
     pub flags: u16,
     /// `v1`/`v2` protocol kinds this piece feeds.
@@ -230,6 +232,13 @@ pub struct DiskCache {
     /// `m_blocks` — blocks whose buffers the cache (or the v2 queue)
     /// owns; feeds `back_pressure`.
     pub num_cached_blocks: i64,
+    /// Buffers taken out by `take_*_run` and not yet retired —
+    /// upstream's in-flight `writev` region (its `m_blocks` still
+    /// covers those until `flush_piece_impl` retires them, which is
+    /// synchronous there; our flushes are async jobs, so the level
+    /// checks subtract this to predict the post-completion level —
+    /// `flush_to_disk`'s `buffer_level() <= target` exit test).
+    pub in_flight_blocks: i64,
     /// `m_num_unhashed` — v1 blocks awaiting the hasher.
     pub num_unhashed: i64,
     /// Write jobs superseded by a duplicate insert or evicted with
@@ -267,6 +276,12 @@ impl Drop for DiskCache {
                 }
             }
         }
+        // jobs already evicted to `orphans` (superseded/cleared
+        // writers) were aborted when they moved — their handlers
+        // still run exactly once even if nobody drained the queue.
+        for mut w in self.orphans.drain(..) {
+            w.call_callback();
+        }
     }
 }
 
@@ -303,7 +318,6 @@ impl DiskCache {
                 flushed_cursor: 0,
                 hasher_cursor: 0,
                 num_jobs: 0,
-                v2_pending: 0,
                 flags: 0,
                 v1: params.v1,
                 v2: params.v2,
@@ -320,6 +334,7 @@ impl DiskCache {
         if buf.is_some() {
             self.dirty_sorted.insert(loc);
         }
+        let mut added = false;
         if let Some(b) = piece.blocks.get_mut(block_idx) {
             // `m_num_unhashed` counts cached blocks the hasher has
             // not consumed — only a freshly landed buffer adds one;
@@ -328,6 +343,10 @@ impl DiskCache {
                 piece.unhashed += 1;
                 self.num_unhashed += 1;
             }
+            // `++m_blocks` upstream only fires when a buffer actually
+            // moves into the slot (`if (wjob.buf)`); a duplicate write
+            // replaces the buffer in place — the slot stays count 1.
+            added = buf.is_some() && b.buf.is_none();
             b.buf = buf;
             // upstream `blk.write_state = write_job` — the writer
             // rides the block until a flush takes it (`take_write_job`)
@@ -336,12 +355,24 @@ impl DiskCache {
                 // a duplicate write on a block that still holds a
                 // parked writer: the older job is superseded — abort
                 // it rather than leak its completion (upstream
-                // overwrites write_state and aborts the old job)
+                // overwrites write_state and aborts the old job). Its
+                // buffer's slot charge transferred to the duplicate,
+                // so the job must not be released again by the Flush
+                // path: clear `CACHED` so `job_done` releases the
+                // back-pressure slot it was charged at submit.
                 if let Some(mut old) = b.writer.replace(w) {
+                    old.flags &= !crate::disk_job::job_flags::CACHED;
                     crate::disk_completed::abort(&mut old);
                     self.orphans.push_back(old);
+                    piece.num_jobs -= 1;
                 }
             }
+        } else if let Some(mut w) = writer {
+            // upstream asserts `block_idx < blocks_in_piece` — a stray
+            // write must still complete, aborted, once.
+            debug_assert!(false, "write block index out of piece");
+            crate::disk_completed::abort(&mut w);
+            self.orphans.push_back(w);
         }
         // the piece just became complete (every block buffered or
         // already flushed) → candidate for a large contiguous flush
@@ -349,10 +380,9 @@ impl DiskCache {
         if piece.blocks.iter().all(|b| b.buf.is_some() || b.flushed) {
             self.ready.push_back(loc);
         }
-        if params.v2 {
-            piece.v2_pending += 1;
+        if added {
+            self.num_cached_blocks += 1;
         }
-        self.num_cached_blocks += 1;
         if force_flush || compute_force_flush(piece) {
             piece.flags |= piece_flags::FORCE_FLUSH;
         }
@@ -362,8 +392,10 @@ impl DiskCache {
         if params.v1
             && piece.hasher_cursor as usize == block_idx
             && piece.flags & piece_flags::PIECE_HASH_RETURNED == 0
+            && piece.flags & piece_flags::NEEDS_HASHER_KICK == 0
         {
             ret.need_hasher_kick = true;
+            piece.flags |= piece_flags::NEEDS_HASHER_KICK;
         }
         self.refresh_run_index(loc);
         ret
@@ -378,16 +410,25 @@ impl DiskCache {
     /// Abort every writer still parked in the cache, queueing them
     /// on `orphans` — teardown callers (`remove_torrent`,
     /// `abort_jobs`) drain them through the completed queue so each
-    /// handler still runs exactly once.
-    pub fn abort_all_writers(&mut self) {
+    /// handler still runs exactly once. Returns the number of cached
+    /// buffers that evaporate with the cache (blocks still holding a
+    /// `buf`, i.e. not out inside an in-flight flush — those release
+    /// their slot when the Flush job completes) so the caller can
+    /// release the matching `write_blocks` back-pressure slots.
+    pub fn abort_all_writers(&mut self) -> i64 {
+        let mut bufs = 0i64;
         for p in self.pieces.values_mut() {
             for b in &mut p.blocks {
+                if b.buf.is_some() {
+                    bufs += 1;
+                }
                 if let Some(mut w) = b.writer.take() {
                     crate::disk_completed::abort(&mut w);
                     self.orphans.push_back(w);
                 }
             }
         }
+        bufs
     }
 
     /// `try_clear_piece` — refuses while a write job or hashing is
@@ -535,6 +576,9 @@ impl DiskCache {
             bufs.push(buf);
         }
         let out = (!bufs.is_empty()).then_some((start as i32, bufs, writers));
+        if let Some((_, bufs, _)) = &out {
+            self.in_flight_blocks += bufs.len() as i64;
+        }
         self.refresh_run_index(loc);
         out
     }
@@ -577,6 +621,9 @@ impl DiskCache {
             bufs.push(buf);
         }
         let out = (!bufs.is_empty()).then_some((best_start as i32, bufs, writers));
+        if let Some((_, bufs, _)) = &out {
+            self.in_flight_blocks += bufs.len() as i64;
+        }
         self.refresh_run_index(loc);
         out
     }
@@ -786,6 +833,9 @@ impl DiskCache {
         bufs: Vec<Vec<u8>>,
         mut writers: Vec<Option<Box<DiskJob>>>,
     ) {
+        // every buffer handed in leaves the in-flight state — back to
+        // the cache slot, or dropped on a re-written block.
+        self.in_flight_blocks -= bufs.len() as i64;
         let ready = {
             let Some(p) = self.pieces.get_mut(&loc) else {
                 return;
@@ -805,12 +855,22 @@ impl DiskCache {
                         p.num_jobs -= 1;
                     }
                     b.writer = w;
-                } else if let Some(mut w) = w {
+                } else {
                     // the block was re-written while the run was
-                    // out — its new writer owns the slot; the old
-                    // job is superseded and completes aborted
-                    crate::disk_completed::abort(&mut w);
-                    self.orphans.push_back(w);
+                    // out — its new buffer owns the slot; the put-back
+                    // buffer is dropped and releases its charge.
+                    self.num_cached_blocks -= 1;
+                    if let Some(mut w) = w {
+                        // its slot charge transferred to the newer
+                        // write — clear `CACHED` so `job_done`
+                        // releases the back-pressure slot instead of
+                        // leaking it (same rule as the duplicate
+                        // insert in `insert`).
+                        w.flags &= !crate::disk_job::job_flags::CACHED;
+                        crate::disk_completed::abort(&mut w);
+                        self.orphans.push_back(w);
+                        p.num_jobs -= 1;
+                    }
                 }
             }
             p.blocks.iter().all(|b| b.buf.is_some() || b.flushed)
@@ -841,16 +901,19 @@ impl DiskCache {
     pub fn run_flushed(&mut self, loc: PieceLocation, first: usize, len: usize) {
         let mut free = false;
         let mut retired = 0i64;
+        let mut inflight = 0i64;
         if let Some(p) = self.pieces.get_mut(&loc) {
             for b in p.blocks.iter_mut().skip(first).take(len) {
                 if b.has_write_job {
                     p.num_jobs -= 1;
+                    inflight += 1;
                 }
                 b.has_write_job = false;
                 b.flushed = true;
                 b.buf = None;
                 retired += 1;
             }
+            self.in_flight_blocks -= inflight;
             self.num_cached_blocks -= retired;
             p.flushed_cursor = compute_flushed_cursor(&p.blocks);
             // the entry leaves the cache once every block is on disk —
@@ -950,6 +1013,10 @@ impl DiskCache {
             && p.hasher_cursor as usize == block_idx
         {
             p.hasher_cursor += 1;
+            // the kick was consumed — a later insert on the new
+            // `hasher_cursor` may emit `need_hasher_kick` again
+            // (upstream clears `needs_hasher_kick_flag` on advance).
+            p.flags &= !piece_flags::NEEDS_HASHER_KICK;
             p.unhashed = p.unhashed.saturating_sub(1);
             self.num_unhashed = self.num_unhashed.saturating_sub(1);
         }
@@ -1152,5 +1219,123 @@ mod tests {
         let (loc, ..) = c.take_coalesced(16).unwrap();
         assert_eq!(loc, at(9));
         assert!(c.take_coalesced(16).is_none());
+    }
+
+    /// A16 D2 — a duplicate write on a cached block replaces the
+    /// buffer in place: `num_cached_blocks` counts *slots*, so it
+    /// must not grow, and the superseded writer loses `CACHED` so
+    /// `job_done` releases its back-pressure slot (it was charged at
+    /// submit and no flush will ever retire it).
+    #[test]
+    fn duplicate_insert_keeps_block_count_and_supersedes() {
+        use crate::disk_job::{JobKind, WriteJob, job_flags};
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        let writer = || {
+            Box::new(DiskJob {
+                storage: StorageIndex(0),
+                flags: job_flags::CACHED,
+                ret: 0,
+                error: Default::default(),
+                action: JobKind::Write(WriteJob {
+                    handler: Box::new(|_| {}),
+                    buf: crate::disk_buffer_pool::DiskBufferHolder::empty(),
+                    piece: PieceIndex(0),
+                    offset: 0,
+                    buffer_size: 4,
+                    force_flush: false,
+                    volatile: false,
+                }),
+            })
+        };
+        c.insert(loc, 0, Some(vec![1; 4]), Some(writer()), false, params());
+        assert_eq!(c.num_cached_blocks, 1);
+        c.insert(loc, 0, Some(vec![2; 4]), Some(writer()), false, params());
+        assert_eq!(
+            c.num_cached_blocks, 1,
+            "duplicate buffer replaces the slot, no +1"
+        );
+        let orphans = c.take_orphans();
+        assert_eq!(orphans.len(), 1, "the older writer is superseded");
+        assert_eq!(
+            orphans[0].flags & job_flags::CACHED,
+            0,
+            "superseded writer releases its own back-pressure slot"
+        );
+        assert_ne!(
+            orphans[0].flags & job_flags::ABORTED,
+            0,
+            "and completes aborted"
+        );
+        // and the block still holds the newer buffer
+        assert_eq!(c.get(loc, 0), Some(&[2u8; 4][..]));
+    }
+
+    /// A16 D1 — buffers taken into a flush run count as in-flight so
+    /// the watermark loop can predict the post-completion level;
+    /// `run_flushed` and `restore_run` settle the count.
+    #[test]
+    fn in_flight_blocks_tracks_taken_runs() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        for b in 0..3 {
+            c.insert(loc, b, Some(vec![0; 4]), None, false, params());
+        }
+        assert_eq!(c.num_cached_blocks, 3);
+        assert_eq!(c.in_flight_blocks, 0);
+        let (first, bufs, writers) = c.take_flush_run(loc).unwrap();
+        assert_eq!(bufs.len(), 3);
+        assert_eq!(c.in_flight_blocks, 3);
+        // put back unflushed → back to cached, not in flight
+        c.restore_run(loc, usize::try_from(first).unwrap_or(0), bufs, writers);
+        assert_eq!(c.in_flight_blocks, 0);
+        assert_eq!(c.num_cached_blocks, 3);
+        let (first, bufs, _w) = c.take_flush_run(loc).unwrap();
+        c.run_flushed(loc, usize::try_from(first).unwrap_or(0), bufs.len());
+        assert_eq!(c.in_flight_blocks, 0);
+        assert_eq!(c.num_cached_blocks, 0);
+    }
+
+    /// A16 D6 — `need_hasher_kick` mirrors upstream's
+    /// `needs_hasher_kick_flag`: emitted once per `hasher_cursor`
+    /// position, re-armed when the hasher consumes the block.
+    #[test]
+    fn hasher_kick_emitted_once_per_cursor() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        assert!(
+            c.insert(loc, 0, Some(vec![1; 4]), None, false, params())
+                .need_hasher_kick
+        );
+        // duplicate insert on the same block — cursor still 0, no re-kick
+        assert!(
+            !c.insert(loc, 0, Some(vec![1; 4]), None, false, params())
+                .need_hasher_kick
+        );
+        c.hashed_block(loc, 0);
+        assert!(
+            c.insert(loc, 1, Some(vec![1; 4]), None, false, params())
+                .need_hasher_kick
+        );
+    }
+
+    /// A16 — teardown: `abort_all_writers` reports the cached buffers
+    /// that die with the cache so the caller can release their
+    /// `write_blocks` slots; orphaned writers keep `CACHED` (their
+    /// slot is covered by that count, not by `job_done`).
+    #[test]
+    fn abort_all_writers_reports_buffers() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        c.insert(loc, 0, Some(vec![1; 4]), None, false, params());
+        c.insert(loc, 1, Some(vec![1; 4]), None, false, params());
+        assert_eq!(c.abort_all_writers(), 2);
+        // a block out in an in-flight flush is NOT counted — its slot
+        // is released when the Flush job completes. Piece 0's two
+        // cached buffers still count; piece 1's in-flight one doesn't.
+        let loc2 = (StorageIndex(0), PieceIndex(1));
+        c.insert(loc2, 0, Some(vec![1; 4]), None, false, params());
+        let _run = c.take_flush_run(loc2);
+        assert_eq!(c.abort_all_writers(), 2);
     }
 }
