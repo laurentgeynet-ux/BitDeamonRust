@@ -28,13 +28,20 @@ use bitdaemon_core::torrent_info::LoadTorrentLimits;
 pub struct SessionState {
     /// `torrents` — `write_resume_data` output per swarm.
     pub torrents: BTreeMap<Sha1Hash, AddTorrentParams>,
-    /// `dht` — opaque dht-state blob (`dht_tracker::save`).
+    /// `dht` — opaque dht-state blob (`dht_tracker::save`);
+    /// also carried as a `"dht state"` dict for upstream readers.
     pub dht_state: Vec<u8>,
     /// `peer-class` counts etc. — opaque extension map.
     pub extra: BTreeMap<Vec<u8>, Vec<u8>>,
     /// `settings` — `settings_pack` persisted by upstream
     /// (`session_state::settings`).
     pub settings: Option<crate::settings::SessionSettings>,
+    /// `session_params::ip_filter` — persisted `ip_filter4`/`6`
+    /// ranges (upstream `save_ip_filter` flag coverage).
+    pub ip_filter: bitdaemon_net::ip_filter::IpFilter,
+    /// `session_params::ext_state` — extension blobs, serialized
+    /// under the upstream `"extensions"` dict.
+    pub extensions: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 /// `save_state` — `Entry` for the whole session.
@@ -55,10 +62,27 @@ pub fn save_session_state(st: &SessionState) -> Entry {
         m.insert(b"torrents".to_vec(), torrents);
         if !st.dht_state.is_empty() {
             m.insert(b"dht".to_vec(), Entry::String(st.dht_state.clone()));
+            // upstream `write_session_params` layout — the routing
+            // state also lands as a `"dht state"` dict so
+            // `read_session_params`-style readers pick it up.
+            if let Some(ds) = bitdaemon_dht::dht_state::read_dht_state_bytes(&st.dht_state) {
+                m.insert(
+                    b"dht state".to_vec(),
+                    bitdaemon_dht::dht_state::save_dht_state(&ds),
+                );
+            }
         }
         if let Some(set) = &st.settings {
             m.insert(b"settings".to_vec(), save_settings(set));
         }
+        if !st.extensions.is_empty() {
+            let mut ext = bitdaemon_bencode::Dictionary::new();
+            for (k, v) in &st.extensions {
+                ext.insert(k.clone(), Entry::String(v.clone()));
+            }
+            m.insert(b"extensions".to_vec(), Entry::Dict(ext));
+        }
+        crate::session_params::write_ip_filter(&st.ip_filter, m);
         for (k, v) in &st.extra {
             m.insert(k.clone(), Entry::String(v.clone()));
         }
@@ -105,9 +129,39 @@ pub fn load_session_state_node(root: &BdecodeNode<'_>) -> Option<SessionState> {
     if !dht.is_empty() {
         st.dht_state = dht.to_vec();
     }
+    // upstream `read_session_params` layout — `"dht state"` is a
+    // dict; keep its raw section so `read_dht_state_bytes` works on
+    // either carrier (our `"dht"` string blob or the upstream dict).
+    let ds = root.dict_find_dict(b"dht state");
+    if ds.node_type() == bitdaemon_bencode::NodeType::Dict {
+        st.dht_state = ds.data_section().to_vec();
+    }
+    // `ip_filter4`/`ip_filter6` — same stride/tolerance as
+    // `read_session_params`.
+    crate::session_params::load_ip_filter(root, &mut st.ip_filter);
+    // `"extensions"` dict — key → blob, like `session_params::ext_state`.
+    let ext = root.dict_find_dict(b"extensions");
+    if ext.node_type() == bitdaemon_bencode::NodeType::Dict {
+        for i in 0..ext.dict_size() {
+            let (k, v) = ext.dict_at(i);
+            if v.node_type() == bitdaemon_bencode::NodeType::String {
+                st.extensions.insert(k.to_vec(), v.string_value().to_vec());
+            }
+        }
+    }
+    // Settings merge order mirrors `read_session_params`: the legacy
+    // `"dht"` *dict* seeds the flat `dht_*` keys first
+    // (`apply_deprecated_dht_settings`), then `"settings"` overlays
+    // per-key. Our `"dht"` string blob doesn't collide — it isn't a
+    // dict, so `dict_find_dict` returns an invalid node and the
+    // overlay is skipped.
+    let dhtd = root.dict_find_dict(b"dht");
     let set = root.dict_find_dict(b"settings");
-    if set.is_valid() {
-        st.settings = Some(read_settings(&set));
+    if dhtd.node_type() == bitdaemon_bencode::NodeType::Dict || set.is_valid() {
+        let mut s = crate::settings::SessionSettings::default();
+        crate::session_params::apply_dht_settings_dict(&mut s, &dhtd);
+        crate::session_params::apply_settings_dict(&mut s, &set);
+        st.settings = Some(s);
     }
     Some(st)
 }

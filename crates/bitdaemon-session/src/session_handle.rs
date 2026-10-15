@@ -376,11 +376,23 @@ impl SessionHandle {
         self.save_state_buf()
     }
 
-    /// `write_session_params` — same serialized form (upstream
-    /// `write_session_params` → bencoded `session_state`).
+    /// `write_session_params` — the upstream `session_params` dict
+    /// (`settings`/`dht`/`dht state`/`extensions`/`ip_filter4`/`6`),
+    /// **not** the torrent-resume container `save_state_buf` emits.
+    /// `load_state` accepts both layouts.
     #[must_use]
     pub fn write_session_params(&self) -> Vec<u8> {
-        self.save_state_buf()
+        let s = lock(&self.inner);
+        let params = crate::settings::SessionParams {
+            settings: s.settings.clone(),
+            dht_settings: s.dht_settings(),
+            dht_state: s.dht_state(),
+            ip_filter: s.ip_filter().clone(),
+            ext_state: std::collections::BTreeMap::new(),
+            disk_io: None,
+            plugins: Vec::new(),
+        };
+        crate::session_params::write_session_params_buf(&params)
     }
 
     /// `set_alert_mask` / `get_alert_mask`.
@@ -489,33 +501,50 @@ impl SessionHandle {
         lock(&self.inner).set_key(key);
     }
 
-    // ---- proxies (`set_proxy` covers `peer`; upstream splits per use)
+    // ---- proxies — upstream 2.x folds every purpose-slot into the
+    // settings-derived `proxy()`; `set_*_proxy` writes `proxy_*` pack
+    // keys and re-applies.
 
-    /// `set_proxy` — the peer-connection proxy.
+    /// `set_proxy` — writes the `proxy_*` settings keys and applies
+    /// them (upstream `session_handle::set_proxy` packs them into a
+    /// `settings_pack` and calls `apply_settings`).
     pub fn set_proxy(&self, p: bitdaemon_net::proxy::ProxySettings) {
-        lock(&self.inner).proxies.peer = p;
+        let mut s = lock(&self.inner);
+        let mut sett = s.settings.clone();
+        sett.proxy_hostname = p.hostname.into_bytes();
+        sett.proxy_username = p.username.into_bytes();
+        sett.proxy_password = p.password.into_bytes();
+        sett.proxy_type = p.proxy_type;
+        sett.proxy_port = i32::from(p.port);
+        sett.proxy_hostnames = p.proxy_hostnames;
+        sett.proxy_peer_connections = p.proxy_peer_connections;
+        s.apply_settings(sett);
     }
 
-    /// `proxy()`.
+    /// `proxy()` — `proxy_settings(m_settings)`.
     #[must_use]
     pub fn proxy(&self) -> bitdaemon_net::proxy::ProxySettings {
-        lock(&self.inner).proxies.peer.clone()
+        lock(&self.inner).proxy_from_settings()
     }
 
-    /// `set_peer_proxy`.
+    /// `set_peer_proxy` — same as `set_proxy` upstream.
     pub fn set_peer_proxy(&self, p: bitdaemon_net::proxy::ProxySettings) {
-        lock(&self.inner).proxies.peer = p;
+        self.set_proxy(p);
     }
 
-    /// `peer_proxy`.
+    /// `peer_proxy` — same as `proxy()` upstream.
     #[must_use]
     pub fn peer_proxy(&self) -> bitdaemon_net::proxy::ProxySettings {
-        lock(&self.inner).proxies.peer.clone()
+        self.proxy()
     }
 
-    /// `set_tracker_proxy`.
+    /// `set_tracker_proxy` — upstream only toggles
+    /// `proxy_tracker_connections` on the pack.
     pub fn set_tracker_proxy(&self, p: bitdaemon_net::proxy::ProxySettings) {
-        lock(&self.inner).proxies.tracker = p;
+        let mut s = lock(&self.inner);
+        let mut sett = s.settings.clone();
+        sett.proxy_tracker_connections = p.proxy_type != bitdaemon_net::proxy::ProxyType::None;
+        s.apply_settings(sett);
     }
 
     /// `tracker_proxy`.
@@ -524,7 +553,9 @@ impl SessionHandle {
         lock(&self.inner).proxies.tracker.clone()
     }
 
-    /// `set_web_seed_proxy`.
+    /// `set_web_seed_proxy` — a NO-OP upstream; the slot stays
+    /// writable here for deployments that key off it until the next
+    /// `apply_settings` rebuilds `proxies` from the pack.
     pub fn set_web_seed_proxy(&self, p: bitdaemon_net::proxy::ProxySettings) {
         lock(&self.inner).proxies.web_seed = p;
     }

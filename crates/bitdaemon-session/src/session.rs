@@ -6148,7 +6148,23 @@ impl Session {
     /// `apply_settings_pack` — hot-swap the settings bag. Upstream
     /// re-reads everything lazily; we mirror that by replacing the
     /// struct (all reads go through `self.settings`).
-    pub fn apply_settings(&mut self, s: crate::settings::SessionSettings) {
+    pub fn apply_settings(&mut self, mut s: crate::settings::SessionSettings) {
+        // `update_connection_speed` — a negative dial rate writes
+        // back 200 upstream (`session_impl.cpp:6721`).
+        if s.connection_speed < 0 {
+            s.connection_speed = 200;
+        }
+        // `update_disk_threads` — thread counts clamp at 0 before
+        // reaching the pools.
+        s.aio_threads = s.aio_threads.max(0);
+        s.hashing_threads = s.hashing_threads.max(0);
+        // `update_user_agent` — newlines become spaces (a raw `\n`
+        // would split HTTP request headers on web seeds).
+        for b in &mut s.user_agent {
+            if *b == b'\n' {
+                *b = b' ';
+            }
+        }
         // hot-applied knobs upstream pushes eagerly
         // (`update_alert_queue_size`, `update_disk_cache_limit`):
         // the rest is read lazily through `self.settings`.
@@ -6208,14 +6224,41 @@ impl Session {
         let ignore_local_changed =
             s.ignore_limits_on_local_network != self.settings.ignore_limits_on_local_network;
         let mixed_mode_changed = s.mixed_mode_algorithm != self.settings.mixed_mode_algorithm;
+        let auto_sequential_changed = s.auto_sequential != self.settings.auto_sequential;
+        // `trigger_auto_manage` — the four `active_*` limits force a
+        // queue recalc upstream (`settings_pack.cpp` callbacks).
+        let auto_limits_changed = s.active_downloads != self.settings.active_downloads
+            || s.active_seeds != self.settings.active_seeds
+            || s.active_checking != self.settings.active_checking
+            || s.active_limit != self.settings.active_limit;
+        // `update_proxy` — the settings-derived `proxy_settings`
+        // (upstream `proxy()` = `proxy_settings(m_settings)`) feeds
+        // every purpose-slot.
+        let proxy_changed = s.proxy_type != self.settings.proxy_type
+            || s.proxy_port != self.settings.proxy_port
+            || s.proxy_hostname != self.settings.proxy_hostname
+            || s.proxy_username != self.settings.proxy_username
+            || s.proxy_password != self.settings.proxy_password
+            || s.proxy_peer_connections != self.settings.proxy_peer_connections
+            || s.proxy_tracker_connections != self.settings.proxy_tracker_connections
+            || s.proxy_hostnames != self.settings.proxy_hostnames
+            || s.proxy_send_host_in_connect != self.settings.proxy_send_host_in_connect;
+        // `update_dht_bootstrap_nodes` — re-seed the router list
+        // when the configured set changes on a running DHT.
+        let dht_boot_changed = s.dht_bootstrap_nodes != self.settings.dht_bootstrap_nodes;
         self.services.dht = s.enable_dht;
         self.services.lsd = s.enable_lsd;
         self.services.natpmp = s.enable_natpmp;
         self.services.upnp = s.enable_upnp;
-        // `update_listen_interfaces`/`update_outgoing_interfaces`/
-        // `update_ssl_listen` — a changed bind spec re-opens sockets.
+        // `reopen_listen_port` upstream fires on `listen_interfaces`,
+        // `proxy_type` or `proxy_peer_connections` changes
+        // (`session_impl.cpp:1568-1575`) — `outgoing_interfaces` only
+        // re-parses the bind list (read lazily by `verify_bound_address`
+        // and the dial path). `ssl_listen` stays in the gate — the key
+        // is still live in our pack.
         if s.listen_interfaces != self.settings.listen_interfaces
-            || s.outgoing_interfaces != self.settings.outgoing_interfaces
+            || s.proxy_type != self.settings.proxy_type
+            || s.proxy_peer_connections != self.settings.proxy_peer_connections
             || s.ssl_listen != self.settings.ssl_listen
         {
             self.reopen_sockets = true;
@@ -6223,6 +6266,33 @@ impl Session {
         let privileged_now_on =
             s.no_connect_privileged_ports && !self.settings.no_connect_privileged_ports;
         self.settings = s;
+        if proxy_changed {
+            // `proxy_settings(m_settings)` — the pack keys build one
+            // proxy config used for every purpose (upstream 2.x
+            // collapsed `m_peer_proxy`/`m_tracker_proxy`/… into
+            // `proxy()`; the `set_*_proxy` handle setters write the
+            // same slots upstream).
+            let p = self.proxy_from_settings();
+            self.proxies.peer = p.clone();
+            self.proxies.tracker = p.clone();
+            self.proxies.web_seed = p.clone();
+            self.proxies.dht = p.clone();
+            self.proxies.i2p = p;
+        }
+        if dht_boot_changed && self.settings.enable_dht && self.services.dht {
+            self.update_dht_bootstrap_nodes();
+        }
+        if auto_limits_changed {
+            // upstream `trigger_auto_manage` throttles to ≥1 s since
+            // the last pass; our scaler does the same through the
+            // `auto_manage_interval` re-arm in `tick`.
+            self.auto_manage_scaler = 0;
+        }
+        if auto_sequential_changed {
+            for t in self.torrents.values_mut() {
+                t.update_auto_sequential(&self.settings);
+            }
+        }
         // upstream nodes read `m_settings` live — our nodes carry a
         // `DhtSettings` copy, so re-push on every apply. This is also
         // `update_dht_upload_rate_limit`'s clamp.
@@ -6273,14 +6343,68 @@ impl Session {
         }
     }
 
+    /// `session_impl::proxy` — `proxy_settings(m_settings)`: the
+    /// `proxy_*` pack keys built into one `ProxySettings` (upstream
+    /// 2.x uses it for every purpose-slot).
+    #[must_use]
+    pub(crate) fn proxy_from_settings(&self) -> bitdaemon_net::proxy::ProxySettings {
+        let s = &self.settings;
+        bitdaemon_net::proxy::ProxySettings {
+            hostname: String::from_utf8_lossy(&s.proxy_hostname).into_owned(),
+            port: s.proxy_port.clamp(0, i32::from(u16::MAX)) as u16,
+            username: String::from_utf8_lossy(&s.proxy_username).into_owned(),
+            password: String::from_utf8_lossy(&s.proxy_password).into_owned(),
+            proxy_type: s.proxy_type,
+            proxy_peer_connections: s.proxy_peer_connections,
+            proxy_tracker_connections: s.proxy_tracker_connections,
+            proxy_hostnames: s.proxy_hostnames,
+            send_host_in_connect: s.proxy_send_host_in_connect,
+        }
+    }
+
+    /// `session_impl::update_dht_bootstrap_nodes` — parse the
+    /// `host:port` list and hand each entry to the resolver path
+    /// (`add_dht_router` upstream). No-op when the DHT is off.
+    fn update_dht_bootstrap_nodes(&mut self) {
+        if !self.settings.enable_dht {
+            return;
+        }
+        let list = String::from_utf8_lossy(&self.settings.dht_bootstrap_nodes).into_owned();
+        for entry in list.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            // `host:port` — upstream `parse_comma_separated_string_port`
+            // splits on the last ':' so bracketed v6 works too.
+            let Some((host, port)) = entry.rsplit_once(':') else {
+                continue;
+            };
+            let Ok(port) = port.parse::<i32>() else {
+                continue;
+            };
+            self.pending_out.push(SessionOut::DhtAddNode {
+                host: host.trim_matches(['[', ']']).to_string(),
+                port,
+            });
+        }
+    }
+
     /// `session_impl::update_connections_limit` — when the cap
     /// drops below the live conn count, disconnect the excess spread
     /// evenly across torrents: `limit/n` slots each, remainder
     /// redistributed to torrents above the quotient, 4 iterations.
-    /// `limit <= 0` maps to `max_open_files` upstream (effectively
-    /// unbounded here — no disconnect sweep runs).
+    /// `limit <= 0` maps to `max_open_files` upstream — effectively
+    /// unbounded, no disconnect sweep, and the resolved value is
+    /// written back into the pack.
     fn update_connections_limit(&mut self) {
-        let limit = self.settings.connections_limit.max(1) as usize;
+        if self.settings.connections_limit <= 0 {
+            // no `max_open_files()` equivalent under injected
+            // transports — `i32::MAX` is the practical unbounded cap.
+            self.settings.connections_limit = i32::MAX;
+            return;
+        }
+        let limit = self.settings.connections_limit as usize;
         let num_conns: usize = self.torrents.values().map(|t| t.peers.len()).sum();
         if num_conns <= limit || self.torrents.is_empty() {
             return;
@@ -6673,7 +6797,11 @@ impl Session {
         if self.settings.choking_algorithm != crate::choker::ChokingAlgorithm::FixedSlots {
             return;
         }
-        if limit != i32::MAX && limit >= 0 {
+        if limit != i32::MAX {
+            // upstream `m_unchoke_time_scaler = 0` — the finite (and
+            // negative-as-unlimited) case only forces a recalc on
+            // the next tick, not an immediate sweep.
+            self.pending_unchoke = true;
             return;
         }
         // unlimited — unchoke everyone eligible (upstream's sweep
@@ -10310,6 +10438,10 @@ impl Session {
                 bitdaemon_bencode::bencode(&bitdaemon_dht::dht_state::save_dht_state(&ds));
         }
         st.settings = Some(self.settings.clone());
+        // `session_params::ip_filter` — upstream `session_state`
+        // carries the live filter when `save_ip_filter` is set;
+        // ours always rides along (empty → no keys emitted).
+        st.ip_filter = (*self.ip_filter).clone();
         st
     }
 
@@ -10325,6 +10457,14 @@ impl Session {
                 .post(Alert::SessionError("invalid session state".into()));
             return 0;
         };
+        // `read_session_params` order — the legacy `"dht"` dict's
+        // keys seed the flat `dht_*` settings before `"settings"`
+        // overlays them (`apply_deprecated_dht_settings`).
+        let dht_node = root.dict_find_dict(b"dht");
+        if dht_node.node_type() == bitdaemon_bencode::NodeType::Dict {
+            crate::session_params::apply_dht_settings_dict(&mut self.settings, &dht_node);
+            self.sync_dht_settings();
+        }
         // upstream `load_state`: `apply_settings_pack_impl` overlays
         // only the keys the file carries, and `pack.clear`s
         // `user_agent`/`peer_fingerprint` — the client identity is
@@ -10341,6 +10481,15 @@ impl Session {
             // `dht_*` keys reached the live nodes like
             // `apply_settings` would push them.
             self.sync_dht_settings();
+        }
+        // `save_ip_filter` — a populated filter replaces the live
+        // one (`session_impl::set_ip_filter` side-effects: torrent
+        // re-share + blocked-peer sweep land in `out`).
+        {
+            let (v4, v6) = st.ip_filter.export_filter();
+            if !v4.is_empty() || !v6.is_empty() {
+                self.set_ip_filter(st.ip_filter, out);
+            }
         }
         if let Some(ds) = bitdaemon_dht::dht_state::read_dht_state_bytes(&st.dht_state) {
             // `session_params::dht_state` — keep the parsed blob so
