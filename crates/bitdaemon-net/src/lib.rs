@@ -65,15 +65,6 @@ pub enum NetError {
 /// Convenience alias for net operations.
 pub type Result<T> = std::result::Result<T, NetError>;
 
-/// Peer wire message codec (`libtorrent::peer_connection` message
-/// dispatch + `bt_peer_connection` serialization).
-///
-/// TODO: implement — length-prefixed framing (4-byte BE len + 1-byte id),
-/// messages: choke/unchoke/interested/not-interested/have/bitfield/
-/// request/piece/cancel/d-port/suggest/have-all/have-none/reject/
-/// allowed-fast + extension protocol (BEP-10) handshake.
-/// Shape as a `tokio_util::codec::{Encoder, Decoder}`.
-pub struct PeerWireCodec;
 /// BEP-10 extended handshake build/parse + framing.
 pub mod bep10;
 /// `bt_peer_connection` — async wire driver over PeerStream.

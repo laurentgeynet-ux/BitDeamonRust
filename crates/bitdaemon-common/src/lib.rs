@@ -26,8 +26,8 @@
 //! | [`mod@index_range`] | `index_range.hpp`                                |
 //! | [`timestamp_history`] | `aux_/timestamp_history.hpp`, `compare_less_wrap` (`utp_stream.cpp`) |
 //!
-//! Still TODO here: `span.hpp`, `disk_buffer` (land with the disk layer),
-//! `stat_cache` (needs `file_storage` — Phase 2).
+//! `span.hpp` is `won't port` (→ `&[T]` slices); `disk_buffer` and
+//! `stat_cache` live in `bitdaemon-disk` with the storage layer.
 
 #![forbid(unsafe_code)]
 

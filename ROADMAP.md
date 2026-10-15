@@ -503,6 +503,25 @@ qBittorrent-class UI.
       (mmap, opt) → net → dht → session → sim → bitdaemon → cli.
 - [ ] `cargo deny` licenses/advisories green; MSRV pinned in
       `rust-toolchain.toml`.
+- [ ] **TODO sweep** — the four `TODO` markers left in the tree
+      (2026-10-15 audit):
+  - [x] `bitdaemon-session/src/lib.rs` — stale: `Session`/`TorrentHandle`
+        placeholder structs + "TODO: implement" docs predate
+        `session.rs`/`session_handle.rs`; crate header still says
+        "not ported yet". Remove placeholders, fix crate doc.
+  - [x] `bitdaemon-net/src/lib.rs` — stale: empty `PeerWireCodec` struct
+        + "TODO: implement" doc; the codec is ported as
+        `net::peer_wire`. Remove the placeholder.
+  - [x] `bitdaemon-common/src/lib.rs` — stale: "Still TODO: `span.hpp`,
+        `disk_buffer`, `stat_cache`" — `span.hpp` is `won't port`
+        (→ slices), `disk_buffer`/`stat_cache` landed in
+        `bitdaemon-disk` (`disk_buffer_pool.rs`, `stat_cache.rs`).
+        Update the doc-table comment.
+  - [ ] `bitdaemon-net/src/transport.rs` — real, conditional:
+        `poll_send_to`-style vectored send on `DatagramSocket` if
+        profiling shows copy overhead in uTP/DHT hot paths.
+        Decision point: benchmark first (Phase G benchmarks), then
+        add the method or drop the TODO.
 
 ---
 

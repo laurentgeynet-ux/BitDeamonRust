@@ -18,7 +18,7 @@
 //! actor task owning all torrent state; public handles communicate via
 //! `mpsc` commands and `mpsc`/`watch` alert channels.
 //!
-//! Status: **not ported yet** — see `docs/PORTING.md`.
+//! See `docs/PORTING.md` for per-module port status.
 
 #![forbid(unsafe_code)]
 
@@ -28,12 +28,6 @@ pub mod peer_conn;
 pub mod peer_info;
 /// `peer_connection` request pipeline + `merge_block_requests`.
 pub mod peer_pipeline;
-/// Client session (`libtorrent::session` / `session_handle`).
-///
-/// TODO: implement — spawn the actor, `add_torrent`, `pause`/`resume`,
-/// `post_torrent_updates`, `pop_alerts`, `apply_settings`, `save_state`
-/// / `load_state` (`.session` file, bencoded), `is_listening`, ports
-/// mapping, DHT/LSD/UPnP/NAT-PMP toggles.
 /// `aux_/piece_picker` — piece availability, priorities, picking.
 pub mod piece_picker;
 /// `aux_/request_blocks` — `request_a_block` glue picker↔peer.
@@ -69,14 +63,6 @@ pub mod torrent;
 /// `announce_entry`/`tracker_list` — retry & failover.
 pub mod tracker_list;
 
-/// Client session (`libtorrent::session` / `session_handle`).
-pub struct Session;
-
-/// Per-torrent handle (`libtorrent::torrent_handle`).
-///
-/// TODO: implement — cheap `Clone`able handle sending commands into the
-/// session actor; mirrors the ~90 methods of `torrent_handle`.
-pub struct TorrentHandle;
 pub mod ut_holepunch;
 pub mod ut_metadata;
 pub mod ut_pex;
