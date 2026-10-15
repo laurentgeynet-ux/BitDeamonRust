@@ -7,7 +7,9 @@ opérer**, pas ce qu'ils contiennent.
 
 ## Le principe en 30 secondes
 
-Chaque audit A06…A29 a deux modes :
+Chaque audit A01…A29 a deux modes. **Les numéros sont l'ordre
+d'application conseillé** — un agent seul applique A01→A29 ; les
+audits `done` (A08–A10, A14–A15) gardent leur place.
 
 | Mode | Ce qu'il fait | Parallélisable ? |
 |---|---|---|
@@ -41,14 +43,14 @@ Dans n'importe quelle session Devin ouverte sur le repo (même
 dossier, plusieurs sessions en même temps — c'est prévu pour) :
 
 ```
-/audit-13-v1-utp-transport
+/audit-05-v1-utp-transport
 ```
 
 Le mode `rapport` est le défaut ; inutile de le préciser. L'agent :
 
 1. lit le chemin Rust, puis les fonctions upstream ciblées par grep
    (jamais les fichiers entiers — certains font 10 000 lignes) ;
-2. écrit `docs/audits/reports/A13_utp-transport.md` (déviations +
+2. écrit `docs/audits/reports/A05_utp-transport.md` (déviations +
    fichiers que le fix touchera + non-bugs tranchés) ;
 3. le commit sur `main` en pathspec-limited (`git commit -- <path>`) :
    n'embarque que son rapport même si un audit voisin a stagé autre
@@ -79,21 +81,21 @@ comportement correct.
 Pour chaque rapport validé :
 
 ```sh
-git worktree add ../LibtorrentRust-a13 -b audit/13-utp-transport
+git worktree add ../LibtorrentRust-a05 -b audit/05-utp-transport
 ```
 
 Puis ouvrez une session Devin **sur ce dossier**
-(`D:\Projet\LibtorrentRust-a13`) — les skills sont commités, donc
+(`D:\Projet\LibtorrentRust-a05`) — les skills sont commités, donc
 découverts dans le worktree aussi — et lancez :
 
 ```
-/audit-13-v1-utp-transport en mode apply
+/audit-05-v1-utp-transport en mode apply
 ```
 
 L'agent corrige, porte les tests de régression, fait tourner les gates
 complets dans le worktree (`fmt --all`, `clippy --workspace`,
 `test --workspace`, `doc`), écrit le fragment
-`docs/audits/changelog/A13.md`, push la branche et ouvre la PR.
+`docs/audits/changelog/A05.md`, push la branche et ouvre la PR.
 
 **Cas particulier — un seul audit à la fois** : si rien d'autre ne
 tourne, le checkout principal suffit (branche `audit/NN-<slug>` en
@@ -103,11 +105,11 @@ place). Le worktree n'est obligatoire que pour la concurrence.
 
 | Vague | Audits | Contrainte |
 |---|---|---|
-| 1 — isolés | A13, A15, A17, A18, A19, A26, A28 | parallèle libre |
-| 2 — session-edge | A20, A23, A24, A27, A29, A11, A12, A16 | parallèle libre |
-| 3 — net-peer | A06 puis A14 | `peer_wire.rs` commun → séquentiels |
-| 4 — session-core | A07, A08, A09, A10, A21, A22 | max 2-3 concurrents |
-| 5 — final | A25 | seul, en dernier (transverse) |
+| 1 — isolés | A05, A16, A17, A18, A24, A25, A26 | parallèle libre |
+| 2 — session-edge | A04, A06, A13, A21, A22, A23, A27, A28 | parallèle libre |
+| 3 — net-peer | A01 puis A03 | `peer_wire.rs` commun → séquentiels |
+| 4 — session-core | A02, A07, A11, A12, A19, A20 | max 2-3 concurrents |
+| 5 — final | A29 | seul, en dernier (transverse) |
 
 ### Merges
 
@@ -148,13 +150,13 @@ committer.
   (fragments `changelog/ANN.md` à la place ; `PORTING.md` seulement
   pour les rows du périmètre).
 - ❌ Push sur `main` depuis un apply — toujours branche + PR.
-- ❌ Lancer A25 avant la fin des autres (il re-audite les compteurs
+- ❌ Lancer A29 avant la fin des autres (il re-audite les compteurs
   que les fixes précédents auront touchés).
 - ❌ Modifier le checkout upstream — lecture seule, toujours.
 
 ## FAQ
 
-**Un audit marqué "done" (A01–A05) se relance ?**
+**Un audit marqué "done" (A08–A10, A14–A15) se relance ?**
 Oui — en mode `rapport` c'est une re-vérification de non-régression :
 le skill note que l'audit est déjà passé et sert à confirmer que les
 fix tiennent après les changements intermédiaires.

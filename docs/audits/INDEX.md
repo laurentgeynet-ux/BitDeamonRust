@@ -1,46 +1,46 @@
 # Registre des audits — couverture complète BitDaemon vs libtorrent
 
 Baseline upstream : `v2.1.2-62-ge7381c7bc` (`D:\Projet\libtorrent\libtorrent`, lecture seule).
-Chaque audit = un skill `.devin/skills/audit-NN-<slug>/` lançable via `/audit-NN-<slug>`.
+Chaque audit = un skill `.devin/skills/audit-NN-vW-<slug>/` lançable via `/audit-NN-vW-<slug>`.
 **Mode d'emploi complet : [`GUIDE.md`](GUIDE.md).**
 
 | # | Audit | Périmètre | Statut |
 |---|---|---|---|
-| A01 | Pipeline disque — bloc entrant → écriture | incoming block → async_write → cache → flush → completion | done — audit initial + commit `5541959` |
-| A02 | Chemin upload/read (Request → fill_send_buffer → async_read) | Request entrant → validation → upload queue → read disque → Piece ; choke drain, rejects, compteurs | done — commit `b518598` (DontHave wire fix) |
-| A03 | Cycle de vie des pièces | incoming_piece → flush → hash → piece_verified → Have → hash_failed → restore | done — commit `e957a83` |
-| A04 | Ops storage & priorités fichiers | move_storage / delete_files / rename_file / prioritize_files / file_priority + complétions | done — commit `24fffc8` |
-| A05 | Chemin download (request→write) & rejects | request_a_block → add_request → send_block_requests → Piece → on_reject → timeouts/snub/endgame | done — commit `cbee65c` |
-| A06 | Codec peer-wire & framing | Encodage/décodage de tous les messages, bornes de longueur, entrées malformées, handshake. | done — rapport `reports/A06_peer-wire-codec.md` |
-| A07 | Protocoles d'extension (ut_metadata, ut_pex, lt_*, suggest, smartban, holepunch) | Extensions BEP-10 : métadata, pex, dont_have/have_none, suggest+allowed_fast, smart_ban, upload_only, holepunch. | à faire |
-| A08 | Choker & optimistic unchoke | Sélection des pairs unchokés : comparateurs, quotas, rotation optimiste, interaction snub/seed. | à faire |
-| A09 | Pipeline time-critical (deadlines) | set_piece_deadline, request_time_critical_pieces, make_time_critical, cancel_non_critical, expiration de deadlines. | à faire |
-| A10 | Cycle de vie des pairs & admission | attach/detach, états de connexion, limites half-open, taxonomie des disconnects, admission entrante. | à faire |
-| A11 | Trackers (HTTP/UDP announce, scrape, backoff, tiers) | Cycle announce complet : events, backoff, failover tiers, scrape, réponses, erreurs. | à faire |
-| A12 | Web seeds (HTTP peer) | web_peer_connection/http_seed_connection : GET ranges, keep-alive, erreurs, retry, comptabilité par seed. | à faire |
-| A13 | Transport uTP | utp_stream : paquets, états connexion, resend, delay/rtt, MTU, buffers out-of-order, fermeture. | à faire |
-| A14 | Chiffrement MSE/PE | Handshake DH, crypto_provide/select, RC4, padding, politiques enc. | à faire |
-| A15 | Proxies (SOCKS5/HTTP CONNECT) | socks5_stream, http_stream, instantiate_connection — auth, UDP associate, erreurs, settings par usage. | à faire |
-| A16 | Torrents SSL | ssl_stream : fingerprint cert vs info-hash, mutual TLS, cert settings, listen ssl, alertes. | à faire |
-| A17 | DHT (krpc, traversals, items, sécurité) | Mainline DHT : messages, traversals, tokens, BEP-44/51, routage, refresh, boot, rate limiting. | à faire |
-| A18 | Cache disque & buffer pool | Coalescing, watermark, éviction, dirty expiry, bornes pool, back-pressure cache. | à faire |
-| A19 | part_file & file_pool | Slots part-file, export, migration priorités, récupération corruption ; pool fd LRU, caps, erreurs reopen. | à faire |
-| A20 | Resume data — round-trip + snapshot sous I/O | read/write resume complet, verify_resume_data verdicts, cohérence du snapshot pendant écritures en vol. | à faire |
-| A21 | Machine d'état torrent | Transitions add→checking→downloading→finished→seeding, pauses, state_updated/save_resume triggers, seed_mode. | à faire |
-| A22 | Magnet & acquisition metadata | Magnet add, ut_metadata pacing, info-hash verify, priorités/trackers conservés, ops sans metadata. | à faire |
-| A23 | Settings hot-apply & .session | apply_settings legs par clé, session_params/.session round-trip, deprecated keys. | à faire |
-| A24 | Piece picker — cas limites | reverse/partial/rarest-first, priorities, streaming, share mode, endgame busy, invariants. | à faire |
-| A25 | Sweep conformité compteurs/stats | Chaque `Counter` ↔ sites upstream inc/dec/set ; session_stats snapshot ; sliding_average. | à faire |
-| A26 | Sanitization chemins & parsing metainfo (sécurité) | file_storage sanitize (.., ADS, device names, drives, abs), symlink, doublons ; metainfo malformé. | à faire |
+| A01 | Codec peer-wire & framing | Encodage/décodage de tous les messages, bornes de longueur, entrées malformées, handshake. | à faire |
+| A02 | Protocoles d'extension (ut_metadata, ut_pex, lt_*, suggest, smartban, holepunch) | Extensions BEP-10 : métadata, pex, dont_have/have_none, suggest+allowed_fast, smart_ban, upload_only, holepunch. | à faire |
+| A03 | Chiffrement MSE/PE | Handshake DH, crypto_provide/select, RC4, padding, politiques enc. | à faire |
+| A04 | Trackers (HTTP/UDP announce, scrape, backoff, tiers) | Cycle announce complet : events, backoff, failover tiers, scrape, réponses, erreurs. | à faire |
+| A05 | Transport uTP | utp_stream : paquets, états connexion, resend, delay/rtt, MTU, buffers out-of-order, fermeture. | à faire |
+| A06 | Web seeds (HTTP peer) | web_peer_connection/http_seed_connection : GET ranges, keep-alive, erreurs, retry, comptabilité par seed. | à faire |
+| A07 | Cycle de vie des pairs & admission | attach/detach, états de connexion, limites half-open, taxonomie des disconnects, admission entrante. | à faire |
+| A08 | Chemin download (request→write) & rejects | request_a_block → add_request → send_block_requests → Piece → on_reject → timeouts/snub/endgame | done — commit `cbee65c` |
+| A09 | Chemin upload/read (Request → fill_send_buffer → async_read) | Request entrant → validation → upload queue → read disque → Piece ; choke drain, rejects, compteurs | done — commit `b518598` (DontHave wire fix) |
+| A10 | Cycle de vie des pièces | incoming_piece → flush → hash → piece_verified → Have → hash_failed → restore | done — commit `e957a83` |
+| A11 | Choker & optimistic unchoke | Sélection des pairs unchokés : comparateurs, quotas, rotation optimiste, interaction snub/seed. | à faire |
+| A12 | Pipeline time-critical (deadlines) | set_piece_deadline, request_time_critical_pieces, make_time_critical, cancel_non_critical, expiration de deadlines. | à faire |
+| A13 | Piece picker — cas limites | reverse/partial/rarest-first, priorities, streaming, share mode, endgame busy, invariants. | à faire |
+| A14 | Pipeline disque — bloc entrant → écriture | incoming block → async_write → cache → flush → completion | done — audit initial + commit `5541959` |
+| A15 | Ops storage & priorités fichiers | move_storage / delete_files / rename_file / prioritize_files / file_priority + complétions | done — commit `24fffc8` |
+| A16 | Cache disque & buffer pool | Coalescing, watermark, éviction, dirty expiry, bornes pool, back-pressure cache. | à faire |
+| A17 | part_file & file_pool | Slots part-file, export, migration priorités, récupération corruption ; pool fd LRU, caps, erreurs reopen. | à faire |
+| A18 | Sanitization chemins & parsing metainfo (sécurité) | file_storage sanitize (.., ADS, device names, drives, abs), symlink, doublons ; metainfo malformé. | à faire |
+| A19 | Magnet & acquisition metadata | Magnet add, ut_metadata pacing, info-hash verify, priorités/trackers conservés, ops sans metadata. | à faire |
+| A20 | Machine d'état torrent | Transitions add→checking→downloading→finished→seeding, pauses, state_updated/save_resume triggers, seed_mode. | à faire |
+| A21 | Resume data — round-trip + snapshot sous I/O | read/write resume complet, verify_resume_data verdicts, cohérence du snapshot pendant écritures en vol. | à faire |
+| A22 | Settings hot-apply & .session | apply_settings legs par clé, session_params/.session round-trip, deprecated keys. | à faire |
+| A23 | Torrents SSL | ssl_stream : fingerprint cert vs info-hash, mutual TLS, cert settings, listen ssl, alertes. | à faire |
+| A24 | Proxies (SOCKS5/HTTP CONNECT) | socks5_stream, http_stream, instantiate_connection — auth, UDP associate, erreurs, settings par usage. | à faire |
+| A25 | NAT traversal (LSD/UPnP/NAT-PMP) | LSD multicast, UPnP IGD lifecycle, NAT-PMP/PCP mappings, external IP election. | à faire |
+| A26 | DHT (krpc, traversals, items, sécurité) | Mainline DHT : messages, traversals, tokens, BEP-44/51, routage, refresh, boot, rate limiting. | à faire |
 | A27 | Glue engine/session | engine.rs : boucle dispatch, ordonnancement commandes, timers, pont disque, starvation. | à faire |
-| A28 | NAT traversal (LSD/UPnP/NAT-PMP) | LSD multicast, UPnP IGD lifecycle, NAT-PMP/PCP mappings, external IP election. | à faire |
-| A29 | Bandwidth manager & peer classes | Quotas par canal, request_bandwidth, class filters, rate channels, mixed mode, overhead. | à faire |
+| A28 | Bandwidth manager & peer classes | Quotas par canal, request_bandwidth, class filters, rate channels, mixed mode, overhead. | à faire |
+| A29 | Sweep conformité compteurs/stats | Chaque `Counter` ↔ sites upstream inc/dec/set ; session_stats snapshot ; sliding_average. | à faire |
 
 ## Utilisation
 
 ```
-/audit-06-v3-peer-wire-codec            # mode rapport (défaut)
-/audit-06-v3-peer-wire-codec en mode apply
+/audit-01-v3-peer-wire-codec            # mode rapport (défaut)
+/audit-01-v3-peer-wire-codec en mode apply
 ```
 
 Le skill embarque : périmètre, fichiers upstream/Rust, checklist,
@@ -84,22 +84,22 @@ Merges **séquentiels** ; en cas de conflit sur les fichiers chauds,
 rebase sur `main` frais + re-run des gates avant merge.
 
 ### Vagues d'application conseillées (recouvrement de fichiers,
-pas de numéros de crate : A07 et A24 sont tous deux dans
+pas de numéros de crate : A02 et A13 sont tous deux dans
 `bitdaemon-session` mais dans des vagues différentes ; la vague 1
 traverse net/dht/disk/core).
 
 | Vague | Audits | Raison |
 |---|---|---|
-| 1 — isolés | A13, A15, A17, A18, A19, A26, A28 | modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat) |
-| 2 — session-edge | A20, A23, A24, A27, A29, A11, A12, A16 | fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés |
-| 3 — net-peer | A06, A14 | `peer_wire.rs` commun aux deux → séquentiels entre eux |
-| 4 — session-core | A07, A08, A09, A10, A21, A22 | tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels |
-| 5 — final | A25 | transverse (sweep compteurs), seul, en dernier |
+| 1 — isolés | A05, A16, A17, A18, A24, A25, A26 | modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat) |
+| 2 — session-edge | A04, A06, A13, A21, A22, A23, A27, A28 | fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés |
+| 3 — net-peer | A01, A03 | `peer_wire.rs` commun aux deux → séquentiels entre eux |
+| 4 — session-core | A02, A07, A11, A12, A19, A20 | tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels |
+| 5 — final | A29 | transverse (sweep compteurs), seul, en dernier |
 
 La description de chaque skill porte son préfixe `[Vn]`. La vraie
 source est la section `## Fichiers du fix` de chaque rapport.
 
-A18+A19 partagent `bitdaemon-disk` mais des modules disjoints — OK
+A16+A17 partagent `bitdaemon-disk` mais des modules disjoints — OK
 ensemble. Dans la vague 4, préférer des paires et merger une PR
 avant d'en appliquer une autre sur le même fichier.
 
@@ -123,38 +123,16 @@ supprime les fragments. Commit : `docs(changelog): aggregate audit entries`.
   les cœurs). Pour du parallélisme massif : sessions cloud séparées,
   une par audit — chacune a sa machine, son checkout, sa PR.
 
-## Ordre conseillé — apply séquentiel
+## Ordre — les numéros SONT l'ordre conseillé
 
-Si un seul agent applique tout : surface protocole d'abord, puis
-sources de pairs, comportement du swarm, disque/état, périphériques,
-glue — et le sweep compteurs en dernier (filet transverse). Les
-rapports eux n'ont aucun ordre (tous parallélisables).
+`A01`→`A29` se lit dans l'ordre d'application recommandé pour un
+agent seul : protocole (wire→ext→MSE) → sources de pairs
+(trackers/uTP/web seeds) → admission → chemins de données swarm
+(download/upload/pièces) → politique (choker/TC/picker) → internes
+disque → métadonnées/état → périphériques (SSL/proxies/NAT/DHT) →
+glue/bandwidth → sweep compteurs. Les audits `done` gardent leur
+position dans la numérotation (ils ont déjà été exécutés là).
+Rapports : aucun ordre — tous parallélisables.
 
-1. **A06** — wire codec — la grammaire du protocole, tout passe par là
-2. **A07** — extensions — couche directement au-dessus du wire
-3. **A14** — MSE/PE — enveloppe le handshake, après stabilisation du codec
-4. **A11** — trackers — source principale de pairs
-5. **A13** — uTP — transport majeur
-6. **A12** — web seeds — autre source de données
-7. **A10** — lifecycle — admission & cycle de vie des pairs
-8. **A08** — choker — politique d'upload
-9. **A09** — time-critical — pipeline deadlines
-10. **A24** — picker — quoi demander, cas limites
-11. **A21** — state machine — transitions du torrent
-12. **A26** — path security — surface d'attaque au parsing metainfo
-13. **A22** — magnet — acquisition metadata (picker+state stabilisés)
-14. **A20** — resume — persistance sur une state machine fixée
-15. **A18** — disk cache — internes disque
-16. **A19** — part_file/file_pool — internes disque
-17. **A23** — settings — hot-apply sur un session stabilisé
-18. **A16** — SSL torrents — niche, isole bien
-19. **A15** — proxies — niche
-20. **A28** — NAT traversal — discovery
-21. **A17** — DHT — gros morceau autonome, crate dédiée
-22. **A27** — engine glue — la boucle qui orchestre tout le reste
-23. **A29** — bandwidth — quotas au-dessus de tout
-24. **A25** — counters sweep — filet final, seul
-
-En parallèle (2-4 apply) : piocher dans la même vague de préférence ;
-l'ordre séquentiel ci-dessus reste le bon guide de priorité entre
-vagues pour les merges.
+En parallèle (2-4 apply) : piocher dans la même vague de préférence,
+et merger dans l'ordre des numéros quand deux PRs se recouvrent.

@@ -443,72 +443,62 @@ AUDITS = [
       "Preemptive unchoke on quota, maybe_unchoke_this_peer"], "", None),
 ]
 
-# Apply waves — grouped by file overlap (NOT by crate: A07 and A24 are
+# Audit numbers encode the recommended execution order — the original
+# ids were a thematic enumeration, not a sequence. EXEC_ORDER lists the
+# ORIGINAL ids in logical apply order (protocol surface → peer supply →
+# swarm data paths & policy → disk internals → metadata/state →
+# peripherals → glue → counters sweep last).
+EXEC_ORDER = [
+    "06", "07", "14",  # protocol: wire codec, extensions, MSE
+    "11", "13", "12",  # peer supply: trackers, uTP, web seeds
+    "10",              # admission/lifecycle
+    "05", "02", "03",  # swarm data paths: download, upload, piece life
+    "08", "09", "24",  # swarm policy: choker, time-critical, picker
+    "01", "04", "18", "19",  # disk internals
+    "26", "22", "21", "20", "23",  # metadata & state
+    "16", "15", "28", "17",  # peripherals: SSL, proxies, NAT, DHT
+    "27", "29",        # engine glue, bandwidth
+    "25",              # transverse counters sweep — always last
+]
+assert sorted(EXEC_ORDER) == sorted(a[0] for a in AUDITS), (
+    "EXEC_ORDER must list every original audit id exactly once")
+_old = {a[0]: a for a in AUDITS}
+AUDITS = [(f"{pos:02d}", *(_old[o][1:])) for pos, o in enumerate(EXEC_ORDER, 1)]
+
+# Apply waves — grouped by file overlap (NOT by crate: A02 and A13 are
 # both bitdaemon-session but different waves; wave 1 spans 4 crates).
-# Wave 5 (A25) is transverse and always last, alone.
+# Wave 5 (A29) is transverse and always last, alone.
 WAVES = {
     1: {
-        "ids": ["13", "15", "17", "18", "19", "26", "28"],
+        "ids": ["05", "16", "17", "18", "24", "25", "26"],
         "label": "isolés",
         "why": "modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat)",
     },
     2: {
-        "ids": ["20", "23", "24", "27", "29", "11", "12", "16"],
+        "ids": ["04", "06", "13", "21", "22", "23", "27", "28"],
         "label": "session-edge",
         "why": "fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés",
     },
     3: {
-        "ids": ["06", "14"],
+        "ids": ["01", "03"],
         "label": "net-peer",
         "why": "`peer_wire.rs` commun aux deux → séquentiels entre eux",
     },
     4: {
-        "ids": ["07", "08", "09", "10", "21", "22", "01", "02", "03", "04", "05"],
+        "ids": ["02", "07", "08", "09", "10", "11", "12", "14", "15", "19", "20"],
         "label": "session-core",
         "why": "tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels",
     },
     5: {
-        "ids": ["25"],
+        "ids": ["29"],
         "label": "final",
         "why": "transverse (sweep compteurs), seul, en dernier",
     },
 }
 WAVE_OF = {aid: w for w, spec in WAVES.items() for aid in spec["ids"]}
 
-# Recommended sequential apply order for one agent: protocol surface
-# first (everything flows through it), then peer supply, swarm
-# behavior, disk internals, metadata/state, peripherals, glue —
-# and the transverse counters sweep last.
-APPLY_ORDER = [
-    ("06", "wire codec — la grammaire du protocole, tout passe par là"),
-    ("07", "extensions — couche directement au-dessus du wire"),
-    ("14", "MSE/PE — enveloppe le handshake, après stabilisation du codec"),
-    ("11", "trackers — source principale de pairs"),
-    ("13", "uTP — transport majeur"),
-    ("12", "web seeds — autre source de données"),
-    ("10", "lifecycle — admission & cycle de vie des pairs"),
-    ("08", "choker — politique d'upload"),
-    ("09", "time-critical — pipeline deadlines"),
-    ("24", "picker — quoi demander, cas limites"),
-    ("21", "state machine — transitions du torrent"),
-    ("26", "path security — surface d'attaque au parsing metainfo"),
-    ("22", "magnet — acquisition metadata (picker+state stabilisés)"),
-    ("20", "resume — persistance sur une state machine fixée"),
-    ("18", "disk cache — internes disque"),
-    ("19", "part_file/file_pool — internes disque"),
-    ("23", "settings — hot-apply sur un session stabilisé"),
-    ("16", "SSL torrents — niche, isole bien"),
-    ("15", "proxies — niche"),
-    ("28", "NAT traversal — discovery"),
-    ("17", "DHT — gros morceau autonome, crate dédiée"),
-    ("27", "engine glue — la boucle qui orchestre tout le reste"),
-    ("29", "bandwidth — quotas au-dessus de tout"),
-    ("25", "counters sweep — filet final, seul"),
-]
-# Guard: every pending audit must appear exactly once in the order.
-assert sorted(a for a, _ in APPLY_ORDER) == sorted(
-    a[0] for a in AUDITS if not a[8]
-), "APPLY_ORDER must cover exactly the pending audits"
+# EXEC_ORDER makes the audit number itself the recommended apply
+# position — A01→A29 reads top-to-bottom as the sequential order.
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
@@ -533,7 +523,7 @@ idx = [
     "# Registre des audits — couverture complète BitDaemon vs libtorrent",
     "",
     "Baseline upstream : `v2.1.2-62-ge7381c7bc` (`D:\\Projet\\libtorrent\\libtorrent`, lecture seule).",
-    "Chaque audit = un skill `.devin/skills/audit-NN-<slug>/` lançable via `/audit-NN-<slug>`.",
+    "Chaque audit = un skill `.devin/skills/audit-NN-vW-<slug>/` lançable via `/audit-NN-vW-<slug>`.",
     "**Mode d'emploi complet : [`GUIDE.md`](GUIDE.md).**",
     "",
     "| # | Audit | Périmètre | Statut |",
@@ -546,8 +536,8 @@ idx += [
     "## Utilisation",
     "",
     "```",
-    f"/audit-06-v{WAVE_OF['06']}-peer-wire-codec            # mode rapport (défaut)",
-    f"/audit-06-v{WAVE_OF['06']}-peer-wire-codec en mode apply",
+    f"/audit-01-v{WAVE_OF['01']}-peer-wire-codec            # mode rapport (défaut)",
+    f"/audit-01-v{WAVE_OF['01']}-peer-wire-codec en mode apply",
     "```",
     "",
     "Le skill embarque : périmètre, fichiers upstream/Rust, checklist,",
@@ -591,7 +581,7 @@ idx += [
     "rebase sur `main` frais + re-run des gates avant merge.",
     "",
     "### Vagues d'application conseillées (recouvrement de fichiers,",
-    "pas de numéros de crate : A07 et A24 sont tous deux dans",
+    "pas de numéros de crate : A02 et A13 sont tous deux dans",
     "`bitdaemon-session` mais dans des vagues différentes ; la vague 1",
     "traverse net/dht/disk/core).",
     "",
@@ -609,7 +599,7 @@ idx += [
     "La description de chaque skill porte son préfixe `[Vn]`. La vraie",
     "source est la section `## Fichiers du fix` de chaque rapport.",
     "",
-    "A18+A19 partagent `bitdaemon-disk` mais des modules disjoints — OK",
+    "A16+A17 partagent `bitdaemon-disk` mais des modules disjoints — OK",
     "ensemble. Dans la vague 4, préférer des paires et merger une PR",
     "avant d'en appliquer une autre sur le même fichier.",
     "",
@@ -633,20 +623,19 @@ idx += [
     "  les cœurs). Pour du parallélisme massif : sessions cloud séparées,",
     "  une par audit — chacune a sa machine, son checkout, sa PR.",
     "",
-    "## Ordre conseillé — apply séquentiel",
+    "## Ordre — les numéros SONT l'ordre conseillé",
     "",
-    "Si un seul agent applique tout : surface protocole d'abord, puis",
-    "sources de pairs, comportement du swarm, disque/état, périphériques,",
-    "glue — et le sweep compteurs en dernier (filet transverse). Les",
-    "rapports eux n'ont aucun ordre (tous parallélisables).",
+    "`A01`→`A29` se lit dans l'ordre d'application recommandé pour un",
+    "agent seul : protocole (wire→ext→MSE) → sources de pairs",
+    "(trackers/uTP/web seeds) → admission → chemins de données swarm",
+    "(download/upload/pièces) → politique (choker/TC/picker) → internes",
+    "disque → métadonnées/état → périphériques (SSL/proxies/NAT/DHT) →",
+    "glue/bandwidth → sweep compteurs. Les audits `done` gardent leur",
+    "position dans la numérotation (ils ont déjà été exécutés là).",
+    "Rapports : aucun ordre — tous parallélisables.",
     "",
-]
-idx += [f"{i}. **A{aid}** — {why}" for i, (aid, why) in enumerate(APPLY_ORDER, 1)]
-idx += [
-    "",
-    "En parallèle (2-4 apply) : piocher dans la même vague de préférence ;",
-    "l'ordre séquentiel ci-dessus reste le bon guide de priorité entre",
-    "vagues pour les merges.",
+    "En parallèle (2-4 apply) : piocher dans la même vague de préférence,",
+    "et merger dans l'ordre des numéros quand deux PRs se recouvrent.",
     "",
 ]
 with open("docs/audits/INDEX.md", "w", encoding="utf-8") as f:
