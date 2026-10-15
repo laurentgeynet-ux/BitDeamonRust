@@ -1,6 +1,6 @@
 ---
 name: audit-08-choker
-description: "Audit sémantique vs libtorrent — Choker & optimistic unchoke"
+description: "[V4] Audit sémantique vs libtorrent — Choker & optimistic unchoke"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A08 — Choker & optimistic unchoke
 
 **Périmètre** : Sélection des pairs unchokés : comparateurs, quotas, rotation optimiste, interaction snub/seed..
+
+**Vague d'apply** : V4 (session-core) — tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

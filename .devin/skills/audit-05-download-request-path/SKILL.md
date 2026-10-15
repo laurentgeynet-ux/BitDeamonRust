@@ -1,6 +1,6 @@
 ---
 name: audit-05-download-request-path
-description: "Audit sémantique vs libtorrent — Chemin download (request→write) & rejects" (re-vérification — déjà passé)
+description: "[V4] Audit sémantique vs libtorrent — Chemin download (request→write) & rejects" (re-vérification — déjà passé)
 allowed-tools:
   - read
   - grep
@@ -16,6 +16,10 @@ allowed-tools:
 > reste verte après les changements intermédiaires.
 
 **Périmètre** : request_a_block → add_request → send_block_requests → Piece → on_reject → timeouts/snub/endgame.
+
+**Vague d'apply** : V4 (session-core) — tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

@@ -1,6 +1,6 @@
 ---
 name: audit-16-ssl-torrents
-description: "Audit sémantique vs libtorrent — Torrents SSL"
+description: "[V2] Audit sémantique vs libtorrent — Torrents SSL"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A16 — Torrents SSL
 
 **Périmètre** : ssl_stream : fingerprint cert vs info-hash, mutual TLS, cert settings, listen ssl, alertes..
+
+**Vague d'apply** : V2 (session-edge) — fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

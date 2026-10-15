@@ -1,6 +1,6 @@
 ---
 name: audit-04-storage-ops-file-prio
-description: "Audit sémantique vs libtorrent — Ops storage & priorités fichiers" (re-vérification — déjà passé)
+description: "[V4] Audit sémantique vs libtorrent — Ops storage & priorités fichiers" (re-vérification — déjà passé)
 allowed-tools:
   - read
   - grep
@@ -16,6 +16,10 @@ allowed-tools:
 > reste verte après les changements intermédiaires.
 
 **Périmètre** : move_storage / delete_files / rename_file / prioritize_files / file_priority + complétions.
+
+**Vague d'apply** : V4 (session-core) — tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

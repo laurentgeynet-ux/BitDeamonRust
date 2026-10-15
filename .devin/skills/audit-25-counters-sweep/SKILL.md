@@ -1,6 +1,6 @@
 ---
 name: audit-25-counters-sweep
-description: "Audit sémantique vs libtorrent — Sweep conformité compteurs/stats"
+description: "[V5] Audit sémantique vs libtorrent — Sweep conformité compteurs/stats"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A25 — Sweep conformité compteurs/stats
 
 **Périmètre** : Chaque `Counter` ↔ sites upstream inc/dec/set ; session_stats snapshot ; sliding_average..
+
+**Vague d'apply** : V5 (final) — transverse (sweep compteurs), seul, en dernier.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

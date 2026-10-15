@@ -1,6 +1,6 @@
 ---
 name: audit-17-dht
-description: "Audit sémantique vs libtorrent — DHT (krpc, traversals, items, sécurité)"
+description: "[V1] Audit sémantique vs libtorrent — DHT (krpc, traversals, items, sécurité)"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A17 — DHT (krpc, traversals, items, sécurité)
 
 **Périmètre** : Mainline DHT : messages, traversals, tokens, BEP-44/51, routage, refresh, boot, rate limiting..
+
+**Vague d'apply** : V1 (isolés) — modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat).
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

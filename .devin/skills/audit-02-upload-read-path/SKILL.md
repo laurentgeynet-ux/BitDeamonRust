@@ -1,6 +1,6 @@
 ---
 name: audit-02-upload-read-path
-description: "Audit sémantique vs libtorrent — Chemin upload/read (Request → fill_send_buffer → async_read)" (re-vérification — déjà passé)
+description: "[V4] Audit sémantique vs libtorrent — Chemin upload/read (Request → fill_send_buffer → async_read)" (re-vérification — déjà passé)
 allowed-tools:
   - read
   - grep
@@ -16,6 +16,10 @@ allowed-tools:
 > reste verte après les changements intermédiaires.
 
 **Périmètre** : Request entrant → validation → upload queue → read disque → Piece ; choke drain, rejects, compteurs.
+
+**Vague d'apply** : V4 (session-core) — tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

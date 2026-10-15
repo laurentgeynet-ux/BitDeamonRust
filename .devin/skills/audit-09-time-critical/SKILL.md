@@ -1,6 +1,6 @@
 ---
 name: audit-09-time-critical
-description: "Audit sémantique vs libtorrent — Pipeline time-critical (deadlines)"
+description: "[V4] Audit sémantique vs libtorrent — Pipeline time-critical (deadlines)"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A09 — Pipeline time-critical (deadlines)
 
 **Périmètre** : set_piece_deadline, request_time_critical_pieces, make_time_critical, cancel_non_critical, expiration de deadlines..
+
+**Vague d'apply** : V4 (session-core) — tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

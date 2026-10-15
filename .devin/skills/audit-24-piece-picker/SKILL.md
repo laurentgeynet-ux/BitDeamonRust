@@ -1,6 +1,6 @@
 ---
 name: audit-24-piece-picker
-description: "Audit sémantique vs libtorrent — Piece picker — cas limites"
+description: "[V2] Audit sémantique vs libtorrent — Piece picker — cas limites"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A24 — Piece picker — cas limites
 
 **Périmètre** : reverse/partial/rarest-first, priorities, streaming, share mode, endgame busy, invariants..
+
+**Vague d'apply** : V2 (session-edge) — fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

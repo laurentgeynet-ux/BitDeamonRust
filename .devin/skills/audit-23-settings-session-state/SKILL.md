@@ -1,6 +1,6 @@
 ---
 name: audit-23-settings-session-state
-description: "Audit sémantique vs libtorrent — Settings hot-apply & .session"
+description: "[V2] Audit sémantique vs libtorrent — Settings hot-apply & .session"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A23 — Settings hot-apply & .session
 
 **Périmètre** : apply_settings legs par clé, session_params/.session round-trip, deprecated keys..
+
+**Vague d'apply** : V2 (session-edge) — fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

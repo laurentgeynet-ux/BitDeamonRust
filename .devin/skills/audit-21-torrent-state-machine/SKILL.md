@@ -1,6 +1,6 @@
 ---
 name: audit-21-torrent-state-machine
-description: "Audit sémantique vs libtorrent — Machine d'état torrent"
+description: "[V4] Audit sémantique vs libtorrent — Machine d'état torrent"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A21 — Machine d'état torrent
 
 **Périmètre** : Transitions add→checking→downloading→finished→seeding, pauses, state_updated/save_resume triggers, seed_mode..
+
+**Vague d'apply** : V4 (session-core) — tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

@@ -1,6 +1,6 @@
 ---
 name: audit-19-partfile-filepool
-description: "Audit sémantique vs libtorrent — part_file & file_pool"
+description: "[V1] Audit sémantique vs libtorrent — part_file & file_pool"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A19 — part_file & file_pool
 
 **Périmètre** : Slots part-file, export, migration priorités, récupération corruption ; pool fd LRU, caps, erreurs reopen..
+
+**Vague d'apply** : V1 (isolés) — modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat).
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

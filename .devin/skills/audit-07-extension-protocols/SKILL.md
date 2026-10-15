@@ -1,6 +1,6 @@
 ---
 name: audit-07-extension-protocols
-description: "Audit sémantique vs libtorrent — Protocoles d'extension (ut_metadata, ut_pex, lt_*, suggest, smartban, holepunch)"
+description: "[V4] Audit sémantique vs libtorrent — Protocoles d'extension (ut_metadata, ut_pex, lt_*, suggest, smartban, holepunch)"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A07 — Protocoles d'extension (ut_metadata, ut_pex, lt_*, suggest, smartban, holepunch)
 
 **Périmètre** : Extensions BEP-10 : métadata, pex, dont_have/have_none, suggest+allowed_fast, smart_ban, upload_only, holepunch..
+
+**Vague d'apply** : V4 (session-core) — tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

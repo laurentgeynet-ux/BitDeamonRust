@@ -1,6 +1,6 @@
 ---
 name: audit-13-utp-transport
-description: "Audit sémantique vs libtorrent — Transport uTP"
+description: "[V1] Audit sémantique vs libtorrent — Transport uTP"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A13 — Transport uTP
 
 **Périmètre** : utp_stream : paquets, états connexion, resend, delay/rtt, MTU, buffers out-of-order, fermeture..
+
+**Vague d'apply** : V1 (isolés) — modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat).
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

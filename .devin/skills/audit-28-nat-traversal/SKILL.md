@@ -1,6 +1,6 @@
 ---
 name: audit-28-nat-traversal
-description: "Audit sémantique vs libtorrent — NAT traversal (LSD/UPnP/NAT-PMP)"
+description: "[V1] Audit sémantique vs libtorrent — NAT traversal (LSD/UPnP/NAT-PMP)"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A28 — NAT traversal (LSD/UPnP/NAT-PMP)
 
 **Périmètre** : LSD multicast, UPnP IGD lifecycle, NAT-PMP/PCP mappings, external IP election..
+
+**Vague d'apply** : V1 (isolés) — modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat).
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

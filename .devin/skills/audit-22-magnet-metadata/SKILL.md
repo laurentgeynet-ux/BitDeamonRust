@@ -1,6 +1,6 @@
 ---
 name: audit-22-magnet-metadata
-description: "Audit sémantique vs libtorrent — Magnet & acquisition metadata"
+description: "[V4] Audit sémantique vs libtorrent — Magnet & acquisition metadata"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A22 — Magnet & acquisition metadata
 
 **Périmètre** : Magnet add, ut_metadata pacing, info-hash verify, priorités/trackers conservés, ops sans metadata..
+
+**Vague d'apply** : V4 (session-core) — tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

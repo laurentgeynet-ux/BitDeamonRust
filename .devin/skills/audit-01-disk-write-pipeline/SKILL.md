@@ -1,6 +1,6 @@
 ---
 name: audit-01-disk-write-pipeline
-description: "Audit sémantique vs libtorrent — Pipeline disque — bloc entrant → écriture" (re-vérification — déjà passé)
+description: "[V4] Audit sémantique vs libtorrent — Pipeline disque — bloc entrant → écriture" (re-vérification — déjà passé)
 allowed-tools:
   - read
   - grep
@@ -16,6 +16,10 @@ allowed-tools:
 > reste verte après les changements intermédiaires.
 
 **Périmètre** : incoming block → async_write → cache → flush → completion.
+
+**Vague d'apply** : V4 (session-core) — tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

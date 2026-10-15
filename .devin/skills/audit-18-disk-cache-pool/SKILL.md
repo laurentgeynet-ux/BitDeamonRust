@@ -1,6 +1,6 @@
 ---
 name: audit-18-disk-cache-pool
-description: "Audit sémantique vs libtorrent — Cache disque & buffer pool"
+description: "[V1] Audit sémantique vs libtorrent — Cache disque & buffer pool"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A18 — Cache disque & buffer pool
 
 **Périmètre** : Coalescing, watermark, éviction, dirty expiry, bornes pool, back-pressure cache..
+
+**Vague d'apply** : V1 (isolés) — modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat).
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

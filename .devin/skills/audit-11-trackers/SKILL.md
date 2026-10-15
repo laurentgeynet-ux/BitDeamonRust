@@ -1,6 +1,6 @@
 ---
 name: audit-11-trackers
-description: "Audit sémantique vs libtorrent — Trackers (HTTP/UDP announce, scrape, backoff, tiers)"
+description: "[V2] Audit sémantique vs libtorrent — Trackers (HTTP/UDP announce, scrape, backoff, tiers)"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A11 — Trackers (HTTP/UDP announce, scrape, backoff, tiers)
 
 **Périmètre** : Cycle announce complet : events, backoff, failover tiers, scrape, réponses, erreurs..
+
+**Vague d'apply** : V2 (session-edge) — fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

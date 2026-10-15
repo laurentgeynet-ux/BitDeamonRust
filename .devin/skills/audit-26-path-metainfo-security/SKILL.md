@@ -1,6 +1,6 @@
 ---
 name: audit-26-path-metainfo-security
-description: "Audit sémantique vs libtorrent — Sanitization chemins & parsing metainfo (sécurité)"
+description: "[V1] Audit sémantique vs libtorrent — Sanitization chemins & parsing metainfo (sécurité)"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A26 — Sanitization chemins & parsing metainfo (sécurité)
 
 **Périmètre** : file_storage sanitize (.., ADS, device names, drives, abs), symlink, doublons ; metainfo malformé..
+
+**Vague d'apply** : V1 (isolés) — modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat).
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

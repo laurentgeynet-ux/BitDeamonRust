@@ -1,6 +1,6 @@
 ---
 name: audit-27-engine-glue
-description: "Audit sémantique vs libtorrent — Glue engine/session"
+description: "[V2] Audit sémantique vs libtorrent — Glue engine/session"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A27 — Glue engine/session
 
 **Périmètre** : engine.rs : boucle dispatch, ordonnancement commandes, timers, pont disque, starvation..
+
+**Vague d'apply** : V2 (session-edge) — fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

@@ -1,6 +1,6 @@
 ---
 name: audit-20-resume-data
-description: "Audit sémantique vs libtorrent — Resume data — round-trip + snapshot sous I/O"
+description: "[V2] Audit sémantique vs libtorrent — Resume data — round-trip + snapshot sous I/O"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A20 — Resume data — round-trip + snapshot sous I/O
 
 **Périmètre** : read/write resume complet, verify_resume_data verdicts, cohérence du snapshot pendant écritures en vol..
+
+**Vague d'apply** : V2 (session-edge) — fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

@@ -1,6 +1,6 @@
 ---
 name: audit-14-mse-encryption
-description: "Audit sémantique vs libtorrent — Chiffrement MSE/PE"
+description: "[V3] Audit sémantique vs libtorrent — Chiffrement MSE/PE"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A14 — Chiffrement MSE/PE
 
 **Périmètre** : Handshake DH, crypto_provide/select, RC4, padding, politiques enc..
+
+**Vague d'apply** : V3 (net-peer) — `peer_wire.rs` commun aux deux → séquentiels entre eux.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

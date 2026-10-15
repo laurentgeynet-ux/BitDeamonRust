@@ -1,6 +1,6 @@
 ---
 name: audit-12-web-seeds
-description: "Audit sémantique vs libtorrent — Web seeds (HTTP peer)"
+description: "[V2] Audit sémantique vs libtorrent — Web seeds (HTTP peer)"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A12 — Web seeds (HTTP peer)
 
 **Périmètre** : web_peer_connection/http_seed_connection : GET ranges, keep-alive, erreurs, retry, comptabilité par seed..
+
+**Vague d'apply** : V2 (session-edge) — fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

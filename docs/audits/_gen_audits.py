@@ -442,6 +442,38 @@ AUDITS = [
       "Preemptive unchoke on quota, maybe_unchoke_this_peer"], "", None),
 ]
 
+# Apply waves — grouped by file overlap (NOT by crate: A07 and A24 are
+# both bitdaemon-session but different waves; wave 1 spans 4 crates).
+# Wave 5 (A25) is transverse and always last, alone.
+WAVES = {
+    1: {
+        "ids": ["13", "15", "17", "18", "19", "26", "28"],
+        "label": "isolés",
+        "why": "modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat)",
+    },
+    2: {
+        "ids": ["20", "23", "24", "27", "29", "11", "12", "16"],
+        "label": "session-edge",
+        "why": "fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés",
+    },
+    3: {
+        "ids": ["06", "14"],
+        "label": "net-peer",
+        "why": "`peer_wire.rs` commun aux deux → séquentiels entre eux",
+    },
+    4: {
+        "ids": ["07", "08", "09", "10", "21", "22", "01", "02", "03", "04", "05"],
+        "label": "session-core",
+        "why": "tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels",
+    },
+    5: {
+        "ids": ["25"],
+        "label": "final",
+        "why": "transverse (sweep compteurs), seul, en dernier",
+    },
+}
+WAVE_OF = {aid: w for w, spec in WAVES.items() for aid in spec["ids"]}
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
 
@@ -522,19 +554,28 @@ idx += [
     "Merges **séquentiels** ; en cas de conflit sur les fichiers chauds,",
     "rebase sur `main` frais + re-run des gates avant merge.",
     "",
-    "### Vagues d'application conseillées (recouvrement de fichiers)",
+    "### Vagues d'application conseillées (recouvrement de fichiers,",
+    "pas de numéros de crate : A07 et A24 sont tous deux dans",
+    "`bitdaemon-session` mais dans des vagues différentes ; la vague 1",
+    "traverse net/dht/disk/core).",
     "",
     "| Vague | Audits | Raison |",
     "|---|---|---|",
-    "| 1 — isolés | A13, A15, A17, A18, A19, A26, A28 | modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat) |",
-    "| 2 — session-edge | A20, A23, A24, A27, A29, A11, A12, A16 | fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés |",
-    "| 3 — net-peer | A06 puis A14 | `peer_wire.rs` commun aux deux → séquentiels entre eux |",
-    "| 4 — session-core | A07, A08, A09, A10, A21, A22 | tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels |",
-    "| 5 — final | A25 | transverse (sweep compteurs), seul, en dernier |",
+]
+status_of = {a[0]: a[8] for a in AUDITS}
+for w in sorted(WAVES):
+    spec = WAVES[w]
+    todo = [f"A{i}" for i in spec["ids"] if not status_of.get(i)]
+    if todo:
+        idx.append(f"| {w} — {spec['label']} | {', '.join(todo)} | {spec['why']} |")
+idx += [
+    "",
+    "La description de chaque skill porte son préfixe `[Vn]`. La vraie",
+    "source est la section `## Fichiers du fix` de chaque rapport.",
     "",
     "A18+A19 partagent `bitdaemon-disk` mais des modules disjoints — OK",
-    "ensemble. Dans la vague 4, préférer des paires (A08+A24-style) et",
-    "merger une PR avant d'en appliquer une autre sur le même fichier.",
+    "ensemble. Dans la vague 4, préférer des paires et merger une PR",
+    "avant d'en appliquer une autre sur le même fichier.",
     "",
     "### Agrégation changelog",
     "",
@@ -569,10 +610,12 @@ with open("docs/audits/INDEX.md", "w", encoding="utf-8") as f:
 for aid, slug, title, scope, up, rs, chk, traps, status in AUDITS:
     d = os.path.join(".devin", "skills", f"audit-{aid}-{slug}")
     os.makedirs(d, exist_ok=True)
+    w = WAVE_OF[aid]
+    wspec = WAVES[w]
     body = [
         "---",
         f"name: audit-{aid}-{slug}",
-        f'description: "Audit sémantique vs libtorrent — {title}"' + (" (re-vérification — déjà passé)" if status else ""),
+        f'description: "[V{w}] Audit sémantique vs libtorrent — {title}"' + (" (re-vérification — déjà passé)" if status else ""),
         "allowed-tools:",
         "  - read",
         "  - grep",
@@ -593,6 +636,10 @@ for aid, slug, title, scope, up, rs, chk, traps, status in AUDITS:
         ]
     body += [
         f"**Périmètre** : {scope}.",
+        "",
+        f"**Vague d'apply** : V{w} ({wspec['label']}) — {wspec['why']}.",
+        "Choix des audits concurrents par recouvrement de fichiers,",
+        "affiner avec la section `## Fichiers du fix` du rapport.",
         "",
         "## Fichiers",
         "",

@@ -1,6 +1,6 @@
 ---
 name: audit-15-proxies
-description: "Audit sémantique vs libtorrent — Proxies (SOCKS5/HTTP CONNECT)"
+description: "[V1] Audit sémantique vs libtorrent — Proxies (SOCKS5/HTTP CONNECT)"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A15 — Proxies (SOCKS5/HTTP CONNECT)
 
 **Périmètre** : socks5_stream, http_stream, instantiate_connection — auth, UDP associate, erreurs, settings par usage..
+
+**Vague d'apply** : V1 (isolés) — modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat).
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

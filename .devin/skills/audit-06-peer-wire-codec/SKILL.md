@@ -1,6 +1,6 @@
 ---
 name: audit-06-peer-wire-codec
-description: "Audit sémantique vs libtorrent — Codec peer-wire & framing"
+description: "[V3] Audit sémantique vs libtorrent — Codec peer-wire & framing"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A06 — Codec peer-wire & framing
 
 **Périmètre** : Encodage/décodage de tous les messages, bornes de longueur, entrées malformées, handshake..
+
+**Vague d'apply** : V3 (net-peer) — `peer_wire.rs` commun aux deux → séquentiels entre eux.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

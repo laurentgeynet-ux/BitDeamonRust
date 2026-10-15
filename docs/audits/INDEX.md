@@ -83,19 +83,25 @@ git worktree remove ../LibtorrentRust-aNN
 Merges **séquentiels** ; en cas de conflit sur les fichiers chauds,
 rebase sur `main` frais + re-run des gates avant merge.
 
-### Vagues d'application conseillées (recouvrement de fichiers)
+### Vagues d'application conseillées (recouvrement de fichiers,
+pas de numéros de crate : A07 et A24 sont tous deux dans
+`bitdaemon-session` mais dans des vagues différentes ; la vague 1
+traverse net/dht/disk/core).
 
 | Vague | Audits | Raison |
 |---|---|---|
 | 1 — isolés | A13, A15, A17, A18, A19, A26, A28 | modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat) |
 | 2 — session-edge | A20, A23, A24, A27, A29, A11, A12, A16 | fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés |
-| 3 — net-peer | A06 puis A14 | `peer_wire.rs` commun aux deux → séquentiels entre eux |
+| 3 — net-peer | A06, A14 | `peer_wire.rs` commun aux deux → séquentiels entre eux |
 | 4 — session-core | A07, A08, A09, A10, A21, A22 | tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels |
 | 5 — final | A25 | transverse (sweep compteurs), seul, en dernier |
 
+La description de chaque skill porte son préfixe `[Vn]`. La vraie
+source est la section `## Fichiers du fix` de chaque rapport.
+
 A18+A19 partagent `bitdaemon-disk` mais des modules disjoints — OK
-ensemble. Dans la vague 4, préférer des paires (A08+A24-style) et
-merger une PR avant d'en appliquer une autre sur le même fichier.
+ensemble. Dans la vague 4, préférer des paires et merger une PR
+avant d'en appliquer une autre sur le même fichier.
 
 ### Agrégation changelog
 

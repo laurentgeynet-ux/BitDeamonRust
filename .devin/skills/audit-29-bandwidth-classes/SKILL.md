@@ -1,6 +1,6 @@
 ---
 name: audit-29-bandwidth-classes
-description: "Audit sémantique vs libtorrent — Bandwidth manager & peer classes"
+description: "[V2] Audit sémantique vs libtorrent — Bandwidth manager & peer classes"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A29 — Bandwidth manager & peer classes
 
 **Périmètre** : Quotas par canal, request_bandwidth, class filters, rate channels, mixed mode, overhead..
+
+**Vague d'apply** : V2 (session-edge) — fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 

@@ -1,6 +1,6 @@
 ---
 name: audit-10-peer-lifecycle
-description: "Audit sémantique vs libtorrent — Cycle de vie des pairs & admission"
+description: "[V4] Audit sémantique vs libtorrent — Cycle de vie des pairs & admission"
 allowed-tools:
   - read
   - grep
@@ -12,6 +12,10 @@ allowed-tools:
 # Audit A10 — Cycle de vie des pairs & admission
 
 **Périmètre** : attach/detach, états de connexion, limites half-open, taxonomie des disconnects, admission entrante..
+
+**Vague d'apply** : V4 (session-core) — tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels.
+Choix des audits concurrents par recouvrement de fichiers,
+affiner avec la section `## Fichiers du fix` du rapport.
 
 ## Fichiers
 
