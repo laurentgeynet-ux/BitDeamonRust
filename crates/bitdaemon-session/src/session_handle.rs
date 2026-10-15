@@ -231,11 +231,18 @@ impl SessionHandle {
         let mut out = Vec::new();
         // INVALID = "session builds the storage from the atp"
         // (`torrent::init`); magnet adds stay INVALID until metadata.
-        let ih = lock(&self.inner).add_torrent_params(
+        let mut s = lock(&self.inner);
+        let ih = s.add_torrent_params(
             atp,
             bitdaemon_common::types::StorageIndex::INVALID,
             &mut out,
         )?;
+        // upstream `add_torrent` runs on the network thread — its
+        // effects (`DhtAddNode` for `.torrent` `nodes`, immediate
+        // announces/connects) must not die with this call. The handle
+        // has no transport access, so they queue on `pending_out`
+        // and drain at the next `Session::tick`.
+        s.pending_out.append(&mut out);
         Some(TorrentHandle {
             session: self.inner.clone(),
             info_hash: ih,
