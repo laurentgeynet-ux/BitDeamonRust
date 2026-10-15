@@ -527,7 +527,7 @@ pas `on_extended`/`on_suggest`/`on_dont_have`/`on_unknown_message`
 
 Gates : `cargo fmt --all` ✓ · `cargo clippy --workspace
 --all-targets -- -D warnings` ✓ · `cargo test --workspace` ✓ ·
-`cargo doc --workspace --no-deps` ✓. Commit `7a21639` — merge
+`cargo doc --workspace --no-deps` ✓. Commit `461f305` — merge
 `--no-ff` sur `main`.
 
 ### Round 3 — audit (historique)
