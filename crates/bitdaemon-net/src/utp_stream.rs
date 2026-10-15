@@ -427,11 +427,14 @@ async fn socket_pump(
                 u16::from_be_bytes([d.bytes[18], d.bytes[19]]),
                 d.bytes.len()
             );
+            // uTP datagrams are `peer_connection` traffic — the
+            // socks5 proxy gate consults `proxy_peer_connections`.
             let flags = if d.dont_fragment {
                 DatagramSendFlags::DONT_FRAGMENT
             } else {
                 DatagramSendFlags::NONE
-            };
+            }
+            .or(DatagramSendFlags::PEER_CONNECTION);
             let _ = dg.send_to_flags(&d.bytes, d.to, flags).await;
         }
         // push received payload toward the reader — only while the

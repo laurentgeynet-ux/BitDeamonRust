@@ -284,7 +284,14 @@ pub async fn udp_announce<S: DatagramSocket>(
     read_timeout: Duration,
 ) -> Result<AnnounceResponse, UdpTrackerError> {
     let tid: u32 = rand::random();
-    socket.send_to(&build_connect(tid), target).await?;
+    // `udp_socket::tracker_connection` — the per-datagram proxy gate.
+    socket
+        .send_to_flags(
+            &build_connect(tid),
+            target,
+            crate::transport::DatagramSendFlags::TRACKER_CONNECTION,
+        )
+        .await?;
 
     let mut buf = vec![0u8; 2048];
     let conn_id = loop {
@@ -299,7 +306,11 @@ pub async fn udp_announce<S: DatagramSocket>(
 
     let tid2: u32 = rand::random();
     socket
-        .send_to(&build_announce(conn_id, tid2, req), target)
+        .send_to_flags(
+            &build_announce(conn_id, tid2, req),
+            target,
+            crate::transport::DatagramSendFlags::TRACKER_CONNECTION,
+        )
         .await?;
 
     loop {

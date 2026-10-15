@@ -43,6 +43,12 @@ pub struct DatagramSendFlags(u8);
 impl DatagramSendFlags {
     /// No flags.
     pub const NONE: Self = Self(0);
+    /// `udp_socket::peer_connection` — outbound peer (uTP) traffic
+    /// (`0_bit` upstream); gated by `proxy_peer_connections`.
+    pub const PEER_CONNECTION: Self = Self(1 << 0);
+    /// `udp_socket::tracker_connection` — tracker announce traffic
+    /// (`1_bit` upstream); gated by `proxy_tracker_connections`.
+    pub const TRACKER_CONNECTION: Self = Self(1 << 1);
     /// `udp_socket::dont_fragment` — request the DF bit on the IP
     /// header (uTP MTU probes only; upstream `1 << 3`).
     pub const DONT_FRAGMENT: Self = Self(1 << 3);
@@ -95,6 +101,34 @@ pub trait DatagramSocket: Send + Sync + Debug + 'static {
     ) -> BoxFut<'a, usize> {
         let _ = flags;
         self.send_to(buf, target)
+    }
+
+    /// `udp_socket::send_hostname` — send to an unresolved hostname.
+    /// Only proxied sockets can route names end-to-end (SOCKS5
+    /// ATYP-3 datagrams); upstream's non-proxy path falls back to
+    /// `make_address`, i.e. IP literals only — the default mirrors
+    /// that (numeric `host` → `send_to_flags`, anything else errors
+    /// since a `DatagramSocket` carries no resolver).
+    fn send_hostname<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+        buf: &'a [u8],
+        flags: DatagramSendFlags,
+    ) -> BoxFut<'a, usize> {
+        let parsed = host.parse::<std::net::IpAddr>();
+        Box::pin(async move {
+            match parsed {
+                Ok(ip) => {
+                    self.send_to_flags(buf, SocketAddr::new(ip, port), flags)
+                        .await
+                }
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "hostname send unsupported (no proxy association)",
+                )),
+            }
+        })
     }
 
     /// Receive one datagram into `buf`, returning its length and sender.

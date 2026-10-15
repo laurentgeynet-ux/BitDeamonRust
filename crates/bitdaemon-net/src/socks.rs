@@ -36,6 +36,14 @@ pub enum SocksError {
     /// `command_not_supported` (SOCKS5 reply 7).
     #[error("SOCKS command not supported")]
     CommandNotSupported,
+    /// `boost::asio::error::address_family_not_supported` — unknown
+    /// ATYP in a reply, or a non-IPv4 target for SOCKS4.
+    #[error("SOCKS address family not supported")]
+    AddrFamilyNotSupported,
+    /// `boost::asio::error::invalid_argument` — CONNECT to an
+    /// unspecified endpoint without a `dst_name`.
+    #[error("SOCKS connect to unspecified endpoint")]
+    UnspecifiedEndpoint,
     /// `general_failure` — upstream's catch-all reply error.
     #[error("SOCKS general failure")]
     GeneralFailure,
@@ -96,6 +104,19 @@ pub async fn socks_connect<S: AsyncRead + AsyncWrite + Unpin>(
         .map(|_| ())
 }
 
+/// The `BND.ADDR`/`BND.PORT` returned by a SOCKS5 reply — needed by
+/// UDP ASSOCIATE to learn the relay endpoint. A domain BND can't be
+/// reduced to an IP: upstream's UDP path uses the proxy's own IP
+/// with the BND port (`udp_socket.cpp` `read_domainname`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Socks5Bound {
+    /// Numeric bound endpoint (ATYP 1/4).
+    Addr(SocketAddr),
+    /// Domain bound address (ATYP 3) — only the port is usable; the
+    /// relay shares the proxy's IP.
+    Domain { port: u16 },
+}
+
 /// `socks_connect` returning the reply's bound address — needed by
 /// UDP ASSOCIATE (BND.ADDR/BND.PORT is the relay endpoint; CONNECT
 /// callers ignore it).
@@ -106,10 +127,12 @@ pub async fn socks_connect_bound<S: AsyncRead + AsyncWrite + Unpin>(
     password: &str,
     target: &SocksTarget,
     command: SocksCommand,
-) -> Result<Option<SocketAddr>, SocksError> {
+) -> Result<Socks5Bound, SocksError> {
     match version {
         5 => socks5(stream, user, password, target, command).await,
-        4 => socks4(stream, user, target, command).await.map(|_| None),
+        4 => socks4(stream, user, target, command)
+            .await
+            .map(|()| Socks5Bound::Addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))),
         _ => Err(SocksError::UnsupportedVersion),
     }
 }
@@ -120,7 +143,17 @@ async fn socks5<S: AsyncRead + AsyncWrite + Unpin>(
     password: &str,
     target: &SocksTarget,
     command: SocksCommand,
-) -> Result<Option<SocketAddr>, SocksError> {
+) -> Result<Socks5Bound, SocksError> {
+    // upstream `socks_connect` rejects a CONNECT to INADDR_ANY when no
+    // `dst_name` was set (`invalid_argument`) — binding is fine, and
+    // UDP ASSOCIATE sends 0.0.0.0:0 deliberately, so the check is
+    // scoped to Connect. Checked before any I/O: upstream validates in
+    // `socks_connect` but a dead target there is unreachable anyway.
+    if command == SocksCommand::Connect
+        && matches!(target, SocksTarget::Addr(a) if a.ip().is_unspecified())
+    {
+        return Err(SocksError::UnspecifiedEndpoint);
+    }
     // methods advertisement: [5, 1, 0] or [5, 2, 0, 2]
     let mut buf = Vec::with_capacity(4);
     buf.push(5u8);
@@ -228,7 +261,7 @@ async fn socks5<S: AsyncRead + AsyncWrite + Unpin>(
         1 => {
             let mut a = [0u8; 4 + 2];
             stream.read_exact(&mut a).await?;
-            Some(SocketAddr::from((
+            Socks5Bound::Addr(SocketAddr::from((
                 Ipv4Addr::new(a[0], a[1], a[2], a[3]),
                 u16::from_be_bytes([a[4], a[5]]),
             )))
@@ -238,7 +271,7 @@ async fn socks5<S: AsyncRead + AsyncWrite + Unpin>(
             stream.read_exact(&mut a).await?;
             let mut o = [0u8; 16];
             o.copy_from_slice(&a[..16]);
-            Some(SocketAddr::from((
+            Socks5Bound::Addr(SocketAddr::from((
                 Ipv6Addr::from(o),
                 u16::from_be_bytes([a[16], a[17]]),
             )))
@@ -253,11 +286,15 @@ async fn socks5<S: AsyncRead + AsyncWrite + Unpin>(
             }
             let mut a = vec![0u8; usize::from(l[0]) + 2];
             stream.read_exact(&mut a).await?;
-            // a domain BND isn't a numeric endpoint — leave the
-            // relay address to the caller's resolve path
-            None
+            // a domain BND isn't a numeric endpoint — the UDP
+            // associate path still needs BND.PORT (upstream
+            // `read_domainname` uses proxy IP + BND.PORT)
+            Socks5Bound::Domain {
+                port: u16::from_be_bytes([a[a.len() - 2], a[a.len() - 1]]),
+            }
         }
-        _ => return Err(SocksError::UnsupportedVersion),
+        // upstream `connect2` → `address_family_not_supported`
+        _ => return Err(SocksError::AddrFamilyNotSupported),
     };
     Ok(bound)
 }
@@ -270,13 +307,9 @@ async fn socks4<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(), SocksError> {
     let addr = match target {
         SocksTarget::Addr(SocketAddr::V4(a)) => *a,
-        // SOCKS4 has no IPv6 / hostname support upstream
-        _ => {
-            return Err(SocksError::ProxyFailure(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "SOCKS4 requires an IPv4 endpoint",
-            )));
-        }
+        // SOCKS4 has no IPv6 / hostname support — upstream
+        // `address_family_not_supported`
+        _ => return Err(SocksError::AddrFamilyNotSupported),
     };
 
     let mut req = Vec::with_capacity(user.len() + 9);
