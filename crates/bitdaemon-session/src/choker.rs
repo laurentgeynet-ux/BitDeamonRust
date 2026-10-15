@@ -162,8 +162,12 @@ pub struct ChokerSettings {
 }
 
 /// `unchoke_sort` — reorder `peers` so the first N should be
-/// unchoked; returns N (`upload_slots`). `peers` must already be
-/// filtered to interested, connectable peers.
+/// unchoked; returns `upload_slots` — the *uncapped* slot count
+/// (upstream `return upload_slots`, not `slots`): the caller
+/// derives `num_opt_unchoke` and `unchoke_set_size` from it, so
+/// capping at `peers.len()` would starve real unchokes when the
+/// eligible set is smaller than the quota.
+/// `peers` must already be filtered to interested, connectable peers.
 pub fn unchoke_sort(
     peers: &mut [ChokePeer],
     unchoke_interval: Duration,
@@ -200,6 +204,9 @@ pub fn unchoke_sort(
     if slots == 0 {
         return 0;
     }
+    // upstream returns `upload_slots` — `slots` only bounds the
+    // `nth_element` partition below.
+    let ret = upload_slots as usize;
     let cmp = |a: &ChokePeer, b: &ChokePeer| match sett.seed_algorithm {
         SeedChokingAlgorithm::FastestUpload => fastest_less(a, b),
         SeedChokingAlgorithm::AntiLeech => anti_leech_less(a, b),
@@ -207,6 +214,5 @@ pub fn unchoke_sort(
     };
     // `nth_element` — only the top `slots` must be ordered
     peers.select_nth_unstable_by(slots.saturating_sub(1), cmp);
-    peers[..slots].sort_by(cmp);
-    slots
+    ret
 }

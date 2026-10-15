@@ -1283,8 +1283,10 @@ fn unchoke_tick_unchokes_top_peer() {
             &ih,
             pid,
             PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
-            // distinct IPs — same-IP incoming dups are dropped.
-            format!("127.0.0.{}:6881", pid).parse().unwrap(),
+            // distinct public IPs — same-IP incoming dups are
+            // dropped, and local-net remotes land in the
+            // unchoke-exempt `local` class (id 2).
+            format!("85.17.9.{}:6881", pid).parse().unwrap(),
             &mut out,
         );
         // mark them interested + give pid 1 the best upload rate

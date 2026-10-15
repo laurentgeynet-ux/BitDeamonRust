@@ -111,6 +111,11 @@ pub enum TorrentEffect {
     /// post an alert on the session bus (`torrent`-level alerts
     /// carry this torrent's `ih`).
     Alert(crate::alerts::Alert),
+    /// `incoming_interested` tail — on a choked conn,
+    /// `maybe_unchoke_this_peer`; on an already-unchoked one, the
+    /// redundant `Unchoke` re-send. Routed through the session for
+    /// the settings/counters/peer-class pool.
+    MaybeUnchoke { peer: u64 },
     /// `choke_this_peer` — an incoming `not_interested` forfeits the
     /// peer's upload slot. Routed through the session because
     /// `choke_peer` touches the shared `Counters` and must schedule
@@ -4991,6 +4996,11 @@ impl Torrent {
                     // the next choker pass).
                     out.push(TorrentEffect::ChokePeer { peer: peer_id });
                 }
+                PeerEffect::MaybeUnchoke => {
+                    // `incoming_interested` tail — session-side for
+                    // counters/settings/pool like `ChokePeer`.
+                    out.push(TorrentEffect::MaybeUnchoke { peer: peer_id });
+                }
                 PeerEffect::SeenComplete => {
                     self.seen_complete();
                 }
@@ -8089,6 +8099,21 @@ impl Torrent {
         ignore
     }
 
+    /// `peer_connection::get_priority(upload_channel)` — the torrent
+    /// leg: max of `priority[UPLOAD]` over the torrent's class set.
+    /// The conn leg lives on `PeerConn::upload_priority`; callers
+    /// take the max of both (base 1), like upstream.
+    #[must_use]
+    pub fn upload_priority(&self, pool: &bitdaemon_net::peer_class::PeerClassPool) -> i32 {
+        let mut prio = 1;
+        self.peer_classes.for_each(|cl| {
+            if let Some(pc) = pool.at(cl) {
+                prio = prio.max(pc.priority[bitdaemon_net::peer_class::UPLOAD]);
+            }
+        });
+        prio
+    }
+
     /// `~torrent`/`abort`'s `m_peer_class` release — `remove_class`
     /// drops the set's reference, then `decref` drops the creator's.
     pub fn release_peer_class(&mut self, pool: &mut bitdaemon_net::peer_class::PeerClassPool) {
@@ -10994,13 +11019,15 @@ impl Torrent {
         true
     }
 
-    /// `peer_connection::maybe_unchoke_this_peer` — once the
-    /// handshake+bitfield went out (and only when we have pieces),
-    /// unchoke on the spot to save a round-trip: `ignore_unchoke_slots`
-    /// conns always (bypassing `max_uploads`, like upstream's direct
+    /// `peer_connection::maybe_unchoke_this_peer` — unchoke on the
+    /// spot to save a round-trip: `ignore_unchoke_slots` conns
+    /// always (bypassing `max_uploads`, like upstream's direct
     /// `send_unchoke`), others only under `preemptive_unchoke`
     /// (fixed-slots choker with free slots, or a negative
-    /// `unchoke_slots_limit`).
+    /// `unchoke_slots_limit`). The `num_have > 0` gate lives at the
+    /// handshake call site upstream (`bt_peer_connection.cpp`,
+    /// post-bitfield) — the `incoming_interested` re-run has no such
+    /// gate, so callers apply it.
     pub fn maybe_unchoke_this_peer(
         &mut self,
         id: u64,
@@ -11010,10 +11037,6 @@ impl Torrent {
         now: std::time::Instant,
         out: &mut Vec<TorrentEffect>,
     ) {
-        // upstream: `t->num_have() > 0` gates the whole leg.
-        if self.have.count() == 0 {
-            return;
-        }
         let exempt = self
             .peers
             .get(&id)
@@ -11034,10 +11057,20 @@ impl Torrent {
     }
 
     /// `free_upload_slots` — under the per-torrent upload cap.
-    pub fn free_upload_slots(&self) -> bool {
-        self.max_uploads <= 0
-            || (self.peers.values().filter(|c| !c.choked).count() as i64)
-                < i64::from(self.max_uploads)
+    /// Upstream `m_num_uploads` counts only slot-consuming conns:
+    /// `ignore_unchoke_slots` conns unchoke for free and stay out of
+    /// the count (`torrent.cpp` invariant at `num_uploads`).
+    pub fn free_upload_slots(&self, pool: &bitdaemon_net::peer_class::PeerClassPool) -> bool {
+        if self.max_uploads <= 0 {
+            return true;
+        }
+        let t_ign = self.ignores_unchoke_slots(pool);
+        (self
+            .peers
+            .values()
+            .filter(|c| !c.choked && !c.ignores_unchoke_slots(pool) && !t_ign)
+            .count() as i64)
+            < i64::from(self.max_uploads)
     }
 
     /// `inc_num_connecting` / `dec_num_connecting` — dial bookkeeping
