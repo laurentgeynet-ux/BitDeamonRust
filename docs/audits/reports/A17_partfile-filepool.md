@@ -178,3 +178,24 @@ suit `part_file.cpp` partout.
 - `to_file_open_mode` bits `read_write=1<<1`, `no_atime=1<<3`,
   `mmapped=1<<7` (`file_pool.rs:54-67` == `file_pool_impl.cpp:304-312`)
   ; `has_mapping=false` correct pour le backend pread. Conforme.
+
+## Résultat
+
+Appliqué sur `audit/17-partfile-filepool` (merge dans `main` local).
+
+- **Déviation 1 corrigée** (`file_pool.rs`) : `Inner.opening` est
+  désormais un `Vec<OpeningEntry>` — plusieurs opens en vol par
+  `file_key` comme la liste `m_opening_files` upstream ; le join des
+  waiters exige l'absence du fichier du pool + compatibilité de mode
+  (`file_pool_impl.cpp:62-98`) ; chaque opener retire *sa* entrée par
+  `id` et ne notifie que ses propres waiters — un opener parallèle en
+  échec ne poisons plus les waiters d'un open encore en cours.
+- **Déviation 2 corrigée** (`part_file.rs`) : `move_partfile` propage
+  l'erreur du `remove` post-`copy_file` (seul le ENOENT du `rename` est
+  toléré, `part_file.cpp:316-326`).
+- **Tests ajoutés** (module `file_pool::tests`) :
+  `parallel_openers_notify_only_own_waiters`,
+  `parallel_opener_failure_does_not_poison_waiters`,
+  `waiter_receives_inflight_result`.
+- Gates : `fmt` · `clippy -D warnings` · `test --workspace` · `doc
+  --no-deps` — tous verts.

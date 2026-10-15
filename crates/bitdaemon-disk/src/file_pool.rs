@@ -124,8 +124,15 @@ impl WaitError {
 }
 
 struct OpeningEntry {
+    /// `opening_file_entry::file_key` — upstream `m_opening_files` is a
+    /// *list*: several opens of the same file may be in flight at once
+    /// (e.g. a write request can't join a read-only open). Each opener
+    /// notifies only its own `waiters` (`notify_file_open`), so entries
+    /// are keyed by `id`, not just `file_key`.
+    file_key: FileId,
     mode: OpenMode,
     waiters: Vec<Arc<Waiter>>,
+    id: u64,
 }
 
 #[derive(Default)]
@@ -133,7 +140,9 @@ struct Inner {
     files: HashMap<FileId, PoolEntry>,
     /// `(last_use_tick, file_id)` → ordered by last use; front is LRU.
     lru: BTreeMap<(u64, FileId), ()>,
-    opening: HashMap<FileId, OpeningEntry>,
+    /// `m_opening_files` — a list upstream: one entry per in-flight
+    /// open, several per `file_key` allowed.
+    opening: Vec<OpeningEntry>,
     hits: i64,
     misses: i64,
     stalls: i64,
@@ -215,6 +224,9 @@ impl FilePool {
         mode: OpenMode,
     ) -> Result<Arc<FileHandle>, StorageError> {
         let mut defer1: Option<Arc<FileHandle>> = None;
+        // assigned on the miss path — every control flow reaching
+        // `open_file_impl` pushed an `opening` entry
+        let opening_id: u64;
 
         {
             let mut g = self.lock();
@@ -243,29 +255,33 @@ impl FilePool {
                 }
             }
 
-            // a file already being opened — join its waiters
-            let can_join = opening.get(&file_key).is_some_and(|oe| {
-                !mode.contains(OpenMode::WRITE) || oe.mode.contains(OpenMode::WRITE)
-            });
-            if can_join {
-                *stalls += 1;
-                let waiter = Arc::new(Waiter {
-                    m: Mutex::new(None),
-                    c: Condvar::new(),
+            // a file already being opened — join its waiters. Upstream
+            // only scans `m_opening_files` when the file is absent from
+            // the pool (`i == key_view.end()`); a pooled entry with an
+            // insufficient mode falls through to a fresh open.
+            if !files.contains_key(&file_key) {
+                let joinable = opening.iter_mut().find(|oe| {
+                    oe.file_key == file_key
+                        && (!mode.contains(OpenMode::WRITE) || oe.mode.contains(OpenMode::WRITE))
                 });
-                if let Some(oe) = opening.get_mut(&file_key) {
+                if let Some(oe) = joinable {
+                    *stalls += 1;
+                    let waiter = Arc::new(Waiter {
+                        m: Mutex::new(None),
+                        c: Condvar::new(),
+                    });
                     oe.waiters.push(waiter.clone());
+                    drop(g);
+                    let mut r = waiter.m.lock().unwrap_or_else(|e| e.into_inner());
+                    while r.is_none() {
+                        r = waiter.c.wait(r).unwrap_or_else(|e| e.into_inner());
+                    }
+                    return match r.take() {
+                        Some(Ok(h)) => Ok(h),
+                        Some(Err(e)) => Err(e.into_storage()),
+                        None => unreachable!(),
+                    };
                 }
-                drop(g);
-                let mut r = waiter.m.lock().unwrap_or_else(|e| e.into_inner());
-                while r.is_none() {
-                    r = waiter.c.wait(r).unwrap_or_else(|e| e.into_inner());
-                }
-                return match r.take() {
-                    Some(Ok(h)) => Ok(h),
-                    Some(Err(e)) => Err(e.into_storage()),
-                    None => unreachable!(),
-                };
             }
 
             // evict LRU when at capacity (size-1 like upstream)
@@ -275,9 +291,12 @@ impl FilePool {
             }
 
             *misses += 1;
-            opening.entry(file_key).or_insert(OpeningEntry {
+            opening_id = self.next_tick();
+            opening.push(OpeningEntry {
+                file_key,
                 mode,
                 waiters: Vec::new(),
+                id: opening_id,
             });
             // drop lock while performing the actual open
         }
@@ -293,7 +312,13 @@ impl FilePool {
             opening,
             ..
         } = &mut *g;
-        let oe = opening.remove(&file_key);
+        // notify only THIS opener's waiters — a parallel opener of the
+        // same file keeps its own entry (upstream `notify_file_open`
+        // erases `s_iterator_to(ofe)`, not "any entry for this key")
+        let oe = opening
+            .iter()
+            .position(|e| e.id == opening_id)
+            .map(|i| opening.remove(i));
         match &result {
             Ok(handle) => {
                 let tick = self.next_tick();
@@ -490,4 +515,166 @@ fn remove_oldest(
     let (&(tick, key), _) = lru.iter().next()?;
     lru.remove(&(tick, key));
     files.remove(&key).map(|e| e.handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "bitdaemon_fp_intra_{}_{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// `opening_file_entry` bookkeeping for a fake in-flight open.
+    fn push_opening(
+        pool: &FilePool,
+        key: FileId,
+        mode: OpenMode,
+        waiters: Vec<Arc<Waiter>>,
+    ) -> u64 {
+        let mut g = pool.lock();
+        let id = pool.next_tick();
+        g.opening.push(OpeningEntry {
+            file_key: key,
+            mode,
+            waiters,
+            id,
+        });
+        id
+    }
+
+    /// Upstream `m_opening_files` is a list — a write request may NOT
+    /// join an in-flight read-only open; it registers its own entry and
+    /// opens in parallel. When it completes, only its own waiters are
+    /// notified — the other entry and its waiters stay untouched
+    /// (`notify_file_open` erases `s_iterator_to(ofe)`).
+    #[test]
+    fn parallel_openers_notify_only_own_waiters() {
+        let d = test_dir("parallel");
+        let path = d.join("f.bin");
+        std::fs::write(&path, b"xy").unwrap();
+        let pool = FilePool::new(40);
+        let key: FileId = (StorageIndex(0), FileIndex(0));
+
+        // a read-only open "in flight" with one waiter already queued
+        let foreign_waiter = Arc::new(Waiter {
+            m: Mutex::new(None),
+            c: Condvar::new(),
+        });
+        let e1 = push_opening(
+            &pool,
+            key,
+            OpenMode::READ_ONLY,
+            vec![foreign_waiter.clone()],
+        );
+
+        // a write request can't join the ro entry — it opens in parallel
+        let h = pool.open_file_at(key, &path, 2, OpenMode::WRITE).unwrap();
+        drop(h);
+
+        let g = pool.lock();
+        // the ro entry survived the write opener's completion…
+        assert_eq!(g.opening.len(), 1);
+        assert_eq!(g.opening[0].id, e1);
+        // …and the pool now holds the rw handle
+        assert_eq!(g.files.len(), 1);
+        drop(g);
+        // …and its waiter was NOT woken by a completion it didn't join
+        assert!(foreign_waiter.m.lock().unwrap().is_none());
+
+        fs::remove_all(&d).unwrap();
+    }
+
+    /// Symmetric failure case: when the *parallel* opener fails, the
+    /// still-pending entry's waiters must not receive that error —
+    /// upstream delivers errors per `opening_file_entry`.
+    #[test]
+    fn parallel_opener_failure_does_not_poison_waiters() {
+        let d = test_dir("parallel_fail");
+        let path = d.join("f.bin");
+        std::fs::write(&path, b"xy").unwrap();
+        // `blocker` is a regular file: `create_directories(blocker)`
+        // fails, so a write-open under it always errors.
+        let blocker = d.join("blocker");
+        std::fs::write(&blocker, b"z").unwrap();
+        let bad_path = blocker.join("f.bin");
+
+        let pool = FilePool::new(40);
+        let key: FileId = (StorageIndex(0), FileIndex(0));
+        let foreign_waiter = Arc::new(Waiter {
+            m: Mutex::new(None),
+            c: Condvar::new(),
+        });
+        let e1 = push_opening(
+            &pool,
+            key,
+            OpenMode::READ_ONLY,
+            vec![foreign_waiter.clone()],
+        );
+
+        // write request → own entry → open fails (uncreatable dir)
+        assert!(
+            pool.open_file_at(key, &bad_path, 2, OpenMode::WRITE)
+                .is_err()
+        );
+
+        let g = pool.lock();
+        // the foreign entry is still registered, its waiter still pending
+        assert_eq!(g.opening.len(), 1);
+        assert_eq!(g.opening[0].id, e1);
+        drop(g);
+        assert!(foreign_waiter.m.lock().unwrap().is_none());
+        assert!(pool.lock().files.is_empty());
+
+        fs::remove_all(&d).unwrap();
+    }
+
+    /// Joining still works: a compatible request queues on the in-flight
+    /// entry (`m_stalls` up) and receives the opener's handle.
+    #[test]
+    fn waiter_receives_inflight_result() {
+        let d = test_dir("join");
+        let path = d.join("f.bin");
+        std::fs::write(&path, b"xy").unwrap();
+        let pool = FilePool::new(40);
+        let key: FileId = (StorageIndex(0), FileIndex(0));
+        push_opening(&pool, key, OpenMode::READ_ONLY, Vec::new());
+
+        std::thread::scope(|s| {
+            let pool = &pool;
+            let path = &path;
+            let t = s.spawn(move || pool.open_file_at(key, path, 2, OpenMode::READ_ONLY));
+            // wait until the requester has queued its waiter
+            loop {
+                if pool.lock().opening[0].waiters.len() == 1 {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            // the "opener" completes — wake the queued waiter ourselves
+            let h = Arc::new(FileHandle::open(path, 2, OpenMode::READ_ONLY).unwrap());
+            {
+                let mut g = pool.lock();
+                let oe = g.opening.remove(0);
+                for w in oe.waiters {
+                    *w.m.lock().unwrap() = Some(Ok(h.clone()));
+                    w.c.notify_all();
+                }
+            }
+            let got = t.join().unwrap().unwrap();
+            assert!(Arc::ptr_eq(&got, &h));
+        });
+        let (_, _, stalls, _, _) = pool.stats_counters();
+        assert_eq!(stalls, 1);
+        fs::remove_all(&d).unwrap();
+    }
 }
