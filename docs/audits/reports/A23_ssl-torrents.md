@@ -269,3 +269,46 @@ Baseline `e7381c7bc`.
 - `ssl_server_config`/`certified_key` ignorent les DH params :
   ECDHE-only rustls, `use_tmp_dh` ignoré comme les builds LibreSSL
   upstream (commentaire `ssl_stream.rs:547-550`).
+
+## Résultat
+
+Appliqué sur `audit/23-ssl-torrents`, commit `4b66a27`
+(`fix(bitdaemon-session,net): audit A23 — SSL torrents semantic
+parity`). Les 11 déviations sont corrigées :
+
+- **D1** `root_certificate` override → `is_ssl_torrent` /
+  `ssl_root_cert` préfèrent `atp.root_certificate` ; propagé aux
+  paramètres SSL de l'engine.
+- **D2** `ssl_accept_torrent` (`LazyConfigAcceptor`) lit le
+  ClientHello, résout le SNI hex→torrent et installe
+  `PinnedClientVerifier` — la vérif client est épinglée au torrent
+  choisi par SNI (`set_context` upstream).
+- **D3** legs `invalid_ssl_cert` à l'attach : pas de ctx / SNI
+  info-hash ≠ handshake info-hash.
+- **D4** `peer_error_alert` `op=ssl_handshake` sur échec TLS inbound.
+- **D5** `TorrentNeedCert` posté au point `init_ssl` ;
+  `TorrentError` + `invalid_ssl_cert` sur PEM cert/key invalide.
+- **D6** `validate_https_trackers=false` → `tracker_no_verify_config`.
+- **D7** `refresh_ssl_certs` reconstruit les maps SNI/roots —
+  `unregister_ssl_torrent` nettoie les entrées périmées.
+- **D8/D10** announces torrents SSL portent `port=ssl_listen_port` ;
+  résolution du port DHT SSL identique.
+- **D9** announces https des torrents SSL passent par le ctx TLS du
+  torrent (`req.ssl_ctx`).
+- **D11** SNI sortant = hash de la version de protocole du pair.
+- **D12** `socket_type` CLI : tcp_ssl=6, utp_ssl=9.
+
+Tests de régression ajoutés :
+
+- `ssl_stream::tests::pinned_verifier_rejects_other_torrent_cert`
+  (cert client valide pour A rejeté quand le SNI résout B).
+- `ssl_stream::tests::ssl_roots_unregister_and_clear` (SNI/root
+  périmés supprimés).
+- `ssl_stream::tests::tracker_no_verify_config_builds`
+  (`validate_https_trackers=false`).
+- `test_add_torrent::add_torrent_root_certificate_override`
+  (`ssl-cert` embarqué seul → SSL ; `root_certificate` préféré).
+
+Gates : `cargo fmt --all`, `cargo clippy --workspace --all-targets --
+-D warnings`, `cargo test --workspace`, `cargo doc --workspace
+--no-deps` — tous verts.

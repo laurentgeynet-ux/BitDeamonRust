@@ -40,26 +40,65 @@ use tracing::{debug, info, trace, warn};
 /// from the OS root store (upstream loads the system trust DB via
 /// OpenSSL defaults). Lazily initialized so non-https setups never
 /// pay for it. `None` when the crypto provider can't build a config.
-fn tracker_tls_config() -> Option<Arc<rustls::ClientConfig>> {
-    static CFG: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
-    CFG.get_or_init(|| {
-        let mut roots = rustls::RootCertStore::empty();
-        let loaded = rustls_native_certs::load_native_certs();
-        for e in &loaded.errors {
-            warn!("skipped a native root cert: {e}");
-        }
-        for c in loaded.certs {
-            let _ = roots.add(c);
-        }
-        match bitdaemon_net::ssl_stream::tracker_client_config(Arc::new(roots)) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                warn!("tracker TLS config unavailable: {e}");
-                None
+fn tracker_tls_config(validate: bool) -> Option<Arc<rustls::ClientConfig>> {
+    static VERIFY: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
+    static NO_VERIFY: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
+    // `update_validate_https` — `m_ssl_ctx` flips between
+    // `verify_peer` and `verify_none` on the setting; the choice is
+    // read per call so a hot-applied `validate_https_trackers`
+    // retargets the next dial.
+    if !validate {
+        return NO_VERIFY
+            .get_or_init(|| {
+                bitdaemon_net::ssl_stream::tracker_no_verify_config()
+                    .map_err(|e| warn!("tracker TLS config unavailable: {e}"))
+                    .ok()
+            })
+            .clone();
+    }
+    VERIFY
+        .get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            let loaded = rustls_native_certs::load_native_certs();
+            for e in &loaded.errors {
+                warn!("skipped a native root cert: {e}");
             }
-        }
-    })
-    .clone()
+            for c in loaded.certs {
+                let _ = roots.add(c);
+            }
+            match bitdaemon_net::ssl_stream::tracker_client_config(Arc::new(roots)) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    warn!("tracker TLS config unavailable: {e}");
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+/// `req.ssl_ctx = m_ssl_ctx.get()` / web-seed `userdata` — the
+/// SSL torrent's own TLS material for tracker/web-seed https:
+/// `(root_pem, expected leaf name, client cert, client key)`.
+/// `None` on plaintext torrents (the session `m_ssl_ctx` path).
+fn torrent_ssl_ctx(
+    ses: &bitdaemon_session::session::Session,
+    ih: &Sha1Hash,
+) -> Option<SslCtxParts> {
+    let t = ses.torrents.get(ih)?;
+    if !t.is_ssl_torrent() {
+        return None;
+    }
+    let ti = t.ti.as_ref()?;
+    let root = t.ssl_root_cert().unwrap_or(&[]).to_vec();
+    if root.is_empty() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(ti.name()).into_owned();
+    let (cert, key) = t.ssl_pem_pair().map_or((None, None), |(c, k)| {
+        (Some(c.as_bytes().to_vec()), Some(k.as_bytes().to_vec()))
+    });
+    Some((root, name, cert, key))
 }
 
 /// One completed tracker exchange, reported back to the session.
@@ -147,6 +186,10 @@ struct DialDone {
     /// `local_endpoint()` — the bound socket address (drives
     /// `new_connection`'s self-connection legs for pending dials).
     local: Option<SocketAddr>,
+    /// inbound SSL conns: the info-hash the ClientHello SNI resolved
+    /// to — the TLS ctx owner. The attach gate refuses a conn whose
+    /// handshake ih differs (`ssl::has_context` upstream).
+    sni_ih: Option<Sha1Hash>,
 }
 
 /// `socket_type_idx` — `TransportKind` → `socket_type_t` index
@@ -171,6 +214,10 @@ fn transport_socket_type(k: &bitdaemon_net::instantiate::TransportKind) -> u8 {
 /// release + the failure detail for `url_seed_alert` and the
 /// `web_seed_t` rescheduling class.
 type WebSeedResult = Result<Vec<(PeerRequest, Vec<u8>)>, WebSeedFailure>;
+
+/// `(root_cert_der, cert_name, ssl_cert_pem, ssl_key_pem)` — the pieces
+/// of a torrent SSL context (upstream `torrent::m_ssl_ctx` inputs).
+type SslCtxParts = (Vec<u8>, String, Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// failure half of [`WebSeedResult`] — the requests to release,
 /// the `url_seed_alert` message, and how the seed reschedules
@@ -1168,6 +1215,13 @@ impl Engine {
         let session = Arc::clone(&self.session);
         let (opts, timeouts, completion, user_agent) =
             Self::tracker_settings(&session, params.private_torrent, params.event == 3);
+        let (validate_https, ssl_ctx) = {
+            let ses = slock(&session);
+            (
+                ses.settings.validate_https_trackers,
+                torrent_ssl_ctx(&ses, &ih),
+            )
+        };
         self.tasks_forget();
         let handle = tokio::spawn(async move {
             params.url = url.clone();
@@ -1341,6 +1395,8 @@ impl Engine {
                                     min_announce_interval: opts.min_announce_interval,
                                 },
                                 &mut stats,
+                                &ssl_ctx,
+                                validate_https,
                             )
                             .await;
                             source_ip = src;
@@ -1417,6 +1473,13 @@ impl Engine {
         let session = Arc::clone(&self.session);
         let (opts, timeouts, completion, user_agent) =
             Self::tracker_settings(&session, false, false);
+        let (validate_https, ssl_ctx) = {
+            let ses = slock(&session);
+            (
+                ses.settings.validate_https_trackers,
+                torrent_ssl_ctx(&ses, &ih),
+            )
+        };
         self.tasks_forget();
         let handle = tokio::spawn(async move {
             let mut stats = bitdaemon_net::http_conn::WireStats::default();
@@ -1527,6 +1590,8 @@ impl Engine {
                             info_hash: &info_hash,
                         },
                         &mut stats,
+                        &ssl_ctx,
+                        validate_https,
                     )
                     .await;
                     source_ip = src;
@@ -1588,7 +1653,19 @@ impl Engine {
         // — upstream reads `m_settings`/`m_ses.proxy()` at connect
         // time; ours reads them at task spawn (same fidelity: the
         // session tick that dispatched the fetch used them too).
-        let (user_agent, anonymous, always_ua, ip_filter, timeout, proxy, ssrf, allow_idna, pf) = {
+        let (
+            user_agent,
+            anonymous,
+            always_ua,
+            ip_filter,
+            timeout,
+            proxy,
+            ssrf,
+            allow_idna,
+            pf,
+            validate_https,
+            ssl_ctx,
+        ) = {
             let s = slock(&self.session);
             (
                 String::from_utf8_lossy(&s.settings.user_agent).into_owned(),
@@ -1603,6 +1680,8 @@ impl Engine {
                 s.settings.ssrf_mitigation,
                 s.settings.allow_idna,
                 s.port_filter.clone(),
+                s.settings.validate_https_trackers,
+                torrent_ssl_ctx(&s, &ih),
             )
         };
         self.tasks_forget();
@@ -1864,6 +1943,8 @@ impl Engine {
                             dial.port,
                             dial.tls,
                             timeout,
+                            &ssl_ctx,
+                            validate_https,
                         )
                         .await;
                         let (stream, resolved) = match dialed {
@@ -3011,6 +3092,7 @@ impl Engine {
         // at attach; `sock_type` feeds `set_peer_classes`.
         conn.exceeded_limit = d.exceeded;
         conn.sock_type = d.kind;
+        conn.ssl_sni = d.sni_ih;
         let mut out = Vec::new();
         slock(&self.session).peer_connected(&d.ih, peer, conn, remote, &mut out);
         self.attach_stream(d.ih, peer, remote, s, d.rc4);
@@ -3060,16 +3142,36 @@ impl Engine {
                 bitdaemon_common::peer_id::generate_peer_id(&ses.settings.peer_fingerprint)
             });
             let t = ses.torrents.get(&ih);
+            let peer_v2 = t
+                .and_then(|t| {
+                    t.peer_list
+                        .find_peer(remote.ip())
+                        .map(|i| &t.peer_list.peers()[i])
+                })
+                .is_some_and(|p| p.protocol_v2);
             let ssl = t.and_then(|t| {
                 if !t.is_ssl_torrent() {
                     return None;
                 }
                 let ti = t.ti.as_ref()?;
-                let root: Vec<u8> = ti.ssl_cert().to_vec();
+                // `atp.root_certificate` overrides the embedded
+                // `ssl-cert` (`torrent.cpp:1977-1979`).
+                let root: Vec<u8> = t.ssl_root_cert().unwrap_or(&[]).to_vec();
                 let name: String = String::from_utf8_lossy(ti.name()).into_owned();
                 let cert: Option<String> = t.ssl_pem_pair().map(|(c, _)| c.to_string());
                 let key: Option<String> = t.ssl_pem_pair().map(|(_, k)| k.to_string());
-                Some((root, name, cert, key))
+                // `connect_to_peer` SNI — `to_hex(info_hashes().get(
+                // peerinfo->protocol()))`: the v2 hash for a v2 peer
+                // (`torrent.cpp:8133-8137`).
+                let h = if peer_v2 && t.info_hashes.has_v2() {
+                    t.info_hashes
+                        .get(bitdaemon_common::info_hash::ProtocolVersion::V2)
+                } else {
+                    t.info_hashes
+                        .get(bitdaemon_common::info_hash::ProtocolVersion::V1)
+                };
+                let sni = crate::common::hex::to_hex(h.as_bytes());
+                Some((root, name, cert, key, sni))
             });
             // upstream `connect_to_peer`: uTP iff `enable_outgoing_utp`
             // && (`!enable_outgoing_tcp` || the peer flagged
@@ -3175,6 +3277,7 @@ impl Engine {
                     our_pid: marked_pid,
                     conn_fast_reconnect: false,
                     local: None,
+                    sni_ih: None,
                 });
             };
             // `instantiate` resolved the socket type — map it back to
@@ -3284,8 +3387,7 @@ impl Engine {
             // torrent name or "*" (`torrent::verify_peer_cert`);
             // mutual TLS — we present our `set_ssl_certificate`
             // cert/key when configured.
-            let mut s = if let Some((root, name, cert, key)) = ssl_params {
-                let sni = crate::common::hex::to_hex(ih.as_bytes());
+            let mut s = if let Some((root, name, cert, key, sni)) = ssl_params {
                 let cfg = match bitdaemon_net::ssl_stream::peer_ssl_client_config(
                     &root,
                     &name,
@@ -3412,6 +3514,7 @@ impl Engine {
                 our_pid: marked_pid,
                 conn_fast_reconnect: false,
                 local,
+                sni_ih: None,
             });
         });
         self.tasks.push(h);
@@ -3566,6 +3669,7 @@ impl Engine {
                             our_pid: Some(our_pid),
                             conn_fast_reconnect: false,
                             local,
+                            sni_ih: None,
                         });
                     }
                     Err(e) => {
@@ -3617,32 +3721,12 @@ impl Engine {
         if let Some(a) = local {
             slock(&self.session).on_listen_succeeded(a.to_string(), kind);
         }
-        let cfg = match rustls::ServerConfig::builder_with_provider(
-            bitdaemon_net::ssl_stream::crypto_provider(),
-        )
-        .with_safe_default_protocol_versions()
-        {
-            Ok(b) => Arc::new(
-                b
-                    // SSL torrents are mutual-TLS upstream
-                    // (`verify_peer | verify_fail_if_no_peer_cert`).
-                    .with_client_cert_verifier(Arc::new(
-                        bitdaemon_net::ssl_stream::TorrentClientVerifier::new(
-                            self.ssl_roots.clone(),
-                        ),
-                    ))
-                    .with_cert_resolver(self.ssl_resolver.clone()),
-            ),
-            Err(e) => {
-                slock(&self.session).on_listen_failed(
-                    local.map_or_else(String::new, |a| a.to_string()),
-                    "ssl".into(),
-                    e.to_string(),
-                    kind,
-                );
-                return;
-            }
-        };
+        // `m_peer_ssl_ctx` + `ssl_server_name_callback` — the cert
+        // and the client-cert trust are picked per-connection from
+        // the ClientHello SNI (`set_context` into the resolved
+        // torrent's `ssl_ctx` upstream), inside `ssl_accept_torrent`.
+        let ssl_resolver = self.ssl_resolver.clone();
+        let ssl_roots = self.ssl_roots.clone();
         let tx = self.connect_tx.clone();
         let fd_tx = self.fd_exhausted_tx.clone();
         let session = self.session.clone();
@@ -3689,17 +3773,38 @@ impl Engine {
                         continue;
                     }
                 };
-                let tls = match bitdaemon_net::ssl_stream::ssl_accept(s0, remote, cfg.clone()).await
+                let (tls, sni) = match bitdaemon_net::ssl_stream::ssl_accept_torrent(
+                    s0,
+                    remote,
+                    ssl_resolver.clone(),
+                    ssl_roots.clone(),
+                )
+                .await
                 {
-                    Ok(t) => t,
+                    Ok(pair) => pair,
                     Err(e) => {
                         warn!(err = %e, "ssl handshake failed");
+                        // `session_impl::ssl_handshake` error leg —
+                        // `peer_error_alert` op `ssl_handshake`
+                        // (empty torrent handle — the ih isn't known
+                        // until the bt handshake).
+                        slock(&session).alerts.post(Alert::PeerError {
+                            ih: Sha1Hash::default(),
+                            remote: remote.to_string(),
+                            op: "ssl_handshake".into(),
+                            error: e.to_string(),
+                        });
                         slock(&session)
                             .counters
                             .add(bitdaemon_session::counters::Counter::NumPeersHalfOpen, -1);
                         continue;
                     }
                 };
+                // the SNI carries the hex info-hash — kept on the
+                // conn for the `has_context` attach leg (a conn
+                // TLS-pinned to a different torrent is refused
+                // `invalid_ssl_cert` upstream).
+                let sni_ih = Sha1Hash::from_hex(sni.as_bytes()).ok();
                 let mut s = Box::new(tls) as bitdaemon_net::transport::BoxedPeerStream;
                 // per-conn peer-id (`generate_peer_id`) for the
                 // responder handshake — same as the plain acceptor.
@@ -3732,6 +3837,7 @@ impl Engine {
                             our_pid: Some(our_pid),
                             conn_fast_reconnect: false,
                             local,
+                            sni_ih,
                         });
                     }
                     Err(e) => {
@@ -3753,6 +3859,11 @@ impl Engine {
     pub fn refresh_ssl_certs(&self) {
         let ses = slock(&self.session);
         let res = &*self.ssl_resolver;
+        // upstream's `ssl_server_name_callback_impl` does a live
+        // `find_torrent` per handshake — a removed torrent stops
+        // resolving. Rebuild both maps so stale certs/roots drop.
+        res.clear();
+        self.ssl_roots.clear();
         for (ih, t) in &ses.torrents {
             if !t.is_ssl_torrent() {
                 continue;
@@ -3762,7 +3873,10 @@ impl Engine {
                 // the trust root comes from the torrent file's
                 // `ssl-cert` field (`init_ssl` upstream)
                 let (name, root) = t.ti.as_ref().map_or((Vec::new(), Vec::new()), |ti| {
-                    (ti.name().to_vec(), ti.ssl_cert().to_vec())
+                    (
+                        ti.name().to_vec(),
+                        t.ssl_root_cert().unwrap_or(&[]).to_vec(),
+                    )
                 });
                 let name = String::from_utf8_lossy(&name).into_owned();
                 match bitdaemon_net::ssl_stream::register_ssl_torrent(
@@ -4637,6 +4751,8 @@ async fn web_seed_dial(
     port: u16,
     tls: bool,
     timeout: std::time::Duration,
+    ssl_ctx: &Option<SslCtxParts>,
+    validate_https: bool,
 ) -> Result<(BoxedPeerStream, Option<SocketAddr>), WebSeedDialError> {
     use bitdaemon_net::proxy::{HttpConnectConnector, ProxyType, SocksConnector};
     let http_px = proxy_addr.is_some()
@@ -4718,10 +4834,22 @@ async fn web_seed_dial(
             .map_err(|e| WebSeedDialError::Io(e.to_string()))?
     };
     if tls {
-        // `m_ses.ssl_ctx()` — the tracker/web client context
-        // (real PKI), same SNI as the request host.
-        let cfg = tracker_tls_config()
-            .ok_or_else(|| WebSeedDialError::Io("no TLS client config".to_string()))?;
+        // `connect_web_seed` userdata — an SSL torrent passes its
+        // own `m_ssl_ctx` (tracker-cert check against the torrent
+        // root + leaf name, client cert if loaded); otherwise the
+        // session `m_ssl_ctx` (system PKI / verify-none per
+        // `validate_https_trackers`). Same SNI as the request host.
+        let cfg = match ssl_ctx {
+            Some((root, name, cert, key)) => bitdaemon_net::ssl_stream::peer_ssl_client_config(
+                root,
+                name,
+                cert.as_deref(),
+                key.as_deref(),
+            )
+            .map_err(|e| WebSeedDialError::Io(e.to_string()))?,
+            None => tracker_tls_config(validate_https)
+                .ok_or_else(|| WebSeedDialError::Io("no TLS client config".to_string()))?,
+        };
         let peer_name = resolved.unwrap_or_else(|| {
             SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
         });
@@ -4922,6 +5050,8 @@ async fn tracker_dial(
     addr: SocketAddr,
     https: bool,
     hostname: &str,
+    ssl_ctx: &Option<SslCtxParts>,
+    validate_https: bool,
 ) -> Result<BoxedPeerStream, AnnounceError> {
     let s = connector
         .clone()
@@ -4934,10 +5064,27 @@ async fn tracker_dial(
     if !https {
         return Ok(s);
     }
-    let cfg = tracker_tls_config().ok_or_else(|| AnnounceError::Op {
-        op: "connect",
-        message: "tls: crypto provider unavailable".into(),
-    })?;
+    // `req.ssl_ctx` — an SSL torrent's announce verifies the tracker
+    // cert against the *torrent's* root and leaf name (mutual TLS
+    // too, when a cert pair was loaded); otherwise the session
+    // `m_ssl_ctx` (system PKI, or verify-none when
+    // `validate_https_trackers` is off).
+    let cfg = match ssl_ctx {
+        Some((root, name, cert, key)) => bitdaemon_net::ssl_stream::peer_ssl_client_config(
+            root,
+            name,
+            cert.as_deref(),
+            key.as_deref(),
+        )
+        .map_err(|e| AnnounceError::Op {
+            op: "connect",
+            message: format!("tls: {e}"),
+        })?,
+        None => tracker_tls_config(validate_https).ok_or_else(|| AnnounceError::Op {
+            op: "connect",
+            message: "tls: crypto provider unavailable".into(),
+        })?,
+    };
     bitdaemon_net::ssl_stream::ssl_connect(s, hostname, addr, cfg)
         .await
         .map(|t| Box::new(t) as BoxedPeerStream)
@@ -4987,6 +5134,8 @@ async fn tracker_http_exchange(
     max_response: usize,
     op: TrackerHttpOp<'_>,
     stats: &mut bitdaemon_net::http_conn::WireStats,
+    ssl_ctx: &Option<SslCtxParts>,
+    validate_https: bool,
 ) -> (
     Result<bitdaemon_net::http_tracker::TrackerResponse, AnnounceError>,
     Option<std::net::IpAddr>,
@@ -5029,13 +5178,16 @@ async fn tracker_http_exchange(
         });
         let mut redirect = None;
         for addr in eps {
-            let mut s = match tracker_dial(connector, addr, https, &c.hostname).await {
-                Ok(s) => s,
-                Err(e) => {
-                    attempt = Err(e);
-                    continue;
-                }
-            };
+            let mut s =
+                match tracker_dial(connector, addr, https, &c.hostname, ssl_ctx, validate_https)
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        attempt = Err(e);
+                        continue;
+                    }
+                };
             let r = tokio::time::timeout(completion, async {
                 match op {
                     TrackerHttpOp::Announce {

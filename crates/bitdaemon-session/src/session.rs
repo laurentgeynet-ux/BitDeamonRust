@@ -226,6 +226,11 @@ enum DhtResult {
         /// `dht::announce::implied_port` — `!announce_port &&
         /// enable_incoming_utp` (not set for ssl torrents).
         implied_port: bool,
+        /// `dht::announce::ssl_torrent` — `port == 0` resolves the
+        /// *SSL* listen port through the observer upstream
+        /// (`node.cpp:452`); single-socket sessions carry it for
+        /// parity only.
+        ssl: bool,
     },
     /// user `dht_get_peers`/`dht_announce` — replies with peers
     /// post `dht_get_peers_reply_alert` (upstream
@@ -3087,6 +3092,7 @@ impl Session {
                 t,
                 self.peer_id,
                 self.listen_port,
+                self.ssl_listen_port,
                 &self.settings,
                 out,
                 &mut sent,
@@ -3307,6 +3313,7 @@ impl Session {
                 t,
                 self.peer_id,
                 self.listen_port,
+                self.ssl_listen_port,
                 &self.settings,
                 out,
                 &mut sent,
@@ -3433,6 +3440,7 @@ impl Session {
         t: &mut Torrent,
         peer_id: bitdaemon_common::PeerId,
         port: u16,
+        ssl_port: u16,
         settings: &crate::settings::SessionSettings,
         out: &mut Vec<SessionOut>,
         sent: &mut Vec<(Sha1Hash, String, i32)>,
@@ -3458,6 +3466,7 @@ impl Session {
                 is_seed,
                 peer_id,
                 port,
+                ssl_port,
                 settings.apply_ip_filter_to_trackers,
                 settings.num_want,
                 settings.report_true_downloaded,
@@ -3987,16 +3996,31 @@ impl Session {
                     }));
                     return;
                 }
-                // `attach_peer` — SSL torrents refuse non-SSL conns
-                // (`requires_ssl_connection`; `invalid_ssl_cert`
-                // when we hold no cert — same refusal path).
-                if t.is_ssl_torrent() && !matches!(conn.sock_type, 6..=9) {
-                    out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
-                        peer,
-                        reason: "requires_ssl_connection",
-                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                    }));
-                    return;
+                // `attach_peer` ssl legs (`torrent.cpp:8475-8505`):
+                // SSL torrents refuse non-SSL conns
+                // (`requires_ssl_connection`), refuse all conns when
+                // we can't serve/verify (`invalid_ssl_cert` @
+                // ssl_handshake — no cert pair was ever loaded), and
+                // refuse a conn whose TLS ctx (SNI-resolved) belongs
+                // to a different torrent (`invalid_ssl_cert` @
+                // bittorrent — cross-torrent SNI circumvention).
+                if t.is_ssl_torrent() {
+                    if !matches!(conn.sock_type, 6..=9) {
+                        out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                            peer,
+                            reason: "requires_ssl_connection",
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                        }));
+                        return;
+                    }
+                    if t.ssl_pem_pair().is_none() || conn.ssl_sni.is_some_and(|sni| sni != *ih) {
+                        out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                            peer,
+                            reason: "invalid_ssl_cert",
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                        }));
+                        return;
+                    }
                 }
                 // `m_has_incoming` — sticky flag.
                 t.has_incoming = true;
@@ -5237,6 +5261,7 @@ impl Session {
                         is_seed,
                         pid,
                         port,
+                        self.ssl_listen_port,
                         apply_filter,
                         num_want,
                         report_true,
@@ -7675,6 +7700,7 @@ impl Session {
                         port,
                         seed,
                         implied_port,
+                        ssl,
                     },
                 );
             }
@@ -8000,6 +8026,7 @@ impl Session {
                         is_seed,
                         pid,
                         port,
+                        self.ssl_listen_port,
                         apply_filter,
                         num_want,
                         report_true,
@@ -8292,6 +8319,7 @@ impl Session {
                 port,
                 seed,
                 implied_port,
+                ssl,
             } => {
                 if tokens.is_empty() {
                     self.finish_announce(ih);
@@ -8303,9 +8331,18 @@ impl Session {
                     tokens.iter().map(|(id, ep, _)| (*id, *ep)).collect();
                 let tok_map: std::collections::BTreeMap<_, _> =
                     tokens.iter().map(|(id, _, t)| (*id, t.clone())).collect();
-                // `listen_port == 0` → the socket's real port
-                // (upstream resolves it through the observer).
-                let port = if port == 0 { self.listen_port } else { port };
+                // `listen_port == 0` → the socket's real port via
+                // the observer; `ssl_torrent` resolves the SSL
+                // listen port upstream (`node.cpp:452`).
+                let port = if port == 0 {
+                    if ssl {
+                        self.ssl_listen_port
+                    } else {
+                        self.listen_port
+                    }
+                } else {
+                    port
+                };
                 if let Some(n) = self.dht.get_node_mut(v6) {
                     n.announce(&ih, port, seed, implied_port, &addrs, |id| {
                         tok_map.get(id).cloned()
@@ -9488,6 +9525,7 @@ impl Session {
                                     true,
                                     self.peer_id,
                                     self.listen_port,
+                                    self.ssl_listen_port,
                                     self.settings.apply_ip_filter_to_trackers,
                                     self.settings.num_want,
                                     self.settings.report_true_downloaded,
@@ -9610,6 +9648,7 @@ impl Session {
                     is_seed,
                     pid,
                     port,
+                    self.ssl_listen_port,
                     apply_filter,
                     num_want,
                     report_true,
@@ -9641,6 +9680,9 @@ impl Session {
         is_seed: bool,
         pid: bitdaemon_common::PeerId,
         port: u16,
+        // `m_ssl_listen_port` — SSL torrents announce this instead
+        // of `port` (`torrent.cpp:2958`).
+        ssl_listen_port: u16,
         apply_ip_filter_to_trackers: bool,
         num_want: i32,
         report_true_downloaded: bool,
@@ -9704,7 +9746,13 @@ impl Session {
         let info_hash = t.info_hashes.get(v).to_bytes();
         let mut params = t.announce_params(
             pid,
-            port,
+            // `build_tracker_request` — SSL torrents announce
+            // `ssl_listen_port` (`torrent.cpp:2958`).
+            if t.is_ssl_torrent() {
+                ssl_listen_port
+            } else {
+                port
+            },
             ev,
             apply_ip_filter_to_trackers,
             num_want,
@@ -10237,6 +10285,7 @@ impl Session {
                             is_seed,
                             pid,
                             port,
+                            self.ssl_listen_port,
                             apply_filter,
                             num_want,
                             report_true,

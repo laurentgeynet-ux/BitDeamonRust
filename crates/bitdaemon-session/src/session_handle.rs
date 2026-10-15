@@ -1801,27 +1801,51 @@ impl TorrentHandle {
     /// `torrent_handle::set_ssl_certificate` — SSL torrents: the
     /// PEM keypair this torrent serves on inbound SSL handshakes
     /// (`dh` kept for signature parity; rustls is ECDHE-only).
-    /// Upstream's `set_ssl_cert_buffer` ends by posting
-    /// `torrent_need_cert_alert` — the cert requirement is now met.
+    /// Upstream `set_ssl_cert` posts `torrent_error_alert
+    /// (not_an_ssl_torrent)` on a non-SSL torrent and
+    /// `torrent_error_alert(ec, "[certificate]"/"[private key]")` on
+    /// unparseable PEM.
     pub fn set_ssl_certificate(&self, cert: String, key: String, dh: String) {
         let mut ses = lock(&self.session);
-        if let Some(t) = ses.torrents.get_mut(&self.info_hash) {
-            let ssl = t.is_ssl_torrent();
-            t.set_ssl_cert_buffer(&cert, &key, &dh);
-            if ssl {
-                ses.alerts.post(crate::alerts::Alert::TorrentNeedCert {
-                    ih: self.info_hash,
-                    error: String::new(),
-                    cert_file: String::new(),
-                });
-            }
+        let Some(t) = ses.torrents.get_mut(&self.info_hash) else {
+            return;
+        };
+        if !t.is_ssl_torrent() {
+            ses.alerts.post(crate::alerts::Alert::TorrentError {
+                ih: self.info_hash,
+                error: "not_an_ssl_torrent".into(),
+                file: String::new(),
+            });
+            return;
+        }
+        if let Err(file) = t.set_ssl_cert_buffer(&cert, &key, &dh) {
+            ses.alerts.post(crate::alerts::Alert::TorrentError {
+                ih: self.info_hash,
+                error: "invalid SSL certificate material".into(),
+                file: file.into(),
+            });
         }
     }
 
     /// `torrent_handle::set_ssl_certificate_buffer` — PEM buffer
-    /// form (same store; the path/buffer distinction is upstream's).
+    /// form. Upstream returns early when the torrent has no SSL ctx
+    /// (`!m_ssl_ctx` → silent), and posts `torrent_error_alert` on
+    /// PEM failures.
     pub fn set_ssl_certificate_buffer(&self, cert: String, key: String, dh: String) {
-        self.set_ssl_certificate(cert, key, dh);
+        let mut ses = lock(&self.session);
+        let Some(t) = ses.torrents.get_mut(&self.info_hash) else {
+            return;
+        };
+        if !t.is_ssl_torrent() {
+            return;
+        }
+        if let Err(file) = t.set_ssl_cert_buffer(&cert, &key, &dh) {
+            ses.alerts.post(crate::alerts::Alert::TorrentError {
+                ih: self.info_hash,
+                error: "invalid SSL certificate material".into(),
+                file: file.into(),
+            });
+        }
     }
 
     /// `torrent_handle::add_http_seed` — **deprecated upstream

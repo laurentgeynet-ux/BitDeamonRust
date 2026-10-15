@@ -453,6 +453,11 @@ pub struct PeerConn {
     /// transports flatten into `peer_class_type_filter` classes via
     /// `set_peer_classes`.
     pub sock_type: u8,
+    /// inbound SSL conns: the info-hash the ClientHello SNI resolved
+    /// to — the TLS ctx owner (`ssl::has_context` leg of
+    /// `torrent::attach_peer`: a conn pinned to a different torrent
+    /// is `invalid_ssl_cert`).
+    pub ssl_sni: Option<bitdaemon_common::Sha1Hash>,
     /// `m_peer_class` — the conn's `peer_class_set`, assigned once at
     /// attach from `peer_class_filter` + `peer_class_type_filter`
     /// (`session_impl::set_peer_classes`). Refcounted in the session
@@ -583,6 +588,7 @@ impl PeerConn {
             pex_first_time: true,
             is_utp: false,
             sock_type: 0,
+            ssl_sni: None,
             peer_classes: bitdaemon_net::peer_class::PeerClassSet::default(),
 
             exceeded_limit: false,
