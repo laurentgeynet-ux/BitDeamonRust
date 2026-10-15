@@ -22,15 +22,19 @@ Upstream : `src/piece_picker.cpp`, `src/request_blocks.cpp`,
   `REVERSE` quand `pipeline.snubbed` — `piece_picker.rs:3036-3067` ;
   upstream `piece_picker.cpp:2204-2227`.
 - Partials : prefer_contiguous_blocks, prioritize_partials,
-  time-critical d'abord — **conforme** — cap `num_partials >
-  num_peers*3/2 || *blocks_per_piece > 2048` → `PRIORITIZE_PARTIALS`
-  + `prefer_contiguous = 0` ; tri rarest-first des partials (le heap
-  upstream est remplacé par un sort — heuristique perf, sémantique
-  identique) ; `add_blocks_downloading` reproduit
-  `requested_from`/exclusive/exclusive_active/backup_blocks à
-  l'identique ; `TIME_CRITICAL` est un bit inerte dans les deux codes
-  — `piece_picker.rs:2841-2919, 2734-2814` ; upstream
-  `piece_picker.cpp:1981-2114, 2752-2840`.
+  time-critical d'abord — **déviation (passe 2)** — le cœur du
+  picker est conforme (cap `num_partials > num_peers*3/2 ||
+  *blocks_per_piece > 2048` → `PRIORITIZE_PARTIALS` +
+  `prefer_contiguous = 0` ; tri rarest-first des partials ;
+  `add_blocks_downloading` reproduit requested_from/exclusive/
+  backup_blocks à l'identique) mais l'*amont* `picker_options()`
+  est incomplet : `initial_picker_threshold`,
+  `prioritize_partial_pieces` et `piece_extent_affinity` jamais
+  câblés, `RAREST_FIRST|SEQUENTIAL` posé en séquentiel — voir
+  Passe 2 — `piece_picker.rs:2841-2919, 2734-2814`,
+  `torrent.rs:6454-6461`, `peer_conn.rs:2237` ; upstream
+  `piece_picker.cpp:1981-2114, 2752-2840`,
+  `peer_connection.cpp:896-940`.
 - Priorities : piece 0/dont_download skip, top-priority first,
   per-piece vs per-file — **conforme** — `filtered()` exclu via
   `is_piece_free`/`can_pick`, downloading-filtré → queue `ZeroPrio`
@@ -53,11 +57,14 @@ Upstream : `src/piece_picker.cpp`, `src/request_blocks.cpp`,
   Déviations #2 — `torrent.rs:10838-10978` ; upstream
   `torrent.cpp:11034-11167`.
 - Endgame : busy blocks requestables en dernier (un busy par peer
-  sauf TC) — **conforme** — `dont_pick_busy_blocks = (strict &&
-  queue < want_left) || outstanding > 0`, un seul `busy_block`
-  retenu puis `add_request(busy, busy)` uniquement si plus de
-  requêtes en vol ; pool end-game restreint à `piece_full` capé à
-  200, un bloc random `state_requested` d'un autre peer —
+  sauf TC) — **déviation (passe 2)** — le gate pré-pick
+  `dont_pick_busy_blocks = (strict && queue < want_left) ||
+  outstanding > 0` est conforme (upstream le calcule aussi avant la
+  boucle), mais le test post-boucle upstream réévalue `dq.size() +
+  rq.size()` en live — les blocs mis en file *pendant* la boucle
+  comptent, et chez nous ils sont stagés — voir Passe 2 ; pool
+  end-game restreint à `piece_full` capé à 200, un bloc random
+  `state_requested` d'un autre peer —
   `request_blocks.rs:166-212`, `piece_picker.rs:3239-3285` ;
   upstream `request_blocks.cpp:172-292`, `piece_picker.cpp:2373-2485`.
 - Invariants : num_peers == downloaders réels, refcount == peers
@@ -161,6 +168,80 @@ Upstream : `src/piece_picker.cpp`, `src/request_blocks.cpp`,
   de rareté si `dl_queue == 0` — cas quasi impossible : 0 pièces
   détenues ni voulues. Gardé comme divergent-bénin à aligner si le
   fix #2 touche la zone.)
+
+## Couverture des tests upstream (test/test_piece_picker.cpp)
+
+121 `TORRENT_TEST` upstream vs ~40 tests Rust
+(`tests/test_piece_picker.rs`). Orphelins notables :
+
+- `piece_extent_affinity*` (6 tests) — inatteignables : l'option
+  n'était jamais armée (déviation #5c).
+- `cursors_*` (11 tests sweep up/down/in × we_have/set_priority/
+  seq_range) — partiel : `cursor`/`sequential` couvrent la logique
+  de base mais pas les balayages dirigés.
+- `pad_*` / `mark_as_pad_*` (~15 tests) — les pad-bytes v2 ont
+  `set_pad_bytes` testé mais pas les scénarios de pick.
+- `restore_piece*`, `reprioritize_*`, `download_filtered_piece`,
+  `break_one_seed`, `started_hash_job`, `resize` — non portés.
+
+## Passe 2 — déviations complémentaires
+
+Relecture approfondie de `request_blocks.cpp` et
+`peer_connection::picker_options()` après le premier apply.
+
+- `request_blocks.rs:207` — le gate post-boucle
+  `busy_block == INVALID || num_outstanding > 0` utilise le snapshot
+  `num_outstanding` pré-pick. Upstream réévalue
+  `dq.size() + rq.size() > 0` **après** la boucle — or
+  `c.add_request(pb, {})` pousse dans `m_request_queue` *pendant* la
+  boucle (`request_blocks.cpp:264-267`). Comme `drive_requests`
+  stage les picks (`picked`) et ne marque/queue qu'au retour, un
+  passage qui met en file ≥1 bloc libre sans remplir `num_requests`
+  envoie quand même le busy-block ; upstream attend que la file soit
+  totalement vide. Conséquence : requête dupliquée wire-visible une
+  passe plus tôt en endgame (bornée par le cap un-busy-par-peer).
+  Sévérité : wire-visible (ordre/volume des requêtes endgame).
+  - **sketch** : compter les `add_request` réussis dans la boucle
+    (`queued` ) et remplacer le test par
+    `busy_block == INVALID || num_outstanding + queued > 0` —
+    équivalent exact du `dq+rq` live upstream. Test : 1 pièce libre
+    + 1 pièce busy, `desired_queue_size` > blocs libres — upstream
+    ne demande pas le busy, Rust le demandait.
+- `torrent.rs:6454-6461` — `picker_options()` incomplet vs
+  `peer_connection.cpp:896-940`. Upstream :
+  `sequential` XOR (`num_have() < initial_picker_threshold` →
+  `prioritize_partials`) XOR (`rarest_first` + `reverse` si snubbed
+  sinon `piece_extent_affinity` si setting et pas de TC), puis
+  `prioritize_partials` si `prioritize_partial_pieces`, puis
+  `on_parole|prioritize_partials` si parole.
+  - (a) `initial_picker_threshold` (défaut 4) jamais consulté :
+    upstream fait un pick **random + partials** (pas de
+    `rarest_first`) tant qu'on a < 4 pièces — stratégie de
+    démarrage délibérée ; Rust fait rarest_first dès le début.
+  - (b) `prioritize_partial_pieces` setting jamais lu →
+    `PRIORITIZE_PARTIALS` ne vient que du cap interne et de parole.
+  - (c) `piece_extent_affinity` setting jamais lu →
+    `PIECE_EXTENT_AFFINITY` inatteignable : `record_downloading_piece`,
+    la passe extent de `pick_pieces` et les 6 tests upstream sont
+    morts.
+  - (d) `RAREST_FIRST | SEQUENTIAL` en séquentiel vs upstream
+    `sequential` seul (l'assert upstream `rarest_first XOR
+    sequential ≤ 1` échouerait) : sous séquentiel+partials, Rust
+    trie les partials rarest-first au lieu de l'ordre
+    `m_downloads`, et un peer snubbed reçoit `REVERSE` qu'upstream
+    ne pose pas (le leg vit dans la branche rarest_first).
+  - (e) `peer_conn.rs:2237` — le leg snubbed→`REVERSE` n'a pas de
+    `else` extent-affinity (`else if piece_extent_affinity &&
+    num_time_critical_pieces()==0`).
+  Sévérité : état/ordre de pick (démarrage random, partials sous
+  séquentiel, settings morts).
+  - **sketch** : helper `piece_picker::picker_options(sequential,
+    num_have, threshold, prioritize_partial_pieces)` pour les legs
+    torrent-level ; `PeerConn::picker_options(base, extent_affinity,
+    tc)` pour les legs per-peer (snubbed→REVERSE else
+    extent-affinity, parole) ; `TorrentRequestCtx` gagne
+    `piece_extent_affinity`. Call sites : `torrent.rs:6454`, `9523`,
+    web-seed `6785`, re-marks `7836`/`12104`.
 
 ## Résultat
 
