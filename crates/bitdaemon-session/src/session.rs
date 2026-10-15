@@ -4670,6 +4670,10 @@ impl Session {
             self.alerts.post(Alert::PeerBan {
                 ih: *ih,
                 ip: remote,
+                // `p->connection ? pid() : peer_id()` upstream.
+                pid: conn_id
+                    .and_then(|id| t.peers.get(&id))
+                    .and_then(|c| c.peer_id),
             });
         }
         self.sync_connected_peers();

@@ -29,8 +29,8 @@
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
 
-use bitdaemon_common::Sha1Hash;
 use bitdaemon_common::types::PieceIndex;
+use bitdaemon_common::{PeerId, Sha1Hash};
 
 /// `alert_category_t` — upstream bit positions verbatim
 /// (`alert.hpp` bits 0–24).
@@ -347,6 +347,10 @@ pub enum Alert {
         ih: Sha1Hash,
         /// `ip` — the banned endpoint.
         ip: SocketAddr,
+        /// `pid` — the peer_id from the live conn if there is one
+        /// (upstream `p->connection ? p->connection->pid() :
+        /// peer_id()` — empty when the conn is already gone).
+        pid: Option<PeerId>,
     },
     /// `peer_unsnubbed_alert` (20).
     PeerUnsnubbed {
@@ -1277,7 +1281,7 @@ impl Alert {
                 format!("{ih} tracker announce to {url} (event {event})")
             }
             Self::HashFailed { ih, piece } => format!("{ih} piece {} hash failed", piece.0),
-            Self::PeerBan { ih, ip } => format!("{ih} banned peer {ip}"),
+            Self::PeerBan { ih, ip, .. } => format!("{ih} banned peer {ip}"),
             Self::PeerUnsnubbed { ih, remote } => format!("{ih} peer {remote} unsnubbed"),
             Self::PeerSnubbed { ih, remote } => format!("{ih} peer {remote} snubbed"),
             Self::PeerError {

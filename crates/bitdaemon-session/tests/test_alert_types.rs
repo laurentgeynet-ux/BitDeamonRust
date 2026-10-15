@@ -212,7 +212,16 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
             N,
             S,
         ),
-        (Alert::PeerBan { ih: ih(), ip: sa() }, 19, N, PEER),
+        (
+            Alert::PeerBan {
+                ih: ih(),
+                ip: sa(),
+                pid: None,
+            },
+            19,
+            N,
+            PEER,
+        ),
         (
             Alert::PeerUnsnubbed {
                 ih: ih(),

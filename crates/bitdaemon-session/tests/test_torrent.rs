@@ -499,3 +499,119 @@ fn recheck_bumps_picker_generation() {
     assert!(t.arm_full_recheck() > 0);
     assert_ne!(t.picker_generation, g0);
 }
+
+/// A10 — a downloader whose conn died before the hash verdict is
+/// still penalized on its swarm entry (`penalize_peers` upstream
+/// iterates `torrent_peer*`, which outlives connections): lone
+/// culprit → `known_bad` → banned, `pid` empty (no live conn), no
+/// `DisconnectPeer` (nothing to drop — `if (p->connection)`).
+#[test]
+fn hash_fail_penalizes_dead_conn_culprit() {
+    use bitdaemon_common::PeerSourceFlags;
+    use bitdaemon_common::types::PieceBlock;
+    use bitdaemon_session::counters::{Counter, Counters};
+    use bitdaemon_session::piece_picker::PickerOptions;
+    use bitdaemon_session::settings::SessionSettings;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let s = SessionSettings::default();
+    let counters = Counters::default();
+    let mut t = torrent(3);
+    t.init_picker(true);
+    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(85, 17, 0, 9)), 6881);
+    t.add_swarm_peer(remote, PeerSourceFlags::TRACKER, &mut Vec::new());
+    let mut c = PeerConn::new(3, PeerPipeline::new(1000, 30, 250), 0);
+    c.remote = Some(remote);
+    c.peer_id = Some(bitdaemon_common::PeerId::from_bytes(&[0x42; 20]).unwrap());
+    let key = c.peer_key().unwrap();
+    t.add_peer(1, c);
+    // attribute every block of piece 1 to that downloader, all
+    // written (finished blocks keep their `block_info.peer`).
+    if let Some(p) = t.picker.as_mut() {
+        for b in 0..p.blocks_in_piece(PieceIndex(1)) {
+            let blk = PieceBlock {
+                piece_index: PieceIndex(1),
+                block_index: b,
+            };
+            p.mark_as_downloading(blk, Some(key), PickerOptions::RAREST_FIRST);
+            p.mark_as_finished(blk, Some(key));
+        }
+    }
+    t.remove_peer(
+        1,
+        &counters,
+        &bitdaemon_net::peer_class::PeerClassPool::new(),
+        &mut Vec::new(),
+    );
+
+    let mut out = Vec::new();
+    t.piece_verified(PieceIndex(1), false, &[], &s, &counters, &mut out);
+
+    let i = t.peer_list.find_peer(remote.ip()).unwrap();
+    let p = &t.peer_list.peers()[i];
+    assert!(p.banned);
+    assert_eq!(p.trust_points, -2);
+    assert_eq!(p.hashfails, 1);
+    assert_eq!(counters.value(Counter::BannedForHashFailure), 1);
+    assert!(out.iter().any(|e| matches!(
+        e,
+        TorrentEffect::Alert(bitdaemon_session::alerts::Alert::PeerBan { ip, pid, .. })
+            if *ip == remote && pid.is_none()
+    )));
+    // `if (p->connection)` — a dead conn has nothing to disconnect.
+    assert!(
+        !out.iter()
+            .any(|e| matches!(e, TorrentEffect::DisconnectPeer { .. }))
+    );
+}
+
+/// A10 — same resolution for the pass leg: a passing piece clears
+/// parole and raises trust on the swarm entry even when the
+/// downloader's conn is already gone.
+#[test]
+fn piece_pass_rewards_dead_conn_downloader() {
+    use bitdaemon_common::PeerSourceFlags;
+    use bitdaemon_common::types::PieceBlock;
+    use bitdaemon_session::counters::Counters;
+    use bitdaemon_session::piece_picker::PickerOptions;
+    use bitdaemon_session::settings::SessionSettings;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let s = SessionSettings::default();
+    let counters = Counters::default();
+    let mut t = torrent(3);
+    t.init_picker(true);
+    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(85, 17, 0, 9)), 6881);
+    t.add_swarm_peer(remote, PeerSourceFlags::TRACKER, &mut Vec::new());
+    let i = t.peer_list.find_peer(remote.ip()).unwrap();
+    t.peer_list.peers_mut()[i].on_parole = true;
+    t.peer_list.peers_mut()[i].trust_points = -4;
+    let mut c = PeerConn::new(3, PeerPipeline::new(1000, 30, 250), 0);
+    c.remote = Some(remote);
+    c.peer_id = Some(bitdaemon_common::PeerId::from_bytes(&[0x42; 20]).unwrap());
+    let key = c.peer_key().unwrap();
+    t.add_peer(1, c);
+    if let Some(p) = t.picker.as_mut() {
+        for b in 0..p.blocks_in_piece(PieceIndex(1)) {
+            let blk = PieceBlock {
+                piece_index: PieceIndex(1),
+                block_index: b,
+            };
+            p.mark_as_downloading(blk, Some(key), PickerOptions::RAREST_FIRST);
+            p.mark_as_finished(blk, Some(key));
+        }
+    }
+    t.remove_peer(
+        1,
+        &counters,
+        &bitdaemon_net::peer_class::PeerClassPool::new(),
+        &mut Vec::new(),
+    );
+
+    let mut out = Vec::new();
+    t.piece_verified(PieceIndex(1), true, &[], &s, &counters, &mut out);
+
+    let p = &t.peer_list.peers()[i];
+    assert!(!p.on_parole);
+    assert_eq!(p.trust_points, -3);
+}
