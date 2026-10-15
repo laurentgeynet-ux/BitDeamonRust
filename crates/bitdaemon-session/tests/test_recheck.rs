@@ -849,3 +849,124 @@ fn hybrid_multifile_pad_files_dont_panic() {
     assert_eq!(t.merkle_trees.len(), num_files as usize);
     assert!(!t.is_v2_only());
 }
+
+/// upstream `on_check_files` alert gating (`torrent.cpp:2314-2323`):
+/// `fastresume_rejected_alert` only posts when the params actually
+/// carried resume data (`contains_resume_data`); a bare
+/// `need_full_check` with no resume is silent. A *verification*
+/// error rejects the resume but is not a fatal disk error —
+/// `handle_disk_error` only runs for `fatal_disk_error`.
+#[test]
+fn check_files_rejected_gates_fastresume_alert() {
+    use bitdaemon_common::types::FileIndex;
+    use bitdaemon_disk::storage::disk_status;
+    use bitdaemon_disk::storage_error::{Operation, StorageError};
+    use bitdaemon_session::alerts::Alert;
+    use bitdaemon_session::session::DiskCompleted;
+
+    let need_full = i32::from(disk_status::NEED_FULL_CHECK);
+    let fatal = i32::from(disk_status::FATAL_DISK_ERROR);
+    let mk = |b: u8| -> (Sha1Hash, Session) {
+        let ih = Sha1Hash::from_bytes(&[b; 20]).unwrap();
+        let mut t = Torrent::new(ih, 2, 128 * 1024, Bitfield::with_size(2), StorageIndex(0));
+        t.piece_hashes = Some(vec![Sha1Hash::from_bytes(&[0; 20]).unwrap(); 2]);
+        t.init_picker(false);
+        let mut s = session();
+        s.add_torrent(t);
+        s.pop_alerts();
+        (ih, s)
+    };
+
+    // 1) no resume data + need_full_check → full recheck, no alert
+    let (ih, mut s) = mk(11);
+    s.disk_completions()
+        .send(DiskCompleted::CheckFiles {
+            ih,
+            accepted: false,
+            status: need_full,
+            had_resume: false,
+            have_bits: 0,
+            err: StorageError::default(),
+        })
+        .unwrap();
+    s.drain_disk_completed(&mut Vec::new());
+    assert!(s.torrents[&ih].checking, "rejected → real check armed");
+    assert!(
+        !s.pop_alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::FastresumeRejected { .. })),
+        "no resume data → no rejection alert"
+    );
+
+    // 2) resume data + need_full_check → alert posts
+    let (ih, mut s) = mk(12);
+    s.disk_completions()
+        .send(DiskCompleted::CheckFiles {
+            ih,
+            accepted: false,
+            status: need_full,
+            had_resume: true,
+            have_bits: 2,
+            err: StorageError::default(),
+        })
+        .unwrap();
+    s.drain_disk_completed(&mut Vec::new());
+    assert!(
+        s.pop_alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::FastresumeRejected { .. })),
+        "rejected resume → alert"
+    );
+
+    // 3) nonfatal verify error + resume → rejected + alert, but the
+    //    torrent is NOT paused / not dropped from auto-manage
+    let (ih, mut s) = mk(13);
+    s.torrents.get_mut(&ih).unwrap().auto_managed = true;
+    let mismatch = StorageError::new(
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "file size mismatch"),
+        FileIndex(0),
+        Operation::CheckResume,
+    );
+    s.disk_completions()
+        .send(DiskCompleted::CheckFiles {
+            ih,
+            accepted: false,
+            status: need_full,
+            had_resume: true,
+            have_bits: 2,
+            err: mismatch,
+        })
+        .unwrap();
+    s.drain_disk_completed(&mut Vec::new());
+    let t = &s.torrents[&ih];
+    assert!(t.checking, "rejected → recheck");
+    assert!(!t.is_paused(), "verify mismatch is not fatal");
+    assert!(
+        s.pop_alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::FastresumeRejected { .. })),
+        "verify error + resume → alert"
+    );
+
+    // 4) fatal flag → on_disk_error path (paused + dropped)
+    let (ih, mut s) = mk(14);
+    s.torrents.get_mut(&ih).unwrap().auto_managed = true;
+    s.disk_completions()
+        .send(DiskCompleted::CheckFiles {
+            ih,
+            accepted: false,
+            status: fatal,
+            had_resume: true,
+            have_bits: 2,
+            err: StorageError::new(
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+                FileIndex(0),
+                Operation::FileOpen,
+            ),
+        })
+        .unwrap();
+    s.drain_disk_completed(&mut Vec::new());
+    let t = &s.torrents[&ih];
+    assert!(t.is_paused(), "fatal → pause");
+    assert!(!t.auto_managed, "fatal → out of auto-manage");
+}

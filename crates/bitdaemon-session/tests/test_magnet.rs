@@ -463,6 +463,8 @@ fn magnet_metadata_creates_storage() {
             ih,
             accepted: true,
             status: 0,
+            had_resume: false,
+            have_bits: 0,
             err: Default::default(),
         })
         .unwrap();

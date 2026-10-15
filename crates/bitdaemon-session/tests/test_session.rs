@@ -576,7 +576,14 @@ fn session_state_roundtrip_through_session() {
     };
     let mut out = Vec::new();
     s.add_torrent_params(&atp, StorageIndex(0), &mut out);
-    s.torrents.get_mut(&ih).unwrap().have.set_bit(0);
+    {
+        let t = s.torrents.get_mut(&ih).unwrap();
+        t.have.set_bit(0);
+        // `pieces` is only persisted once `files_checked` proved the
+        // storage (upstream `write_resume_data` gate) — simulate the
+        // accepted verdict before saving state.
+        t.files_checked = true;
+    }
 
     let st = s.save_state();
     assert!(st.torrents.contains_key(&ih));
