@@ -715,6 +715,104 @@ Until `1.0.0`, breaking changes may occur in any release.
 - **Ctor** : restauration des flags `atp.flags` manquants —
   `pinned`, `apply_ip_filter`, update subscription, sequential /
   upload / share / super-seeding, disable DHT/LSD/PEX.
+- **Resume `pieces` bitfield gating (audit A21)**: `to_resume_data`
+  no longer writes `have_pieces` unconditionally. Matching
+  `torrent.cpp:7624-7650`, nothing is emitted before `files_checked`,
+  and a mid-`checking_files` snapshot emits only the
+  `num_checked_pieces` prefix. Previously an unchecked torrent saved
+  an all-zero bitfield which read back as *valid* resume data —
+  suppressing the required full disk check and ignoring complete
+  on-disk data.
+
+- **Partial fastresume (`pieces` shorter than `num_pieces`)**: the
+  `CheckFiles` verdict now carries the resume bitfield size; an
+  accepted but short bitfield resumes `checking_files` at
+  `end_index()` instead of re-hashing everything or accepting
+  blindly (`torrent.cpp:2335-2350`, new `Torrent::on_resume_partial`).
+
+- **Rejected fastresume unwinds all claims**: `unfinished_pieces` are
+  now held in `pending_unfinished` and applied only in the accepted
+  leg of `on_resume_data_checked` (`torrent.cpp:2366-2404`); the
+  reject leg additionally clears `seed_mode` and drops the pending
+  block claims, so no phantom `Finished` blocks survive a bad resume.
+
+- **`has_error_status` mask includes `file_exist`**, and
+  `fastresume_rejected_alert` is gated on `contains_resume_data`
+  (`torrent.cpp:2314-2323`) — a no-resume `need_full_check` no longer
+  alerts, a verify error now carries its real `operation`/`file`, and
+  a nonfatal verify error no longer routes through
+  `handle_disk_error` (pause + auto-manage drop). Only
+  `fatal_disk_error` does.
+
+- **`need_save_resume` preserved across the verdict**:
+  `on_files_checked` saves and restores the dirty flag like upstream
+  `on_resume_data_checked`, so a clean fastresume load no longer
+  reports `need_save_resume_data() == true`.
+
+- **`save_resume_data` completeness**: a removed torrent now posts
+  `save_resume_data_failed_alert(torrent_removed)` instead of
+  silence, and a new `flush_disk_cache` flag releases the storage's
+  open files (`async_release_files`) before the snapshot
+  (`torrent.cpp:10096-10129`). `TorrentHandle::save_resume_data_flush`
+  exposes it.
+
+- **Minor resume-data fidelity**: `piece_priority` is omitted when
+  every piece is at `default_priority` (`torrent.cpp:7731-7749`);
+  deferred peers are shuffled before the 100-peer cap
+  (`aux::random_shuffle`); `need_save_resume` is seeded from the
+  `NEED_SAVE_RESUME` atp flag at add time; `recheck_piece_done`
+  sets `files_checked` + extension replay on drain; seed-mode
+  construction treats an empty `have_pieces` as vacuously
+  all-present like upstream `std::find`.
+- **Settings hot-apply legs (audit A22)**: `apply_settings` now covers
+  the upstream legs that were missing (`session_impl.cpp` callbacks):
+  `connection_speed < 0` writes back 200, `aio_threads`/`hashing_threads`
+  clamp at 0, `user_agent` newlines become spaces (would otherwise
+  split web-seed HTTP request headers), `trigger_auto_manage` re-arms
+  the queue scaler on `active_*` limit changes, `auto_sequential`
+  propagates to live torrents, `update_proxy` rebuilds every
+  purpose-slot from `proxy_settings(m_settings)`, and
+  `update_dht_bootstrap_nodes` re-seeds the router list on a running
+  DHT. `peer_dscp` and `mixed_mode_algorithm` remain documented
+  no-live-effect keys like upstream.
+
+- **`reopen_listen_port` gate**: now follows the upstream trigger set
+  (`session_impl.cpp:1568-1575`) — `listen_interfaces`, `proxy_type`
+  and `proxy_peer_connections` reopen sockets; `outgoing_interfaces`
+  only re-parses the bind list and no longer forces a reopen.
+
+- **`connections_limit <= 0`**: mapped to the unbounded cap
+  (upstream `max_open_files()`) instead of `max(1)` — setting the
+  limit to 0 no longer disconnects all peers but one
+  (`session_impl.cpp:6901`).
+
+- **`unchoke_slots_limit` apply**: a finite change only re-arms the
+  unchoke scaler (`m_unchoke_time_scaler = 0` upstream); the
+  immediate sweep stays reserved for `INT_MAX`→unlimited, and a
+  negative limit no longer triggers a spurious unchoke sweep.
+
+- **`.session`/session-params interop**: `SessionState` now carries
+  the upstream `session_params` keys — `"dht state"` dict,
+  `"extensions"`, `ip_filter4`/`ip_filter6` (12/36-byte stride,
+  `first > last` entries skipped like `read_session_params`).
+  `load_state` reads an upstream `write_session_params` blob: legacy
+  `"dht"` dict seeds `dht_*` keys before `"settings"` overlays, the
+  ip filter replaces the live one through `set_ip_filter`, and
+  `user_agent`/`peer_fingerprint` are preserved (upstream
+  `pack.clear` identity behavior). `SessionHandle::write_session_params`
+  now emits the real `session_params` dict instead of the
+  torrent-resume container.
+
+- **Settings decoding parity**: `apply_settings_dict` applies any
+  *present* string key — an empty string clears the setting
+  (`load_pack_from_dict` semantics), and the 1.x alias `peer_tos`
+  maps to `peer_dscp` (`setting_by_name` compat).
+
+- **Proxy setters**: `set_proxy`/`set_peer_proxy` write the `proxy_*`
+  pack keys through `apply_settings` (upstream `session_handle`
+  semantics); `proxy()`/`peer_proxy()` return
+  `proxy_settings(m_settings)` so every purpose-slot reflects the
+  pack.
 
 ### Added
 
