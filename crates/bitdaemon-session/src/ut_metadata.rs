@@ -44,9 +44,14 @@ pub fn metadata_packet(
     if have_metadata && !metadata.is_empty() {
         d.insert(b"total_size".to_vec(), Entry::Int(metadata.len() as i64));
         if ty == MetadataMsg::Piece {
-            let offset = piece as usize * 16 * 1024;
-            let end = (offset + 16 * 1024).min(metadata.len());
-            payload = metadata[offset..end].to_vec();
+            let offset = piece.max(0) as usize * 16 * 1024;
+            // the serving side bounds-checks `piece` upstream before
+            // calling this; clamp anyway so an out-of-range piece
+            // degrades to an empty payload, never a panic.
+            if offset < metadata.len() {
+                let end = (offset + 16 * 1024).min(metadata.len());
+                payload = metadata[offset..end].to_vec();
+            }
         }
     }
     let mut out = bencode(&e);
@@ -54,31 +59,49 @@ pub fn metadata_packet(
     out
 }
 
-/// Parse a metadata packet body. Returns `(msg_type, piece,
-/// total_size, payload)` — `payload` is the data after the dict
-/// (`msg.data_section()` upstream gives us its extent).
-pub fn parse_metadata_packet(body: &[u8]) -> Option<(MetadataMsg, i64, i64, &[u8])> {
-    let msg = bdecode_checked(body).ok()?;
+/// `parse_metadata_packet` verdict — upstream `on_extended`
+/// distinguishes *malformed* (bdecode failure, non-dict, missing or
+/// non-int `msg_type`/`piece` → `invalid_metadata_message` peer-error
+/// disconnect) from *unknown `msg_type`* (the switch has no default:
+/// consumed silently, still counted).
+#[derive(Debug)]
+pub enum MetadataParse<'a> {
+    /// well-formed `(msg_type, piece, total_size, payload)`.
+    Msg(MetadataMsg, i64, i64, &'a [u8]),
+    /// valid dict with an out-of-range `msg_type` — upstream's
+    /// switch has no `default`, so the packet is consumed and
+    /// counted but otherwise ignored.
+    UnknownType,
+    /// bdecode failure, non-dict, or absent/wrong-type
+    /// `msg_type`/`piece` — `invalid_metadata_message` disconnect.
+    Malformed,
+}
+
+/// Parse a metadata packet body. `payload` is the data after the
+/// dict (`msg.data_section()` upstream gives us its extent).
+pub fn parse_metadata_packet(body: &[u8]) -> MetadataParse<'_> {
+    let Ok(msg) = bdecode_checked(body) else {
+        return MetadataParse::Malformed;
+    };
     if msg.node_type() != NodeType::Dict {
-        return None;
+        return MetadataParse::Malformed;
     }
     // upstream requires both `msg_type` and `piece` present as ints
     let ty_node = msg.dict_find_int(b"msg_type");
     let piece_node = msg.dict_find_int(b"piece");
     if ty_node.node_type() != NodeType::Int || piece_node.node_type() != NodeType::Int {
-        return None;
+        return MetadataParse::Malformed;
     }
-    let ty = match ty_node.int_value() {
-        0 => MetadataMsg::Request,
-        1 => MetadataMsg::Piece,
-        2 => MetadataMsg::Reject,
-        _ => return None,
-    };
     let piece = piece_node.int_value();
     let total_size = msg.dict_find_int_value(b"total_size", 0);
     let data_len = msg.data_section().len();
     let payload = &body[data_len.min(body.len())..];
-    Some((ty, piece, total_size, payload))
+    match ty_node.int_value() {
+        0 => MetadataParse::Msg(MetadataMsg::Request, piece, total_size, payload),
+        1 => MetadataParse::Msg(MetadataMsg::Piece, piece, total_size, payload),
+        2 => MetadataParse::Msg(MetadataMsg::Reject, piece, total_size, payload),
+        _ => MetadataParse::UnknownType,
+    }
 }
 
 /// `metadata_piece` — per-piece request state.
@@ -111,6 +134,28 @@ impl UtMetadataTracker {
     #[must_use]
     pub fn metadata(&self) -> &[u8] {
         &self.metadata
+    }
+
+    /// `metadata_size` — the peer advertised the info-dict size in
+    /// its extended handshake: pre-size the buffers so the first
+    /// `metadata_request` can pick any piece, not just 0. Upstream
+    /// ignores the advertisement when we already have metadata and
+    /// caps it at 4 MiB (`m_metadata.resize` guard); `received_metadata`
+    /// applies the looser `max_metadata_size` cap instead when the
+    /// handshake never carried a size.
+    pub fn metadata_size(&mut self, size: i64, have_valid_metadata: bool) {
+        if have_valid_metadata || size <= 0 || size > 4 * 1024 * 1024 {
+            return;
+        }
+        self.metadata = vec![0u8; size as usize];
+        let n = (size as usize).div_ceil(16 * 1024);
+        self.pieces = (0..n)
+            .map(|_| MetadataPiece {
+                num_requests: 0,
+                last_request: None,
+                source: None,
+            })
+            .collect();
     }
 
     /// `metadata_request(has_metadata)` — pick the least-requested

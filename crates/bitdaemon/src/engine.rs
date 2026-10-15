@@ -3105,14 +3105,21 @@ impl Engine {
             if !is_priv && !(is_i2p && !ses.settings.allow_i2p_mixed) {
                 hs.messages.insert("ut_pex".into(), 1);
             }
-            // `i2p_pex` only exists on i2p sockets upstream; the
-            // torrent-level approximation here is the i2p flag.
-            if is_i2p {
+            // `create_i2p_pex_plugin` — `!priv && is_i2p`, and the
+            // peer plugin only attaches on i2p sockets (the SAM
+            // transport isn't implemented — `conn.i2p` is never set,
+            // so the torrent flag is the best available signal).
+            if !is_priv && is_i2p {
                 hs.messages.insert("i2p_pex".into(), 9);
             }
-            hs.messages.insert("ut_metadata".into(), 2);
-            if let Some(md) = &t.metadata_raw {
-                hs.metadata_size = Some(md.len() as i64);
+            // `create_ut_metadata_plugin` — absent only when the
+            // torrent is private AND already has metadata (a private
+            // magnet still needs the extension to fetch it).
+            if !(is_priv && t.valid_metadata()) {
+                hs.messages.insert("ut_metadata".into(), 2);
+                if let Some(md) = &t.metadata_raw {
+                    hs.metadata_size = Some(md.len() as i64);
+                }
             }
             hs.complete_ago = t.time_since_complete();
             // upstream `write_extensions`: suppress `upload_only`

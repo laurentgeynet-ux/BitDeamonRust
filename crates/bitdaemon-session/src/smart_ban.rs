@@ -17,12 +17,12 @@ pub use bitdaemon_common::types::PieceBlock;
 /// `block_entry` — ties a block CRC to the peer that sent it.
 #[derive(Debug, Clone)]
 struct BlockEntry {
-    /// peer identity (`aux::torrent_peer*` upstream → our handle +
-    /// address; the address is used to resolve churn like
-    /// `find_peers(a)`).
+    /// peer identity (`aux::torrent_peer*` upstream → our conn
+    /// handle).
     peer: u64,
-    /// kept for `find_peers(a)`-style resolution on reconnect
-    #[allow(dead_code)]
+    /// the IP recorded at request time — upstream re-resolves the
+    /// swarm entry via `find_peers(a)` when the CRC lands, so a
+    /// same-IP reconnect still bans the fresh connection.
     peer_addr: IpAddr,
     digest: Sha1Hash,
 }
@@ -30,8 +30,9 @@ struct BlockEntry {
 /// What the owner should do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BanDecision {
-    /// `m_torrent.ban_peer(p)` + disconnect — peer handle.
-    Ban(u64),
+    /// `m_torrent.ban_peer(p)` + disconnect — conn handle plus the
+    /// recorded IP for `find_peers`-style re-resolution.
+    Ban(u64, IpAddr),
     /// nothing.
     None,
 }
@@ -77,10 +78,10 @@ impl SmartBan {
                     block_index: block as i32,
                 };
                 if let Some(digest) = read_digest(pb) {
-                    if let BanDecision::Ban(h) =
+                    if let BanDecision::Ban(h, a) =
                         self.record_failed_block(pb, *peer, addr(*peer), digest)
                     {
-                        decision = BanDecision::Ban(h);
+                        decision = BanDecision::Ban(h, a);
                     }
                 }
             }
@@ -91,7 +92,10 @@ impl SmartBan {
 
     /// `on_read_failed_block` — store/confirm a block CRC for `peer`.
     /// Ban when the same peer gives a *different* CRC for the same
-    /// block on the second failed piece.
+    /// block on the second failed piece. Upstream keeps the FIRST
+    /// recorded entry per block (`std::map::insert` never replaces)
+    /// and only bans through `!p->banned` — the caller owns both
+    /// checks via the returned address.
     pub fn record_failed_block(
         &mut self,
         b: PieceBlock,
@@ -104,11 +108,12 @@ impl SmartBan {
                 // already have an entry from this peer for this block:
                 // differing digest means at least one of them was bad
                 if e.digest != digest {
-                    return BanDecision::Ban(peer);
+                    return BanDecision::Ban(peer, peer_addr);
                 }
                 BanDecision::None
             }
-            _ => {
+            Some(_) => BanDecision::None,
+            None => {
                 self.block_hashes.insert(
                     b,
                     BlockEntry {
@@ -160,7 +165,7 @@ impl SmartBan {
             // the peer that sent the bad copy
             if let Some(ok) = read_digest(k) {
                 if ok != e.digest {
-                    out.push(BanDecision::Ban(e.peer));
+                    out.push(BanDecision::Ban(e.peer, e.peer_addr));
                 }
             }
             // (read errors are ignored upstream — `if (error) return`)

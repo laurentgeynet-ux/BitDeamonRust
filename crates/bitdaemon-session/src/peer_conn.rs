@@ -174,6 +174,18 @@ pub struct PeerConn {
     /// (with a +5 min base when the metadata is a single piece).
     /// `None` = `min_time()` (always expired).
     pub metadata_request_limit: Option<std::time::Instant>,
+    /// `m_incoming_requests` — `ut_metadata` pieces this peer asked
+    /// for while our send buffer was at/above the 160 KiB serve
+    /// limit (upstream caps it at 1024; overflow → `dont_have`).
+    pub metadata_incoming_requests: std::collections::VecDeque<i32>,
+    /// `m_sent_allowed_fast` — the allowed-fast set goes out once,
+    /// on the peer's first `Interested` (upstream defers it to save
+    /// bandwidth and to skip pieces the peer already has).
+    pub sent_allowed_fast: bool,
+    /// `m_holepunch_mode` — set by `set_holepunch_mode` when a
+    /// `ut_holepunch` `connect` targets an already-connected peer:
+    /// the conn retries faster and sticks to uTP.
+    pub holepunch_mode: bool,
     /// `m_has_metadata` — upstream ctor `true`; the ext handshake
     /// clears it when `ut_metadata` is advertised without
     /// `metadata_size` (the peer is still fetching the info dict);
@@ -491,6 +503,9 @@ impl PeerConn {
             metadata_size: None,
             metadata_sent_requests: Vec::new(),
             metadata_request_limit: None,
+            metadata_incoming_requests: std::collections::VecDeque::new(),
+            sent_allowed_fast: false,
+            holepunch_mode: false,
             has_metadata: true,
             local_ut_pex: 1,
             local_ut_metadata: 2,
@@ -1064,6 +1079,14 @@ impl PeerConn {
                 }
             }
             M::Interested => {
+                // upstream `on_interested` — the allowed-fast set is
+                // deferred to the first `Interested` (saves bandwidth
+                // and skips pieces the peer already has); the flag
+                // stamps before `send_allowed_set` runs.
+                if !self.sent_allowed_fast && self.supports_fast {
+                    self.sent_allowed_fast = true;
+                    eff.push(PeerEffect::SendAllowedSet);
+                }
                 // `incoming_interested` — `num_peers_up_interested`
                 // on the not-interested→interested edge.
                 if !self.peer_interested {
@@ -1553,7 +1576,10 @@ impl PeerConn {
                     ));
                     return;
                 }
-                self.on_allowed_fast(i);
+                // `incoming_allowed_fast`'s bounds/have checks and
+                // the `peer_is_interesting` leg need torrent state —
+                // routed as an effect.
+                eff.push(PeerEffect::AllowedFast(i));
             }
             M::SuggestPiece(i) => {
                 // upstream `on_suggest_piece` — `invalid_suggest`
@@ -1594,8 +1620,19 @@ impl PeerConn {
                         if self.ext_ut_metadata != 0 {
                             self.has_metadata = hs.metadata_size.is_some_and(|sz| sz > 0);
                         }
-                        self.remote_upload_only = hs.upload_only;
-                        self.remote_share_mode = hs.share_mode;
+                        // upstream `on_extended_handshake`: an
+                        // `upload_only` key calls `set_upload_only`
+                        // (peer-list sync + `disconnect_if_redundant`
+                        // — the torrent arm handles all three); a
+                        // `share_mode` key is honored only under
+                        // `settings.support_share_mode` — also
+                        // torrent-side.
+                        if hs.upload_only {
+                            eff.push(PeerEffect::RemoteUploadOnly(true));
+                        }
+                        if hs.share_mode {
+                            eff.push(PeerEffect::RemoteShareMode);
+                        }
                         // BEP-21 `complete_ago` — when this peer last
                         // saw a complete copy (upstream stores it as
                         // `m_last_seen_complete` on the conn; the
@@ -1645,16 +1682,46 @@ impl PeerConn {
                         }
                         eff.push(PeerEffect::ExtHandshake);
                     }
-                } else if id == self.local_ut_metadata {
-                    // `ut_metadata` plugin bumps its own subtype
-                    // counter on top of `num_incoming_extended`.
-                    counters.inc(crate::counters::Counter::NumIncomingMetadata);
+                } else if id == self.local_ut_metadata && self.local_ut_metadata != 0 {
+                    // `ut_metadata_plugin::on_extended` — a peer that
+                    // never advertised `ut_metadata` (m_message_index
+                    // == 0 upstream) makes the plugin refuse the
+                    // message → it falls through to `invalid_message`
+                    // like any unconsumed id.
+                    if self.ext_ut_metadata == 0 {
+                        eff.push(PeerEffect::Disconnect(
+                            "invalid message",
+                            bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                        ));
+                        return;
+                    }
+                    // `num_incoming_metadata` bumps at the END of the
+                    // upstream handler — only messages that reach the
+                    // switch are counted (not oversized/malformed
+                    // disconnects, not unwanted pieces/dont_haves);
+                    // the torrent arm owns it.
                     eff.push(PeerEffect::MetadataPacket(data.to_vec()));
-                } else if id == self.local_ut_pex {
-                    counters.inc(crate::counters::Counter::NumIncomingPex);
+                } else if id == self.local_ut_pex && self.local_ut_pex != 0 {
+                    // same upstream gate for `ut_pex`
+                    // (`m_message_index == 0` → refuse).
+                    if self.ext_ut_pex == 0 {
+                        eff.push(PeerEffect::Disconnect(
+                            "invalid message",
+                            bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                        ));
+                        return;
+                    }
+                    // `num_incoming_pex` counts at the handler tail —
+                    // after disable/size/flood/parse verdicts.
                     eff.push(PeerEffect::PexPacket(data.to_vec()));
-                } else if id == self.local_i2p_pex {
-                    counters.inc(crate::counters::Counter::NumIncomingPex);
+                } else if id == self.local_i2p_pex && self.local_i2p_pex != 0 {
+                    if self.ext_i2p_pex == 0 {
+                        eff.push(PeerEffect::Disconnect(
+                            "invalid message",
+                            bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                        ));
+                        return;
+                    }
                     eff.push(PeerEffect::I2pPexPacket(data.to_vec()));
                 } else if id == self.local_upload_only {
                     // `upload_only` — 1-byte flag (upstream checks
@@ -1673,8 +1740,9 @@ impl PeerConn {
                         self.remote_share_mode = data[0] != 0;
                     }
                 } else if id == self.local_ut_holepunch {
-                    // `on_holepunch` — upstream drops the message when
-                    // the remote never advertised the extension.
+                    // `on_holepunch` line 1508 — `m_holepunch_id == 0`
+                    // (the peer never advertised `ut_holepunch`) drops
+                    // the message silently; malformed bodies ignored.
                     if self.ext_holepunch != 0
                         && let Some(hp) = crate::ut_holepunch::decode_hp(data)
                     {
@@ -2125,6 +2193,18 @@ pub enum PeerEffect {
     /// `incoming_suggest` — BEP-6 SUGGEST payload; the checks live
     /// on the torrent side (it owns `have_piece`/`valid_metadata`).
     SuggestPiece(PieceIndex),
+    /// `incoming_allowed_fast` — BEP-6 allowed-fast payload; bounds
+    /// checks, `have_piece` skip and the `peer_is_interesting` leg
+    /// all need torrent state (`valid_metadata`/`picker`).
+    AllowedFast(PieceIndex),
+    /// `on_interested` — first `Interested` on a FAST conn triggers
+    /// `send_allowed_set` (BEP-6); torrent-side because the set
+    /// needs the piece count and the peer's bitfield.
+    SendAllowedSet,
+    /// `on_extended_handshake` `share_mode` key — honored only under
+    /// `settings_pack::support_share_mode` upstream, so the gate
+    /// lives on the torrent side.
+    RemoteShareMode,
     /// `incoming_have` — the peer took a suggested piece; under
     /// `suggest_read_cache` refill the suggestion slot.
     SuggestAck(PieceIndex),
