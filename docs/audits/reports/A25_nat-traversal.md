@@ -395,8 +395,8 @@ ADR-0008/0018/0019).
 ## Résultat
 
 Mode `apply` exécuté dans le worktree dédié
-(`audit/25-nat-traversal`). Commit
-`fix(net,session): nat-traversal parity — PCP-first + LSD lifecycle`.
+(`audit/25-nat-traversal`). Commit apply : `9c99518` (`audit/25-nat-traversal`, rebasée sur `main` `26bfd43`,
+mergée en `1abaa4f`).
 
 ### Déviations corrigées
 
