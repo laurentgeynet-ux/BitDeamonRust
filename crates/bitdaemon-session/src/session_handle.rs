@@ -1196,9 +1196,26 @@ impl TorrentHandle {
         lock(&self.session).scrape_tracker(&self.info_hash, tracker_idx, out);
     }
 
-    /// `get_peer_info` — `peer_info` snapshot of one connection.
+    /// `torrent_handle::get_peer_info(v)` — one `peer_info`
+    /// snapshot per live connection, in a single call (upstream
+    /// fills the caller's vector; avoids a session lock per peer).
     #[must_use]
-    pub fn get_peer_info(
+    pub fn get_peer_info(&self) -> Vec<crate::peer_info::PeerInfo> {
+        let s = lock(&self.session);
+        s.torrents.get(&self.info_hash).map_or_else(Vec::new, |t| {
+            t.peers
+                .keys()
+                .copied()
+                .filter_map(|id| t.peer_info(id, None, &s.settings))
+                .collect()
+        })
+    }
+
+    /// `peer_info` of one connection (upstream ABI<4
+    /// `get_peer_info(peer_id)`); `remote` hints the swarm entry
+    /// for `source`/`num_hashfails`.
+    #[must_use]
+    pub fn peer_info(
         &self,
         peer: u64,
         remote: Option<std::net::SocketAddr>,
@@ -1311,19 +1328,16 @@ impl TorrentHandle {
         self.set_flags(bitdaemon_common::flags::TorrentFlags::NONE, flags);
     }
 
-    /// `torrent_handle::trackers` — the announce list snapshot.
+    /// `torrent_handle::trackers` — the announce list snapshot
+    /// (`std::vector<announce_entry>` upstream): url, tier, scrape
+    /// counters, per-endpoint announce state and last error —
+    /// everything the tracker tab needs, not just `(url, tier)`.
     #[must_use]
-    pub fn trackers(&self) -> Vec<(String, i32)> {
+    pub fn trackers(&self) -> Vec<crate::tracker_list::AnnounceEntry> {
         lock(&self.session)
             .torrents
             .get(&self.info_hash)
-            .map(|t| {
-                t.trackers
-                    .trackers
-                    .iter()
-                    .map(|e| (e.url.clone(), e.tier))
-                    .collect()
-            })
+            .map(|t| t.trackers.trackers.clone())
             .unwrap_or_default()
     }
 
@@ -1655,11 +1669,24 @@ impl TorrentHandle {
         }
     }
 
-    /// `torrent_handle::apply_ip_filter`.
+    /// `torrent_handle::apply_ip_filter(bool)` — the setter form;
+    /// goes through `Torrent::set_apply_ip_filter` so the change
+    /// marks `state_updated` + resume-dirty like upstream.
     pub fn apply_ip_filter(&self, on: bool) {
         if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.apply_ip_filter = on;
+            t.set_apply_ip_filter(on);
         }
+    }
+
+    /// `web_seed_statuses` — the per-URL runtime snapshot for every
+    /// `url_seeds` entry (`web_seed_entry`-ish; upstream exposes
+    /// the same counters on its `web_seed_t` connections).
+    #[must_use]
+    pub fn web_seed_statuses(&self) -> Vec<crate::status::WebSeedStatus> {
+        lock(&self.session)
+            .torrents
+            .get(&self.info_hash)
+            .map_or_else(Vec::new, Torrent::web_seed_statuses)
     }
 
     /// `torrent_handle::save_path` — the save path this torrent was
@@ -2063,12 +2090,7 @@ impl TorrentHandle {
     pub fn post_trackers(&self) {
         let mut s = lock(&self.session);
         if let Some(t) = s.torrents.get(&self.info_hash) {
-            let trackers = t
-                .trackers
-                .trackers
-                .iter()
-                .map(|e| (e.url.clone(), e.tier))
-                .collect();
+            let trackers = t.trackers.trackers.clone();
             s.alerts.post(Alert::TrackerList {
                 ih: self.info_hash,
                 trackers,

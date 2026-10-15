@@ -882,8 +882,9 @@ pub enum Alert {
     TrackerList {
         /// torrent.
         ih: Sha1Hash,
-        /// `(url, tier)` announce entries.
-        trackers: Vec<(String, i32)>,
+        /// the `announce_entry` list — upstream carries the full
+        /// `std::vector<announce_entry>` (scrape state, endpoints).
+        trackers: Vec<crate::tracker_list::AnnounceEntry>,
     },
     /// `file_priorities_alert` — `post_file_priorities` (105).
     FilePriorities {
@@ -1141,6 +1142,342 @@ impl Alert {
             | Self::TorrentConflict { .. } => AlertPriority::High,
             Self::AlertsDropped { .. } => AlertPriority::Meta,
             _ => AlertPriority::Normal,
+        }
+    }
+
+    /// `alert::message()` — the one-line human-readable rendering
+    /// upstream's `alert` subclasses produce for the log. Alerts
+    /// carry `ih` (not the torrent name like upstream), so the id
+    /// renders as its hex info-hash.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::TorrentAdded(ih) => format!("added torrent: {ih}"),
+            Self::TorrentRemoved(ih) => format!("removed torrent: {ih}"),
+            Self::ReadPiece { ih, piece, buffer } => {
+                format!("read piece {piece} of {ih} ({} bytes)", buffer.len())
+            }
+            Self::ReadPieceFailed { ih, piece, error } => {
+                format!("read piece {piece} of {ih} failed: {error}")
+            }
+            Self::FileCompleted { ih, index } => format!("{ih} file {index} completed"),
+            Self::FileRenamed {
+                ih,
+                index,
+                name,
+                old_name,
+            } => format!("{ih} file {index} renamed: {old_name} -> {name}"),
+            Self::FileRenameFailed { ih, index, error } => {
+                format!("{ih} renaming file {index} failed: {error}")
+            }
+            Self::Performance { warning } => format!("performance warning: {warning}"),
+            Self::StateChanged { ih, prev, next } => {
+                format!("{ih} state changed: {prev} -> {next}")
+            }
+            Self::TrackerError { ih, url, error } => {
+                format!("{ih} tracker {url} error: {error}")
+            }
+            Self::TrackerWarning {
+                ih,
+                url,
+                msg,
+                times_in_row,
+            } => format!("{ih} tracker {url} warning: {msg} ({times_in_row}x)"),
+            Self::ScrapeReply {
+                ih,
+                url,
+                complete,
+                incomplete,
+            } => format!("{ih} scrape {url}: {complete} seeds, {incomplete} peers"),
+            Self::ScrapeFailed { ih, url, reason } => {
+                format!("{ih} scrape {url} failed: {reason}")
+            }
+            Self::TrackerReply { ih, url, num_peers } => {
+                format!("{ih} tracker {url} replied with {num_peers} peers")
+            }
+            Self::DhtReply { ih, url, num_peers } => {
+                format!("{ih} {url} replied with {num_peers} peers")
+            }
+            Self::TrackerAnnounce { ih, url, event } => {
+                format!("{ih} tracker announce to {url} (event {event})")
+            }
+            Self::HashFailed { ih, piece } => format!("{ih} piece {} hash failed", piece.0),
+            Self::PeerBan { ih, ip } => format!("{ih} banned peer {ip}"),
+            Self::PeerUnsnubbed { ih, remote } => format!("{ih} peer {remote} unsnubbed"),
+            Self::PeerSnubbed { ih, remote } => format!("{ih} peer {remote} snubbed"),
+            Self::PeerError {
+                ih,
+                remote,
+                op,
+                error,
+            } => format!("{ih} peer {remote} {op} failed: {error}"),
+            Self::PeerConnect { ih, remote } => format!("{ih} connected to {remote}"),
+            Self::PeerDisconnected { ih, reason } => format!("{ih} peer disconnected: {reason}"),
+            Self::InvalidRequest { ih, remote, msg } => {
+                format!("{ih} invalid request from {remote}: {msg}")
+            }
+            Self::TorrentFinished(ih) => format!("{ih} torrent finished"),
+            Self::PieceFinished { ih, piece } => format!("{ih} piece {} finished", piece.0),
+            Self::RequestDropped {
+                ih,
+                remote,
+                piece,
+                block,
+            } => format!(
+                "{ih} request dropped by {remote} (piece {}, block {block})",
+                piece.0
+            ),
+            Self::BlockTimeout {
+                ih,
+                remote,
+                piece,
+                block,
+            } => format!(
+                "{ih} block timed out from {remote} (piece {}, block {block})",
+                piece.0
+            ),
+            Self::BlockFinished { ih, piece, block } => {
+                format!("{ih} block finished (piece {}, block {block})", piece.0)
+            }
+            Self::BlockDownloading {
+                ih,
+                remote,
+                piece,
+                block,
+            } => format!(
+                "{ih} downloading block (piece {}, block {block}) from {remote}",
+                piece.0
+            ),
+            Self::UnwantedBlock {
+                ih,
+                remote,
+                piece,
+                block,
+            } => format!(
+                "{ih} unwanted block from {remote} (piece {}, block {block})",
+                piece.0
+            ),
+            Self::StorageMoved { ih, path, old_path } => {
+                format!("{ih} storage moved: {old_path} -> {path}")
+            }
+            Self::StorageMovedFailed {
+                ih,
+                file,
+                op,
+                error,
+            } => format!("{ih} storage move failed in {op} on {file}: {error}"),
+            Self::TorrentDeleted(ih) => format!("{ih} torrent deleted"),
+            Self::TorrentDeleteFailed { ih, error } => {
+                format!("deleting torrent {ih} failed: {error}")
+            }
+            Self::SaveResumeData { ih, .. } => format!("{ih} resume data saved"),
+            Self::SaveResumeDataFailed { ih, error } => {
+                format!("{ih} saving resume data failed: {error}")
+            }
+            Self::TorrentPaused { ih } => format!("{ih} torrent paused"),
+            Self::TorrentResumed { ih } => format!("{ih} torrent resumed"),
+            Self::TorrentChecked(ih) => format!("{ih} torrent checked"),
+            Self::UrlSeed { ih, url, msg } => format!("{ih} url seed {url}: {msg}"),
+            Self::FileError { ih, path, error } => format!("{ih} file error {path}: {error}"),
+            Self::MetadataFailed { ih, error } => format!("{ih} metadata failed: {error}"),
+            Self::MetadataReceived { ih } => format!("{ih} metadata received"),
+            Self::UdpError { remote, op, error } => format!("udp {op} to {remote} failed: {error}"),
+            Self::ExternalIp { addr } => format!("external ip elected: {addr}"),
+            Self::ListenFailed {
+                remote,
+                op,
+                error,
+                kind,
+            } => format!("listen failed on {remote} (kind {kind}) in {op}: {error}"),
+            Self::ListenSucceeded { remote, kind } => {
+                format!("listening on {remote} (kind {kind})")
+            }
+            Self::PortmapError {
+                mapping,
+                transport,
+                local_addr,
+                error,
+            } => format!("portmap {transport} mapping {mapping} on {local_addr} failed: {error}"),
+            Self::Portmap {
+                mapping,
+                transport,
+                protocol,
+                ext_port,
+                local_addr,
+            } => format!(
+                "portmap {transport} added mapping {mapping}: \
+                 {local_addr} proto {protocol} ext {ext_port}"
+            ),
+            Self::PortmapLog {
+                transport,
+                local_addr,
+                msg,
+            } => format!("portmap {transport} on {local_addr}: {msg}"),
+            Self::FastresumeRejected {
+                ih,
+                error,
+                op,
+                file,
+            } => format!("{ih} fastresume rejected in {op} on {file}: {error}"),
+            Self::PeerBlocked { ih, remote, reason } => {
+                format!("{ih} blocked peer {remote}: {reason}")
+            }
+            Self::DhtAnnounce {
+                remote,
+                port,
+                ih,
+                msg,
+            } => format!("dht announce {ih} to {remote}:{port}: {msg}"),
+            Self::DhtGetPeers { ih, msg } => format!("dht get_peers {ih}: {msg}"),
+            Self::Stats {
+                ih,
+                interval_ms,
+                counters,
+            } => format!("{ih} stats ({interval_ms} ms): {counters:?}"),
+            Self::CacheFlushed(ih) => format!("{ih} cache flushed"),
+            Self::AnonymousMode { ih, kind, msg } => {
+                format!("{ih} anonymous mode violation (kind {kind}): {msg}")
+            }
+            Self::LsdPeer { ih, remote } => format!("{ih} lsd peer {remote}"),
+            Self::Trackerid { ih, url, trackerid } => {
+                format!("{ih} tracker {url} trackerid {trackerid}")
+            }
+            Self::DhtBootstrap {} => "dht bootstrap complete".to_string(),
+            Self::TorrentError { ih, error, file } => {
+                format!("{ih} error {error} (file: {file})")
+            }
+            Self::TorrentNeedCert {
+                ih,
+                error,
+                cert_file,
+            } => format!("{ih} needs cert {cert_file}: {error}"),
+            Self::IncomingConnection { remote, kind } => {
+                format!("incoming connection {remote} (kind {kind})")
+            }
+            Self::AddTorrent { ih, error } => format!("add torrent {ih}: {error}"),
+            Self::StateUpdate { statuses } => format!("state update: {} torrents", statuses.len()),
+            Self::SessionStats { stats } => format!("session stats: {stats:?}"),
+            Self::DhtError { op, error } => format!("dht error op {op}: {error}"),
+            Self::DhtImmutableItem { target, value } => {
+                format!("dht immutable item {target} ({} bytes)", value.len())
+            }
+            Self::DhtMutableItem(a) => {
+                let a = a.as_ref();
+                format!(
+                    "dht mutable item {} seq {} ({} bytes){}",
+                    a.target,
+                    a.seq,
+                    a.value.len(),
+                    if a.authoritative {
+                        " authoritative"
+                    } else {
+                        ""
+                    }
+                )
+            }
+            Self::DhtPut(a) => {
+                format!("dht put {} stored on {} nodes", a.target, a.num_success)
+            }
+            Self::I2p { error } => format!("i2p error: {error}"),
+            Self::DhtOutgoingGetPeers { ih, obfuscated, ep } => {
+                format!("dht get_peers {ih} (obf {obfuscated}) -> {ep}")
+            }
+            Self::Log { msg } => msg.clone(),
+            Self::TorrentLog { ih, msg } => format!("{ih} {msg}"),
+            Self::PeerLog { ih, remote, msg } => format!("{ih} peer {remote}: {msg}"),
+            Self::LsdError { error } => format!("lsd error: {error}"),
+            Self::DhtStats { v4, v6 } => {
+                format!("dht stats: v4 {} nodes, v6 {} nodes", v4.nodes, v6.nodes)
+            }
+            Self::IncomingRequest {
+                ih,
+                remote,
+                piece,
+                start,
+                length,
+            } => format!(
+                "{ih} incoming request from {remote}: piece {} start {start} len {length}",
+                piece.0
+            ),
+            Self::DhtLog { module, msg } => format!("dht[{module}]: {msg}"),
+            Self::DhtPacket {
+                direction,
+                remote,
+                msg,
+            } => format!(
+                "dht pkt {} {remote} ({} bytes)",
+                if *direction == 0 { "<-" } else { "->" },
+                msg.len()
+            ),
+            Self::DhtGetPeersReply { ih, num_peers, .. } => {
+                format!("dht get_peers reply {ih}: {num_peers} peers")
+            }
+            Self::DhtDirectResponse {
+                remote,
+                user_data,
+                response,
+            } => format!(
+                "dht direct response from {remote} (tag {user_data}, {} bytes)",
+                response.len()
+            ),
+            Self::PickerLog {
+                ih,
+                picker_flags,
+                blocks,
+            } => format!(
+                "{ih} picker (flags {picker_flags}, {} blocks)",
+                blocks.len()
+            ),
+            Self::SessionError(msg) => format!("session error: {msg}"),
+            Self::DhtLiveNodes { ih, nodes } => {
+                format!("dht live nodes for {ih}: {}", nodes.len())
+            }
+            Self::SessionStatsHeader {} => "session stats header".to_string(),
+            Self::DhtSampleInfohashes(a) => {
+                let a = a.as_ref();
+                format!(
+                    "dht sample infohashes from {}: {} samples of {} (interval {}s)",
+                    a.remote,
+                    a.samples.len(),
+                    a.num,
+                    a.interval_secs
+                )
+            }
+            Self::BlockUploaded {
+                ih,
+                remote,
+                piece,
+                block,
+            } => format!(
+                "{ih} block uploaded to {remote} (piece {}, block {block})",
+                piece.0
+            ),
+            Self::AlertsDropped { types } => format!("alerts dropped: {}", types.len()),
+            Self::Socks5 { remote, op, error } => {
+                format!("socks5 {op} via {remote} failed: {error}")
+            }
+            Self::FilePrio { ih, op, error } => format!("{ih} file priority {op}: {error}"),
+            Self::OversizedFile { ih, file } => format!("{ih} oversized file {file}"),
+            Self::TorrentConflict { ih, other, url } => match other {
+                Some(o) => format!("torrent {ih} conflicts with {o} from {url}"),
+                None => format!("torrent {ih} conflicts with add from {url}"),
+            },
+            Self::PeerInfo { ih, peers } => format!("{ih} peer info: {} peers", peers.len()),
+            Self::FileProgress { ih, files } => {
+                format!("{ih} file progress: {} files", files.len())
+            }
+            Self::PieceInfo { ih, queue } => {
+                format!("{ih} download queue: {} pieces", queue.len())
+            }
+            Self::PieceAvailability { ih, .. } => format!("{ih} piece availability"),
+            Self::TrackerList { ih, trackers } => {
+                format!("{ih} tracker list: {} trackers", trackers.len())
+            }
+            Self::FilePriorities { ih, priorities } => {
+                format!("{ih} file priorities: {} files", priorities.len())
+            }
+            Self::FileStatus { ih, state } => format!("{ih} file status: {} files", state.len()),
+            Self::IpBan { remote, reason } => format!("ip banned {remote}: {reason}"),
         }
     }
 

@@ -516,7 +516,10 @@ fn flags_ban_and_tracker_ops() {
     th.add_tracker("http://t1/announce".into(), 1);
     th.add_tracker("http://t0/announce".into(), 0);
     th.replace_trackers(&[("http://x/announce".into(), 0)]);
-    assert_eq!(th.trackers(), vec![("http://x/announce".to_string(), 0)]);
+    let trackers = th.trackers();
+    assert_eq!(trackers.len(), 1);
+    assert_eq!(trackers[0].url, "http://x/announce");
+    assert_eq!(trackers[0].tier, 0);
 
     // ban: peer not connected → just flagged, no disconnect effect
     let mut out = Vec::new();

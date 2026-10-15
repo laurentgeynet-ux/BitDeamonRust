@@ -8284,40 +8284,40 @@ impl Session {
 
     /// `web_peer_connection::on_body_data` — one web-seed block
     /// arrived; routes to the disk-write path (marks the picker
-    /// block `writing` under `Torrent::WEB_SEED_PEER`).
+    /// block `writing` under `Torrent::WEB_SEED_PEER`). `url`
+    /// attributes the payload to the seed's per-URL counters.
     pub fn on_web_seed_block(
         &mut self,
         ih: &Sha1Hash,
+        url: &str,
         req: bitdaemon_common::types::PeerRequest,
         data: Vec<u8>,
         out: &mut Vec<SessionOut>,
     ) {
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(ih) {
-            t.on_web_seed_block(req, data, &mut eff);
+            t.on_web_seed_block(url, req, data, &mut eff);
         }
         self.route(*ih, eff, out);
     }
 
     /// `web_peer_connection` failure — release the picked blocks.
-    /// Upstream posts `url_seed_alert` on web-seed errors.
+    /// Upstream posts `url_seed_alert` on web-seed errors, carrying
+    /// the failing seed's URL and the error message.
     pub fn on_web_seed_error(
         &mut self,
         ih: &Sha1Hash,
+        url: &str,
         reqs: &[bitdaemon_common::types::PeerRequest],
+        msg: &str,
     ) {
-        let url = self
-            .torrents
-            .get(ih)
-            .and_then(|t| t.web_seeds.first().cloned())
-            .unwrap_or_default();
         if let Some(t) = self.torrents.get_mut(ih) {
-            t.on_web_seed_error(reqs);
+            t.on_web_seed_error(url, reqs, msg);
         }
         self.alerts.post(Alert::UrlSeed {
             ih: *ih,
-            url,
-            msg: "web seed error".into(),
+            url: url.to_string(),
+            msg: msg.to_string(),
         });
     }
 

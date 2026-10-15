@@ -297,6 +297,12 @@ pub struct Torrent {
     /// (`web_peer_connection` bumps availability for every piece
     /// on connect — the seed serves the full payload).
     web_seed_refcounted: bool,
+    /// `web_seed_t`-ish per-URL runtime state — our pull model has
+    /// no persistent seed connection, so the observable counters
+    /// (`m_requests` depth, payload received, last fetch error)
+    /// live here keyed by base URL. Surfaced via
+    /// [`Self::web_seed_statuses`].
+    pub web_seed_state: std::collections::BTreeMap<String, crate::status::WebSeedStatus>,
     /// last synced count of conns with a non-empty download queue —
     /// the session applies its delta to `num_peers_down_requests`
     /// (upstream incs/decs at every `m_download_queue` transition).
@@ -403,6 +409,13 @@ pub struct Torrent {
     pub part_file_dir: String,
     /// display name (`ti->name()` or `atp.name`).
     pub name: String,
+    /// `m_comment` — from the .torrent's top-level `comment` or the
+    /// resume data; re-emitted verbatim by `write_resume_data`.
+    pub comment: Vec<u8>,
+    /// `m_created_by` — the `created by` field, same lifecycle.
+    pub created_by: Vec<u8>,
+    /// `m_creation_date` — `creation date` posix time, 0 when absent.
+    pub creation_date: i64,
     /// a `check_files` job is in flight (`m_checking_piece` coarse).
     pub checking: bool,
     /// upstream `m_state == checking_resume_data` — the
@@ -845,6 +858,7 @@ impl Torrent {
             web_seed_idx: 0,
             web_seed_outstanding: std::collections::BTreeSet::new(),
             web_seed_refcounted: false,
+            web_seed_state: std::collections::BTreeMap::new(),
             down_request_peers: 0,
             peer_list: bitdaemon_net::peer_list::PeerList::default(),
             peer_list_state: bitdaemon_net::peer_list::PeerListState::default(),
@@ -880,6 +894,9 @@ impl Torrent {
             storage_mode: bitdaemon_core::StorageMode::default(),
             part_file_dir: String::new(),
             name: String::new(),
+            comment: Vec::new(),
+            created_by: Vec::new(),
+            creation_date: 0,
             checking: false,
             checking_resume: false,
             down_rate: 0,
@@ -1109,6 +1126,13 @@ impl Torrent {
             .iter()
             .map(|(i, n)| (*i, String::from_utf8_lossy(n).into_owned()))
             .collect();
+        // upstream ctor init list: `m_comment(p.comment)`,
+        // `m_created_by(p.created_by)`, `m_creation_date(p.creation_date)`
+        // — metainfo metadata the torrent carries until the next
+        // `write_resume_data` re-emits it.
+        t.comment = atp.comment.clone();
+        t.created_by = atp.created_by.clone();
+        t.creation_date = atp.creation_date;
         for &ep in &atp.peers {
             // upstream runs `add_peer` for `atp.peers` inside the
             // torrent ctor — `m_ip_filter`/`m_port_filter` aren't
@@ -2117,6 +2141,12 @@ impl Torrent {
         atp.max_connections = i64::from(self.max_connections);
         atp.max_uploads = i64::from(self.max_uploads);
         atp.last_seen_complete = self.last_seen_complete;
+        // upstream `torrent::write_resume_data`: `ret.comment =
+        // m_comment` / `created by` / `creation date` — the
+        // metainfo metadata round-trips through the resume blob.
+        atp.comment = self.comment.clone();
+        atp.created_by = self.created_by.clone();
+        atp.creation_date = self.creation_date;
         // `num_complete`/`num_incomplete`/`num_downloaded` — the
         // `update_scrape_state` cache (-1 = never scraped).
         atp.num_complete = i64::from(self.complete);
@@ -2167,7 +2197,13 @@ impl Torrent {
         // piece count + hashes.
         if let Some(raw) = &self.metadata_raw {
             let node = bitdaemon_bencode::bdecode(raw);
-            if let Ok(ti) = TorrentInfo::from_info_node(&node, &LoadTorrentLimits::default()) {
+            if let Ok(mut ti) = TorrentInfo::from_info_node(&node, &LoadTorrentLimits::default()) {
+                // `ti` carries the metainfo metadata too — the
+                // `info` dict alone doesn't hold it (it lives at
+                // the resume dict's top level).
+                ti.internal_set_comment(&self.comment);
+                ti.internal_set_creator(&self.created_by);
+                ti.internal_set_creation_date(self.creation_date);
                 atp.ti = Some(std::sync::Arc::new(ti));
             }
         }
@@ -5050,6 +5086,7 @@ impl Torrent {
         // (`request_merger` tracks torrent-space offsets and
         // `map_block` resolves them).
         let block_size = self.block_size();
+        let mut inserted = 0i32;
         let mut reqs: Vec<PeerRequest> = Vec::with_capacity(picked.len());
         for (b, _busy) in picked {
             if !self.picker.as_mut().is_some_and(|p| {
@@ -5057,7 +5094,9 @@ impl Torrent {
             }) {
                 continue;
             }
-            self.web_seed_outstanding.insert(b);
+            if self.web_seed_outstanding.insert(b) {
+                inserted += 1;
+            }
             if !(0..self.num_pieces).contains(&b.piece_index.0) {
                 continue;
             }
@@ -5087,6 +5126,15 @@ impl Torrent {
         }
         let url = self.web_seeds[self.web_seed_idx % self.web_seeds.len()].clone();
         self.web_seed_idx += 1;
+        // the whole batch rides this seed — attribute the in-flight
+        // blocks to its per-URL counters (`web_seed_t::m_requests`).
+        let st = self.web_seed_state.entry(url.clone()).or_insert_with(|| {
+            crate::status::WebSeedStatus {
+                url: url.clone(),
+                ..Default::default()
+            }
+        });
+        st.outstanding += inserted;
         Some((url, reqs))
     }
 
@@ -5125,8 +5173,11 @@ impl Torrent {
     /// covered blocks (upstream `web_peer_connection` consumes its
     /// `m_requests` per pending_block), then `mark_as_writing` +
     /// emit a disk write each — the same path a wire `Piece` takes.
+    /// `url` attributes the delivered payload to the seed's per-URL
+    /// counters (upstream's `web_seed_t` conn lives per seed).
     pub fn on_web_seed_block(
         &mut self,
+        url: &str,
         req: PeerRequest,
         data: Vec<u8>,
         out: &mut Vec<TorrentEffect>,
@@ -5147,6 +5198,11 @@ impl Torrent {
                 break;
             }
             self.web_seed_outstanding.remove(&b);
+            if let Some(st) = self.web_seed_state.get_mut(url) {
+                st.outstanding -= 1;
+                st.downloaded += bs as u64;
+                st.last_error = None;
+            }
             if let Some(p) = self.picker.as_mut() {
                 p.mark_as_writing(b, Some(Self::WEB_SEED_PEER));
             }
@@ -5170,16 +5226,41 @@ impl Torrent {
     /// re-requested from a real peer or another seed (`web_seed`
     /// `fail_count`→`abort_download` upstream path). Merged
     /// (`request_large_blocks`) requests expand to all blocks they
-    /// covered.
-    pub fn on_web_seed_error(&mut self, reqs: &[PeerRequest]) {
+    /// covered. `url`/`msg` record the per-URL error — upstream's
+    /// `url_seed_alert` carries the failing seed + its message.
+    pub fn on_web_seed_error(&mut self, url: &str, reqs: &[PeerRequest], msg: &str) {
         for r in reqs {
             for b in self.web_seed_blocks(r) {
                 self.web_seed_outstanding.remove(&b);
+                if let Some(st) = self.web_seed_state.get_mut(url) {
+                    st.outstanding -= 1;
+                }
                 if let Some(p) = self.picker.as_mut() {
                     p.abort_download(b, Some(Self::WEB_SEED_PEER));
                 }
             }
         }
+        if let Some(st) = self.web_seed_state.get_mut(url) {
+            st.last_error = Some(msg.to_string());
+        }
+    }
+
+    /// `web_seed_statuses` — the live per-URL snapshot over
+    /// `web_seed_state` for every `m_web_seeds` entry (upstream
+    /// surfaces the same observability through `web_seed_t` conns).
+    #[must_use]
+    pub fn web_seed_statuses(&self) -> Vec<crate::status::WebSeedStatus> {
+        self.web_seeds
+            .iter()
+            .map(|u| {
+                self.web_seed_state.get(u).cloned().unwrap_or_else(|| {
+                    crate::status::WebSeedStatus {
+                        url: u.clone(),
+                        ..Default::default()
+                    }
+                })
+            })
+            .collect()
     }
 
     /// `is_seed`-side helper — all blocks of `piece` have been
@@ -6422,6 +6503,9 @@ impl Torrent {
     pub fn remove_url_seed(&mut self, url: &str) {
         if self.web_seeds.iter().any(|u| u == url) {
             self.web_seeds.retain(|u| u != url);
+            // upstream deletes the `web_seed_t` entry — its runtime
+            // state goes with it (in-flight fetches still resolve).
+            self.web_seed_state.remove(url);
             self.need_save_resume = true;
         }
     }

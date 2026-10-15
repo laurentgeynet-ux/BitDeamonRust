@@ -115,6 +115,48 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Added
 
+- **UI-facing API completeness (upstream parity sweep)**: every
+  surface the desktop client needed is now exposed with upstream
+  semantics —
+  - `TorrentInfo::comment()`/`creator()`/`creation_date()` plus the
+    `internal_set_*` backdoors `parse_torrent_file`/
+    `read_resume_data` use to populate them from metainfo and fast
+    resume (upstream `torrent_info` carries all three).
+  - `Torrent` retains `comment`/`created_by`/`creation_date` from
+    `AddTorrentParams` and writes them back on `to_resume_data` —
+    the values now round-trip `.resume` like upstream's
+    `torrent.cpp` ctor/`write_resume_data` pair.
+  - `TorrentHandle::get_peer_info()` returns `Vec<PeerInfo>` for
+    the whole swarm in one call (upstream `torrent_handle::
+    get_peer_info`); the old per-peer lookup is `peer_info(id,
+    addr)`.
+  - `TorrentHandle::web_seed_statuses()` reports per-URL
+    `WebSeedStatus` (outstanding requests, last error, error count)
+    — upstream tracks the same per-`web_seed_t`, and errors are
+    now attributed to the seed that actually served/failed the
+    request instead of `web_seeds.first()`.
+  - `Alert::message()` renders a human-readable line per variant
+    (the `alert::message()` surface), and `Alert::TrackerList`
+    carries full `AnnounceEntry` state like upstream's
+    `tracker_list_alert`.
+- **Web-seed per-URL accounting**: `WebSeedDone` carries the seed
+  URL and a real error string through `Session::on_web_seed_error`;
+  `url_seed_alert` names the failing seed and message, and
+  `Torrent` keeps `web_seed_errors`/`web_seed_outstanding` per URL.
+
+### Changed
+
+- `TorrentHandle::trackers()` returns `Vec<AnnounceEntry>` (full
+  upstream `announce_entry` state — tier, verified, endpoints,
+  scrape counters, announce timing) instead of `(url, tier)`
+  pairs, matching `torrent_handle::trackers`. Callers consuming
+  the tuple form must read `entry.url`/`entry.tier`.
+- `TorrentHandle::apply_ip_filter` now routes through the torrent
+  setter (`set_apply_ip_filter`) so the change marks resume data
+  dirty like upstream's `torrent::set_apply_ip_filter`.
+
+### Added
+
 - Session `on_tick` leg parity: `try_connect_more_peers` verbatim
   (`m_prio_torrents` ticket queue, `connect_seed_every_n_download`
   downloading/finished round-robin split, `smooth_connects`,

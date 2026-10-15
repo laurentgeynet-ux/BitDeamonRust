@@ -136,9 +136,14 @@ pub fn read_resume_data_node(rd: &BdecodeNode<'_>, piece_limit: i64) -> Result<A
                 max_pieces: piece_limit as usize,
                 ..LoadTorrentLimits::default()
             };
-            ret.ti = Some(std::sync::Arc::new(TorrentInfo::from_info_node(
-                &info, &cfg,
-            )?));
+            let mut ti = TorrentInfo::from_info_node(&info, &cfg)?;
+            // upstream `read_resume_data` mirrors the resume dict's
+            // comment/creator/creation-date onto the rebuilt `ti`
+            // (`internal_set_*`, ABI<4 path).
+            ti.internal_set_creation_date(ret.creation_date);
+            ti.internal_set_creator(&ret.created_by);
+            ti.internal_set_comment(&ret.comment);
+            ret.ti = Some(std::sync::Arc::new(ti));
         } else {
             return Err(Error::Torrent(TorrentError::MismatchingInfoHash));
         }

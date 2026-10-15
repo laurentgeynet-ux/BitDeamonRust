@@ -55,6 +55,23 @@ impl StatusFlags {
     }
 }
 
+/// `web_seed_entry`-ish runtime snapshot for one url-seed — the
+/// pull-model analogue of upstream's live `web_seed_t` counters
+/// (our seeds are fetch tasks, not persistent connections, so the
+/// observable state lives on `Torrent::web_seed_state`).
+#[derive(Clone, Debug, Default)]
+pub struct WebSeedStatus {
+    /// seed base URL (`m_web_seeds` entry).
+    pub url: String,
+    /// blocks in flight toward this seed (`m_requests`).
+    pub outstanding: i32,
+    /// payload bytes received from this seed this session.
+    pub downloaded: u64,
+    /// last fetch error text (`url_seed_alert`'s message —
+    /// `None` while the seed is healthy).
+    pub last_error: Option<String>,
+}
+
 /// `torrent_status::error_file_none` — the error was not
 /// file-scoped.
 pub const ERROR_FILE_NONE: i32 = -1;

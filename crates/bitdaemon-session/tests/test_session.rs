@@ -634,7 +634,13 @@ fn web_seed_tick_and_block() {
     // a returned block goes down the normal disk-write path
     let r0 = reqs[0];
     let mut out2 = Vec::new();
-    s.on_web_seed_block(&ih(1), r0, vec![0xAB; r0.length as usize], &mut out2);
+    s.on_web_seed_block(
+        &ih(1),
+        "http://seed.example/file.bin",
+        r0,
+        vec![0xAB; r0.length as usize],
+        &mut out2,
+    );
     let ih1 = ih(1);
     assert!(
         out2.iter().any(|e| matches!(
@@ -647,7 +653,7 @@ fn web_seed_tick_and_block() {
 
     // a failed fetch releases the blocks for re-pick
     let rest: Vec<PeerRequest> = reqs[1..].to_vec();
-    s.on_web_seed_error(&ih(1), &rest);
+    s.on_web_seed_error(&ih(1), "http://seed.example/file.bin", &rest, "test error");
     let t2 = &s.torrents[&ih(1)];
     assert!(t2.web_seed_outstanding.len() <= 1);
 }

@@ -127,11 +127,18 @@ fn transport_socket_type(k: &bitdaemon_net::instantiate::TransportKind) -> u8 {
     }
 }
 
+/// `Ok` = fetched blocks with data; `Err` = the requests to
+/// release + the human-readable failure for `url_seed_alert`.
+type WebSeedResult = Result<Vec<(PeerRequest, Vec<u8>)>, (Vec<PeerRequest>, String)>;
+
 /// A web-seed fetch completion: per-block data or the failed
-/// request list (to release the picked blocks).
+/// request list (to release the picked blocks). `url` attributes
+/// the outcome to the seed — upstream's `url_seed_alert` and
+/// `web_seed_t` state live per seed, so the message rides along.
 struct WebSeedDone {
     ih: Sha1Hash,
-    result: Result<Vec<(PeerRequest, Vec<u8>)>, Vec<PeerRequest>>,
+    url: String,
+    result: WebSeedResult,
 }
 
 /// `natpmp` per-protocol mapping state — the 12-byte request +
@@ -665,10 +672,12 @@ impl Engine {
             match w.result {
                 Ok(blocks) => {
                     for (req, data) in blocks {
-                        slock(&self.session).on_web_seed_block(&w.ih, req, data, &mut out);
+                        slock(&self.session).on_web_seed_block(&w.ih, &w.url, req, data, &mut out);
                     }
                 }
-                Err(reqs) => slock(&self.session).on_web_seed_error(&w.ih, &reqs),
+                Err((reqs, msg)) => {
+                    slock(&self.session).on_web_seed_error(&w.ih, &w.url, &reqs, &msg);
+                }
             }
         }
         while let Ok(a) = self.dhtnode_rx.try_recv() {
@@ -1247,31 +1256,33 @@ impl Engine {
             // requests while retrying the failed tail on a fresh
             // connection (`maybe_reconnect`).
             macro_rules! report {
-                ($done:expr, $rest:expr) => {{
+                ($done:expr, $rest:expr, $msg:expr) => {{
                     if !$done.is_empty() {
                         let _ = tx.send(WebSeedDone {
                             ih,
+                            url: url.clone(),
                             result: Ok($done),
                         });
                     }
                     if !$rest.is_empty() {
                         let _ = tx.send(WebSeedDone {
                             ih,
-                            result: Err($rest),
+                            url: url.clone(),
+                            result: Err(($rest, $msg.to_string())),
                         });
                     }
                 }};
             }
             let Ok(c) = bitdaemon_net::parse_url::parse_url_components(&url) else {
-                report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs);
+                report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs, "invalid url");
                 return;
             };
             let mut done: Vec<(PeerRequest, Vec<u8>)> = Vec::with_capacity(reqs.len());
             let port = u16::try_from(c.port).unwrap_or(80);
             let addr = match resolve(&resolver, &c.hostname, port).await {
                 Ok(a) => a,
-                Err(_) => {
-                    report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs);
+                Err(e) => {
+                    report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs, e);
                     return;
                 }
             };
@@ -1287,7 +1298,7 @@ impl Engine {
                     remote: addr.to_string(),
                     reason: "ip_filter".into(),
                 });
-                report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs);
+                report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs, "ip filter");
                 return;
             }
             // `format_host_header` — omit the default http port
@@ -1355,8 +1366,8 @@ impl Engine {
                             Ok(s) => {
                                 conns.insert(g.base.clone(), s);
                             }
-                            Err(_) => {
-                                report!(done, reqs[i..].to_vec());
+                            Err(e) => {
+                                report!(done, reqs[i..].to_vec(), e);
                                 return;
                             }
                         }
@@ -1365,7 +1376,7 @@ impl Engine {
                         &files, g, &headers, false, first,
                     );
                     let Some(s) = conns.get_mut(&g.base) else {
-                        report!(done, reqs[i..].to_vec());
+                        report!(done, reqs[i..].to_vec(), "no connection");
                         return;
                     };
                     match fetch_block(s, &wreq, 4 * 1024 * 1024).await {
@@ -1393,7 +1404,7 @@ impl Engine {
                             conns.remove(&g.base);
                             num_redirects += 1;
                             if num_redirects > 64 {
-                                report!(done, reqs[i..].to_vec());
+                                report!(done, reqs[i..].to_vec(), "too many redirects");
                                 return;
                             }
                             // upstream `handle_redirect`:
@@ -1408,17 +1419,17 @@ impl Engine {
                             );
                             let Ok((rbase, rpath)) = bitdaemon_net::parse_url::split_url(&loc)
                             else {
-                                report!(done, reqs[i..].to_vec());
+                                report!(done, reqs[i..].to_vec(), "invalid redirect url");
                                 return;
                             };
                             let Ok(rc) = bitdaemon_net::parse_url::parse_url_components(&loc)
                             else {
-                                report!(done, reqs[i..].to_vec());
+                                report!(done, reqs[i..].to_vec(), "invalid redirect url");
                                 return;
                             };
                             let rport = u16::try_from(rc.port).unwrap_or(80);
                             let Ok(raddr) = resolve(&resolver, &rc.hostname, rport).await else {
-                                report!(done, reqs[i..].to_vec());
+                                report!(done, reqs[i..].to_vec(), "redirect resolution failed");
                                 return;
                             };
                             let auth = if bitdaemon_net::parse_url::same_origin(&url, &loc) {
@@ -1446,8 +1457,8 @@ impl Engine {
                             bases.entry(rbase).or_insert(raddr);
                             continue 'outer;
                         }
-                        Err(_) => {
-                            report!(done, reqs[i..].to_vec());
+                        Err(e) => {
+                            report!(done, reqs[i..].to_vec(), e);
                             return;
                         }
                     }
@@ -1455,7 +1466,7 @@ impl Engine {
                 done.push((r, data));
                 i += 1;
             }
-            report!(done, Vec::<PeerRequest>::new());
+            report!(done, Vec::<PeerRequest>::new(), "");
         });
         self.tasks.push(handle);
     }

@@ -250,6 +250,13 @@ pub struct TorrentInfo {
     /// `m_piece_layers` — v2 per-file piece-layer hashes keyed by the
     /// file's merkle root.
     piece_layers: std::collections::HashMap<Sha256Hash, Vec<u8>>,
+    /// `m_comment` — the torrent file's top-level `comment` (or the
+    /// resume dict's) — re-emitted verbatim by `write_resume_data`.
+    comment: Vec<u8>,
+    /// `m_created_by` — `created by`.
+    created_by: Vec<u8>,
+    /// `m_creation_date` — `creation date` (posix time, 0 absent).
+    creation_date: i64,
 }
 
 impl TorrentInfo {
@@ -506,6 +513,9 @@ impl TorrentInfo {
             ssl_cert,
             flags,
             piece_layers: Default::default(),
+            comment: Vec::new(),
+            created_by: Vec::new(),
+            creation_date: 0,
         })
     }
 
@@ -673,6 +683,45 @@ impl TorrentInfo {
     #[must_use]
     pub fn flags(&self) -> TorrentInfoFlags {
         self.flags
+    }
+
+    /// `creation_date()` — posix timestamp of the torrent's
+    /// `creation date` key; `0` when absent (upstream ABI<4
+    /// accessor — we keep it unconditionally).
+    #[must_use]
+    pub fn creation_date(&self) -> i64 {
+        self.creation_date
+    }
+
+    /// `creator()` — the `created by` string (empty when absent).
+    #[must_use]
+    pub fn creator(&self) -> &[u8] {
+        &self.created_by
+    }
+
+    /// `comment()` — the torrent comment (empty when absent).
+    #[must_use]
+    pub fn comment(&self) -> &[u8] {
+        &self.comment
+    }
+
+    /// `internal_set_comment` — fills `m_comment` outside the parse
+    /// path (resume data, ctor init mirroring).
+    #[doc(hidden)]
+    pub fn internal_set_comment(&mut self, s: &[u8]) {
+        self.comment = s.to_vec();
+    }
+
+    /// `internal_set_creator` — fills `m_created_by`.
+    #[doc(hidden)]
+    pub fn internal_set_creator(&mut self, c: &[u8]) {
+        self.created_by = c.to_vec();
+    }
+
+    /// `internal_set_creation_date` — fills `m_creation_date`.
+    #[doc(hidden)]
+    pub fn internal_set_creation_date(&mut self, t: i64) {
+        self.creation_date = t;
     }
 }
 
@@ -1286,6 +1335,15 @@ pub fn parse_torrent_file(
             .to_vec();
     }
     verify_encoding(&mut out.created_by);
+
+    // upstream `torrent_info::parse_torrent_file` (ABI<4) mirrors the
+    // top-level metadata fields back onto the info object itself
+    // (`m_comment = atp.comment` …); `load_torrent_parsed` sets only
+    // `creation_date` on `ti`. Ours is the same object
+    // `status.torrent_file` exposes — carry all three.
+    ti.internal_set_comment(&out.comment);
+    ti.internal_set_creator(&out.created_by);
+    ti.internal_set_creation_date(out.creation_date);
 
     // `load_torrent_parsed` — collision-safe filename resolution fills
     // `renamed_files` (the storage layout itself keeps original names)
