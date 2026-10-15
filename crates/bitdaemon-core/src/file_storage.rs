@@ -188,25 +188,22 @@ impl FileStorage {
         debug_assert!(file_size >= 0);
         debug_assert!(filename.is_none_or(|f| !is_complete(f)));
 
+        // upstream: `errc::file_too_large` for the per-file cap, the
+        // lt::errors code only for the cumulative-offset overflow
         if file_size > Self::MAX_FILE_SIZE {
-            return Err(TorrentError::TorrentInvalidLength.into());
+            return Err(Error::FileTooLarge);
         }
         if Self::MAX_FILE_OFFSET - self.total_size < file_size {
             return Err(TorrentError::TorrentInvalidLength.into());
         }
 
+        // upstream: `errc::filename_too_long` (leaf cap is 4096 bytes)
         if let Some(f) = filename {
             if f.len() >= (1 << 12) {
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "filename too long",
-                )));
+                return Err(Error::FilenameTooLong);
             }
         } else if crate::path::filename(path).len() >= (1 << 12) {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "filename too long",
-            )));
+            return Err(Error::FilenameTooLong);
         }
 
         if !has_parent_path(path) {
