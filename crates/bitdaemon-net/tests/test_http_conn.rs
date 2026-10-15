@@ -30,6 +30,8 @@ async fn get_round_trip() {
         "http://tracker.example/announce?info_hash=x",
         &[("User-Agent".into(), "bitdaemon".into())],
         MAX_RESPONSE,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -56,7 +58,7 @@ async fn chunked_response() {
     send_request(&mut cli, "GET", "/", "h", &[], &[])
         .await
         .unwrap();
-    let r = recv_response(&mut cli, MAX_RESPONSE).await.unwrap();
+    let r = recv_response(&mut cli, MAX_RESPONSE, None).await.unwrap();
     server.await.unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(r.body(), b"hello");
@@ -85,9 +87,16 @@ async fn gzip_body_inflated() {
         srv.write_all(resp.as_bytes()).await.unwrap();
         srv.write_all(&gz).await.unwrap();
     });
-    let r = http_get(&mut cli, "http://t.example/announce", &[], MAX_RESPONSE)
-        .await
-        .unwrap();
+    let r = http_get(
+        &mut cli,
+        "http://t.example/announce",
+        &[],
+        MAX_RESPONSE,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(r.body(), b"d:8:completei42e10:incompleti7ee");
 }

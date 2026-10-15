@@ -328,6 +328,20 @@ pub enum WebSeedBackoff {
 pub struct Torrent {
     /// `m_torrent_file->info_hash()`.
     pub info_hash: Sha1Hash,
+    /// `m_info_hash` — the torrent's info-hash set (v1 and/or v2);
+    /// `info_hash` stays the map key (v1, or truncated v2 for
+    /// v2-only torrents). Tracker announce selection announces each
+    /// supported version independently.
+    pub info_hashes: bitdaemon_common::InfoHash,
+    /// `tracker_key()` — upstream hashes the torrent/session/storage
+    /// pointers into a per-torrent announce key, stable for the
+    /// object's lifetime. A random nonce drawn at construction is
+    /// the equivalent (same stability, same churn on reload).
+    pub tracker_key: u32,
+    /// `m_trackerid` — client-supplied tracker id
+    /// (`AddTorrentParams::trackerid`); an endpoint's own
+    /// `trackerid` response value takes precedence.
+    pub trackerid: Vec<u8>,
     /// `num_pieces`.
     pub num_pieces: i32,
     /// `piece_length`.
@@ -867,6 +881,9 @@ impl Torrent {
     ) -> Self {
         Self {
             info_hash,
+            info_hashes: bitdaemon_common::InfoHash::from_v1(info_hash),
+            tracker_key: rand::random(),
+            trackerid: Vec::new(),
             num_pieces,
             piece_length,
             piece_hashes: None,
@@ -1063,6 +1080,12 @@ impl Torrent {
                     Bitfield::with_size(ti.num_pieces() as usize),
                     storage,
                 );
+                // `m_info_hash = m_torrent_file->info_hashes()` —
+                // the metainfo's set wins over atp's (they're
+                // consistent by the hash check at add time).
+                t.info_hashes = *ti.info_hashes();
+                // `m_private = m_torrent_file->priv()` — BEP-27.
+                t.private = ti.is_private();
                 t.piece_hashes = Some(
                     (0..ti.num_pieces())
                         .map(|i| ti.hash_for_piece(PieceIndex(i)))
@@ -1120,6 +1143,11 @@ impl Torrent {
                 // `m_add_torrent_params` alive until `init`, so the
                 // add-time priorities/flags ride along here.
                 let mut t = Self::new(ih, 0, 0, Bitfield::default(), storage);
+                // `m_info_hash` from atp — a hybrid magnet (`btih`
+                // + `btmh`) announces both hash versions.
+                if atp.info_hashes.has_v1() || atp.info_hashes.has_v2() {
+                    t.info_hashes = atp.info_hashes;
+                }
                 t.magnet = true;
                 t.default_dont_download = atp
                     .flags
@@ -1164,6 +1192,10 @@ impl Torrent {
         t.comment = atp.comment.clone();
         t.created_by = atp.created_by.clone();
         t.creation_date = atp.creation_date;
+        // `m_trackerid(p.trackerid)` — the client-supplied tracker
+        // id, echoed until a tracker's own `trackerid` lands on the
+        // announce entry.
+        t.trackerid = atp.trackerid.clone();
         for &ep in &atp.peers {
             // upstream runs `add_peer` for `atp.peers` inside the
             // torrent ctor — `m_ip_filter`/`m_port_filter` aren't
@@ -1412,6 +1444,10 @@ impl Torrent {
             self.build_merkle_trees(&info);
         }
         self.files = Some(std::sync::Arc::new(info.files().clone()));
+        // `m_info_hash = m_torrent_file->info_hashes()` — upstream
+        // replaces the add-time hash set with the metainfo's.
+        self.info_hashes = *info.info_hashes();
+        self.private = info.is_private();
         self.ti = Some(std::sync::Arc::new(info));
         self.metadata_raw = Some(metadata.to_vec());
         self.magnet = false;
@@ -2896,41 +2932,97 @@ impl Torrent {
         self.trackers.add(e);
     }
 
-    /// `announce_req` — the `AnnounceParams` for a due tracker
-    /// (`torrent::tracker_request`). `port`/`key`/`peer_id` come
-    /// from the session. `left` is approximated as
-    /// `num_pieces * piece_length - verified` (the tail-piece
-    /// delta needs `total_size` — close enough for `left=`).
-    /// `url`/`tracker_id`/`ipv4`/`ipv6` are per-announce-entry —
-    /// the caller fills them from the `AnnounceEntry`.
+    /// `torrent::bytes_left` — payload bytes still wanted:
+    /// `total_size - have·piece_length`, corrected for the short
+    /// tail piece when we have it (the picker counts pieces, so the
+    /// partial last piece is over-subtracted by `piece_length -
+    /// piece_size(last)`). `None` before metadata — the announce
+    /// falls back to 16 KiB upstream.
+    #[must_use]
+    pub fn bytes_left(&self) -> Option<i64> {
+        let fs = self.files.as_ref()?;
+        if self.seed_mode {
+            return Some(0);
+        }
+        let Some(p) = &self.picker else {
+            return Some(if self.is_seed() { 0 } else { fs.total_size() });
+        };
+        let pc = p.have();
+        let mut left = fs.total_size() - i64::from(pc.num_pieces) * i64::from(fs.piece_length());
+        if pc.last_piece {
+            left += i64::from(fs.piece_length()) - i64::from(fs.piece_size(fs.last_piece()));
+        }
+        Some(left)
+    }
+
+    /// `build_tracker_request` — the `AnnounceParams` for a due
+    /// tracker. `peer_id`/`port` come from the session; `key` is the
+    /// per-torrent `tracker_key` (upstream's pointer hash — our
+    /// random nonce, same stability). `uploaded`/`downloaded` are the
+    /// real payload counters (`downloaded` minus `failed_bytes`;
+    /// `report_true_downloaded == false` subtracts `redundant` and —
+    /// on seeds — the payload bytes peers are mid-flight on, which
+    /// will land as redundant anyway). `num_want` is 0 on `stopped`
+    /// like upstream. `url`/`tracker_id`/`ipv4`/`ipv6` are
+    /// per-announce-entry — the caller fills them from the
+    /// `AnnounceEntry` (`tracker_id` falls back to the torrent-level
+    /// `m_trackerid` when the entry has none).
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn announce_params(
         &self,
         peer_id: bitdaemon_common::PeerId,
         port: u16,
         event: i32,
-        key: i32,
         apply_ip_filter_to_trackers: bool,
+        num_want: i32,
+        report_true_downloaded: bool,
+        info_hash: [u8; 20],
     ) -> bitdaemon_net::tracker_client::AnnounceParams {
+        // `req.downloaded = total_payload_download - failed` /
+        // `req.uploaded = total_payload_upload` upstream.
+        let mut downloaded = self.total_download() - self.failed_bytes;
+        let mut redundant = self.redundant_bytes;
+        if !report_true_downloaded {
+            downloaded -= redundant;
+            // a torrent that just completed still receives payload
+            // on in-flight requests — every such byte is redundant,
+            // so fold the mid-message progress into `redundant`
+            // instead of letting `downloaded` exceed the size.
+            if self.is_seed() {
+                for c in self.peers.values() {
+                    let b =
+                        c.bw.piece_recv_staged
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                    if b > 0 {
+                        downloaded -= b;
+                        redundant += b;
+                    }
+                }
+            }
+        }
         bitdaemon_net::tracker_client::AnnounceParams {
             url: String::new(),
-            info_hash: self.info_hash.to_bytes(),
+            info_hash,
             peer_id: *peer_id.as_bytes(),
             port,
-            uploaded: 0,
-            downloaded: self.verified_bytes,
-            left: (i64::from(self.num_pieces) * self.piece_length - self.verified_bytes).max(0),
-            corrupt: 0,
-            redundant: 0,
+            uploaded: self.total_upload(),
+            downloaded: downloaded.max(0),
+            left: self.bytes_left().unwrap_or(16 * 1024),
+            corrupt: self.failed_bytes,
+            redundant,
             event,
-            num_want: -1,
-            key: key as u32,
+            // `event == stopped → numwant = 0` — we don't want new
+            // peers while tearing down.
+            num_want: if event == 3 { 0 } else { num_want },
+            key: self.tracker_key,
             tracker_id: Vec::new(),
             ipv4: Vec::new(),
             ipv6: Vec::new(),
-            i2p: false,
-            // `build_tracker_request` — `req.filter = m_ip_filter`
-            // only when both flags are set.
+            private_torrent: self.private,
+            high_priority: false,
+            i2p: self.ti.as_ref().is_some_and(|ti| ti.is_i2p()),
+            // `req.filter = m_ip_filter` only when both flags are set.
             filter: (apply_ip_filter_to_trackers && self.apply_ip_filter)
                 .then(|| self.ip_filter.clone())
                 .flatten(),

@@ -459,7 +459,9 @@ pub async fn fetch_block(
     let mut out = Vec::new();
     let mut close = false;
     for f in req.files.iter().filter(|f| f.got_get) {
-        let r = crate::http_conn::recv_response(s, max_response).await?;
+        // web-seed receive timeouts come from the peer-connection
+        // machinery — audit A06 wave; `None` keeps prior behavior.
+        let r = crate::http_conn::recv_response(s, max_response, None).await?;
         // upstream: `!is_ok_status` aborts; `is_redirect` is handled
         // first (redirects pass `is_ok_status` but carry no body).
         if crate::http_parser::is_redirect(r.status()) {

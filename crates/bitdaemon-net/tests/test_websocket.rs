@@ -120,6 +120,8 @@ async fn ws_announce_round_trip() {
         ipv6: Vec::new(),
         i2p: false,
         filter: None,
+        high_priority: false,
+        private_torrent: false,
     };
     let payload = build_announce(&p, &[]);
     assert!(payload.contains("\"action\":\"announce\""));
@@ -241,6 +243,8 @@ fn announce_params() -> bitdaemon_net::tracker_client::AnnounceParams {
         ipv6: Vec::new(),
         i2p: false,
         filter: None,
+        high_priority: false,
+        private_torrent: false,
     }
 }
 

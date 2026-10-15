@@ -9,9 +9,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Instant;
 
 use bitdaemon_common::flags::PeerSourceFlags;
+use bitdaemon_common::info_hash::ProtocolVersion;
 use bitdaemon_common::types::StorageIndex;
 use bitdaemon_common::{Bitfield, Sha1Hash};
 use bitdaemon_net::http_tracker::TrackerResponse;
+use bitdaemon_net::tracker_client::AnnounceError;
 use bitdaemon_session::session::{Session, SessionOut};
 use bitdaemon_session::torrent::Torrent;
 
@@ -46,7 +48,9 @@ fn announce_cycle() {
     assert_eq!(*ai, ih);
     assert_eq!(url, "udp://tr/announce");
     assert_eq!(params.info_hash, ih.to_bytes());
-    assert_eq!(params.left, 4 * 128 * 1024);
+    // `bytes_left` is `-1` without file metadata → upstream
+    // `req.left < 0` sends the 16 KiB magnet fallback.
+    assert_eq!(params.left, 16 * 1024);
     // first announce carries `started` (BEP-3 event 2) and the
     // entry is held in-flight — no re-fire while it is out.
     assert_eq!(params.event, 2);
@@ -70,7 +74,14 @@ fn announce_cycle() {
         external_ip: None,
         ..Default::default()
     };
-    s.on_announce_response(&ih, "udp://tr/announce", Ok(resp), &mut Vec::new());
+    s.on_announce_response(
+        &ih,
+        "udp://tr/announce",
+        ProtocolVersion::V1,
+        Ok(resp),
+        None,
+        &mut Vec::new(),
+    );
     let t = s.torrents.get(&ih).unwrap();
     assert_eq!(t.peer_list.num_peers(), 2);
     // upstream: announce `complete` is scrape population data —
@@ -178,7 +189,14 @@ fn announce_failure_backs_off() {
     );
     let mut s = Session::new();
     s.add_torrent(t);
-    s.on_announce_response(&ih, "http://tr", Err("timeout".into()), &mut Vec::new());
+    s.on_announce_response(
+        &ih,
+        "http://tr",
+        ProtocolVersion::V1,
+        Err(AnnounceError::TimedOut),
+        None,
+        &mut Vec::new(),
+    );
     // just failed → not due
     let mut out = Vec::new();
     s.tracker_announce_due(Instant::now(), 0, &mut out);

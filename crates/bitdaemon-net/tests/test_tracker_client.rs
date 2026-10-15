@@ -31,6 +31,8 @@ fn params() -> AnnounceParams {
         ipv6: Vec::new(),
         i2p: false,
         filter: None,
+        high_priority: false,
+        private_torrent: false,
     }
 }
 
@@ -62,6 +64,8 @@ async fn http_announce_e2e() {
         &bitdaemon_net::http_tracker::AnnounceOptions::default(),
         &[],
         1024 * 1024,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -82,19 +86,99 @@ async fn udp_announce_e2e() {
     let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 6969);
     let udp = ScriptedUdp::default();
     let sock = &udp as &dyn DatagramSocket;
+    let mut stats = bitdaemon_net::http_conn::WireStats::default();
     let r = announce_udp(
         sock,
         &udp.demux,
         target,
         &params(),
         &bitdaemon_net::http_tracker::AnnounceOptions::default(),
-        Duration::from_secs(5),
+        bitdaemon_net::tracker_client::TrackerTimeouts {
+            receive: Duration::from_secs(5),
+            conn_id_ttl: Duration::from_secs(60),
+        },
+        &mut stats,
     )
     .await
     .unwrap();
     assert_eq!(r.interval, 1800);
     assert_eq!(r.peers.len(), 1);
     assert_eq!(udp.sent_count(), 2);
+}
+
+/// `udp_tracker_connection_manager::m_connection_cache` — a second
+/// announce to the same tracker reuses the cached `connection_id`
+/// within `udp_tracker_token_expiry` and skips the BEP-15 connect
+/// datagram (3 sends total, not 4).
+#[tokio::test]
+async fn udp_conn_id_reused_within_ttl() {
+    let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 6969);
+    let udp = ScriptedUdp::default();
+    let sock = &udp as &dyn DatagramSocket;
+    let timeouts = bitdaemon_net::tracker_client::TrackerTimeouts {
+        receive: Duration::from_secs(5),
+        conn_id_ttl: Duration::from_secs(60),
+    };
+    let mut stats = bitdaemon_net::http_conn::WireStats::default();
+    let opts = bitdaemon_net::http_tracker::AnnounceOptions::default();
+    announce_udp(
+        sock,
+        &udp.demux,
+        target,
+        &params(),
+        &opts,
+        timeouts,
+        &mut stats,
+    )
+    .await
+    .unwrap();
+    announce_udp(
+        sock,
+        &udp.demux,
+        target,
+        &params(),
+        &opts,
+        timeouts,
+        &mut stats,
+    )
+    .await
+    .unwrap();
+    assert_eq!(udp.sent_count(), 3, "second announce must reuse conn_id");
+    assert!(stats.sent > 0 && stats.recv > 0);
+}
+
+/// `announce_url` — tracker-assigned `trackerid` is echoed and a
+/// pre-baked query string is rejected under `ssrf_mitigation`.
+#[test]
+fn announce_url_trackerid_and_ssrf() {
+    use bitdaemon_net::http_tracker::AnnounceOptions;
+    use bitdaemon_net::tracker_client::{AnnounceError, announce_url};
+
+    let mut p = params();
+    p.tracker_id = b"tid-xyz".to_vec();
+    let opts = AnnounceOptions::default();
+    let url = announce_url(&p, &opts).unwrap();
+    assert!(url.contains("trackerid=tid-xyz"));
+    assert!(url.contains("key=0000abcd") || url.contains("key=0000ABCD"));
+    assert!(url.starts_with("http://tracker.example/announce?"));
+
+    // a tracker URL carrying its own announce args (e.g. `left=`)
+    // is an SSRF vector — `ssrf_mitigation` rejects it. Benign args
+    // (passkeys) are allowed and get `&`-joined like upstream.
+    let mut p2 = params();
+    p2.url = "http://tracker.example/announce?left=1".into();
+    let strict = AnnounceOptions {
+        ssrf_mitigation: true,
+        ..Default::default()
+    };
+    assert!(matches!(
+        announce_url(&p2, &strict),
+        Err(AnnounceError::Ssrf)
+    ));
+    let mut p3 = params();
+    p3.url = "http://tracker.example/announce?passkey=abc".into();
+    let url3 = announce_url(&p3, &strict).unwrap();
+    assert!(url3.contains("/announce?passkey=abc&info_hash="));
 }
 
 /// echoes transaction ids back — connect + announce canned replies.
