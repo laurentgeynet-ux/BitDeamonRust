@@ -1,472 +1,362 @@
-# Audit A06 — rapport d'analyse
+# Audit A06 — rapport d'analyse (V2)
 
-Périmètre : `web_peer_connection` / `web_connection_base` (BEP-19 url
-seeds) + legs torrent (`maybe_connect_web_seeds`, `retry_web_seed`,
-`connect_to_url_seed`, `add/remove_web_seed`). `http_seed_connection.cpp`
-n'existe pas upstream en 2.1 (BEP-17 supprimé, ChangeLog « removed
-support for BEP 17 web seeds ») — le Rust le traite déjà en no-op
-déprécié + merge dans `web_seeds`, conforme.
+Ré-audit après apply de la V1 (`a084101`, PR #3). Périmètre inchangé :
+`web_peer_connection` / `web_connection_base` (BEP-19 url seeds ;
+`http_seed_connection.cpp` n'existe pas en 2.1, BEP-17 retiré — le
+merge `http_seeds` → `web_seeds` Rust est conforme) + legs torrent
+(`maybe_connect_web_seeds`, `retry_web_seed`, `connect_to_url_seed`,
+`connect_web_seed`, `handle_redirect`, `received_invalid_data`).
 
 Baseline upstream : `e7381c7bc` (`D:\Projet\libtorrent\libtorrent`,
-lecture seule). Modèle Rust : pull — `Torrent::next_web_seed_blocks`
-émet `SessionOut::WebSeedFetch` par tick, `engine.rs::spawn_web_seed`
-fait le dial+GET+parse, `Session::on_web_seed_block`/`on_web_seed_error`
-réinjecte. Pas de connexion persistante `web_seed_t` : l'état par-URL
-vit dans `Torrent::web_seed_state` (`WebSeedStatus`).
+lecture seule). Modèle Rust : pull — `Session::tick` →
+`Torrent::next_web_seed_blocks` émet `SessionOut::WebSeedFetch`,
+`engine.rs::spawn_web_seed` fait dial+GET+parse dans une tâche,
+`on_web_seed_block`/`on_web_seed_error`/`on_web_seed_done`
+réinjectent. État par-URL dans `Torrent::web_seed_state` (`WebSeed`).
+
+## État V1 → V2
+
+Corrigé et vérifié conforme cette passe : validation
+`Content-Range`/`Content-Length` + `disable` (`web_seed.rs:483-507`),
+`normalize_web_seed_url` appelée (`engine.rs:1414`), timeout
+`urlseed_timeout` par fetch + sweep `check_web_seed_timeouts`
+(`engine.rs:1671`, `torrent.rs:6004`), SSRF + `ip_filter` +
+`no_local_ips` (`engine.rs:1599-1648`), proxy web-seed câblé
+(`engine.rs:1425-1486`, `web_seed_dial`), backoff `retry_ms` /
+`disabled` / `removed` / `NameLookup` (`torrent.rs:5937-5988`),
+`prefer_contiguous_blocks` + sizing keep-alive (`torrent.rs:5657-5670`),
+pure-pad sans GET (`engine.rs:1536-1541`), gate `files_checked` +
+caps connexions (`torrent.rs:5519-5601`), compteurs payload +
+`report_web_seed_downloads` (`torrent.rs:5864-5867`), drain
+`remove_url_seed` (`torrent.rs:7305-7340`), ban-on-hash-fail
+(`torrent.rs:3636-3647`).
 
 ## Verdicts checklist
 
-- **Range requests : pièces complètes vs blocs, `block_size` alignment,
-  coalescing contigu** — verdict : **déviation** (partielle).
-  Conforme : `plan_piece_request` mappe le span via `map_block`, pads
-  incluses sans GET (`got_get:false`), `Range: bytes=start-end` inclusif
-  — `crates/bitdaemon-net/src/web_seed.rs:201-285,349-353` ;
-  `render_web_request` émet un GET par `file_request` non-pad dans
-  l'ordre `m_file_requests` — `web_seed.rs:291-360` ; les blocs choisis
-  contigus fusionnent en une seule `PeerRequest` franchissant les
-  frontières de pièce (`request_large_blocks`) —
-  `crates/bitdaemon-session/src/torrent.rs:5125-5138` ; le span v2
-  pad-inclus est le `map_length` upstream —
-  `web_seed.rs:191-198`. Déviant : `prefer_contiguous_blocks` non porté
-  (`prefer_contiguous_blocks: 0` — `torrent.rs:5074`) et le sizing
-  upstream `max(max(keepalive?1:4 MiB, piece_length),
-  urlseed_max_request_bytes)` n'existe pas — les requêtes plafonnent à
-  `web_seed_blocks_per_tick`×`block_size` ≈ 64 Kio par batch vs
-  ~16 Mio upstream — `src/web_peer_connection.cpp:67-74` ;
-  `urlseed_max_request_bytes` déclaré (`settings.rs:606`) jamais lu ;
-  adaptation `supports_keepalive` (4 Mio min) absente.
+- **Range requests : pièces complètes vs blocs, `block_size`
+  alignment, coalescing contigu** — verdict : **conforme** (une
+  déviation latente sous D1). `plan_piece_request` mappe via
+  `map_block`, pads `got_get:false` sans GET — `web_seed.rs:201-285` ;
+  GET par `file_request` non-pad dans l'ordre `m_file_requests`,
+  `Range: bytes=start-end` inclusif — `web_seed.rs:291-360` ; blocs
+  contigus fusionnés en une `PeerRequest` franchissant les pièces,
+  cap `urlseed_max_request_bytes` — `torrent.rs:5701-5741` ;
+  `prefer_contiguous_blocks = max(max(ka?1:4MiB, piece_length),
+  urlseed_max_request_bytes)/block_size` — `torrent.rs:5661-5670` =
+  `web_peer_connection.cpp:67-74`. Détail upstream confirmé :
+  `urlseed_max_request_bytes` est une *préférence* de picking, pas un
+  cap dur — `request_merger` n'a pas de borne (le nôtre borne le merge
+  à 16 Mio, différence bénigne). `urlseed_pipeline_size` est mort
+  upstream aussi (aucun usage `src/`) — non-bug.
 
 - **Erreurs : HTTP non-200, redirect loops, content-length mismatch,
   EOF mid-piece → url_seed_alert + seed marqué** — verdict :
-  **déviation**. Conforme : statut non-ok → erreur →
-  `on_web_seed_error` → `Alert::UrlSeed` + `abort_download` des blocs —
-  `session.rs:8431-8446`, `torrent.rs:5247-5262`. Déviant : (a) le
-  payload d'alerte porte le header `Server` au lieu de
-  `"<status> <reason>"` — `web_seed.rs:441-446` vs
-  `handle_error` `to_string(status_code)+" "+m_parser.message()`
-  (`web_peer_connection.cpp:619-626`) ; (b) aucune validation
-  `Content-Range`/`content_length` (`get_range`,
-  `web_peer_connection.cpp:524-555,948-981`) — un corps de bonne
-  taille mais mauvais offset est accepté → hash-fail ; `no_content_
-  length` non détecté ; (c) aucun marquage du seed — upstream
-  `have_files.clear_bit(file)` sur non-2xx (`:911-918`), `disable()`
-  permanent sur `invalid_range`/`missing_location` (`:631-646,979`) ;
-  (d) redirects apprises en mémoire par *tâche de fetch* seulement —
-  `engine.rs:1340-1343` vs `m_web->redirects` + `add_web_seed`
-  éphémère persistants (`:648-784`) ; `Retry-After` ignoré
-  (`header_duration("retry-after")`, `:619`) ; (e) EOF/parse-error :
-  upstream disconnect `http_parse_error` après `received_bytes`, Rust
-  `HttpError` → release — sémantique proche mais sans backoff
-  (voir item retry).
+  **déviation**. Conforme : redirect traité avant le statut générique
+  (`web_seed.rs:465-477` = `is_redirect` avant `is_ok_status`,
+  `web_peer_connection.cpp:919-923`) ; 206 sans `Content-Range` ou
+  non-206 sans `Content-Length` → `InvalidRange` → `Disable` =
+  upstream `disable(errors::invalid_range / no_content_length)`
+  (`web_peer_connection.cpp:524-555`) ; range mismatch → `Retry` =
+  upstream `disconnect(invalid_range, peer_error)` qui re-trie avec
+  backoff ; `Retry-After` parsé et propagé (`:475`). Déviant : corps
+  trop court → `Retry`+30 s là où upstream EOF mid-body = sévérité
+  `normal` sans backoff (D3) ; `Location` vide → boucle de 64 →
+  `Retry` vs `disable(missing_location)` (D5) ; taxonomie d'alertes
+  réduite à `UrlSeed` seul (D7) ; timeouts → backoff + UrlSeed là où
+  upstream poste `peer_disconnected` sans backoff (D2).
 
 - **Retry : backoff par seed, `retry_web_seed`, bannissement
-  temporaire** — verdict : **déviation** (majeure). Aucun état de
-  backoff : `web_seed_t::retry` (`urlseed_wait_retry` sur
-  `error>=failure` + `uninteresting_upload_peer` —
-  `web_peer_connection.cpp:233-235,276-280` ; `web_seed_name_lookup_
-  retry` sur DNS fail — `torrent.cpp:7095-7098`), `disabled`
-  (protocole non-http, IDNA, port 0, port_filter, SSRF, banned —
-  `torrent.cpp:6815-6916,7210-7249`), `interesting`, `have_files` —
-  rien d'équivalent dans `WebSeedStatus` (`status.rs:62-73`) et
-  `next_web_seed_blocks` ne consulte jamais `last_error`
-  (`torrent.rs:5037-5044`). `Torrent::retry_web_seed` est un stub à
-  sémantique inversée (reset du curseur round-robin, `_url` ignoré,
-  aucun caller) — `torrent.rs:9667-9673`. Conséquence : un seed en
-  échec est re-sollicité à chaque tick (~1 s) au lieu de 30 s/30 min,
-  et indéfiniment (pas de `disabled`) — martèlement réseau + spam
-  d'alertes. `urlseed_wait_retry`, `web_seed_name_lookup_retry`,
-  `ban_web_seeds`, `report_web_seed_downloads` déclarés+sérialisés
-  jamais lus (grep workspace : seuls `settings.rs`/`session_params.rs`
-  matchent).
+  temporaire** — verdict : **déviation**. Conforme : `retry_ms` par
+  seed + gate `retry_ms > now` (`torrent.rs:5611`) = `web->retry` ;
+  `NameLookup` → `web_seed_name_lookup_retry` ; `Disable`/`Remove`
+  mappés sur les bonnes gates (`engine.rs:1339-1408` ↔
+  `torrent.cpp:6815-6916` : idna→disable ✓, parse→remove ✓,
+  proto→disable ✓, hostname→remove ✓, port 0→remove ✓,
+  port_filter→disable ✓). Déviant : backoff sur les erreurs
+  mid-transfer qui n'en ont pas upstream (D3), `Retry-After` < 30 s
+  honoré sans le plancher `urlseed_wait_retry` (D4), échec de
+  résolution du *proxy* → retry 1800 s vs `disabled` upstream (D9),
+  bannissement temporaire : upstream banisse via `peer_info.banned`
+  (réversible via `unban`), le nôtre `disabled` est terminal — même
+  effet pratique, note dans D10.
 
-- **Attribution : erreurs/compteurs par URL** (cohérence
-  `on_web_seed_error(url)`) — verdict : **déviation** (partielle).
-  Conforme : `WebSeedDone{ih,url,result}` transporte l'URL jusqu'au
-  dispatch (`engine.rs:130-142,677-686`) ; `st.outstanding`/`st.
-  downloaded`/`st.last_error` mis à jour sous la clé URL sur les deux
-  legs (`torrent.rs:5147-5153,5216-5221,5249-5261`) ;
-  `web_seed_statuses()` snapshot par `m_web_seeds` entry
-  (`torrent.rs:5268-5280`). Déviant : les octets payload web-seed
-  n'entrent **jamais** dans `payload_downloaded`/`stat_down_total`/
-  `down_rate` — `total_download()` ne somme que les conns réelles +
-  `payload_downloaded` (`torrent.rs:7960`) — upstream compte via
-  `received_bytes`→`m_stat` sauf `report_web_seed_downloads=false`
-  (`web_peer_connection.cpp:59-60`, `session_impl.cpp:6756-6766`).
-  `total_download`, `total_payload_download`, `download_rate`, les
-  compteurs session et `total_downloaded` du resume sous-reportent
-  d'autant ; `report_web_seed_downloads` inerte. Edge :
-  `piece_failed`/restores picker bypassent `on_web_seed_error` →
-  `web_seed_outstanding` et `st.outstanding` peuvent dériver (bloc
-  restauré côté picker encore marqué in-flight côté seed).
+- **Attribution : erreurs/compteurs par URL** (cohérence du fix
+  `on_web_seed_error(url)`) — verdict : **conforme**.
+  `WebSeedDone{ih,url}` transporte l'URL de bout en bout ;
+  `st.outstanding`/`downloaded`/`last_error` sous la clé URL sur les
+  deux legs (`torrent.rs:5839-5860,5945-5988`) ; `abort_download(b,
+  Some(key))` vérifie l'attribution du downloader (`torrent.rs:5967`)
+  — un bloc re-piqué par un autre n'est pas décrémenté à tort ;
+  `web_seed_statuses()` snapshot par entrée (`torrent.rs:6056`) ;
+  payload sous `report_web_seed_downloads` (`torrent.rs:5864` ↔
+  `web_peer_connection.cpp:59-60` + `update_report_web_seed_
+  downloads`). Le masque d'alertes est appliqué dans `post`
+  (`alerts.rs:1699-1705`) = le gate `should_post` upstream — le
+  `UrlSeed` inconditionnel en surface est conforme.
 
 - **Request pacing : `web_seed_blocks_per_tick`, connection reuse vs
-  reconnect** — verdict : **déviation**. Conforme : reuse par base à
-  l'intérieur d'une tâche, `Connection: close`/`connection_close()` →
-  conn retirée et re-dialée (`engine.rs:1365-1391,1389-1391`),
-  `first_request` par connexion — `m_first_request` upstream
-  (`web_seed.rs:301` note, `engine.rs:1365`). Déviant : aucun gate
-  `max_web_seed_connections` (3), `m_max_connections` ni
-  `connections_limit` (`maybe_connect_web_seeds`,
-  `torrent.cpp:10997-11031`) — chaque tick peut spawner un fetch pour
-  la même URL tant que des blocs sont pickables → conns concurrentes
-  non bornées vers un seed lent ; aucun timeout de fetch
-  (`urlseed_timeout` = timeout() upstream, `web_connection_base.cpp:
-  76-81`, jamais lu) → une réponse qui pend laisse ses blocs
-  `downloading` sous `WEB_SEED_PEER` pour toujours —
-  `check_request_timeouts` n'itère que `self.peers`
-  (`torrent.rs:7390`) ; requête pure-pad émet quand même un
-  `WebSeedFetch` → dial + `write_all("")` alors qu'upstream livre les
-  zéros localement (`num_pad_files == size` → `on_receive_padfile`,
-  `web_peer_connection.cpp:499-505`) — un échec de dial fait échouer
-  un bloc qui n'avait besoin d'aucun réseau ; gate `m_files_checked`
-  absent — `next_web_seed_blocks` ne teste que `picker.is_some() &&
-  files.is_some()` (`torrent.rs:5038-5043`), `want_tick` admet les
-  torrents avec peers avant la fin du check (`torrent.rs:8609-8613`)
-  → fetch possible avant vérification disque.
+  reconnect** — verdict : **conforme** (au modèle pull près, note D11).
+  Batch ≤ `web_seed_blocks_per_tick` (4) blocs par tick par torrent
+  (`session.rs:6085,6247`) ≈ `desired_queue_size` rate-based upstream
+  (`urlseed_pipeline_size` mort des deux côtés) ; reuse par base à
+  l'intérieur d'un batch avec vrai pipelining (tous les GET écrits en
+  une fois, réponses lues en série — `web_seed.rs:456-461`,
+  `engine.rs:1532-1601`) ; `Connection: close` → conn retirée +
+  `supports_keepalive=false` + refcount drop (`engine.rs:1687-1689`,
+  `torrent.rs:5896-5901`) = `m_received_disconnect` +
+  `~peer_connection`. Caveats : une tâche = une connexion par batch
+  (upstream garde la conn entre les ticks — handshake TCP par batch
+  en plus, wire-visible mais sans effet sémantique) ; ≤ 1 seed
+  démarré par tick/torrent vs la boucle complète upstream (D11).
 
 - **Pseudo-peer `web_seed_t` : download queue partagée, legs upload
-  N/A** — verdict : **conforme** (au modèle pull près). Blocs trackés
-  sous `WEB_SEED_PEER` (`torrent.rs:5030`), `inc_refcount_all` virtuel
-  (`:5045-5051`), `mark_as_downloading`/`mark_as_writing`/
-  `abort_download` sous la clé (`:5109,5223,5255`) — les vrais peers
-  ne double-requestent pas ; jamais de leg upload (`m_upload_only=
-  true` upstream, `web_connection_base.cpp:88`) ; skips web-seed dans
-  choker/optimistic (`session.rs:7429-7430,7578`) vacuums mais
-  corrects — nos seeds ne sont jamais des conns.
+  N/A** — verdict : **déviation** (partielle). Conforme : clé picker
+  par seed + `web_seed_outstanding` — jamais de double-request ;
+  `mark_as_writing` + `DiskWrite` = le chemin `Piece` ; pas de leg
+  upload (`m_upload_only` upstream implicite) ; `busy` = le slot
+  `peer_info.connection || resolving`. Déviant : le timeout de la
+  session n'aborde pas la tâche engine — zombie qui livre des blocs
+  comptés `redundant_bytes` et dont le `on_web_seed_done` tardif peut
+  écraser `busy`/`refcounted`/`supports_keepalive` d'un successeur
+  (D2) ; `have_files`/`ephemeral`/`interesting` par fichier absents —
+  redirects ré-appris par batch, pas de seeds éphémères enregistrés,
+  non-certain hash-fail sans effet (D6/D10).
 
 ## Déviations
 
-- `crates/bitdaemon-session/src/torrent.rs:5037` — aucun backoff /
-  `disabled` / `have_files` par seed : `next_web_seed_blocks` re-pique
-  une URL en échec à chaque tick. Upstream `web->retry` +
-  `w->disabled || w->removed || w->retry > now || !w->interesting`
-  (`torrent.cpp:11022`) ; `urlseed_wait_retry` (30 s), `web_seed_name_
-  lookup_retry` (1800 s), `Retry-After` (`handle_error`,
-  `web_peer_connection.cpp:619`), `disabled` permanent sur
-  proto/IDNA/port/SSRF/ban/DNS-proxy. Fix : ajouter `retry_until` +
-  `disabled` + `have_files` (ou bitfield fichiers-404) à
-  `WebSeedStatus`/état interne, les consulter dans
-  `next_web_seed_blocks`, parser `Retry-After` dans le leg erreur.
-  Sévérité : **wire-visible** (martèlement d'un seed mort, absence de
-  bannissement).
+- `crates/bitdaemon/src/engine.rs:1671` — `fetch_block(s, &wreq, 4 *
+  1024 * 1024)` : cap de réponse codé en dur à 4 Mio alors que le
+  merge peut produire des `FileRequest` jusqu'à
+  `urlseed_max_request_bytes` (16 Mio défaut, `torrent.rs:5702`).
+  Upstream n'a aucun cap de réponse — `urlseed_max_request_bytes` ne
+  borne que `prefer_contiguous_blocks` (`web_peer_connection.cpp:
+  67-74`). Avec les défauts (`web_seed_blocks_per_tick=4` × 16 Kio)
+  inatteignable ; dès que le knob monte ou `block_size` croît, un
+  span >4 Mio échoue en `HttpError` → `Retry` à l'infini sur une
+  requête que NOUS avons générée. Sévérité : wire-visible (latent).
+  - **sketch** : `let cap = wreq.files.iter().filter(|f|
+    f.got_get).map(|f| f.length as usize + 16 * 1024).max().
+    unwrap_or(64 * 1024)` passé à `fetch_block` (cap par réponse =
+    corps attendu + marge headers) — ou plafonner le merge lui-même.
+    Test : serveur duplex répondant `206` + corps 5 Mio → succès ;
+    corps > attendu → erreur.
 
-- `crates/bitdaemon-session/src/torrent.rs:5247` + `engine.rs:1287-
-  1290` — pas de distinction transient/permanent ni marquage par
-  fichier : un 404 sur `file N` ré-émet la requête sur ce fichier
-  chaque tick ; upstream `have_files.clear_bit(file)` exclut le
-  fichier du seed (`web_peer_connection.cpp:908-918`). Fix : bitfield
-  `have_files` par seed (ou set de file_index 404) consulté au pick
-  via les spans de `map_block`. Sévérité : wire-visible.
+- `crates/bitdaemon-session/src/torrent.rs:5999-6049` +
+  `engine.rs:1671-1682` — timeout d'inactivité : (a) `retry_ms =
+  now + urlseed_wait_retry` alors que `disconnect(timed_out_
+  inactivity, bittorrent)` upstream est sévérité `normal` → **pas**
+  de bump `retry` (`peer_connection.cpp:4988-4996` + `disconnect`
+  default `normal` ; le bump n'arrive que si `error >= failure`) ;
+  (b) `Alert::UrlSeed "web seed timed out"` au lieu de
+  `peer_disconnected_alert` (`peer_connection.cpp:4486-4488`) ; (c)
+  la tâche engine n'est pas tuée — le fetch continue en zombie,
+  livre des blocs → `redundant_bytes`, et son `on_web_seed_done`
+  tardif remet `busy=false`/`supports_keepalive=false`/drop le
+  refcount d'un éventuel successeur (`torrent.rs:5892-5912` n'est
+  pas génération-gardé). Sévérité : état + wire (pénalité 30 s
+  injustifiée + race zombie).
+  - **sketch** : (a) supprimer le `st.retry_ms.max(now + wait)` du
+    leg timeout (le seed re-pique au tick suivant, = upstream) ;
+    (b) poster `Alert::PeerDisconnected`-équivalent (ou variante
+    dédiée) au lieu de `UrlSeed` ; (c) engine : stocker le
+    `JoinHandle` par `(ih,url)` (`self.tasks` existe déjà) et
+    `abort()` au timeout — ou passer une génération dans
+    `WebSeedDone` et ignorer les done des générations périmées dans
+    `on_web_seed_done`.
 
-- `crates/bitdaemon-net/src/web_seed.rs:441-455` + `engine.rs:1387` —
-  `fetch_block` ne valide ni `Content-Range` (206) ni
-  `content_length` (non-206) : corps accepté si `len == want` quel que
-  soit l'offset — upstream `get_range` + `invalid_range` → `disable`
-  (`web_peer_connection.cpp:524-555,963-981`). Fix : lire
-  `parser.content_range()`/`content_length`, vérifier
-  `range_start==start && range_end==start+length`, marquer le seed
-  `disabled` sur mismatch. Sévérité : wire-visible (données
-  silencieusement fausses → hash-fail loop).
+- `crates/bitdaemon/src/engine.rs:1574-1593,1674-1682,1812-1820` —
+  erreurs transport mid-transfer (`WebSeedDialError::Io` post-
+  connect inclus côté lecture, `fetch_block` Io/Timeout,
+  `ShortBody`, EOF-entre-réponses → `Http{status:-1}`) →
+  `WebSeedBackoff::Retry` = +30 s. Upstream : `disconnect(e,
+  op_sock_read)` = sévérité `normal` → **aucun** backoff, re-dial au
+  tick suivant (`peer_connection.cpp:4336-4339,6143` ; seuls les
+  échecs de *connect* sont `failure` → +30 s, `:4274` — notre
+  `WebSeedDialError::Io` au dial y correspond déjà). Sévérité :
+  wire-visible (sous-débit sur seed flaky : 30 s de trou au lieu de
+  reconnexion immédiate, et EOF mid-batch HTTP/1.0 pénalisé).
+  - **sketch** : ajouter `WebSeedBackoff::Now` (release des blocs,
+    `retry_ms` inchangé) pour les legs `fetch_block`
+    `Transport`/`ShortBody`/`Timeout` mid-batch ; garder `Retry`
+    pour les échecs de dial. Attention à l'EOF-entre-réponses :
+    `recv_response` sur stream fermée renvoie un parser vide →
+    `status()==-1` → aujourd'hui classé `Http{-1}` ; le classer
+    `Now` aussi (upstream : EOF = déconnexion normale, la queue
+    survit).
 
-- `crates/bitdaemon-net/src/web_seed.rs:33-57` —
-  `normalize_web_seed_url` **jamais appelée** : seed single-file
-  finissant par `/` n'obtient jamais le nom de fichier → GET du
-  répertoire (upstream ctor `m_path += escape_file_path(file 0)`,
-  `web_peer_connection.cpp:86-99`). Le cas multi-file sans `/` final
-  est sauvé par le render (`web_seed.rs:330-334`) mais le cas
-  single-file est cassé. Fix : appeler la normalization au chargement
-  (`torrent.rs:1104`) ou dans `spawn_web_seed`. Sévérité :
-  wire-visible (fonctionnalité single-file seed inopérante pour les
-  URL directory).
+- `crates/bitdaemon/src/engine.rs:1789-1800` +
+  `torrent.rs:5985-5986` — `Retry-After` honoré tel quel :
+  `Header(d)` → `retry_ms = now + d` même si `d < 30 s`. Upstream
+  `handle_error` fait `retry_web_seed(retry_after)` **puis**
+  `disconnect(status, failure)` qui impose un second
+  `retry_web_seed(urlseed_wait_retry)` → effectif `max(d, 30 s)`
+  (`web_peer_connection.cpp:619-628`, `torrent.cpp:11773-11774` +
+  leg `error >= failure` `:276-280`). Sévérité : état (politesse —
+  on peut revenir avant le 30 s du serveur).
+  - **sketch** : dans le bras `Header(d)` de `retry_web_seed`,
+    `let eff = d.max(s.urlseed_wait_retry)` puis `retry_ms = now +
+    eff`. Test : 503 + `Retry-After: 5` → `retry_ms == now+30 s` ;
+    `Retry-After: 90` → `now+90 s`.
 
-- `crates/bitdaemon/src/engine.rs:1228-1477` — aucun timeout sur le
-  fetch : `resolve`/`connect`/`fetch_block` sans `tokio::time::
-  timeout` ; upstream `web_connection_base::timeout() =
-  urlseed_timeout` (20 s) tue la conn → disconnect libère les blocs.
-  Chez nous un seed qui trickle → blocs `downloading` sous
-  `WEB_SEED_PEER` à jamais (`check_request_timeouts` n'itère que
-  `self.peers`, `torrent.rs:7390`). Fix : timeout `urlseed_timeout`
-  par opération (connect/read) ou global par requête →
-  `on_web_seed_error`. Sévérité : état (fuite de blocs permanente).
+- `crates/bitdaemon/src/engine.rs:1726-1730` — `Location` vide :
+  `resolve_redirect_location(&url, "")` renvoie le referrer →
+  self-redirect → boucle jusqu'à `num_redirects > 64` → `Retry`.
+  Upstream `handle_redirect` : `location.empty()` →
+  `disable(errors::missing_location)` (`web_peer_connection.cpp:
+  658-662`). Sévérité : wire-visible (seed en 302-vide martelé
+  64×/batch au lieu d'être désactivé).
+  - **sketch** : dans le bras `Err(Redirect{location,..})`, avant
+    `resolve_redirect_location`, `if location.is_empty()` →
+    `report!(done, reqs[i..], "missing location",
+    WebSeedBackoff::Disable, saw_close)`. Test : 302 avec header
+    `Location:` vide → `st.disabled` + alerte.
 
-- `crates/bitdaemon/src/engine.rs:1340-1463` — `redirects` et bases
-  éphémères vivent dans la tâche : ré-appris à chaque batch ;
-  upstream persiste `web_seed_t::redirects` + `add_web_seed`
-  éphémère réutilisable (`web_peer_connection.cpp:722-758`), avec
-  `have_files` par fichier sur le seed d'origine ET le redirect. Fix :
-  remonter la table redirects au `Torrent` (par (seed,file_index)) et
-  propager `have_files` manquant. Sévérité : état/perf (round-trip
-  redirect par batch, re-404 répétés).
+- `crates/bitdaemon/src/engine.rs:1487-1786` +
+  `torrent.rs:255-305` — état redirect/éphémère non persistant : les
+  maps `redirects`/`bases`/`base_addrs` meurent avec la tâche —
+  chaque batch re-suit la même chaîne 302, `WebSeed.ephemeral`
+  n'est jamais posé `true` (`torrent.rs:5567`), `interesting`
+  jamais remis à `false` (upstream `m_web->have_files.none_set()` →
+  `interesting=false`, et `have_files.clear_bit(file)` sur le seed
+  d'origine — `web_peer_connection.cpp:723-757` + `on_connected`
+  `:127-135`). Conséquences : GET+302 superflu par batch (wire) ;
+  `no_local_ips` non posé quand l'origine a été jointe en
+  `proxy_hostnames` (`resolved=None` → `resolved_origin_global`
+  false, `engine.rs:4211-4219` vs upstream `is_global(remote() =
+  proxy publique)` → flag posé) ; les seeds éphémères n'apparaissent
+  ni dans `url_seeds()` ni dans les statuses (upstream les liste)
+  ; leur état `retry`/`disabled` propre est inexistant (un redirect
+  mort pénalise le seed d'origine). Sévérité : état/perf + SSRF
+  edge.
+  - **sketch** : monter `redirects: HashMap<file_index,
+    RedirectTarget>` et les flags `ephemeral`/`no_local_ips` dans
+    `WebSeed` (torrent.rs), renvoyés par `WebSeedDone` ; enregistrer
+    les bases redirect comme entrées `web_seed_state` éphémères
+    (jamais persistées — `write_resume_data` `torrent.rs:2391`
+    devra les filtrer, upstream `:11746` `!i->ephemeral`). Fix de
+    taille moyenne ; cœur du modèle par-fichier manquant (voir D10).
 
-- `crates/bitdaemon/src/engine.rs:1294-1308` — SSRF web-seed absent :
-  `connect_web_seed` upstream bloque IP locale + query string quand
-  `ssrf_mitigation` (`torrent.cpp:7231-7250`), et `handle_redirect`
-  pose `no_local_ips` sur les redirects depuis une IP globale
-  (`:670-672`) filtré à la résolution (`:7105`). Rust : rien — un
-  seed internet peut rediriger vers 127.0.0.1/169.254.x. Helpers
-  `is_local`/`is_global` existent (`ip_helpers.rs:13,83`). Fix :
-  check `is_local(addr) && path contient '?'` au connect + filtrer
-  les addrs résolues des redirect-targets si `ssrf_mitigation` et
-  seed d'origine global. Sévérité : wire-visible + **sécurité**.
+- `crates/bitdaemon-session/src/session.rs:8495-8499` — taxonomie
+  d'alertes : tout échec → `Alert::UrlSeed`. Upstream : gates
+  connect-time postent `url_seed_alert` ✓ (`torrent.cpp:6821-6911`)
+  ; `handle_error` (statut non-ok) → `url_seed_alert` **+**
+  `peer_disconnected_alert` (`web_peer_connection.cpp:619-628`) ;
+  `disable()` (invalid_range, missing_location…) → `peer_error_
+  alert` (sévérité `peer_error`, `peer_connection.cpp:4479-4484`) ;
+  EOF/reset/timeout → `peer_disconnected_alert`. Nos `UrlSeed` ne
+  distinguent pas, et aucun `PeerError`/`PeerDisconnected` n'est
+  émis pour un web seed. Le payload `"http {code}: {server}"` reste
+  écarté de `"{code} {reason-phrase}"` (`to_string(status)+" "+
+  m_parser.message()` — V1 déjà noté, toujours présent :
+  `web_seed.rs:472-476` utilise `header("server")`). Sévérité :
+  observabilité (clients filtrant par type d'alerte perdent le
+  signal).
+  - **sketch** : router par `WebSeedBackoff` — `Disable`/`Remove`
+    → `PeerError` (+`UrlSeed` pour les gates connect-time,
+    identifiables par un flag dans `WebSeedFailure`) ; transport
+    mid-transfer → `PeerDisconnected` ; `Http`/`Header` → `UrlSeed`
+    (conforme). Corriger le message : `format!("{status} {reason}")`
+    via `parser.message()` (raison stockée côté parser — sinon
+    status text canonique). Test : 404 → `UrlSeed` ; EOF mid-body →
+    `PeerDisconnected` ; range invalide → `PeerError`.
 
-- `crates/bitdaemon/src/engine.rs:1333-1337` + `engine.rs:3670-3687`
-  — failover multi-endpoints absent : `resolve` garde `.next()` seul ;
-  upstream empile `web->endpoints` et pop le front sur échec de
-  connect (`web_peer_connection.cpp:215-220`,
-  `torrent.cpp:7101-7134`). Fix : garder la liste d'addrs par base,
-  itérer à l'échec. Sévérité : état (connectivity).
+- `crates/bitdaemon/src/engine.rs:1295` +
+  `session_handle.rs:529` — source du proxy web-seed : `proxies.
+  web_seed` n'est peuplé que par `set_web_seed_proxy()` ; upstream
+  cette API est **NO-OP** et le seed utilise `m_ses.proxy()` =
+  `settings_pack::proxy_*` (`session_handle.cpp:1040-1043`,
+  `session_impl.cpp:937-940`). `apply_settings` ne recopie jamais
+  `proxy_*` vers `proxies.*` (`session.rs:5240+` ne touche pas
+  `self.proxies`) → un proxy configuré via `apply_settings_pack`
+  n'atteint pas les web seeds (ni `proxies.peer`, d'ailleurs — à
+  coordonner avec A24). Sévérité : wire-visible (feature morte par
+  le chemin settings).
+  - **sketch** : dans `Session::apply_settings`, reconstruire
+    `proxies.peer/web_seed/dht` depuis `s.proxy_*` quand les champs
+    changent (`update_proxy` upstream), garder `proxies.tracker`
+    gatée par `proxy_tracker_connections` ; `web_seed` =
+    `peer` upstream (même `proxy()`). À arbitrer : soit mapper,
+    soit documenter `won't port` du settings-path (A24 tranche).
 
-- `crates/bitdaemon-session/src/torrent.rs:5194-5239` — compteurs :
-  bytes web-seed hors `payload_downloaded`/`stat_down_*` →
-  `total_download`, `down_rate`, `total_payload_download`, resume
-  `total_downloaded` sous-reportent ; `report_web_seed_downloads`
-  (défaut true) inerte — upstream compte via `m_stat` sauf opt-out
-  (`web_peer_connection.cpp:59-60`). Fix : accumuler
-  `payload_downloaded`/rate avec `data.len()` par leg (honorer le
-  flag). Sévérité : état (stats/resume faux).
+- `crates/bitdaemon/src/engine.rs:1430-1443` — échec de résolution
+  du *proxy* → `WebSeedBackoff::NameLookup` (1800 s). Upstream
+  `on_proxy_name_lookup` error → `web->disabled = true`
+  (`torrent.cpp:6992-7003`) — le retry `web_seed_name_lookup_retry`
+  ne vaut que pour le *host* (`:7095-7098`). Sévérité : état.
+  - **sketch** : bras `Err(e)` du `resolve(&proxy.hostname…)` →
+    `WebSeedBackoff::Disable` (ou variante `ProxyNameLookup`).
+    Test : proxy injoignable au DNS → `st.disabled`.
 
-- `crates/bitdaemon/src/engine.rs:1370-1379` + `plan_piece_request`
-  — bloc pure-pad fait dial+write("") : upstream synthétise les zéros
-  sans réseau (`on_receive_padfile`, `web_peer_connection.cpp:
-  499-505,1272-1324`). Fix : court-circuiter les plans sans `got_get`
-  (livrer des zéros directement à `on_web_seed_block`). Sévérité :
-  état (échec possible d'un bloc sans-besoin-réseau + dial inutile).
+- `crates/bitdaemon-session/src/torrent.rs:3630-3648` — hash-fail :
+  bras certain (`known_bad && ban_web_seeds`) → `disabled` ✓
+  (`peer_info.banned` → `connect_to_url_seed` disable,
+  `torrent.cpp:6852-6864` — même état terminal, alerte `peer_banned`
+  ok). Bras non-certain : `continue` → **rien**. Upstream
+  `received_invalid_data` multi-fichier : `incoming_dont_have` sur
+  le(s) fichier(s)/pièce touchés (`web_peer_connection.cpp:562-
+  601`), ban seulement à `num_have_pieces()==0`, sinon le seed
+  continue sur les autres fichiers ; chez nous le seed entier est
+  re-sollicité sur les mêmes données à chaque hash-fail non-certain.
+  Sévérité : wire-visible (re-fetch de poison).
+  - **sketch** : dépend du `have_files` par seed (item redirect) —
+    à fixer ensemble : bitfield fichiers par `WebSeed`, hash-fail
+    non-certain → clear les bits des fichiers couvrant la pièce,
+    `none_set()` → `interesting=false`. Note : upstream distingue
+    `banned` (caché de `web_seeds()`) de `disabled` (listé) — notre
+    fold ban→disabled garde l'URL listée ; écart tolérable à
+    documenter, ou ajouter `st.banned` pour filtrer `url_seeds()`.
 
-- `crates/bitdaemon-session/src/torrent.rs:5038-5043` — gate
-  `m_files_checked` manquant (`maybe_connect_web_seeds`,
-  `torrent.cpp:11004`) : un torrent non vérifié avec peers tick et
-  peut fetcher des pièces déjà sur disque. Fix : ajouter
-  `!self.files_checked` au early-out. Sévérité : état/perf.
-
-- `crates/bitdaemon-session/src/session.rs:6206` — aucune borne de
-  concurrence par torrent (`max_web_seed_connections` 3, conn limits)
-  ni de `peer_info.connection` équivalent : un fetch par tick par URL
-  pickable → accumulation. Fix : compter les fetches en vol par
-  torrent (`web_seed_state.busy` ou set dédié), caper, ne pas
-  re-spawner pour une URL déjà en vol. Sévérité : état/ressource.
-
-- `crates/bitdaemon/src/engine.rs:1380-1381` — proxy web-seed jamais
-  câblé : `using_proxy=false` constant, `proxies.web_seed` (=
-  `m_ses.proxy()` upstream, filtré par `proxy_peer_connections`/
-  `proxy_hostnames` — `torrent.cpp:6786-6791,6924-6946`) déclaré non
-  lu. Fix : si proxy http/http_pw actif → conn via proxy (ou
-  CONNECT), `using_proxy=true` (absolute-form + Proxy-Connection +
-  Proxy-Authorization si http_pw), `proxy_hostnames` → résolution
-  distante. Sévérité : wire-visible (feature morte).
-
-- `crates/bitdaemon/src/engine.rs:1387` — payload d'alerte
-  `url_seed_alert` : `"{status} {reason-phrase}"` upstream ; Rust
-  envoie `"http {code}: {server_header}"` (`web_seed.rs:441-446` —
-  utiliser `parser.message()` pas `header("server")`). Sévérité :
-  cosmétique/observabilité.
-
-- `crates/bitdaemon-session/src/torrent.rs:9667-9673` —
-  `retry_web_seed` stub inversé + `maybe_connect_web_seeds`
-  (`:9675-9679`) sans caller — dead code à faire vivre ou marquer ;
-  upstream `retry_web_seed(conn, retry-after)` *pose* le backoff.
-  Sévérité : cosmétique (l'API ne fait rien).
-
-- `crates/bitdaemon-session/src/torrent.rs:3386-3396` — hash-fail :
-  `WEB_SEED_PEER` correctement exclu du disconnect mais **rien** ne
-  reproduit `received_invalid_data` web-seed (clear `have_files`
-  fichier/pièce, ban si `num_have_pieces()==0` single-file, gate
-  `ban_web_seeds` — `web_peer_connection.cpp:562-601`,
-  `torrent.cpp:11919-11926`). Un seed qui sert du poison est
-  re-sollicité indéfiniment. Sévérité : état/wire-visible.
-
-- `crates/bitdaemon/src/engine.rs:1281-1286` — parsing URL : upstream
-  distingue `invalid_hostname`/`invalid_port`/`unsupported_url_
-  protocol`/`blocked_by_idna`/`port_blocked` → `disabled` (jamais
-  retenté) ; Rust `parse_url_components` fail → "invalid url" →
-  retenté chaque tick ; `port==-1→80` même pour https (443 attendu)
-  et port 0 non rejeté ; `allow_idna`/`is_idna` non consulté ;
-  `port_filter` non consulté. Sévérité : wire-visible.
-
-- `crates/bitdaemon/src/engine.rs` — pas de `restart_request`/
-  `restart_piece` (`web_peer_connection.cpp:178-183,240-266,
-  340-366`) : un échec mid-body jette le buffer accumulé de la
-  requête courante ; upstream resume au point d'interruption via
-  suggest. Fix : conserver le fragment partiel par (seed,req) ou
-  accepter le re-téléchargement entier. Sévérité : état/perf (mineur).
-
-- `crates/bitdaemon/src/engine.rs` — pas de `supports_keepalive`
-  appris (`connection_close` sur 1re réponse → `m_web->
-  supports_keepalive=false` → requêtes 4 Mio min, reconnect immédiat
-  sur EOF normal — `web_peer_connection.cpp:65-68,268-274,887-892`).
-  Fix : stocker le flag par seed, l'utiliser dans le sizing.
-  Sévérité : perf (mineur).
-
-- `crates/bitdaemon-core/src/resume_data.rs:314` +
-  `flags.rs:136-141` — `DEPRECATED_OVERRIDE_WEB_SEEDS` posé à la
-  lecture mais jamais appliqué : le merge `resume.url_seeds` ⊕
-  metainfo `url-list` (clear sauf `merge_resume_http_seeds` —
-  `session_handle.cpp:272-294`) n'existe pas ; `merge_resume_*`
-  flags absents. Frontière avec A21 — à coordonner. Sévérité : état.
-
-- `crates/bitdaemon-session/src/torrent.rs:6524-6531` —
-  `remove_url_seed` laisse `web_seed_outstanding` marqués
-  `downloading` sous `WEB_SEED_PEER` jusqu'à la fin (ou la pendaison
-  — cf. timeout) de la tâche en vol ; upstream `remove_web_seed_iter`
-  → disconnect + `picker().clear_peer` immédiat (`torrent.cpp:
-  6764-6776`). Fix : drainer `web_seed_outstanding` par URL (nécessite
-  de tracker URL par bloc ou `clear_peer(WEB_SEED_PEER)` partiel).
-  Sévérité : état (mineur).
-
-- `engine.rs` — `https://` seeds non supportés : connector = TCP
-  clair ; upstream wrappe `ssl_stream` + `m_ssl` +
-  `format_host_header(443)` (`web_connection_base.cpp:61-67`,
-  `torrent.cpp:7177-7185`). Recouvre le périmètre A23 (SSL) —
-  noter comme dépendance. Sévérité : wire-visible (https seeds
-  inopérants).
+- `crates/bitdaemon-session/src/session.rs:6247` — ramp-up : ≤ 1
+  seed dispatché par tick et par torrent ; upstream boucle tous les
+  éligibles à chaque `maybe_connect_web_seeds`
+  (`torrent.cpp:11019-11030`). Converge en N ticks pour N seeds —
+  plus lent, pas incorrect. Sévérité : perf (mineur — à documenter
+  ou boucler `next_web_seed_blocks` tant qu'il renvoie Some).
 
 ## Fichiers du fix
 
-- `crates/bitdaemon-net/src/web_seed.rs` — validation Content-Range/
-  content-length, `message()` dans l'erreur HTTP, gate `disabled`/
-  `have_files` sur la planification (signature de
-  `plan_piece_request` pour recevoir l'état par seed).
-- `crates/bitdaemon-session/src/torrent.rs` — `WebSeedStatus`+état
-  interne : `retry_until`, `disabled`, `have_files`, `busy`,
-  redirects persistants ; gates `files_checked`/`retry`/`disabled`/
-  caps dans `next_web_seed_blocks` ; `on_web_seed_error` varianté
-  (permanent vs transient, fichier 404) ; compteurs payload ;
-  `remove_url_seed` drain ; `piece_failed` hook
-  `web_seed_outstanding`.
-- `crates/bitdaemon-session/src/status.rs` — champs WebSeedStatus.
-- `crates/bitdaemon-session/src/session.rs` — `on_web_seed_error`
-  enrichi (kind/permanent/file_index), alertes `url_seed` payload
-  `"{status} {message}"`, pacing caps.
-- `crates/bitdaemon-session/src/session_handle.rs` — `retry_web_seed`
-  réel (ou retrait), `web_seed_statuses` enrichi.
-- `crates/bitdaemon/src/engine.rs` — timeout `urlseed_timeout`,
-  pads-only short-circuit, multi-endpoints failover, SSRF checks,
-  proxy web-seed, redirects persistants transmis, `https`.
-- `crates/bitdaemon-core/src/resume_data.rs` + `flags.rs` —
-  merge_resume_http_seeds/override (coord. A21).
-- Tests : `crates/bitdaemon-net/tests/test_web_seed_natpmp.rs`,
-  `crates/bitdaemon-session/tests/test_session.rs` (+ nouveau test
-  backoff/404/disable/pure-pad).
+- `crates/bitdaemon/src/engine.rs` — cap `fetch_block`, split des
+  classes d'erreur (`Now`/`Disable` proxy), `Location` vide,
+  redirects persistants remontés, kill-abort des tâches, proxy
+  résolution classée.
+- `crates/bitdaemon-session/src/torrent.rs` — timeout sans backoff,
+  `retry_web_seed` floor `urlseed_wait_retry`, `WebSeed` :
+  `redirects`/`ephemeral`/`no_local_ips`/`have_files`/`banned`,
+  `on_web_seed_done` génération-gardé, `write_resume_data` filtre
+  éphémères, `url_seeds()` filtre banned.
+- `crates/bitdaemon-session/src/session.rs` — routage alertes par
+  classe (`PeerError`/`PeerDisconnected`/`UrlSeed`), boucle ramp-up.
+- `crates/bitdaemon-session/src/alerts.rs` — variantes payload si
+  nécessaire.
+- `crates/bitdaemon-net/src/web_seed.rs` — `MissingLocation`,
+  message `{status} {reason}` (`parser.message()`).
+- `crates/bitdaemon-session/src/status.rs` — champs WebSeedStatus
+  si exposés.
+- Tests : `crates/bitdaemon-net/tests/test_web_seed_natpmp.rs`
+  (fetch 5 Mio, Location vide, Retry-After), nouveau test session
+  (timeout sans backoff, zombie-done ignoré, redirect persistant).
 
 ## Non-bugs tranchés
 
-- **Modèle pull vs connexion persistante** — divergence d'architecture
-  assumée (PORTING.md row `web_connection_base.cpp` + ADR-0008
-  transports injectés) : les seeds sont des tâches de fetch, pas des
-  `peer_connection`. Les items ci-dessus ne portent que sur les
-  *invariants wire-visible/état* que le modèle pull doit quand même
-  respecter.
-- **`is_seed()` vs `is_finished()`** dans `next_web_seed_blocks`
-  (`torrent.rs:5039`) — upstream gate `is_finished()` ; le picker ne
-  rend que des blocs voulus → un torrent finished-non-seed rend
-  `picked` vide → `None` : même observable.
-- **`urlseed_pipeline_size`** (5) — déclaré+sérialisé mais mort
-  upstream aussi (`settings_pack.cpp:241` seule référence src/) ;
-  `web_seed_blocks_per_tick` (4) est l'analogue documenté pull-model.
-- **Legs upload/`m_upload_only`/`disconnect_if_redundant`/`choker`**
-  — N/A pull-model ; les skips choker sur `p.web_seed` sont vacuums
-  mais corrects.
-- **BEP-17 `http_seed_connection`** — supprimé upstream en 2.1 ;
-  `add/remove_http_seed` no-op + `http_seeds()` vide + merge
-  `atp.http_seeds`→`web_seeds` : conforme (`torrent.rs:6472-6487,
-  1109-1120`).
-- **`m_first_request` par connexion** et headers (`User-Agent` gate
-  `anonymous_mode`/`always_send_user_agent`, `Authorization` Basic +
-  same-origin only, `Connection: keep-alive` 1re-req/proxy) —
-  `web_seed.rs:129-164` conforme. Écart : upstream émet
-  `User-Agent:` même vide (`web_connection_base.cpp:113-118`),
-  Rust skip si `user_agent.is_empty()` — différence wire cosmétique
-  assumée (fingerprint deviation documentée PORTING.md settings row).
-- **`ephemeral`/resume** — nos seeds redirect ne sont jamais ajoutés
-  à `web_seeds`, donc rien d'éphémère à exclure du resume ;
-  `write_resume_data` émet tout `web_seeds` (`torrent.rs:2198-2202`)
-  comme upstream émet non-ephemeral — la *perte* de persistance des
-  redirects est la déviation listée plus haut.
-
-## Résultat
-
-Appliqué sur la branche `audit/06-web-seeds` (worktree
-`LibtorrentRust-a06`). Correctifs livrés :
-
-- **`web_seed_t` par seed** (`torrent.rs`) — `retry_ms`,
-  `disabled`, `removed`, `interesting`, `no_local_ips`, `busy`,
-  `supports_keepalive`, `refcounted`, `deadline_ms`, `outstanding`
-  par seed, `status` par URL. Picker key stable par seed
-  (`next_web_seed_key` décrémental depuis `u64::MAX - 1`) — plus de
-  remboursement croisé entre seeds.
-- **Gates `maybe_connect_web_seeds` complets** — `aborted`,
-  `finished`, `is_seed`, `upload_only`, `is_paused`,
-  `files_checked`, `max_connections` (peers + fetches en vol),
-  `connections_limit` session (compte `web_seed_inflight`),
-  `max_web_seed_connections` (`zero_or(…, 100)`, les seeds
-  éligibles-occupés consomment un slot), skips
-  `disabled`/`removed`/`retry > now`/`!interesting`/`busy`.
-- **Sizing upstream** — `prefer_contiguous_blocks` =
-  `max(1 Mio|4 Mio (no keep-alive), piece_length,
-  urlseed_max_request_bytes) / block_size` ; merge cap
-  `urlseed_max_request_bytes`.
-- **Backoff réel** — `WebSeedBackoff` (Retry → `urlseed_wait_retry`,
-  NameLookup → `web_seed_name_lookup_retry`, Header(d) → `Retry-After`
-  verbatim, Disable → `web->disabled`, Remove →
-  `remove_web_seed_iter`) plombé de `spawn_web_seed` à
-  `on_web_seed_error`.
-- **`urlseed_timeout`** — `tokio::time::timeout` par dial/GET
-  moteur + sweep `check_web_seed_timeouts` au tick (release des
-  blocs, `retry_ms = now + urlseed_wait_retry`, `url_seed_alert`) ;
-  deadline ré-armée à chaque bloc reçu (timer par-op upstream).
-- **Validation de réponse** (`web_seed.rs::fetch_block`) — 206 sans
-  `Content-Range` valide → `InvalidRange` (→ `Disable` upstream
-  `disable()`) ; non-206 sans `Content-Length` → idem
-  (`no_content_length`) ; range bien formé mais différent →
-  `RangeMismatch` (retryable, comme upstream `disconnect`) ;
-  `Retry-After` parsé et propagé.
-- **SSRF** — `is_local(addr) && query-string` → `PeerBlocked` +
-  `Disable` ; `no_local_ips` sur les seeds éphémères issus d'une
-  origine globale (filtré à la résolution).
-- **`ip_filter`/`port_filter`/`allow_idna`/proto/port0** — gates
-  `connect_to_url_seed` complets avec classes Disable/Remove.
-- **Proxy + TLS** — http : `no_connect` + absolute-form +
-  `Proxy-Authorization` ; https via CONNECT (`send_host_in_connect`
-  / `proxy_hostnames` honorent le nom) ; socks4/5 avec
-  `connect_dest`/`SocksTarget::Name` (pas de fuite DNS) ; `https://`
-  wrappe `ssl_connect` (+ port par défaut 443).
-- **Keep-alive** — `Connection: close` → `supports_keepalive=false`
-  (élargit la taille préférée suivante) + drop refcount.
-- **Compteurs** — `report_web_seed_downloads` on →
-  `web_seed_payload_downloaded` plié dans `total_download`,
-  `update_rates` (down + wire), `Counter::RecvPayloadBytes` ;
-  blocs stalles → `redundant_bytes` sans réécriture.
-- **`normalize_web_seed_url`** appelée dans `spawn_web_seed`
-  (single-file `/` → +nom échappé ; multi-file → `/` terminal).
-- **Pure-pad** — groupe sans `got_get` répondu avec des zéros sans
-  dial (`on_receive_padfile`).
-- **Cycle de vie conn** — `inc_refcount_all` à la première
-  connexion du seed, `dec_refcount_all` sur erreur/timeout/
-  `Connection: close`/remove/ban (`~peer_connection` upstream).
-- **`remove_url_seed`** — draine les blocs outstanding du seed
-  immédiatement ; tombstone `removed` si une tâche est en vol
-  (GC dans `on_web_seed_done`).
-- **`ban_web_seeds`** — `known_bad` sur une clé web-seed →
-  `disabled` + `url_seed_alert`.
-
-Déviations restantes (inchangées, hors périmètre ou mineures) :
-
-- **`have_files` par fichier** — un 404 fichier reste invisible au
-  pick (upstream exclut le fichier du seed) ; partiellement couvert
-  par le backoff de la seed entière.
-- **Redirects persistants** (`web_seed_t::redirects` au niveau
-  torrent, appris une fois) — toujours ré-appris par tâche.
-- **Failover multi-endpoints** (`web->endpoints`, pop-front sur
-  échec de connect) — `resolve` ne retourne qu'une adresse.
-- **`restart_request`/`restart_piece`** — pas de reprise
-  mid-body ; le fragment partiel est perdu (re-téléchargement).
-- **Payload `url_seed_alert`** — `"{status} {server-header}"` au
-  lieu de `"{status} {reason-phrase}"` (cosmétique).
-- **`DEPRECATED_OVERRIDE_WEB_SEEDS`/merge resume** — frontière
-  A21 (resume-data), à coordonner là-bas.
-
-Tests ajoutés : 8 session (`test_session.rs` — gate files_checked,
-backoff par seed, disable terminal, sweep timeout, cap connexion,
-compteurs on/off, bloc stale→redundant, remove libère + refcount,
-merge cap) + 5 net (`test_web_seed_natpmp.rs` — Content-Range
-absent/mismatch, Content-Length absent, Retry-After,
-Connection: close).
+- **Modèle pull vs connexion persistante** — assumé (ADR-0008,
+  transports injectés). Reconnect-par-batch = un handshake TCP de
+  plus par batch : wire-visible, sans divergence d'état. Le vrai
+  pipelining intra-batch (tous les GET écrits d'un coup) est
+  conforme au comportement upstream.
+- **`urlseed_pipeline_size`** — dead setting upstream (aucun usage
+  `src/`) ; notre `web_seed_blocks_per_tick` est un knob équivalent
+  assumé, pas un port du setting mort.
+- **`retry_ms = max(...)` vs overwrite** — upstream `retry = now +
+  retry` écrase ; nous prenons le max (jamais plus tôt qu'un backoff
+  existant). Direction plus conservative, sans divergence
+  observable majeure.
+- **`is_upload_only`/`is_paused` gatés dans `next_web_seed_blocks`**
+  vs upstream dans `connect_web_seed` après resolve — même effet
+  observable (pas de fetch), ordre des gates différent mais
+  invisible.
+- **`web_seed_inflight` hors `--limit` des seeds éligibles** : la
+  consommation de slot par seed éligible-connecté est reproduite
+  (`torrent.rs:5586-5601`).
+- **`ephemeral` absent de `url_seeds()`** : upstream `web_seeds()`
+  les liste (filtre `banned`/`removed` seuls) — couvert sous
+  déviation, pas non-bug.
