@@ -10,7 +10,6 @@
 use bitdaemon_common::flags::PeerSourceFlags;
 use bitdaemon_common::types::StorageIndex;
 use bitdaemon_common::{Bitfield, Sha1Hash};
-use bitdaemon_net::pe_crypto::EncPolicy;
 use bitdaemon_session::session::{Session, SessionOut};
 use bitdaemon_session::settings::SessionSettings;
 use bitdaemon_session::torrent::Torrent;
@@ -63,14 +62,11 @@ fn pump_capped_by_connection_speed() {
         ..harness_settings()
     });
     let ih = s.add_torrent(torrent(1, 8));
-    let dials = s.try_connect_more_peers(0, EncPolicy::Enabled, None);
+    let dials = s.try_connect_more_peers(0, None);
     assert_eq!(dials.len(), 3);
     assert!(dials.iter().all(|(i, ..)| *i == ih));
     // a second pass keeps handing out (candidates left).
-    assert_eq!(
-        s.try_connect_more_peers(1, EncPolicy::Enabled, None).len(),
-        3
-    );
+    assert_eq!(s.try_connect_more_peers(1, None).len(), 3);
 }
 
 #[test]
@@ -85,14 +81,11 @@ fn boost_dials_deduct_from_speed() {
     for _ in 0..4 {
         s.inc_boost_connections();
     }
-    let dials = s.try_connect_more_peers(0, EncPolicy::Enabled, None);
+    let dials = s.try_connect_more_peers(0, None);
     assert_eq!(dials.len(), 6);
     assert!(dials.iter().all(|(i, ..)| *i == ih));
     // boost consumed — next pass is the full budget again.
-    assert_eq!(
-        s.try_connect_more_peers(1, EncPolicy::Enabled, None).len(),
-        6
-    );
+    assert_eq!(s.try_connect_more_peers(1, None).len(), 6);
 }
 
 #[test]
@@ -107,7 +100,7 @@ fn smooth_connects_halves_free_slot_burst() {
     });
     s.add_torrent(torrent(1, 30));
     // free slots = 20 → cap = (20+1)/2 = 10 < 30 → 10 dials.
-    let dials = s.try_connect_more_peers(0, EncPolicy::Enabled, None);
+    let dials = s.try_connect_more_peers(0, None);
     assert_eq!(dials.len(), 10);
 }
 
@@ -124,7 +117,7 @@ fn finished_torrents_share_via_ratio() {
     let mut fin = torrent(2, 6);
     fin.finished = true;
     let fin = s.add_torrent(fin);
-    let dials = s.try_connect_more_peers(0, EncPolicy::Enabled, None);
+    let dials = s.try_connect_more_peers(0, None);
     assert_eq!(dials.len(), 4);
     let by_dl = dials.iter().filter(|(i, ..)| *i == dl).count();
     let by_fin = dials.iter().filter(|(i, ..)| *i == fin).count();
@@ -143,7 +136,7 @@ fn prioritized_torrent_dials_first() {
     // upstream `prioritize_connections` — tracker-response torrents
     // get 10 tickets ahead of the round-robin.
     s.prioritize_connections(b);
-    let dials = s.try_connect_more_peers(0, EncPolicy::Enabled, None);
+    let dials = s.try_connect_more_peers(0, None);
     assert!(dials.iter().all(|(i, ..)| *i == b));
     let _ = a;
 }
@@ -155,10 +148,7 @@ fn connections_limit_blocks_the_pump() {
         ..harness_settings()
     });
     s.add_torrent(torrent(1, 4));
-    assert!(
-        s.try_connect_more_peers(0, EncPolicy::Enabled, None)
-            .is_empty()
-    );
+    assert!(s.try_connect_more_peers(0, None).is_empty());
 }
 
 #[test]
@@ -235,10 +225,7 @@ fn connect_boost_fires_on_tracker_response() {
     );
     // and `boost_connections` was credited for the first burst —
     // the next pump pass deducts 4 from `connection_speed` = 2 → 0.
-    assert!(
-        s.try_connect_more_peers(10, EncPolicy::Enabled, None)
-            .is_empty()
-    );
+    assert!(s.try_connect_more_peers(10, None).is_empty());
 }
 
 #[test]
@@ -252,23 +239,31 @@ fn utp_flags_follow_dial_outcome() {
     let st = s.peer_list_state();
     // drain one candidate manually so we control the outcome.
     let t = s.torrents.get_mut(&ih).unwrap();
-    let (ep1, ..) = t.try_connect_peer(0, &st, EncPolicy::Enabled, &[]).unwrap();
-    // uTP failure → supports_utp cleared, no cooldown: upstream
-    // `connect_failed` re-dials the SAME entry over TCP right away
-    // (`connect_to_peer(pi, ignore_limit)`) — the retry rides
-    // `pending_out`, bypassing the candidate scan.
-    s.peer_connect_failed(&ih, ep1, true, false);
+    let (ep1, _pid1) = t.try_connect_peer(0, &st, &[]).unwrap();
+    // uTP failure → supports_utp cleared, no cooldown: the deferred
+    // `connect_to_peer` retry rides `pending_out` (the entry was
+    // re-marked connecting inside `peer_dial_failed`).
+    s.peer_connect_failed(&ih, ep1, true);
     let i = s.torrents[&ih].peer_list.find_peer(ep1.ip()).unwrap();
     assert!(!s.torrents[&ih].peer_list.peers()[i].supports_utp);
-    assert!(s.pending_out.iter().any(|o| matches!(
-        o,
-        SessionOut::ConnectPeer { ep, .. } if *ep == ep1
-    )));
-    // the other candidate still dials normally through the pump.
     let t = s.torrents.get_mut(&ih).unwrap();
-    let (ep2, ..) = t.try_connect_peer(1, &st, EncPolicy::Enabled, &[]).unwrap();
+    let (ep2, pid2) = t.try_connect_peer(1, &st, &[]).unwrap();
+    assert_ne!(ep2, ep1);
     let t = s.torrents.get_mut(&ih).unwrap();
-    t.peer_connected_outgoing(ep2, false, 1, 1, false, true, None);
+    t.peer_connected_outgoing(
+        ep2,
+        bitdaemon_session::torrent::PeerAttach {
+            outgoing: true,
+            encrypted: false,
+            protocol_v2: false,
+            was_utp: true,
+            out_enabled: false,
+        },
+        1,
+        42,
+        false,
+        Some(pid2),
+    );
     let i = t.peer_list.find_peer(ep2.ip()).unwrap();
     let p = &t.peer_list.peers()[i];
     assert!(p.confirmed_supports_utp);

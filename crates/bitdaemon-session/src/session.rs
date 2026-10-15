@@ -136,13 +136,6 @@ pub enum SessionOut {
         ih: Sha1Hash,
         /// remote endpoint.
         ep: SocketAddr,
-        /// dial MSE-encrypted (`bt_peer_connection` policy pick).
-        encrypted: bool,
-        /// `m_fast_reconnect` — this dial is a pe_enabled/uTP
-        /// retry arm: the peer-list entry was already rewound, the
-        /// conn carries the flag so `connection_closed` keeps the
-        /// stamp.
-        fast_reconnect: bool,
         /// the peer-id generated for this conn's handshake
         /// (`create_peer_connection` — per-conn `generate_peer_id`,
         /// tracked in the torrent's `outgoing_pids`).
@@ -1254,14 +1247,14 @@ impl Session {
     /// downloading/finished round-robin at the
     /// `connect_seed_every_n_download` ratio. `speed_override`
     /// replaces `connection_speed` (harness knob — upstream has no
-    /// equivalent). Returns `(ih, endpoint, encrypted)` dial
-    /// requests.
+    /// equivalent). Returns `(ih, endpoint)` dial requests — the
+    /// wire crypto is decided per-dial by [`Self::peer_link_up`]
+    /// once the stream exists (upstream `on_connected`).
     pub fn try_connect_more_peers(
         &mut self,
         session_time: i32,
-        out_policy: bitdaemon_net::pe_crypto::EncPolicy,
         speed_override: Option<i32>,
-    ) -> Vec<(Sha1Hash, SocketAddr, bool, bool, bitdaemon_common::PeerId)> {
+    ) -> Vec<(Sha1Hash, SocketAddr, bitdaemon_common::PeerId)> {
         let mut dials = Vec::new();
         // `peer_fingerprint` — per-conn `generate_peer_id` seed for
         // the dial pid (`create_peer_connection`).
@@ -1393,11 +1386,11 @@ impl Session {
                 }
                 continue;
             }
-            match t.try_connect_peer(session_time, &st, out_policy, &fp) {
-                Some((ep, enc, fast, pid)) => {
+            match t.try_connect_peer(session_time, &st, &fp) {
+                Some((ep, pid)) => {
                     self.counters
                         .inc(crate::counters::Counter::ConnectionAttempts);
-                    dials.push((ih, ep, enc, fast, pid));
+                    dials.push((ih, ep, pid));
                     max_connections -= 1;
                     steps_since_last_connect = 0;
                 }
@@ -1429,7 +1422,6 @@ impl Session {
     /// `prioritize_connections`.
     fn do_connect_boost(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
         let st = self.peer_list_state();
-        let policy = self.settings.out_enc_policy;
         let nconn = self.num_connections();
         let Some(t) = self.torrents.get_mut(ih) else {
             return;
@@ -1442,7 +1434,6 @@ impl Session {
         let dials = t.do_connect_boost(
             self.session_time,
             &st,
-            policy,
             nconn,
             &self.settings,
             &self.settings.peer_fingerprint,
@@ -1450,7 +1441,7 @@ impl Session {
         for _ in &dials {
             self.inc_boost_connections();
         }
-        for (ep, enc, fast, pid) in dials {
+        for (ep, pid) in dials {
             // `peer_connect_alert` — upstream posts it at dial for
             // outgoing conns (`peer_connection::start`).
             self.alerts.post(Alert::PeerConnect {
@@ -1460,8 +1451,6 @@ impl Session {
             out.push(SessionOut::ConnectPeer {
                 ih: *ih,
                 ep,
-                encrypted: enc,
-                fast_reconnect: fast,
                 our_pid: pid,
             });
         }
@@ -3796,13 +3785,22 @@ impl Session {
             let Some(t) = t else {
                 return;
             };
+            // the `pe_support` write-backs are `is_outgoing() &&
+            // out_enc_policy == pe_enabled`-gated upstream.
+            let out_enabled =
+                self.settings.out_enc_policy == bitdaemon_net::pe_crypto::EncPolicy::Enabled;
             match t.peer_connected_outgoing(
                 remote,
-                conn.supports_encryption,
+                crate::torrent::PeerAttach {
+                    outgoing: true,
+                    encrypted: conn.supports_encryption,
+                    protocol_v2: conn.protocol_v2,
+                    was_utp,
+                    out_enabled,
+                },
                 session_time,
                 peer,
                 conn.fast_reconnect,
-                was_utp,
                 conn.our_peer_id,
             ) {
                 Some((_, dl, ul)) => {
@@ -4019,11 +4017,16 @@ impl Session {
                     bitdaemon_net::peer_list::NewConnVerdict::Attach(i) => {
                         let (dl, ul) = t.peer_connected_attach(
                             i,
-                            conn.supports_encryption,
+                            crate::torrent::PeerAttach {
+                                outgoing: false,
+                                encrypted: conn.supports_encryption,
+                                protocol_v2: conn.protocol_v2,
+                                was_utp,
+                                out_enabled: false,
+                            },
                             session_time,
                             peer,
                             conn.fast_reconnect,
-                            was_utp,
                             false,
                         );
                         conn.stat_down_total += dl;
@@ -4148,11 +4151,16 @@ impl Session {
                         t.peer_list.unlock_peer();
                         let (dl, ul) = t.peer_connected_attach(
                             index,
-                            conn.supports_encryption,
+                            crate::torrent::PeerAttach {
+                                outgoing: false,
+                                encrypted: conn.supports_encryption,
+                                protocol_v2: conn.protocol_v2,
+                                was_utp,
+                                out_enabled: false,
+                            },
                             session_time,
                             peer,
                             conn.fast_reconnect,
-                            was_utp,
                             false,
                         );
                         conn.stat_down_total += dl;
@@ -4219,14 +4227,9 @@ impl Session {
                 ih: *ih,
                 remote: remote.to_string(),
             });
-            // `peer_info::protocol_v2` — the handshake came in keyed
-            // by the torrent's v2 (SHA-256, truncated) info-hash.
-            conn.protocol_v2 = self
-                .torrents
-                .get(ih)
-                .and_then(|t| t.ti.as_ref())
-                .and_then(|ti| ti.info_hash_v2())
-                .is_some_and(|v2| v2.as_bytes()[..20] == ih.as_bytes()[..]);
+            // `peer_info::protocol_v2` — resolved at handshake parse
+            // (skey version / reserved bit / v2 echo); the engine
+            // already wrote it on the conn.
             // `m_exceeded_limit` re-eval — the session may have
             // dipped back under the cap between accept and attach.
             if conn.exceeded_limit
@@ -4802,45 +4805,246 @@ impl Session {
         self.route(*ih, eff, &mut out);
     }
 
-    /// `peer_connect_failed` — an outbound dial never completed the
-    /// handshake. `was_utp` marks uTP sockets: upstream clears
-    /// `supports_utp`, fast-reconnects the entry (no failcount,
-    /// normal severity) and immediately re-dials it over TCP —
-    /// the returned retry rides `pending_out` as a `ConnectPeer`.
-    /// `conn_fast` is the failed conn's own `m_fast_reconnect` (an
-    /// MSE retry keeps the dial-time `last_connected` stamp).
-    pub fn peer_connect_failed(
+    /// `peer_connection::connect_failed` + `disconnect(e, op, sev)`
+    /// — an outbound dial died before attach (transport refusal or
+    /// handshake failure). Applies the upstream counter block and
+    /// alert (`peer_disconnected` for severity ≤ failure,
+    /// `peer_error` otherwise — posted even when the torrent is
+    /// gone, like upstream's detached handles), then the swarm-entry
+    /// bookkeeping. A failed uTP leg on a `supports_utp` peer posts
+    /// upstream's deferred TCP retry (`connect_to_peer(pi,
+    /// ignore_limit)`) as a `ConnectPeer` on `pending_out`.
+    pub fn peer_dial_failed(
         &mut self,
         ih: &Sha1Hash,
         remote: SocketAddr,
-        was_utp: bool,
-        conn_fast: bool,
+        fail: &bitdaemon_net::bt_peer_conn::DialFail,
     ) {
-        let Some(t) = self.torrents.get_mut(ih) else {
-            return;
-        };
-        if let Some((ep, enc, fast, pid)) = t.peer_connect_failed(
-            remote,
-            self.session_time,
+        use bitdaemon_net::pe_crypto::EncPolicy;
+        self.disconnect_alert_counters(*ih, remote, fail, true);
+        // `init_bt_handshake` re-arms `pe_support` the instant PE4
+        // completes — before the inner handshake — so a conn whose
+        // encrypted portion finished retries encrypted even when the
+        // BT leg failed. Gated `is_outgoing && pe_enabled` upstream.
+        if fail.mse_done && self.settings.out_enc_policy == EncPolicy::Enabled {
+            if let Some(t) = self.torrents.get_mut(ih) {
+                t.rearm_pe_support(remote);
+            }
+        }
+        if let Some(t) = self.torrents.get_mut(ih) {
+            if let Some(pid) = t.peer_dial_failed(
+                remote,
+                self.session_time,
+                fail,
+                &self.settings.peer_fingerprint,
+            ) {
+                // `connect_to_peer(pi, ignore_limit)` — the retry
+                // bypasses the connect-pump budget (the dial mark
+                // was re-armed, not refunded).
+                self.alerts.post(Alert::PeerConnect {
+                    ih: *ih,
+                    remote: remote.to_string(),
+                });
+                self.pending_out.push(SessionOut::ConnectPeer {
+                    ih: *ih,
+                    ep: remote,
+                    our_pid: pid,
+                });
+            }
+        }
+    }
+
+    /// `disconnect()` on an *inbound* conn that died during the
+    /// accept-side handshake — upstream runs the same counter block
+    /// and posts the same alert even for an unattached conn (the
+    /// alert's torrent handle is simply invalid). The peer-list legs
+    /// are a no-op: `new_connection` registers the entry only after
+    /// the full handshake, so `connection_closed` sees a null
+    /// `peer_info_struct`.
+    pub fn peer_conn_failed_inbound(
+        &mut self,
+        ih: Option<Sha1Hash>,
+        remote: SocketAddr,
+        fail: &bitdaemon_net::bt_peer_conn::DialFail,
+    ) {
+        use crate::counters::Counter as C;
+        self.counters.add(C::NumPeersHalfOpen, -1);
+        self.disconnect_alert_counters(ih.unwrap_or_default(), remote, fail, false);
+    }
+
+    /// the `disconnect()` counter block + alert — shared by the
+    /// outgoing-dial and inbound-accept failure paths. `outgoing`
+    /// selects `error_outgoing_peers`/`error_incoming_peers`.
+    fn disconnect_alert_counters(
+        &mut self,
+        ih: Sha1Hash,
+        remote: SocketAddr,
+        fail: &bitdaemon_net::bt_peer_conn::DialFail,
+        outgoing: bool,
+    ) {
+        use crate::counters::Counter as C;
+        use bitdaemon_net::bt_peer_conn::{DisconnectSeverity, FailOp};
+        // `connect_failed` bumps `connect_timeouts` for the transport
+        // refusal itself; `timed_out_no_handshake` inside
+        // `disconnect()` carries it for the handshake deadline.
+        if fail.op == FailOp::Connect {
+            self.counters.inc(C::ConnectTimeouts);
+        }
+        // `disconnected_peers` — every `ec != 0` close.
+        self.counters.inc(C::DisconnectedPeers);
+        // per-`ec` transport legs.
+        if let Some(k) = fail.io_kind {
+            use std::io::ErrorKind as K;
+            let c = match k {
+                K::ConnectionReset => Some(C::ConnresetPeers),
+                K::UnexpectedEof => Some(C::EofPeers),
+                K::ConnectionRefused => Some(C::ConnrefusedPeers),
+                K::ConnectionAborted => Some(C::ConnabortedPeers),
+                K::NotConnected => Some(C::NotconnectedPeers),
+                K::PermissionDenied => Some(C::PermPeers),
+                K::BrokenPipe => Some(C::BrokenPipePeers),
+                K::AddrInUse => Some(C::AddrinusePeers),
+                K::TimedOut => Some(C::TransportTimeoutPeers),
+                _ => None,
+            };
+            if let Some(c) = c {
+                self.counters.inc(c);
+            }
+        }
+        // named lt-error legs (`timed_out_no_handshake` & co.).
+        if let Some(c) = crate::counters::disconnect_reason_counter(fail.reason) {
+            self.counters.inc(c);
+        }
+        if fail.severity > DisconnectSeverity::Normal {
+            self.counters.inc(if fail.utp {
+                C::ErrorUtpPeers
+            } else {
+                C::ErrorTcpPeers
+            });
+            self.counters.inc(if outgoing {
+                C::ErrorOutgoingPeers
+            } else {
+                C::ErrorIncomingPeers
+            });
+            // crypto legs — `type()==bittorrent && op != connect`:
+            // `supports_encryption` → `error_encrypted_peers`, plus
+            // `rc4_encrypted` → `error_rc4_peers`.
+            if fail.op != FailOp::Connect && fail.encrypted {
+                self.counters.inc(C::ErrorEncryptedPeers);
+                if fail.rc4 {
+                    self.counters.inc(C::ErrorRc4Peers);
+                }
+            }
+        }
+        if fail.severity == DisconnectSeverity::PeerError {
+            self.counters.inc(C::ErrorPeers);
+            self.alerts.post(Alert::PeerError {
+                ih,
+                remote: remote.to_string(),
+                op: fail.op.name().into(),
+                error: fail.reason.into(),
+            });
+        } else {
+            self.alerts.post(Alert::PeerDisconnected {
+                ih,
+                reason: format!("peer {remote}: {}", fail.reason),
+            });
+        }
+    }
+
+    /// `peer_connect_failed` — a transport-level dial failure
+    /// (`connect()` refused/errored). Thin wrapper over
+    /// [`Self::peer_dial_failed`]; returns `true` when the deferred
+    /// TCP retry is owed (failed uTP leg).
+    pub fn peer_connect_failed(&mut self, ih: &Sha1Hash, remote: SocketAddr, was_utp: bool) {
+        let fail = bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
+            std::io::ErrorKind::Other,
             was_utp,
-            conn_fast,
-            self.settings.out_enc_policy,
-            &self.settings.peer_fingerprint,
-        ) {
-            // `connect_to_peer(pi, ignore_limit)` — the retry
-            // bypasses the connect-pump budget (the dial mark was
-            // re-armed, not refunded).
-            self.alerts.post(Alert::PeerConnect {
-                ih: *ih,
-                remote: ep.to_string(),
+        );
+        self.peer_dial_failed(ih, remote, &fail);
+    }
+
+    /// `bt_peer_connection::on_connected` — runs on a freshly
+    /// *connected* outbound socket, before the handshake is written:
+    /// the wire crypto is decided there (the `pe_support` toggle and
+    /// the `fast_reconnect` arm both live at this point upstream).
+    /// `is_ssl` forces `pe_disabled` (SSL streams never run MSE).
+    ///
+    /// Returns `(wire_ih, protocol_v2, has_v2, encrypted)` — the
+    /// `associated_info_hash` for the wire + SKEY, the conn's
+    /// protocol version, the v2 reserved-bit advertise, and whether
+    /// to run MSE. `None` when the peer entry vanished mid-dial.
+    pub fn peer_link_up(
+        &mut self,
+        ih: &Sha1Hash,
+        remote: SocketAddr,
+        is_ssl: bool,
+    ) -> Option<(Sha1Hash, bool, bool, bool)> {
+        let policy = self.settings.out_enc_policy;
+        let stime = self.session_time;
+        self.torrents
+            .get_mut(ih)?
+            .peer_link_up(remote, policy, is_ssl, stime)
+    }
+
+    /// Resolve an inbound wire info-hash (plaintext handshake or MSE
+    /// skey) to a torrent — upstream `torrent_list::find`/`find_
+    /// obfuscated` semantics: every torrent is indexed under *both*
+    /// its v1 hash and its truncated v2 hash.
+    #[must_use]
+    pub fn known_torrent(
+        &self,
+        wire_ih: &Sha1Hash,
+    ) -> Option<bitdaemon_net::bt_peer_conn::KnownTorrent> {
+        use bitdaemon_common::info_hash::ProtocolVersion as PV;
+        self.torrents.iter().find_map(|(kih, t)| {
+            let mut hit = None;
+            t.info_hashes.for_each(|h, v| {
+                if hit.is_none() && h == *wire_ih {
+                    hit = Some(Self::known_torrent_of(kih, t, h, v == PV::V2));
+                }
             });
-            self.pending_out.push(SessionOut::ConnectPeer {
-                ih: *ih,
-                ep,
-                encrypted: enc,
-                fast_reconnect: fast,
-                our_pid: pid,
+            hit
+        })
+    }
+
+    /// `torrent_list::find_obfuscated` — resolve an MSE `req2`
+    /// stream-key hash (`SHA1("req2" + ih)`) to a torrent; both the
+    /// v1 and the truncated v2 hash of every torrent are probed
+    /// (upstream indexes each under its own obfuscated key).
+    #[must_use]
+    pub fn known_torrent_by_skey(
+        &self,
+        sk: &Sha1Hash,
+    ) -> Option<bitdaemon_net::bt_peer_conn::KnownTorrent> {
+        use bitdaemon_common::info_hash::ProtocolVersion as PV;
+        self.torrents.iter().find_map(|(kih, t)| {
+            let mut hit = None;
+            t.info_hashes.for_each(|h, v| {
+                if hit.is_none() && bitdaemon_net::pe_crypto::stream_key_hash(&h) == *sk {
+                    hit = Some(Self::known_torrent_of(kih, t, h, v == PV::V2));
+                }
             });
+            hit
+        })
+    }
+
+    fn known_torrent_of(
+        kih: &Sha1Hash,
+        t: &Torrent,
+        wire_ih: Sha1Hash,
+        protocol_v2: bool,
+    ) -> bitdaemon_net::bt_peer_conn::KnownTorrent {
+        bitdaemon_net::bt_peer_conn::KnownTorrent {
+            ih: *kih,
+            wire_ih,
+            protocol_v2,
+            has_v2: t.info_hashes.has_v2(),
+            v2_ih: t.info_hashes.has_v2().then(|| {
+                t.info_hashes
+                    .get(bitdaemon_common::info_hash::ProtocolVersion::V2)
+            }),
+            valid_metadata: t.valid_metadata(),
         }
     }
 
@@ -5864,7 +6068,13 @@ impl Session {
         self.pe_settings = bitdaemon_net::pe_crypto::PeSettings {
             out_enc_policy: s.out_enc_policy,
             in_enc_policy: s.in_enc_policy,
-            allowed_enc_level: s.allowed_enc_level,
+            // `sanitize_settings`: `allowed_enc_level` outside
+            // {plaintext, rc4, both} → `pe_both` upstream.
+            allowed_enc_level: if matches!(s.allowed_enc_level, 1..=3) {
+                s.allowed_enc_level
+            } else {
+                bitdaemon_net::pe_crypto::enc_level::BOTH
+            },
             prefer_rc4: s.prefer_rc4,
         };
         // `update_dht`/`update_lsd`/`update_natpmp`/`update_upnp`
@@ -6926,9 +7136,8 @@ impl Session {
         // here in upstream order (after scrape, before the unchoke
         // scalers); `ConnectPeer` effects ride `out` and the engine
         // dispatches the dials.
-        let policy = self.settings.out_enc_policy;
         let stime = self.session_time;
-        for (ih, ep, enc, fast, pid) in self.try_connect_more_peers(stime, policy, None) {
+        for (ih, ep, pid) in self.try_connect_more_peers(stime, None) {
             // `peer_connect_alert` — upstream posts it at dial for
             // outgoing conns.
             self.alerts.post(Alert::PeerConnect {
@@ -6938,8 +7147,6 @@ impl Session {
             out.push(SessionOut::ConnectPeer {
                 ih,
                 ep,
-                encrypted: enc,
-                fast_reconnect: fast,
                 our_pid: pid,
             });
         }

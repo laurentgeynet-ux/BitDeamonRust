@@ -248,12 +248,8 @@ fn outgoing_dials_get_distinct_peer_ids() {
     let ih = s.add_torrent(t);
     let st = PeerListState::default();
     let t = s.torrents.get_mut(&ih).unwrap();
-    let (e1, _, _, pid1) = t
-        .try_connect_peer(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled, &[])
-        .unwrap();
-    let (e2, _, _, pid2) = t
-        .try_connect_peer(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled, &[])
-        .unwrap();
+    let (e1, pid1) = t.try_connect_peer(0, &st, &[]).unwrap();
+    let (e2, pid2) = t.try_connect_peer(0, &st, &[]).unwrap();
     assert_ne!(pid1, pid2);
     assert_ne!(e1, e2);
     // both registered for the self-connection probe.
@@ -292,13 +288,13 @@ fn utp_failure_retries_tcp_without_failcount() {
     let ih = t2;
     let st = PeerListState::default();
     // mark a dial on the entry (uTP conns share the entry bookkeeping).
-    let (ep1, _, _, _pid) = s
+    let (ep1, _pid) = s
         .torrents
         .get_mut(&ih)
         .unwrap()
-        .try_connect_peer(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled, &[])
+        .try_connect_peer(0, &st, &[])
         .unwrap();
-    s.peer_connect_failed(&ih, ep1, true, false);
+    s.peer_connect_failed(&ih, ep1, true);
     let t = &s.torrents[&ih];
     let i = t.peer_list.find_peer(ep1.ip()).unwrap();
     let p = &t.peer_list.peers()[i];
@@ -311,7 +307,7 @@ fn utp_failure_retries_tcp_without_failcount() {
         SessionOut::ConnectPeer { ih: h, ep, .. } if *h == ih && *ep == ep1
     )));
     // and a normal TCP failure DOES count.
-    s.peer_connect_failed(&ih, ep1, false, false);
+    s.peer_connect_failed(&ih, ep1, false);
     let p = &s.torrents[&ih].peer_list.peers()[i];
     assert_eq!(p.failcount, 1);
 }

@@ -402,6 +402,11 @@ pub struct PeerConn {
     /// `crypto_select` (plaintext-select still counts). Feeds the
     /// `pex_encryption` flag in ut_pex.
     pub supports_encryption: bool,
+    /// `m_rc4_encrypted` — PE4 selected RC4 (`crypto_select == rc4`).
+    /// Drives `peer_info::rc4_encrypted` vs `plaintext_encrypted`
+    /// (upstream reports one of them whenever `m_encrypted`) and the
+    /// `error_rc4_peers` disconnect counter.
+    pub rc4_encrypted: bool,
     /// `HaveAll`/`Have` semantics arrived while the torrent had no
     /// metadata (magnet): the peer claims every piece but
     /// `peer_pieces` could not represent it yet — replayed into a
@@ -607,6 +612,7 @@ impl PeerConn {
             sent_bitfield: false,
             local_dht_port: None,
             supports_encryption: false,
+            rc4_encrypted: false,
             local_dont_have: 7,
             local_share_mode: 8,
             ext_i2p_pex: 0,

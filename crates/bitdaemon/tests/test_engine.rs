@@ -50,7 +50,19 @@ async fn connect_and_receive_bitfield() {
     let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(Some(mine))));
 
     let mut eng = Engine::new(conn, None);
-    let t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
+    // the dial targets a swarm entry (upstream `on_connected` only
+    // runs on a conn created for a `torrent_peer`); boost off so
+    // `add_torrent` doesn't spend the single connector stream.
+    lock(&eng.session).apply_settings(bitdaemon_session::settings::SessionSettings {
+        torrent_connect_boost: 0,
+        ..Default::default()
+    });
+    let mut t = Torrent::new(ih, 4, 128 * 1024, Bitfield::with_size(4), StorageIndex(0));
+    t.add_swarm_peer(
+        ep(),
+        bitdaemon_common::flags::PeerSourceFlags::TRACKER,
+        &mut Vec::new(),
+    );
     lock(&eng.session).add_torrent(t);
 
     // scripted remote: handshake + bitfield(0,2) — keep the stream
@@ -62,7 +74,7 @@ async fn connect_and_receive_bitfield() {
     let hs = write_handshake(&ih, &remote_pid, false, false, false, false);
     boxed.write_all(&hs).await.unwrap();
     let mut buf = [0u8; 68];
-    let dial = eng.connect_peer(&ih, ep(), false);
+    let dial = eng.connect_peer(&ih, ep());
     let (res, _) = tokio::join!(
         dial,
         tokio::io::AsyncReadExt::read_exact(&mut boxed, &mut buf)
@@ -109,9 +121,9 @@ async fn connect_pump_lists_candidates() {
         ses.add_torrent(t);
     }
     let dialing = eng.connect_pump(0, 10);
-    // pe_enabled + pe_support=false → first dial is plaintext
-    // (the self-toggling flag retries encrypted on failure).
-    assert_eq!(dialing, vec![(ih, ep(), false)]);
+    // the pump hands out the endpoint; the wire crypto is decided
+    // at `on_connected` (peer_link_up), not at pick.
+    assert_eq!(dialing, vec![(ih, ep())]);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -314,15 +326,24 @@ async fn spawn_dial_connects_peer() {
     let (mine, theirs) = tokio::io::duplex(64 * 1024);
     let conn = Arc::new(DuplexConnector(tokio::sync::Mutex::new(Some(mine))));
     let mut eng = Engine::new(conn, None);
-    lock(&eng.session).add_torrent(Torrent::new(
-        ih,
-        1,
-        16384,
-        Bitfield::with_size(1),
-        StorageIndex(0),
-    ));
+    // boost off — the test drives `spawn_dial` itself and the
+    // connector holds a single stream.
+    lock(&eng.session).apply_settings(bitdaemon_session::settings::SessionSettings {
+        torrent_connect_boost: 0,
+        ..Default::default()
+    });
     let ep = ep();
-    eng.spawn_dial(ih, ep, false, false, None);
+    let mut t = Torrent::new(ih, 1, 16384, Bitfield::with_size(1), StorageIndex(0));
+    // `peer_link_up` needs a `torrent_peer` entry for the dialed
+    // endpoint (upstream: conns are only opened for peer-list
+    // candidates).
+    t.add_swarm_peer(
+        ep,
+        bitdaemon_common::flags::PeerSourceFlags::TRACKER,
+        &mut Vec::new(),
+    );
+    lock(&eng.session).add_torrent(t);
+    eng.spawn_dial(ih, ep, None);
 
     // scripted remote: answer our handshake + drain the ext handshake
     let remote = tokio::spawn(async move {
@@ -333,7 +354,16 @@ async fn spawn_dial_connects_peer() {
             &pid,
             false,
             false,
-            |_| true,
+            |ih| {
+                Some(bitdaemon_net::bt_peer_conn::KnownTorrent {
+                    ih: *ih,
+                    wire_ih: *ih,
+                    protocol_v2: false,
+                    has_v2: false,
+                    v2_ih: None,
+                    valid_metadata: true,
+                })
+            },
         )
         .await;
         let mut tmp = [0u8; 512];
@@ -395,7 +425,8 @@ async fn acceptor_pump_registers_peer() {
     let remote = tokio::spawn(async move {
         let mut b: BoxedPeerStream = Box::new(theirs);
         let pid = bitdaemon_common::PeerId::default();
-        let _ = bitdaemon_net::bt_peer_conn::run_handshake(&mut b, &ih, &pid, false, false).await;
+        let _ = bitdaemon_net::bt_peer_conn::run_handshake(&mut b, &ih, &pid, false, false, false)
+            .await;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         b
     });
