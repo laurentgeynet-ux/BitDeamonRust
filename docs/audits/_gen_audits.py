@@ -475,6 +475,41 @@ WAVES = {
 }
 WAVE_OF = {aid: w for w, spec in WAVES.items() for aid in spec["ids"]}
 
+# Recommended sequential apply order for one agent: protocol surface
+# first (everything flows through it), then peer supply, swarm
+# behavior, disk internals, metadata/state, peripherals, glue —
+# and the transverse counters sweep last.
+APPLY_ORDER = [
+    ("06", "wire codec — la grammaire du protocole, tout passe par là"),
+    ("07", "extensions — couche directement au-dessus du wire"),
+    ("14", "MSE/PE — enveloppe le handshake, après stabilisation du codec"),
+    ("11", "trackers — source principale de pairs"),
+    ("13", "uTP — transport majeur"),
+    ("12", "web seeds — autre source de données"),
+    ("10", "lifecycle — admission & cycle de vie des pairs"),
+    ("08", "choker — politique d'upload"),
+    ("09", "time-critical — pipeline deadlines"),
+    ("24", "picker — quoi demander, cas limites"),
+    ("21", "state machine — transitions du torrent"),
+    ("26", "path security — surface d'attaque au parsing metainfo"),
+    ("22", "magnet — acquisition metadata (picker+state stabilisés)"),
+    ("20", "resume — persistance sur une state machine fixée"),
+    ("18", "disk cache — internes disque"),
+    ("19", "part_file/file_pool — internes disque"),
+    ("23", "settings — hot-apply sur un session stabilisé"),
+    ("16", "SSL torrents — niche, isole bien"),
+    ("15", "proxies — niche"),
+    ("28", "NAT traversal — discovery"),
+    ("17", "DHT — gros morceau autonome, crate dédiée"),
+    ("27", "engine glue — la boucle qui orchestre tout le reste"),
+    ("29", "bandwidth — quotas au-dessus de tout"),
+    ("25", "counters sweep — filet final, seul"),
+]
+# Guard: every pending audit must appear exactly once in the order.
+assert sorted(a for a, _ in APPLY_ORDER) == sorted(
+    a[0] for a in AUDITS if not a[8]
+), "APPLY_ORDER must cover exactly the pending audits"
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
 
@@ -598,10 +633,20 @@ idx += [
     "  les cœurs). Pour du parallélisme massif : sessions cloud séparées,",
     "  une par audit — chacune a sa machine, son checkout, sa PR.",
     "",
-    "## Ordre conseillé (séquentiel, si un seul agent)",
+    "## Ordre conseillé — apply séquentiel",
     "",
-    "Par blast radius d'interop : A06/A07 (wire+ext) → A11/A13 (réseau) →",
-    "A20 (resume) → A21/A24 (état) → A17 (DHT) → A25 (sweep compteurs final).",
+    "Si un seul agent applique tout : surface protocole d'abord, puis",
+    "sources de pairs, comportement du swarm, disque/état, périphériques,",
+    "glue — et le sweep compteurs en dernier (filet transverse). Les",
+    "rapports eux n'ont aucun ordre (tous parallélisables).",
+    "",
+]
+idx += [f"{i}. **A{aid}** — {why}" for i, (aid, why) in enumerate(APPLY_ORDER, 1)]
+idx += [
+    "",
+    "En parallèle (2-4 apply) : piocher dans la même vague de préférence ;",
+    "l'ordre séquentiel ci-dessus reste le bon guide de priorité entre",
+    "vagues pour les merges.",
     "",
 ]
 with open("docs/audits/INDEX.md", "w", encoding="utf-8") as f:
