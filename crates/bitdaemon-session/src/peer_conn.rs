@@ -2197,6 +2197,37 @@ impl PeerConn {
         })
     }
 
+    /// `peer_connection::picker_options()` — the per-peer legs on
+    /// top of the torrent-level `base` (see
+    /// `piece_picker::picker_options`): parole peers pick
+    /// `on_parole | prioritize_partials` (only pieces they touched
+    /// first) on any branch; inside `rarest_first`, snubbed peers
+    /// pick `reverse` so they converge on the same common pieces —
+    /// else `piece_extent_affinity` when the setting is on and no
+    /// time-critical pieces are open.
+    #[must_use]
+    pub fn picker_options(
+        &self,
+        base: crate::piece_picker::PickerOptions,
+        piece_extent_affinity: bool,
+        time_critical_mode: bool,
+    ) -> crate::piece_picker::PickerOptions {
+        let mut opts = base;
+        if self.on_parole {
+            opts = opts
+                | crate::piece_picker::PickerOptions::ON_PAROLE
+                | crate::piece_picker::PickerOptions::PRIORITIZE_PARTIALS;
+        }
+        if opts.contains(crate::piece_picker::PickerOptions::RAREST_FIRST) {
+            if self.pipeline.snubbed {
+                opts = opts | crate::piece_picker::PickerOptions::REVERSE;
+            } else if piece_extent_affinity && !time_critical_mode {
+                opts = opts | crate::piece_picker::PickerOptions::PIECE_EXTENT_AFFINITY;
+            }
+        }
+        opts
+    }
+
     /// Drive the picker → request queue → wire for this peer
     /// (`request_a_block` + `send_block_requests` in upstream order).
     /// `opts` is `picker_options()` for `mark_as_downloading`.
@@ -2224,20 +2255,8 @@ impl PeerConn {
         let outstanding = self.outstanding();
         let disconnecting = self.disconnecting;
         let time_critical_mode = t.time_critical_mode;
-        // `picker_options()` — parole peers pick `on_parole |
-        // prioritize_partials` (pieces only they touched first);
-        // snubbed peers pick `reverse` so they converge on the
-        // same common pieces.
-        let mut opts = opts;
-        if self.on_parole {
-            opts = opts
-                | crate::piece_picker::PickerOptions::ON_PAROLE
-                | crate::piece_picker::PickerOptions::PRIORITIZE_PARTIALS;
-        }
-        if self.pipeline.snubbed && opts.contains(crate::piece_picker::PickerOptions::RAREST_FIRST)
-        {
-            opts = opts | crate::piece_picker::PickerOptions::REVERSE;
-        }
+        // `picker_options()` — per-peer legs on the caller's base.
+        let opts = self.picker_options(opts, t.piece_extent_affinity, t.time_critical_mode);
         let mut ctx = self.request_ctx(false, disconnecting, rate);
         ctx.outstanding = &outstanding;
         ctx.picker_options = opts;

@@ -50,6 +50,10 @@ pub struct TorrentRequestCtx {
     pub time_critical_mode: bool,
     /// `t.num_peers()` — feeds the picker's partial-pieces cap.
     pub num_peers: i32,
+    /// `settings.piece_extent_affinity` — read by the per-peer legs
+    /// of `picker_options()` (extent-affinity when not snubbed and
+    /// no time-critical pieces are open).
+    pub piece_extent_affinity: bool,
     /// `settings.whole_pieces_threshold` (seconds; 0 disables).
     pub whole_pieces_threshold: i32,
     /// `settings.strict_end_game_mode`.
@@ -169,6 +173,7 @@ pub fn request_a_block(
         || num_outstanding > 0;
 
     let mut busy_block = PieceBlock::INVALID;
+    let mut queued = 0i32;
 
     for &pb in &interesting_pieces {
         if prefer_contiguous_blocks == 0 && num_requests <= 0 {
@@ -194,6 +199,10 @@ pub fn request_a_block(
             continue;
         }
         num_requests -= 1;
+        // upstream's `add_request` pushes to `m_request_queue`
+        // mid-loop — the post-loop `dq.size() + rq.size() > 0`
+        // busy-block gate counts them live.
+        queued += 1;
     }
 
     if num_requests <= 0 {
@@ -203,8 +212,10 @@ pub fn request_a_block(
     // couldn't fill the queue => end-game (unless choked)
     let endgame = !c.peer_choked;
 
-    // no busy block, or requests already outstanding => done
-    if busy_block == PieceBlock::INVALID || num_outstanding > 0 {
+    // no busy block, or requests already outstanding — including
+    // the ones queued by this very pass (`dq + rq` is re-read after
+    // the loop upstream, not snapshotted)
+    if busy_block == PieceBlock::INVALID || num_outstanding + queued > 0 {
         return Some(endgame);
     }
 

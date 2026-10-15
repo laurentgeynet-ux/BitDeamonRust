@@ -273,3 +273,42 @@ Tests ajoutés (`tests/test_piece_picker.rs`) :
 Gates : `cargo fmt --all` · `cargo clippy --workspace --all-targets
 -D warnings` · `cargo test --workspace` (33/33 picker, workspace
 vert) · `cargo doc --workspace --no-deps` — toutes passées.
+
+## Résultat — passe 2
+
+Branche `audit/13-piece-picker` (worktree `C:/Projet/wt/LibtorrentRust-a13`).
+
+Déviations corrigées :
+
+- `request_blocks.rs` — le gate busy-block post-boucle compte
+  maintenant les blocs mis en file *pendant* la passe
+  (`num_outstanding + queued > 0`), équivalent du `dq.size() +
+  rq.size() > 0` relu en live upstream.
+- `picker_options()` complet — nouveau helper
+  `piece_picker::picker_options` (legs torrent-level :
+  `sequential` XOR threshold→`prioritize_partials` XOR
+  `rarest_first`, `prioritize_partial_pieces` ORé dessus) +
+  `PeerConn::picker_options` (legs per-peer : snubbed→`reverse`
+  else `piece_extent_affinity` hors TC dans la branche
+  rarest-first, parole→`on_parole|prioritize_partials` toute
+  branche). `TorrentRequestCtx` gagne `piece_extent_affinity` ;
+  `Torrent::num_have()` ajouté (miroir `torrent::num_have` :
+  seed_mode/picker/have-all). Call sites rewirés : request path
+  (6454), second_tick (9523), web-seed (6785+6818), re-mark
+  inflight (7836), snub-peer replacement (9859), time-critical
+  mark (12104).
+
+Tests ajoutés (`tests/test_piece_picker.rs`) :
+
+- `request_block_busy_waits_for_empty_queue` — une passe qui met en
+  file des blocs libres n'émet pas le busy-block ; il le devient
+  quand la file est réellement vide.
+- `picker_options_legs` — XOR sequential/threshold/rarest_first +
+  `prioritize_partial_pieces`.
+- `peer_picker_options_legs` — snubbed→reverse (rarest_first
+  seulement), extent-affinity else-leg + gate TC, parole sur
+  toute branche.
+
+Gates : `cargo fmt --all` · `cargo clippy --workspace --all-targets
+-D warnings` · `cargo test --workspace` (36/36 picker, workspace
+vert) · `cargo doc --workspace --no-deps` — toutes passées.
