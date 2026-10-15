@@ -644,7 +644,9 @@ async fn upnp_map_cycle() {
         }
     }
     assert_eq!(
-        lock(&eng.session).external_ip_agg().external_address(&observer),
+        lock(&eng.session)
+            .external_ip_agg()
+            .external_address(&observer),
         std::net::IpAddr::from([203, 0, 113, 9])
     );
 }

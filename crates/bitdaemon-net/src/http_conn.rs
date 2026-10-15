@@ -11,10 +11,9 @@
 //! phase is composed by the caller — resolve/connect/proxy first,
 //! then `send_request`/`recv_response`.
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::http_parser::HttpParser;
-use crate::transport::BoxedPeerStream;
 
 /// `default_max_bottled_buffer_size`-scale cap for response buffers.
 pub const MAX_RESPONSE: usize = 16 * 1024 * 1024;
@@ -74,8 +73,8 @@ pub enum HttpError {
 /// `User-Agent`/`Authorization` come from `headers`, gzip always
 /// advertised, one-shot → `Connection: close`). `body` is appended
 /// after the blank line (for POST).
-pub async fn send_request(
-    s: &mut BoxedPeerStream,
+pub async fn send_request<S: AsyncWrite + Unpin>(
+    s: &mut S,
     method: &str,
     path: &str,
     host: &str,
@@ -169,8 +168,8 @@ impl HttpResponse {
 /// whole receive buffer. `read_timeout` bounds *each* `read`
 /// (upstream `http_connection` rearms `tracker_receive_timeout`
 /// on every incoming chunk); `None` waits indefinitely.
-pub async fn recv_response(
-    s: &mut BoxedPeerStream,
+pub async fn recv_response<S: AsyncRead + Unpin>(
+    s: &mut S,
     max_response: usize,
     read_timeout: Option<std::time::Duration>,
 ) -> Result<HttpResponse, HttpError> {
@@ -219,8 +218,8 @@ pub async fn recv_response(
 /// for tracker callers); `stats` accumulates wire bytes when given
 /// (each redirect hop counts, like upstream's per-connection
 /// `sent_bytes`/`received_bytes`).
-pub async fn http_get(
-    s: &mut BoxedPeerStream,
+pub async fn http_get<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut S,
     url: &str,
     headers: &[(String, String)],
     max_response: usize,
