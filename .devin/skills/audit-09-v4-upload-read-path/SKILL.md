@@ -71,6 +71,19 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    ```markdown
    # Audit A09 — rapport d'analyse
 
+   ## Verdicts checklist
+   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
+   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
+   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
+   `## Déviations`. Un rapport « tout conforme » sans preuve par item
+   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   - `incoming_request` : validation piece/start/len (len ≤ 32K sauf allowed_fast), reject vs accept — verdict : … — preuve : …
+   - Upload queue : FIFO, choked peers non servis, `fill_send_buffer` ordering — verdict : … — preuve : …
+   - Drain on choke : requests en vol annulées + `Rejected` wire + `clear_request_queue` — verdict : … — preuve : …
+   - `DontHave`/`Have`/`Rejected` wire encodings — bit-level — verdict : … — preuve : …
+   - Compteurs upload : `num_uploads`, `upload_payload`, read-quotas par canal — verdict : … — preuve : …
+   - fast-extension : allowed_fast requests servis même choked — verdict : … — preuve : …
+
    ## Déviations
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
      (`src/foo.cpp`, fonction) — fix proposé — sévérité

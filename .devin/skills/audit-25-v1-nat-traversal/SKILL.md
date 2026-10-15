@@ -71,6 +71,19 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    ```markdown
    # Audit A25 — rapport d'analyse
 
+   ## Verdicts checklist
+   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
+   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
+   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
+   `## Déviations`. Un rapport « tout conforme » sans preuve par item
+   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   - LSD : multicast group/port, cadence par torrent, cookie, receive → peer feed, off en anonymous_mode — verdict : … — preuve : …
+   - UPnP : SSDP discover, WANIP/WANPPP, AddPortMapping + renew, DeletePortMapping au stop — verdict : … — preuve : …
+   - NAT-PMP/PCP : mapping request, external address, epoch, renew, delete — verdict : … — preuve : …
+   - External IP election : consensus trackers/DHT/UPnP/NAT-PMP → external_ip_alert — verdict : … — preuve : …
+   - portmap alerts : mapping add/error/log transport+protocol — verdict : … — preuve : …
+   - Mapping per listen port : tcp+udp, proto field correct — verdict : … — preuve : …
+
    ## Déviations
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
      (`src/foo.cpp`, fonction) — fix proposé — sévérité

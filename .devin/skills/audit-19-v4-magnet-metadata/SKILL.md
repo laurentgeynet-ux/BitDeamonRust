@@ -71,6 +71,19 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    ```markdown
    # Audit A19 — rapport d'analyse
 
+   ## Verdicts checklist
+   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
+   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
+   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
+   `## Déviations`. Un rapport « tout conforme » sans preuve par item
+   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   - Phases : magnet add → metadata download → verify hash → init picker/files → apply pending state — verdict : … — preuve : …
+   - ut_metadata pacing upstream (intervalle entre requêtes, ban on flood) — verdict : … — preuve : …
+   - pending state préservé : file/piece priorities, trackers, peers, flags à l'arrivée metadata — verdict : … — preuve : …
+   - Ops metadata-less : API qui doivent no-op ou defer (file_priority bounds, trackers add, save_resume) — verdict : … — preuve : …
+   - Metadata reject : hash mismatch → ban peers contributeurs, retry autres — verdict : … — preuve : …
+   - info re-encode : jamais re-sérialiser info pour le hash (bytes verbatim) — verdict : … — preuve : …
+
    ## Déviations
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
      (`src/foo.cpp`, fonction) — fix proposé — sévérité

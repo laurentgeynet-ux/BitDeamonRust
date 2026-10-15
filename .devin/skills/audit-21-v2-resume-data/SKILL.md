@@ -71,6 +71,19 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    ```markdown
    # Audit A21 — rapport d'analyse
 
+   ## Verdicts checklist
+   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
+   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
+   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
+   `## Déviations`. Un rapport « tout conforme » sans preuve par item
+   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   - Champs : pieces bitfield, unfinished, priorities, trackers, peers+banned, seeds_dht, limits, totals, active/seeding time, flags (upload/share/seed/auto_managed/paused/apply_ip_filter), save_path, renamed/mapped_files, file_format_version, ih v2, comment/created_by/creation_date — verdict : … — preuve : …
+   - verify_resume_data verdicts : no_resume/need_full_check, fichiers manquants/modifiés/tailles, `partial` — verdict : … — preuve : …
+   - Snapshot sous I/O : dirty cache blocks cohérents avec le disque post-reload — écritures en vol + fences pendant write_resume_data — verdict : … — preuve : …
+   - Round-trip BIDIRECTIONNEL : fichier upstream → lu ici ; écrit ici → lu par upstream (golden vectors) — verdict : … — preuve : …
+   - Versions : upgrade/downgrade du format resume entre versions libtorrent — verdict : … — preuve : …
+   - save_resume_data timing : dirty flags, déclencheurs `need_save_resume` exhaustifs — verdict : … — preuve : …
+
    ## Déviations
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
      (`src/foo.cpp`, fonction) — fix proposé — sévérité

@@ -71,6 +71,19 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    ```markdown
    # Audit A06 — rapport d'analyse
 
+   ## Verdicts checklist
+   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
+   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
+   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
+   `## Déviations`. Un rapport « tout conforme » sans preuve par item
+   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   - Range requests : pièces complètes vs blocs, `block_size` alignment, coalescing contigu — verdict : … — preuve : …
+   - Erreurs : HTTP non-200, redirect loops, content-length mismatch, EOF mid-piece → url_seed_alert + seed marqué — verdict : … — preuve : …
+   - Retry : backoff par seed, `retry_web_seed`, bannissement temporaire — verdict : … — preuve : …
+   - Attribution : erreurs/compteurs par URL (cohérence du fix récent `on_web_seed_error(url)` sur les deux legs) — verdict : … — preuve : …
+   - Request pacing : `web_seed_blocks_per_tick`, connection reuse vs reconnect — verdict : … — preuve : …
+   - Pseudo-peer `web_seed_t` : download queue partagée, legs upload N/A — verdict : … — preuve : …
+
    ## Déviations
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
      (`src/foo.cpp`, fonction) — fix proposé — sévérité

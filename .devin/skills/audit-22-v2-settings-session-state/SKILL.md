@@ -70,6 +70,18 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    ```markdown
    # Audit A22 — rapport d'analyse
 
+   ## Verdicts checklist
+   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
+   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
+   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
+   `## Déviations`. Un rapport « tout conforme » sans preuve par item
+   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   - apply_settings : chaque clé ayant un effet live vs celles ne s'appliquant qu'au prochain storage/conn — verdict : … — preuve : …
+   - Clés sans effet live : documenté comme upstream — verdict : … — preuve : …
+   - .session file : layout dict, ip_filter4/6, dht_state embed, version compat — verdict : … — preuve : …
+   - Deprecated keys : conservés en écriture pour round-trip interop? — verdict : … — preuve : …
+   - Diff ciblé : parmi les 266 keys validées par défaut, lesquelles sont réellement consommées — verdict : … — preuve : …
+
    ## Déviations
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
      (`src/foo.cpp`, fonction) — fix proposé — sévérité

@@ -70,6 +70,18 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    ```markdown
    # Audit A17 — rapport d'analyse
 
+   ## Verdicts checklist
+   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
+   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
+   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
+   `## Déviations`. Un rapport « tout conforme » sans preuve par item
+   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   - part_file : header format (magic, version, endianness!), slot alloc/free FIFO, export_on_flush, bit `flushed` — verdict : … — preuve : …
+   - Corruption : header illisible → comportement upstream, missing file, taille mismatch — verdict : … — preuve : …
+   - Migration : prioritize → bytes straddling vers .parts, export quand pièce complète — verdict : … — preuve : …
+   - file_pool : LRU eviction, cap `file_pool_size`, open/upgrade read→write, reopen on error — verdict : … — preuve : …
+   - Sparse/allocate flags propagés, `file_open_failed` retry — verdict : … — preuve : …
+
    ## Déviations
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
      (`src/foo.cpp`, fonction) — fix proposé — sévérité

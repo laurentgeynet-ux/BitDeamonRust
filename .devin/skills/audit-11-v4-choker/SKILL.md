@@ -71,6 +71,19 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    ```markdown
    # Audit A11 — rapport d'analyse
 
+   ## Verdicts checklist
+   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
+   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
+   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
+   `## Déviations`. Un rapport « tout conforme » sans preuve par item
+   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   - `unchoke_sort` verbatim : comparateurs rate-based/RR/fastest/anti-leech, quota `piece_length·quota` + 60 s, nth_element top-slots — verdict : … — preuve : …
+   - Slots : fixed vs rate-based, `unchoke_slots_limit`, seed expansions — verdict : … — preuve : …
+   - Optimistic unchoke : période, rotation, `num_opt_unchoke` — verdict : … — preuve : …
+   - Snub/parole/endgame peers exclus ou inclus selon upstream — verdict : … — preuve : …
+   - Choke/unchoke effects : envoi msg + `expect_choke` mark + pending requests handling — verdict : … — preuve : …
+   - peer_class filters dans le calcul des slots — verdict : … — preuve : …
+
    ## Déviations
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
      (`src/foo.cpp`, fonction) — fix proposé — sévérité

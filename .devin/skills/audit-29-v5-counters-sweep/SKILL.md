@@ -71,6 +71,19 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    ```markdown
    # Audit A29 — rapport d'analyse
 
+   ## Verdicts checklist
+   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
+   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
+   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
+   `## Déviations`. Un rapport « tout conforme » sans preuve par item
+   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   - Exhaustif : pour CHAQUE counter upstream, le site Rust correspondant (ou N/A documenté) — verdict : … — preuve : …
+   - Jamais incrémentés : pattern trouvé 2× — suspecter tous les compteurs — verdict : … — preuve : …
+   - Gauges transitionnels (num_peers_*) : inc/dec aux bons edges, pas de drift — verdict : … — preuve : …
+   - sliding_average vs add-blend : request_time, request_latency, rates — verdict : … — preuve : …
+   - session_stats_metrics : noms/indices exposés aux clients — verdict : … — preuve : …
+   - waste_reason totals, disk_job counters, peer_class channels — verdict : … — preuve : …
+
    ## Déviations
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
      (`src/foo.cpp`, fonction) — fix proposé — sévérité

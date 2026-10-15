@@ -71,6 +71,19 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    ```markdown
    # Audit A27 — rapport d'analyse
 
+   ## Verdicts checklist
+   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
+   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
+   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
+   `## Déviations`. Un rapport « tout conforme » sans preuve par item
+   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   - Ordonnancement : ordre commandes vs ticks vs disk completions vs net events — verdict : … — preuve : …
+   - Tick starvation : le bug corrigé — vérifier toutes les sources de réveil — verdict : … — preuve : …
+   - Command channel : ordre FIFO préservé ? priorités ? — verdict : … — preuve : …
+   - Alert routing : broadcast + notify + wait_for_alert — verdict : … — preuve : …
+   - Peer pump : connect/dial ordering, acceptor pump, handshake_timeout — verdict : … — preuve : …
+   - Timers : chaque deadline upstream a son tick (second_tick, unchoke, stats, lsd, auto-scrape, peer_turnover) — verdict : … — preuve : …
+
    ## Déviations
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
      (`src/foo.cpp`, fonction) — fix proposé — sévérité

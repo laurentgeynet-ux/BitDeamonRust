@@ -71,6 +71,19 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    ```markdown
    # Audit A24 — rapport d'analyse
 
+   ## Verdicts checklist
+   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
+   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
+   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
+   `## Déviations`. Un rapport « tout conforme » sans preuve par item
+   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+   - SOCKS5 : méthodes auth (no-auth, user/pass), commandes connect/UDP associate, erreurs → mapping — verdict : … — preuve : …
+   - HTTP CONNECT : auth basic, tunnel keep-alive, host header — verdict : … — preuve : …
+   - UDP associate : datagrammes encapsulés (RSV/FRAG/ATYP), trackers UDP via proxy — verdict : … — preuve : …
+   - Proxy par usage : `proxy_peer_connections`/`proxy_tracker_connections`/`proxy_dht` flags par proto — verdict : … — preuve : …
+   - Hostname vs résolution via proxy, `resolve_hostnames` flag — verdict : … — preuve : …
+   - Instantiate : choix socket_type selon proxy + ssl — verdict : … — preuve : …
+
    ## Déviations
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
      (`src/foo.cpp`, fonction) — fix proposé — sévérité

@@ -39,6 +39,14 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    ```markdown
    # Audit A{aid} — rapport d'analyse
 
+   ## Verdicts checklist
+   Un verdict par item — `conforme` / `déviation` / `N-A` — chacun avec
+   une preuve `fichier.rs:ligne` (ou réf. upstream `src/foo.cpp`,
+   fonction). Tout item marqué `déviation` DOIT avoir une entrée dans
+   `## Déviations`. Un rapport « tout conforme » sans preuve par item
+   est incomplet — la preuve est ce qui rend le verdict vérifiable.
+{checklist_verdicts}
+
    ## Déviations
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
      (`src/foo.cpp`, fonction) — fix proposé — sévérité
@@ -696,7 +704,12 @@ for aid, slug, title, scope, up, rs, chk, traps, _status in AUDITS:
         body.append("")
     if traps:
         body += ["## Pièges propres au périmètre", "", traps, ""]
-    body.append(PROTOCOL.format(aid=aid, slug=slug))
+    chk_verdicts = (
+        "\n".join(f"   - {c} — verdict : … — preuve : …" for c in chk)
+        if chk else
+        "   (aucune checklist spécifique — appliquer les `Pièges connus` transverses ci-dessous, un verdict chacun)"
+    )
+    body.append(PROTOCOL.format(aid=aid, slug=slug, checklist_verdicts=chk_verdicts))
     with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(body))
     print(f"wrote {d}/SKILL.md")

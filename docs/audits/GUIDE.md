@@ -50,8 +50,9 @@ Le mode `rapport` est le défaut ; inutile de le préciser. L'agent :
 
 1. lit le chemin Rust, puis les fonctions upstream ciblées par grep
    (jamais les fichiers entiers — certains font 10 000 lignes) ;
-2. écrit `docs/audits/reports/A05_utp-transport.md` (déviations +
-   fichiers que le fix touchera + non-bugs tranchés) ;
+2. écrit `docs/audits/reports/A05_utp-transport.md` — verdicts par item
+   de checklist (avec preuve `fichier:ligne`), déviations, fichiers que
+   le fix touchera, non-bugs tranchés ;
 3. le commit sur `main` en pathspec-limited (`git commit -- <path>`) :
    n'embarque que son rapport même si un audit voisin a stagé autre
    chose entre-temps.
@@ -63,8 +64,11 @@ disjoints, toujours fast-forward.
 
 ## Gate humain — la relecture (obligatoire)
 
-**Avant tout `apply`, lisez le rapport.** Chaque déviation listée doit
-être confirmée ou contestée :
+**Avant tout `apply`, lisez le rapport.** D'abord `## Verdicts
+checklist` : chaque item doit avoir un verdict ET une preuve
+`fichier:ligne` — un « tout conforme » sans preuves est un rapport
+bâclé, pas un audit propre. Puis chaque déviation listée doit être
+confirmée ou contestée :
 
 - Confirmée → reste dans `## Déviations`.
 - Contestée / écart volontaire → déplacez-la dans `## Non-bugs
