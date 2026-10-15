@@ -976,13 +976,58 @@ impl PeerConn {
         block
     }
 
+    /// `start_receive_piece` — the header-time bookkeeping upstream
+    /// runs when the 9-byte `piece` header completes, before the
+    /// payload lands: a block found in `request_queue` migrates into
+    /// `download_queue` (its wire request never went out — the entry
+    /// carries `not_wanted` = false so the payload is treated as a
+    /// normal arrival), and a block unknown to *both* queues is
+    /// inserted at the head with `not_wanted` — the payload is
+    /// consumed and written anyway, `unwanted_block_alert` marks the
+    /// waste. Both inserts grow `outstanding_bytes`; a conn that is
+    /// disconnecting skips the whole step.
+    ///
+    /// Returns `true` when the block was unsolicited (drives the
+    /// `unwanted_block_alert` at apply time).
+    fn start_receive_piece(&mut self, block: PieceBlock, len: i32) -> bool {
+        if self
+            .pipeline
+            .download_queue
+            .iter()
+            .any(|b| b.block == block)
+        {
+            return false;
+        }
+        if self.disconnecting {
+            return false;
+        }
+        let rq_pos = self
+            .pipeline
+            .request_queue
+            .iter()
+            .position(|b| b.block == block);
+        if let Some(pos) = rq_pos {
+            // migrated entry — if it sat inside the time-critical
+            // prefix, the prefix shrinks with it.
+            if pos < self.pipeline.queued_time_critical as usize {
+                self.pipeline.queued_time_critical -= 1;
+            }
+            self.pipeline.request_queue.remove(pos);
+        }
+        let mut pb = PendingBlock::new(block);
+        let unsolicited = rq_pos.is_none();
+        pb.not_wanted = unsolicited;
+        self.pipeline.download_queue.insert(0, pb);
+        self.pipeline.outstanding_bytes += i64::from(len);
+        unsolicited
+    }
+
     /// `peer_connection::incoming_piece` — was this block actually
-    /// requested? Upstream looks up `m_download_queue` only: a block
-    /// that matches a still-unsent `request_queue` entry is *not*
-    /// wanted (the peer can't know it — the payload is dropped and
-    /// the queued request goes out on the wire later). `block_size`
-    /// is `t->block_size()` — `min(piece_length, 0x4000)`, so a
-    /// hardcoded 16 KiB divisor mis-indexes small-piece torrents.
+    /// requested? Runs after `start_receive_piece`, so the lookup sees
+    /// the migrated `request_queue` entry and the `not_wanted` insert
+    /// — `m_download_queue` only, matching upstream.
+    /// `block_size` is `t->block_size()` — `min(piece_length, 0x4000)`,
+    /// so a hardcoded 16 KiB divisor mis-indexes small-piece torrents.
     #[must_use]
     pub fn was_requested(&self, r: &PeerRequest, block_size: i32) -> bool {
         let block = PieceBlock {
@@ -1030,14 +1075,21 @@ impl PeerConn {
                 // upstream `on_choke`: without the FAST extension a
                 // choke rejects every outstanding block request —
                 // `incoming_reject_request(to_req(pb.block))` runs per
-                // download_queue entry.
-                if !self.supports_fast {
+                // download_queue entry, tail included (graceful
+                // check, gated re-pick — allowed-fast pieces only
+                // while choked — and an unconditional
+                // `send_block_requests`; the batch applies them in
+                // order and a mid-batch graceful disconnect makes the
+                // later sends no-op, as upstream's `is_disconnecting`
+                // return does).
+                if !self.supports_fast && !self.disconnecting {
                     let blocks: Vec<PieceBlock> = self
                         .pipeline
                         .download_queue
                         .iter()
                         .map(|b| b.block)
                         .collect();
+                    let had_in_flight = !blocks.is_empty();
                     for block in blocks {
                         // `to_req` — start is block-aligned, length is
                         // the block's tail-clamped size.
@@ -1061,7 +1113,18 @@ impl PeerConn {
                             if let Some(b) = abort {
                                 eff.push(PeerEffect::AbortDownload(b));
                             }
+                            eff.push(PeerEffect::GracefulCheck);
+                            if self.pipeline.request_queue.is_empty()
+                                && self.pipeline.download_queue.len() < 2
+                            {
+                                eff.push(PeerEffect::MaybePick(Some(
+                                    crate::counters::Counter::RejectPiecePicks,
+                                )));
+                            }
                         }
+                    }
+                    if had_in_flight {
+                        eff.push(PeerEffect::FlushRequests);
                     }
                 }
             }
@@ -1426,6 +1489,49 @@ impl PeerConn {
                     ));
                     return;
                 }
+                // `start_receive_piece` → `validate_piece_request` —
+                // in-range piece index, aligned `start < piece_size`,
+                // and an exact `to_req` length match. Merged responses
+                // can't exist here (`request_large_blocks` is
+                // web-seed-only upstream). Anything else disconnects
+                // `invalid_piece` — including a zero-length payload
+                // (the BitComet reject-like quirk inside
+                // `incoming_piece` is only reachable from
+                // `web_peer_connection`, which bypasses
+                // `start_receive_piece`).
+                let piece_sz = if r.piece.0 >= 0 && r.piece.0 < num_pieces {
+                    files.map_or_else(
+                        || i32::try_from(piece_length).unwrap_or(i32::MAX),
+                        |f| f.piece_size(r.piece),
+                    )
+                } else {
+                    0
+                };
+                if piece_sz <= 0
+                    || r.start < 0
+                    || r.start >= piece_sz
+                    || r.start % block_size.max(1) != 0
+                    || r.length != (piece_sz - r.start).min(block_size)
+                {
+                    eff.push(PeerEffect::Disconnect(
+                        "invalid_piece",
+                        bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    ));
+                    return;
+                }
+                let block = PieceBlock {
+                    piece_index: r.piece,
+                    block_index: r.start / block_size.max(1),
+                };
+                // `start_receive_piece` — a block still sitting in
+                // `request_queue` migrates into `download_queue` (the
+                // request never hit the wire); a block unknown to
+                // both queues is inserted `not_wanted` — its payload
+                // is written anyway, `unwanted_block_alert` marking
+                // the waste. A disconnecting conn skips the insert.
+                if self.start_receive_piece(block, r.length) {
+                    eff.push(PeerEffect::UnwantedBlockAlert(block));
+                }
                 // `incoming_piece` — an omitted bitfield reads as
                 // `have_none`; upstream runs the real
                 // `incoming_have_none` here (`m_has_metadata` on; the
@@ -1435,48 +1541,44 @@ impl PeerConn {
                     self.on_have_none();
                     self.has_metadata = true;
                 }
+                // `incoming_piece` — a conn mid-teardown ignores the
+                // rest of the message (upstream's `is_disconnecting`
+                // return after `have_none`).
+                if self.disconnecting {
+                    return;
+                }
                 // upstream `incoming_piece` runs the slow-start bump
                 // + `update_desired_queue_size` before the
-                // empty-piece/seed/requested checks.
+                // seed/requested checks.
                 self.pipeline.on_piece_received(
                     self.now_ms,
                     i64::from(self.rate_down_speed),
                     block_size,
                 );
-                // BitComet quirk upstream: a zero-length `piece`
-                // message is used as a reject-request — upstream
-                // routes it to `incoming_reject_request`, whose
-                // validation always rejects `length == 0`
-                // (`r.length != min(piece_sz - start, block_size)`),
-                // so the whole thing is a `peer_error` alert with no
-                // queue/picker state change.
-                if r.length == 0 {
-                    eff.push(PeerEffect::PeerError("peer sent empty piece"));
-                    return;
-                }
                 // `incoming_piece` is_seed leg — a `piece` received
                 // while we are seeding is dropped outright: one stale
                 // `m_download_queue` front entry self-heals per
-                // message, the payload counts as `piece_seed` waste,
-                // and nothing reaches unsnub, the picker, or disk.
+                // message (the block we may have just inserted is
+                // the one it takes), the payload counts as
+                // `piece_seed` waste, and nothing reaches unsnub,
+                // the picker, or disk. `num_peers_down_requests`
+                // reconciles via `sync_down_requests`; the payload's
+                // `outstanding_bytes` are consumed regardless of the
+                // seed state (upstream decrements per fragment).
                 if is_seed {
                     if !self.pipeline.download_queue.is_empty() {
                         self.pipeline.download_queue.remove(0);
-                        if self.pipeline.download_queue.is_empty() {
-                            counters.add(crate::counters::Counter::NumPeersDownRequests, -1);
-                        }
                     }
+                    self.pipeline.outstanding_bytes =
+                        (self.pipeline.outstanding_bytes - i64::from(r.length)).max(0);
                     eff.push(PeerEffect::SeedWaste(r.length));
                     return;
                 }
-                let block = PieceBlock {
-                    piece_index: r.piece,
-                    block_index: r.start / block_size,
-                };
+                // Defensive `b == end` arm — unreachable once
+                // `start_receive_piece` ran (the block was either
+                // found or inserted), kept for parity with upstream:
+                // `unwanted_block_alert` + `piece_unknown` waste.
                 if !self.was_requested(&r, block_size) {
-                    // `incoming_piece` — unsolicited payload is
-                    // `piece_unknown` waste + `unwanted_block_alert`;
-                    // never touches disk or the invalid-request count.
                     eff.push(PeerEffect::UnwantedBlock(block, r.length));
                     return;
                 }
@@ -1501,8 +1603,13 @@ impl PeerConn {
                         }
                     });
                 // `incoming_piece` clears snub only when the block
-                // arrived inside the request-timeout window.
-                if self.pipeline.maybe_unsnub(self.now_ms) {
+                // arrived inside the request-timeout window — and
+                // only on the *write* path (the `is_downloaded` arm
+                // returns before the check). The window is evaluated
+                // here, before `on_piece` re-arms `requested_ms`;
+                // the flag clears torrent-side when `DiskWrite`
+                // actually reaches disk.
+                if self.pipeline.unsnub_window_open(self.now_ms) {
                     eff.push(PeerEffect::Unsnub);
                 }
                 let block = self.on_piece(&r, block_size);
@@ -1536,6 +1643,12 @@ impl PeerConn {
                     ));
                     return;
                 }
+                // `incoming_reject_request` — a conn mid-teardown
+                // ignores the message outright (upstream's
+                // `is_disconnecting` return before validation).
+                if self.disconnecting {
+                    return;
+                }
                 // `piece_size_for_req` — 0 when the piece is out of
                 // range, which fails validation upstream-style.
                 let piece_sz = if r.piece.0 >= 0 && r.piece.0 < num_pieces {
@@ -1565,6 +1678,12 @@ impl PeerConn {
                         crate::counters::Counter::RejectPiecePicks,
                     )));
                 }
+                // upstream ends `incoming_reject_request` with an
+                // unconditional `send_block_requests` — a parole
+                // block requeued at the head (and any surviving
+                // `request_queue` entries) go on the wire now, not
+                // at the next pick.
+                eff.push(PeerEffect::FlushRequests);
             }
             M::AllowedFast(i) => {
                 // upstream `on_allowed_fast` — `invalid_allow_fast`
@@ -2208,9 +2327,22 @@ pub enum PeerEffect {
     /// `incoming_have` — the peer took a suggested piece; under
     /// `suggest_read_cache` refill the suggestion slot.
     SuggestAck(PieceIndex),
-    /// `unwanted_block_alert` — a `piece` message arrived for a
-    /// block that is not in either request queue.
+    /// `unwanted_block_alert` — posted at `start_receive_piece` time
+    /// when an unsolicited block is inserted `not_wanted` into the
+    /// download queue; the payload still goes through the normal
+    /// write path (no waste is counted here — the `is_downloaded`
+    /// consult downstream decides `piece_cancelled`).
+    UnwantedBlockAlert(PieceBlock),
+    /// `unwanted_block_alert` + `piece_unknown` waste — the
+    /// `b == m_download_queue.end()` arm of `incoming_piece`
+    /// (unreachable once `start_receive_piece` ran; kept for parity).
     UnwantedBlock(PieceBlock, i32),
+    /// `send_block_requests` alone — upstream flushes the
+    /// `request_queue` after every valid `incoming_reject_request`
+    /// (and once at the tail of the non-FAST choke rejection loop)
+    /// regardless of the pick gates; nothing is picked, queued
+    /// entries just go on the wire.
+    FlushRequests,
     /// `incoming_piece` seed leg — a `piece` message received while
     /// we hold every piece: `piece_seed` waste, no alert, no write.
     SeedWaste(i32),
