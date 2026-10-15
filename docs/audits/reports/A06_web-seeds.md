@@ -381,3 +381,92 @@ vit dans `Torrent::web_seed_state` (`WebSeedStatus`).
   `write_resume_data` émet tout `web_seeds` (`torrent.rs:2198-2202`)
   comme upstream émet non-ephemeral — la *perte* de persistance des
   redirects est la déviation listée plus haut.
+
+## Résultat
+
+Appliqué sur la branche `audit/06-web-seeds` (worktree
+`LibtorrentRust-a06`). Correctifs livrés :
+
+- **`web_seed_t` par seed** (`torrent.rs`) — `retry_ms`,
+  `disabled`, `removed`, `interesting`, `no_local_ips`, `busy`,
+  `supports_keepalive`, `refcounted`, `deadline_ms`, `outstanding`
+  par seed, `status` par URL. Picker key stable par seed
+  (`next_web_seed_key` décrémental depuis `u64::MAX - 1`) — plus de
+  remboursement croisé entre seeds.
+- **Gates `maybe_connect_web_seeds` complets** — `aborted`,
+  `finished`, `is_seed`, `upload_only`, `is_paused`,
+  `files_checked`, `max_connections` (peers + fetches en vol),
+  `connections_limit` session (compte `web_seed_inflight`),
+  `max_web_seed_connections` (`zero_or(…, 100)`, les seeds
+  éligibles-occupés consomment un slot), skips
+  `disabled`/`removed`/`retry > now`/`!interesting`/`busy`.
+- **Sizing upstream** — `prefer_contiguous_blocks` =
+  `max(1 Mio|4 Mio (no keep-alive), piece_length,
+  urlseed_max_request_bytes) / block_size` ; merge cap
+  `urlseed_max_request_bytes`.
+- **Backoff réel** — `WebSeedBackoff` (Retry → `urlseed_wait_retry`,
+  NameLookup → `web_seed_name_lookup_retry`, Header(d) → `Retry-After`
+  verbatim, Disable → `web->disabled`, Remove →
+  `remove_web_seed_iter`) plombé de `spawn_web_seed` à
+  `on_web_seed_error`.
+- **`urlseed_timeout`** — `tokio::time::timeout` par dial/GET
+  moteur + sweep `check_web_seed_timeouts` au tick (release des
+  blocs, `retry_ms = now + urlseed_wait_retry`, `url_seed_alert`) ;
+  deadline ré-armée à chaque bloc reçu (timer par-op upstream).
+- **Validation de réponse** (`web_seed.rs::fetch_block`) — 206 sans
+  `Content-Range` valide → `InvalidRange` (→ `Disable` upstream
+  `disable()`) ; non-206 sans `Content-Length` → idem
+  (`no_content_length`) ; range bien formé mais différent →
+  `RangeMismatch` (retryable, comme upstream `disconnect`) ;
+  `Retry-After` parsé et propagé.
+- **SSRF** — `is_local(addr) && query-string` → `PeerBlocked` +
+  `Disable` ; `no_local_ips` sur les seeds éphémères issus d'une
+  origine globale (filtré à la résolution).
+- **`ip_filter`/`port_filter`/`allow_idna`/proto/port0** — gates
+  `connect_to_url_seed` complets avec classes Disable/Remove.
+- **Proxy + TLS** — http : `no_connect` + absolute-form +
+  `Proxy-Authorization` ; https via CONNECT (`send_host_in_connect`
+  / `proxy_hostnames` honorent le nom) ; socks4/5 avec
+  `connect_dest`/`SocksTarget::Name` (pas de fuite DNS) ; `https://`
+  wrappe `ssl_connect` (+ port par défaut 443).
+- **Keep-alive** — `Connection: close` → `supports_keepalive=false`
+  (élargit la taille préférée suivante) + drop refcount.
+- **Compteurs** — `report_web_seed_downloads` on →
+  `web_seed_payload_downloaded` plié dans `total_download`,
+  `update_rates` (down + wire), `Counter::RecvPayloadBytes` ;
+  blocs stalles → `redundant_bytes` sans réécriture.
+- **`normalize_web_seed_url`** appelée dans `spawn_web_seed`
+  (single-file `/` → +nom échappé ; multi-file → `/` terminal).
+- **Pure-pad** — groupe sans `got_get` répondu avec des zéros sans
+  dial (`on_receive_padfile`).
+- **Cycle de vie conn** — `inc_refcount_all` à la première
+  connexion du seed, `dec_refcount_all` sur erreur/timeout/
+  `Connection: close`/remove/ban (`~peer_connection` upstream).
+- **`remove_url_seed`** — draine les blocs outstanding du seed
+  immédiatement ; tombstone `removed` si une tâche est en vol
+  (GC dans `on_web_seed_done`).
+- **`ban_web_seeds`** — `known_bad` sur une clé web-seed →
+  `disabled` + `url_seed_alert`.
+
+Déviations restantes (inchangées, hors périmètre ou mineures) :
+
+- **`have_files` par fichier** — un 404 fichier reste invisible au
+  pick (upstream exclut le fichier du seed) ; partiellement couvert
+  par le backoff de la seed entière.
+- **Redirects persistants** (`web_seed_t::redirects` au niveau
+  torrent, appris une fois) — toujours ré-appris par tâche.
+- **Failover multi-endpoints** (`web->endpoints`, pop-front sur
+  échec de connect) — `resolve` ne retourne qu'une adresse.
+- **`restart_request`/`restart_piece`** — pas de reprise
+  mid-body ; le fragment partiel est perdu (re-téléchargement).
+- **Payload `url_seed_alert`** — `"{status} {server-header}"` au
+  lieu de `"{status} {reason-phrase}"` (cosmétique).
+- **`DEPRECATED_OVERRIDE_WEB_SEEDS`/merge resume** — frontière
+  A21 (resume-data), à coordonner là-bas.
+
+Tests ajoutés : 8 session (`test_session.rs` — gate files_checked,
+backoff par seed, disable terminal, sweep timeout, cap connexion,
+compteurs on/off, bloc stale→redundant, remove libère + refcount,
+merge cap) + 5 net (`test_web_seed_natpmp.rs` — Content-Range
+absent/mismatch, Content-Length absent, Retry-After,
+Connection: close).

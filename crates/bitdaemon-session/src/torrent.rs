@@ -255,6 +255,75 @@ impl SuggestSet {
     }
 }
 
+/// `web_seed_t` — per-URL runtime state of a url seed. Upstream
+/// keeps one `web_peer_connection` per seed; our pull model
+/// spawns one fetch task per block batch, so `busy` doubles as
+/// the `peer_info.connection`/`resolving` marker upstream uses
+/// to avoid double-connecting a seed.
+#[derive(Clone, Debug)]
+pub struct WebSeed {
+    /// picker downloader key (`peer_key`) this seed's blocks are
+    /// marked under — per-seed, so error/timeout release never
+    /// refunds another seed's blocks.
+    pub key: u64,
+    /// `web_seed_t::retry` — don't pick the seed before the
+    /// torrent clock (`now_ms`) reaches this.
+    pub retry_ms: i64,
+    /// `web_seed_t::disabled` — terminal for the session
+    /// (banned, SSRF-blocked, unsupported protocol, bad port…).
+    pub disabled: bool,
+    /// `web_seed_t::removed` — dropped from `web_seeds` while a
+    /// fetch was in flight; its late result is discarded.
+    pub removed: bool,
+    /// `web_seed_t::interesting` — upstream clears it when an
+    /// ephemeral seed disconnects `uninteresting_upload_peer`.
+    pub interesting: bool,
+    /// `web_seed_t::ephemeral` — redirect-added; never persisted.
+    pub ephemeral: bool,
+    /// `web_seed_t::no_local_ips` — SSRF: a redirect seed learned
+    /// from a global server must not resolve to a local address.
+    pub no_local_ips: bool,
+    /// `peer_info.connection || resolving` — a fetch task is in
+    /// flight for this seed.
+    pub busy: bool,
+    /// the virtual conn's all-pieces refcount — held while the
+    /// seed's conn lives (`peer_connection::init` /
+    /// `~peer_connection`'s `dec_refcount` upstream); dropped on
+    /// error/timeout/`Connection: close`/removal.
+    pub refcounted: bool,
+    /// `web_seed_t::supports_keepalive` — cleared when a response
+    /// carries `Connection: close` (HTTP/1.0 seed), which widens
+    /// the next request's preferred size upstream-style.
+    pub supports_keepalive: bool,
+    /// deadline of the in-flight batch on the `now_ms` clock —
+    /// `urlseed_timeout` from dispatch.
+    pub deadline_ms: i64,
+    /// blocks the in-flight batch covers (`m_requests`).
+    pub outstanding: std::collections::BTreeSet<bitdaemon_common::types::PieceBlock>,
+    /// observable per-URL counters (`web_seed_statuses`).
+    pub status: crate::status::WebSeedStatus,
+}
+
+/// How a failed fetch reschedules its seed — the engine-side
+/// outcome folded into `Session::on_web_seed_error`, mapped here
+/// onto upstream's `web_seed_t::retry`/`disabled`/erase moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebSeedBackoff {
+    /// transport/status error — `now + urlseed_wait_retry`
+    /// (upstream `on_disconnect(error >= failure)`).
+    Retry,
+    /// name resolution failed — `now + web_seed_name_lookup_retry`.
+    NameLookup,
+    /// the server sent `Retry-After` — `retry_web_seed(this, d)`.
+    Header(std::time::Duration),
+    /// never try again — `web->disabled = true` (SSRF, idna,
+    /// unsupported protocol, filtered port, invalid range).
+    Disable,
+    /// erase the seed — `remove_web_seed_iter` (unparseable URL,
+    /// empty hostname, port 0).
+    Remove,
+}
+
 /// `torrent` — one swarm.
 pub struct Torrent {
     /// `m_torrent_file->info_hash()`.
@@ -291,19 +360,27 @@ pub struct Torrent {
     pub files: Option<std::sync::Arc<bitdaemon_core::FileStorage>>,
     /// round-robin cursor over `web_seeds`.
     pub web_seed_idx: usize,
-    /// blocks in flight toward web seeds (`m_requests` of the
-    /// virtual web peer).
+    /// blocks in flight toward web seeds — the union of every
+    /// seed's `outstanding` set (the `m_requests` of all live
+    /// `web_peer_connection`s).
     pub web_seed_outstanding: std::collections::BTreeSet<bitdaemon_common::types::PieceBlock>,
-    /// the virtual web peer's bitfield was refcounted once
-    /// (`web_peer_connection` bumps availability for every piece
-    /// on connect — the seed serves the full payload).
-    web_seed_refcounted: bool,
-    /// `web_seed_t`-ish per-URL runtime state — our pull model has
-    /// no persistent seed connection, so the observable counters
-    /// (`m_requests` depth, payload received, last fetch error)
-    /// live here keyed by base URL. Surfaced via
-    /// [`Self::web_seed_statuses`].
-    pub web_seed_state: std::collections::BTreeMap<String, crate::status::WebSeedStatus>,
+    /// `m_web_seeds` runtime half — per-URL `web_seed_t` state
+    /// (retry/disabled/busy/keep-alive), keyed by base URL.
+    /// Surfaced via [`Self::web_seed_statuses`].
+    pub web_seed_state: std::collections::BTreeMap<String, WebSeed>,
+    /// picker downloader keys handed to web seeds — counts down
+    /// from `u64::MAX - 1` (`WEB_SEED_PEER` stays the generic
+    /// sentinel). Conn keys derive from `peer_id`'s high 64
+    /// bits, so descending-from-MAX seeds can't collide in
+    /// practice.
+    next_web_seed_key: u64,
+    /// web-seed payload bytes credited this session — folded into
+    /// `total_download()` here because the pull model has no conn
+    /// to carry `stat_down_total` (upstream's `m_stat` fold).
+    pub web_seed_payload_downloaded: i64,
+    /// previous-tick shadow of `web_seed_payload_downloaded` for
+    /// `update_rates` deltas.
+    last_web_seed_down: i64,
     /// last synced count of conns with a non-empty download queue —
     /// the session applies its delta to `num_peers_down_requests`
     /// (upstream incs/decs at every `m_download_queue` transition).
@@ -810,8 +887,10 @@ impl Torrent {
             files: None,
             web_seed_idx: 0,
             web_seed_outstanding: std::collections::BTreeSet::new(),
-            web_seed_refcounted: false,
             web_seed_state: std::collections::BTreeMap::new(),
+            next_web_seed_key: Self::WEB_SEED_PEER - 1,
+            web_seed_payload_downloaded: 0,
+            last_web_seed_down: 0,
             down_request_peers: 0,
             peer_list: bitdaemon_net::peer_list::PeerList::default(),
             peer_list_state: bitdaemon_net::peer_list::PeerListState::default(),
@@ -3540,14 +3619,37 @@ impl Torrent {
     ) {
         for key in peers.iter().flatten() {
             let key = *key;
+            // `web_peer_connection::received_invalid_data` — a
+            // certain-culprit web seed gets banned upstream
+            // (`peer_info.banned` → `connect_to_url_seed` disables
+            // it); `ban_web_seeds` gates that. A seed that has
+            // delivered good data keeps serving — upstream only
+            // clears its have-bits for the failed piece's files
+            // (our seeds are whole-torrent, so a softer retry is
+            // the closest analogue short of per-file bitfields).
+            if let Some(url) = self
+                .web_seed_state
+                .iter()
+                .find(|(_, st)| st.key == key)
+                .map(|(u, _)| u.clone())
+            {
+                if known_bad && s.ban_web_seeds {
+                    if let Some(st) = self.web_seed_state.get_mut(&url) {
+                        st.disabled = true;
+                    }
+                    // banned conns die upstream — refcount drops.
+                    self.dec_web_seed_refcount(&url);
+                    out.push(TorrentEffect::Alert(crate::alerts::Alert::UrlSeed {
+                        ih: self.info_hash,
+                        url,
+                        msg: "peer banned".to_string(),
+                    }));
+                }
+                continue;
+            }
             if key == Self::WEB_SEED_PEER {
                 continue;
             }
-            // `web_peer_connection::received_invalid_data` declines
-            // the disconnect (the file gets marked un-had instead) —
-            // our web seeds aren't `torrent_peer`s, so they're never
-            // in `downloaders` under a real key anyway; the guard is
-            // for clarity.
             let allow_disconnect = true;
             let Some(id) = self.conn_by_key(key) else {
                 continue;
@@ -5292,32 +5394,150 @@ impl Torrent {
     /// under this key so real peers never double-request them.
     pub const WEB_SEED_PEER: u64 = u64::MAX;
 
-    /// `web_peer_connection::write_request` drive — pick up to
-    /// `max_blocks` blocks the web seed can serve (it has every
-    /// piece) and mark them `requested` under [`Self::WEB_SEED_PEER`].
-    /// Returns the url (round-robin over `web_seeds`) and the
-    /// picked block requests, or `None` when nothing applies.
-    pub fn next_web_seed_blocks(&mut self, max_blocks: i32) -> Option<(String, Vec<PeerRequest>)> {
-        if self.web_seeds.is_empty()
+    /// `maybe_connect_web_seeds` + `web_peer_connection::write_request`
+    /// — pick up to `max_blocks` blocks one eligible seed can serve
+    /// and mark them `requested` under *that seed's* picker key.
+    ///
+    /// Upstream gates: `m_abort`, empty seed list, `is_finished()`,
+    /// `!m_files_checked`, `num_peers() >= m_max_connections`,
+    /// `num_connections() >= connections_limit`; then per seed
+    /// `disabled || removed || retry > now || !interesting` skips,
+    /// each eligible seed consumes one `max_web_seed_connections`
+    /// slot, and `peer_info.connection || resolving` skips. Our
+    /// pull model maps the conn slot to `busy` (a fetch task in
+    /// flight) and issues at most one batch per call.
+    pub fn next_web_seed_blocks(
+        &mut self,
+        max_blocks: i32,
+        s: &crate::settings::SessionSettings,
+        session_conns: i64,
+    ) -> Option<(String, Vec<PeerRequest>)> {
+        if self.aborted
+            || self.web_seeds.is_empty()
+            || self.finished
             || self.is_seed()
+            || self.upload_mode
+            || self.is_paused()
+            || !self.files_checked
             || self.picker.is_none()
             || self.files.is_none()
         {
             return None;
         }
-        if !self.web_seed_refcounted {
-            // virtual `peer_has` — the seed has every piece
+        // upstream's `num_peers()` counts live web-seed conns too —
+        // our in-flight fetch tasks are their equivalent.
+        let inflight = self.web_seed_inflight() as i64;
+        if self.max_connections >= 0
+            && self.peers.len() as i64 + inflight >= i64::from(self.max_connections)
+        {
+            return None;
+        }
+        if s.connections_limit > 0 && session_conns >= i64::from(s.connections_limit) {
+            return None;
+        }
+        // `zero_or(max_web_seed_connections, 100)` — unlimited
+        // means 100 upstream. Upstream's `--limit` lands on every
+        // *eligible* seed — including already-connected ones — so
+        // in-flight fetches consume slots even where our
+        // round-robin scan would visit them later.
+        let limit: i64 = if s.max_web_seed_connections == 0 {
+            100
+        } else {
+            i64::from(s.max_web_seed_connections)
+        };
+        let now_ms = self.now_ms;
+        // ensure every listed seed has its `web_seed_t` entry (and
+        // picker key) before accounting.
+        for u in self.web_seeds.clone() {
+            if let std::collections::btree_map::Entry::Vacant(e) =
+                self.web_seed_state.entry(u.clone())
+            {
+                let key = self.next_web_seed_key;
+                self.next_web_seed_key = self.next_web_seed_key.wrapping_sub(1);
+                e.insert(WebSeed {
+                    key,
+                    retry_ms: 0,
+                    disabled: false,
+                    removed: false,
+                    interesting: true,
+                    ephemeral: false,
+                    no_local_ips: false,
+                    busy: false,
+                    refcounted: false,
+                    supports_keepalive: true,
+                    deadline_ms: 0,
+                    outstanding: std::collections::BTreeSet::new(),
+                    status: crate::status::WebSeedStatus {
+                        url: u,
+                        ..Default::default()
+                    },
+                });
+            }
+        }
+        // eligible-and-busy seeds hold conn slots already —
+        // upstream's `--limit` lands on every eligible seed
+        // (`disabled || removed || retry > now || !interesting`
+        // skips don't consume), `peer_info.connection || resolving`
+        // included.
+        if self
+            .web_seeds
+            .iter()
+            .filter(|u| {
+                self.web_seed_state.get(u.as_str()).is_some_and(|st| {
+                    st.busy
+                        && !st.disabled
+                        && !st.removed
+                        && st.retry_ms <= now_ms
+                        && st.interesting
+                })
+            })
+            .count() as i64
+            >= limit
+        {
+            return None;
+        }
+        let n = self.web_seeds.len();
+        let mut url: Option<String> = None;
+        for off in 0..n {
+            let idx = (self.web_seed_idx + off) % n;
+            let u = self.web_seeds[idx].clone();
+            let Some(st) = self.web_seed_state.get(&u) else {
+                continue;
+            };
+            if st.disabled || st.removed || st.retry_ms > now_ms || !st.interesting || st.busy {
+                continue;
+            }
+            url = Some(u);
+            self.web_seed_idx = idx + 1;
+            break;
+        }
+        let url = url?;
+        let key = self.web_seed_state.get(&url).map(|st| st.key)?;
+        // `peer_connection::init` — the virtual conn's all-pieces
+        // bitfield joins the picker before the request is written
+        // (the seed serves the full payload); `dec_refcount` on
+        // teardown mirrors `~peer_connection`.
+        if !self
+            .web_seed_state
+            .get(&url)
+            .is_some_and(|st| st.refcounted)
+            && let Some(st) = self.web_seed_state.get_mut(&url)
+        {
+            st.refcounted = true;
             if let Some(p) = self.picker.as_mut() {
                 p.inc_refcount_all();
             }
-            self.web_seed_refcounted = true;
         }
+        let keepalive = self
+            .web_seed_state
+            .get(&url)
+            .is_none_or(|st| st.supports_keepalive);
         let all = Bitfield::with_value(self.num_pieces as usize, true);
         let tctx = crate::request_blocks::TorrentRequestCtx {
             is_seed: false,
             upload_mode: false,
             valid_metadata: true,
-            files_checked: true,
+            files_checked: self.files_checked,
             graceful_pause: self.graceful_pause,
             time_critical_mode: false,
             num_peers: (self.peers.len() + 1) as i32,
@@ -5328,18 +5548,27 @@ impl Torrent {
         };
         let allowed_fast = Vec::new();
         let suggested = Vec::new();
-        let outstanding: Vec<_> = self.web_seed_outstanding.iter().copied().collect();
+        let st = self.web_seed_state.get(&url)?;
+        let outstanding: Vec<_> = st.outstanding.iter().copied().collect();
+        // `web_peer_connection` ctor — `prefer_contiguous_blocks`:
+        // keep-alive seeds get `max(1 MiB, piece_length)`, HTTP/1.0
+        // seeds `max(4 MiB, piece_length)`, both raised to
+        // `urlseed_max_request_bytes`.
+        let min_size =
+            (i64::from(if keepalive { 1 } else { 4 }) * 1024 * 1024).max(self.piece_length);
+        let preferred_size = min_size.max(s.urlseed_max_request_bytes);
+        let block_size_i64 = i64::from(self.block_size());
         let pctx = crate::request_blocks::PeerRequestCtx {
             no_download: false,
             disconnecting: false,
             desired_queue_size: max_blocks,
             outstanding: &outstanding,
-            prefer_contiguous_blocks: 0,
+            prefer_contiguous_blocks: (preferred_size / block_size_i64.max(1)) as i32,
             download_payload_rate: 0,
             peer_choked: false,
             allowed_fast: &allowed_fast,
             peer_pieces: &all,
-            peer_key: Some(Self::WEB_SEED_PEER),
+            peer_key: Some(key),
             picker_options: PickerOptions::RAREST_FIRST,
             suggested_pieces: &suggested,
         };
@@ -5361,20 +5590,27 @@ impl Torrent {
         }
         // `request_large_blocks` — upstream's `web_peer_connection`
         // coalesces the contiguous run into one byte-range request
-        // per file span; a run may cross a piece boundary
-        // (`request_merger` tracks torrent-space offsets and
-        // `map_block` resolves them).
+        // per file span; a run may cross a piece boundary and is
+        // capped at `urlseed_max_request_bytes` (`request_merger`
+        // tracks torrent-space offsets and `map_block` resolves
+        // them).
         let block_size = self.block_size();
+        let max_req = s.urlseed_max_request_bytes.max(i64::from(block_size));
         let mut inserted = 0i32;
         let mut reqs: Vec<PeerRequest> = Vec::with_capacity(picked.len());
         for (b, _busy) in picked {
-            if !self.picker.as_mut().is_some_and(|p| {
-                p.mark_as_downloading(b, Some(Self::WEB_SEED_PEER), PickerOptions::RAREST_FIRST)
-            }) {
+            if !self
+                .picker
+                .as_mut()
+                .is_some_and(|p| p.mark_as_downloading(b, Some(key), PickerOptions::RAREST_FIRST))
+            {
                 continue;
             }
             if self.web_seed_outstanding.insert(b) {
                 inserted += 1;
+            }
+            if let Some(st) = self.web_seed_state.get_mut(&url) {
+                st.outstanding.insert(b);
             }
             if !(0..self.num_pieces).contains(&b.piece_index.0) {
                 continue;
@@ -5389,7 +5625,7 @@ impl Torrent {
                 let last_end = i64::from(last.piece.0) * self.piece_length
                     + i64::from(last.start)
                     + i64::from(last.length);
-                if last_end == off {
+                if last_end == off && i64::from(last.length) + i64::from(length) <= max_req {
                     last.length += length;
                     continue;
                 }
@@ -5401,19 +5637,28 @@ impl Torrent {
             });
         }
         if reqs.is_empty() {
+            // defensive: picked blocks that produced no request
+            // must not stay `downloading` under the seed's key.
+            if let Some(st) = self.web_seed_state.get_mut(&url) {
+                let blocks: Vec<_> = st.outstanding.iter().copied().collect();
+                st.outstanding.clear();
+                for b in &blocks {
+                    self.web_seed_outstanding.remove(b);
+                    if let Some(p) = self.picker.as_mut() {
+                        p.abort_download(*b, Some(key));
+                    }
+                }
+            }
             return None;
         }
-        let url = self.web_seeds[self.web_seed_idx % self.web_seeds.len()].clone();
-        self.web_seed_idx += 1;
-        // the whole batch rides this seed — attribute the in-flight
-        // blocks to its per-URL counters (`web_seed_t::m_requests`).
-        let st = self.web_seed_state.entry(url.clone()).or_insert_with(|| {
-            crate::status::WebSeedStatus {
-                url: url.clone(),
-                ..Default::default()
-            }
-        });
-        st.outstanding += inserted;
+        // the batch rides this seed — mark it busy (the
+        // `peer_info.connection` slot) and arm its
+        // `urlseed_timeout` deadline.
+        if let Some(st) = self.web_seed_state.get_mut(&url) {
+            st.busy = true;
+            st.deadline_ms = now_ms + s.urlseed_timeout.as_millis() as i64;
+            st.status.outstanding += inserted;
+        }
         Some((url, reqs))
     }
 
@@ -5453,18 +5698,28 @@ impl Torrent {
     /// `m_requests` per pending_block), then `mark_as_writing` +
     /// emit a disk write each — the same path a wire `Piece` takes.
     /// `url` attributes the delivered payload to the seed's per-URL
-    /// counters (upstream's `web_seed_t` conn lives per seed).
+    /// counters and picker key (upstream's `web_seed_t` conn lives
+    /// per seed).
+    ///
+    /// A block that is no longer `outstanding` for this seed —
+    /// released by a timeout or a `remove_url_seed` while the fetch
+    /// was in flight — counts as redundant instead of writing
+    /// (upstream's conn teardown discards the same bytes).
+    #[allow(clippy::too_many_arguments)]
     pub fn on_web_seed_block(
         &mut self,
         url: &str,
         req: PeerRequest,
         data: Vec<u8>,
+        s: &crate::settings::SessionSettings,
+        counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
         // one `Vec → Bytes` conversion, then refcounted slices per
         // covered block (`request_large_blocks` replies span many).
         let data = bytes::Bytes::from(data);
         let block_size = i64::from(self.block_size());
+        let key = self.web_seed_state.get(url).map(|st| st.key);
         let blocks = self.web_seed_blocks(&req);
         let mut data_off = 0usize;
         for b in blocks {
@@ -5472,21 +5727,45 @@ impl Torrent {
                 i64::from(f.piece_size(b.piece_index))
             });
             let start = i64::from(b.block_index) * block_size;
-            let bs = ((psize - start).min(block_size) as usize).min(data.len() - data_off);
+            let bs =
+                ((psize - start).min(block_size) as usize).min(data.len().saturating_sub(data_off));
             if bs == 0 {
                 break;
             }
+            let still_mine = self
+                .web_seed_state
+                .get_mut(url)
+                .is_some_and(|st| st.outstanding.remove(&b));
             self.web_seed_outstanding.remove(&b);
+            if !still_mine {
+                // released underneath the in-flight task —
+                // `waste_reason::piece_closing` bookkeeping.
+                self.redundant_bytes += bs as i64;
+                data_off += bs;
+                if data_off >= data.len() {
+                    break;
+                }
+                continue;
+            }
             if let Some(st) = self.web_seed_state.get_mut(url) {
-                st.outstanding -= 1;
-                st.downloaded += bs as u64;
-                st.last_error = None;
+                st.status.outstanding -= 1;
+                st.status.downloaded += bs as u64;
+                st.status.last_error = None;
+                // `web_connection_base` re-arms its deadline per
+                // received payload — a serving batch isn't "stuck".
+                st.deadline_ms = self.now_ms + s.urlseed_timeout.as_millis() as i64;
+            }
+            // `report_web_seed_downloads` — upstream skips
+            // `m_stat` accounting when off (`ignore_stats(true)`).
+            if s.report_web_seed_downloads {
+                self.web_seed_payload_downloaded += bs as i64;
+                counters.add(crate::counters::Counter::RecvPayloadBytes, bs as i64);
             }
             if let Some(p) = self.picker.as_mut() {
-                p.mark_as_writing(b, Some(Self::WEB_SEED_PEER));
+                p.mark_as_writing(b, key);
             }
             out.push(TorrentEffect::DiskWrite {
-                peer: Self::WEB_SEED_PEER,
+                peer: key.unwrap_or(Self::WEB_SEED_PEER),
                 req: PeerRequest {
                     piece: b.piece_index,
                     start: (i64::from(b.block_index) * block_size) as i32,
@@ -5501,26 +5780,168 @@ impl Torrent {
         }
     }
 
+    /// `web_seed_t` keep-alive bookkeeping — a `Connection: close`
+    /// response (or dead conn) clears `supports_keepalive`,
+    /// widening the next preferred request size upstream-style.
+    /// Also frees the seed's conn slot (`busy`) once a fetch
+    /// resolved — the batch is over.
+    pub fn on_web_seed_done(&mut self, url: &str, saw_close: bool) {
+        if let Some(st) = self.web_seed_state.get_mut(url) {
+            st.busy = false;
+            st.deadline_ms = 0;
+            if saw_close {
+                // upstream's conn dropped on `m_received_disconnect`
+                // — its picker refcount goes with it.
+                st.supports_keepalive = false;
+                self.dec_web_seed_refcount(url);
+            }
+            // GC a `removed` seed whose last fetch just resolved —
+            // upstream's `on_name_lookup`/`on_disconnect` does the
+            // deferred `remove_web_seed_iter` here.
+            if self
+                .web_seed_state
+                .get(url)
+                .is_some_and(|st| st.removed && st.outstanding.is_empty())
+            {
+                self.web_seed_state.remove(url);
+            }
+        }
+    }
+
+    /// `~web_peer_connection` — the virtual conn's all-pieces
+    /// refcount leaves the picker. Idempotent.
+    fn dec_web_seed_refcount(&mut self, url: &str) {
+        let Some(st) = self.web_seed_state.get_mut(url) else {
+            return;
+        };
+        if !st.refcounted {
+            return;
+        }
+        st.refcounted = false;
+        if let Some(p) = self.picker.as_mut() {
+            p.dec_refcount_all();
+        }
+    }
+
     /// a web-seed fetch failed — release the blocks so they can be
     /// re-requested from a real peer or another seed (`web_seed`
-    /// `fail_count`→`abort_download` upstream path). Merged
-    /// (`request_large_blocks`) requests expand to all blocks they
-    /// covered. `url`/`msg` record the per-URL error — upstream's
-    /// `url_seed_alert` carries the failing seed + its message.
-    pub fn on_web_seed_error(&mut self, url: &str, reqs: &[PeerRequest], msg: &str) {
+    /// `fail_count`→`abort_download` upstream path), then apply
+    /// `backoff` (`retry_web_seed` / `disable()` /
+    /// `remove_web_seed_iter`). `url`/`msg` record the per-URL
+    /// error — upstream's `url_seed_alert` carries the failing
+    /// seed + its message.
+    pub fn on_web_seed_error(
+        &mut self,
+        url: &str,
+        reqs: &[PeerRequest],
+        msg: &str,
+        backoff: WebSeedBackoff,
+        s: &crate::settings::SessionSettings,
+    ) {
+        let (key, mut release) = match self.web_seed_state.get_mut(url) {
+            Some(st) => {
+                let v: Vec<_> = std::mem::take(&mut st.outstanding).into_iter().collect();
+                (Some(st.key), v)
+            }
+            None => (None, Vec::new()),
+        };
+        // the fetch died — upstream's conn teardown
+        // (`~peer_connection`) drops its picker refcount here.
+        self.dec_web_seed_refcount(url);
+        // safety net — blocks named by `reqs` still outstanding but
+        // missing from the seed's set get released too.
         for r in reqs {
             for b in self.web_seed_blocks(r) {
-                self.web_seed_outstanding.remove(&b);
-                if let Some(st) = self.web_seed_state.get_mut(url) {
-                    st.outstanding -= 1;
-                }
-                if let Some(p) = self.picker.as_mut() {
-                    p.abort_download(b, Some(Self::WEB_SEED_PEER));
+                if self.web_seed_outstanding.contains(&b) && !release.contains(&b) {
+                    release.push(b);
                 }
             }
         }
+        for b in &release {
+            self.web_seed_outstanding.remove(b);
+            if let Some(p) = self.picker.as_mut() {
+                p.abort_download(*b, key);
+            }
+        }
         if let Some(st) = self.web_seed_state.get_mut(url) {
-            st.last_error = Some(msg.to_string());
+            st.status.outstanding = 0;
+            st.status.last_error = Some(msg.to_string());
+        }
+        match backoff {
+            WebSeedBackoff::Disable => {
+                if let Some(st) = self.web_seed_state.get_mut(url) {
+                    st.disabled = true;
+                }
+            }
+            WebSeedBackoff::Remove => {
+                self.web_seeds.retain(|u| u != url);
+                self.web_seed_state.remove(url);
+                self.need_save_resume = true;
+            }
+            WebSeedBackoff::Retry | WebSeedBackoff::NameLookup | WebSeedBackoff::Header(_) => {
+                self.retry_web_seed(url, backoff, s);
+            }
+        }
+    }
+
+    /// `maybe_connect_web_seeds`'s conn-count leg — in-flight
+    /// fetch tasks count toward `max_web_seed_connections` /
+    /// `max_connections` upstream-style (`peer_info.connection`).
+    #[must_use]
+    pub fn web_seed_inflight(&self) -> usize {
+        self.web_seed_state.values().filter(|st| st.busy).count()
+    }
+
+    /// `web_seed_t` deadline sweep — upstream bounds a web-seed
+    /// request by `web_connection_base::timeout()`
+    /// (`urlseed_timeout`); an expired in-flight batch releases
+    /// its blocks and reschedules the seed with
+    /// `urlseed_wait_retry` backoff.
+    pub fn check_web_seed_timeouts(
+        &mut self,
+        s: &crate::settings::SessionSettings,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        let now = self.now_ms;
+        if now <= 0 {
+            return;
+        }
+        let wait = s.urlseed_wait_retry.as_millis() as i64;
+        let mut expired: Vec<(String, u64, bool, Vec<_>)> = Vec::new();
+        for (url, st) in &mut self.web_seed_state {
+            if !st.busy || st.deadline_ms <= 0 || st.deadline_ms > now {
+                continue;
+            }
+            st.busy = false;
+            st.deadline_ms = 0;
+            st.status.outstanding = 0;
+            st.status.last_error = Some("timed out".to_string());
+            st.retry_ms = st.retry_ms.max(now + wait);
+            let was_refcounted = std::mem::replace(&mut st.refcounted, false);
+            expired.push((
+                url.clone(),
+                st.key,
+                was_refcounted,
+                std::mem::take(&mut st.outstanding).into_iter().collect(),
+            ));
+        }
+        for (url, key, was_refcounted, blocks) in expired {
+            if was_refcounted && let Some(p) = self.picker.as_mut() {
+                // `~web_peer_connection` — the timed-out conn's
+                // bitfield leaves the picker.
+                p.dec_refcount_all();
+            }
+            for b in &blocks {
+                self.web_seed_outstanding.remove(b);
+                if let Some(p) = self.picker.as_mut() {
+                    p.abort_download(*b, Some(key));
+                }
+            }
+            out.push(TorrentEffect::Alert(crate::alerts::Alert::UrlSeed {
+                ih: self.info_hash,
+                url,
+                msg: "web seed timed out".to_string(),
+            }));
         }
     }
 
@@ -5532,12 +5953,13 @@ impl Torrent {
         self.web_seeds
             .iter()
             .map(|u| {
-                self.web_seed_state.get(u).cloned().unwrap_or_else(|| {
-                    crate::status::WebSeedStatus {
+                self.web_seed_state.get(u).map_or_else(
+                    || crate::status::WebSeedStatus {
                         url: u.clone(),
                         ..Default::default()
-                    }
-                })
+                    },
+                    |st| st.status.clone(),
+                )
             })
             .collect()
     }
@@ -6779,9 +7201,36 @@ impl Torrent {
     pub fn remove_url_seed(&mut self, url: &str) {
         if self.web_seeds.iter().any(|u| u == url) {
             self.web_seeds.retain(|u| u != url);
-            // upstream deletes the `web_seed_t` entry — its runtime
-            // state goes with it (in-flight fetches still resolve).
-            self.web_seed_state.remove(url);
+            // upstream deletes the `web_seed_t` entry — its conn
+            // teardown frees the picked blocks, so ours release
+            // here. A fetch still in flight marks the entry
+            // `removed` (deferred delete — upstream does the same
+            // while a resolve is outstanding); the late result is
+            // discarded by `on_web_seed_done`'s GC.
+            let (key, blocks) = self
+                .web_seed_state
+                .get(url)
+                .map_or((None, Vec::new()), |st| {
+                    (Some(st.key), st.outstanding.iter().copied().collect())
+                });
+            for b in &blocks {
+                self.web_seed_outstanding.remove(b);
+                if let Some(p) = self.picker.as_mut() {
+                    p.abort_download(*b, key);
+                }
+            }
+            // `~peer_connection` — the seed's refcount leaves the
+            // picker whether or not a fetch is still resolving.
+            self.dec_web_seed_refcount(url);
+            if self.web_seed_state.get(url).is_some_and(|st| st.busy) {
+                if let Some(st) = self.web_seed_state.get_mut(url) {
+                    st.removed = true;
+                    st.outstanding.clear();
+                    st.status.outstanding = 0;
+                }
+            } else {
+                self.web_seed_state.remove(url);
+            }
             self.need_save_resume = true;
         }
     }
@@ -8212,7 +8661,9 @@ impl Torrent {
     /// `st->total_download` adds the protocol channel on top —
     /// `status()` folds `protocol_downloaded` separately.
     pub fn total_download(&self) -> i64 {
-        self.payload_downloaded + self.peers.values().map(|c| c.stat_down_total).sum::<i64>()
+        self.payload_downloaded
+            + self.web_seed_payload_downloaded
+            + self.peers.values().map(|c| c.stat_down_total).sum::<i64>()
     }
 
     /// ditto upload.
@@ -8620,11 +9071,19 @@ impl Torrent {
         // that disconnected between ticks must contribute 0 to this
         // tick, not a negative delta (its total vanishes from the
         // sum → `down - prev` < 0 → bogus negative rate).
+        // web-seed payload isn't carried by a conn — fold its
+        // folded accumulator's delta into both legs (upstream's
+        // `web_peer_connection::received_bytes` feeds the same
+        // `m_stat` channels unless `report_web_seed_downloads`
+        // turned stats off).
+        let web_down = self.web_seed_payload_downloaded - self.last_web_seed_down;
+        self.last_web_seed_down = self.web_seed_payload_downloaded;
         let down: i64 = self
             .peers
             .values()
             .map(|c| c.stat_down_total - c.last_down_total)
-            .sum();
+            .sum::<i64>()
+            + web_down;
         let up: i64 = self
             .peers
             .values()
@@ -8637,7 +9096,8 @@ impl Torrent {
             .peers
             .values()
             .map(|c| c.stat_down_total + c.stat_down_protocol + c.stat_down_ip - c.last_down_wire)
-            .sum();
+            .sum::<i64>()
+            + web_down;
         let up_wire: i64 = self
             .peers
             .values()
@@ -9922,18 +10382,42 @@ impl Torrent {
         self.num_connecting
     }
 
-    /// `retry_web_seed` — re-arm a web seed after backoff
-    /// (`web_seed_t::retry` upstream schedules on the tracker timer;
-    /// ours just clears the error flag so `next_web_seed_blocks`
-    /// picks it up again).
-    pub fn retry_web_seed(&mut self, _url: &str) {
-        self.web_seed_idx = 0;
+    /// `retry_web_seed` — reschedule a seed after a failure:
+    /// upstream sets `web->retry = time_now() +
+    /// retry.value_or(urlseed_wait_retry)`, skipping
+    /// removed/disabled seeds. `backoff` carries the engine's
+    /// classification (`Retry-After` header, name-lookup failure…).
+    pub fn retry_web_seed(
+        &mut self,
+        url: &str,
+        backoff: WebSeedBackoff,
+        s: &crate::settings::SessionSettings,
+    ) {
+        let wait = match backoff {
+            WebSeedBackoff::Header(d) => d,
+            WebSeedBackoff::NameLookup => s.web_seed_name_lookup_retry,
+            _ => s.urlseed_wait_retry,
+        };
+        if let Some(st) = self.web_seed_state.get_mut(url) {
+            if st.removed || st.disabled {
+                return;
+            }
+            st.retry_ms = self.now_ms + wait.as_millis() as i64;
+        }
     }
 
     /// `maybe_connect_web_seeds` — nudge the engine to pull blocks
     /// off url seeds (session `next_web_seed_blocks` does the pick).
+    /// Mirrors the upstream early-outs that don't need the picker:
+    /// aborted, no seeds, finished, unchecked files.
     pub fn maybe_connect_web_seeds(&self) -> bool {
-        !self.web_seeds.is_empty() && !self.is_paused() && !self.is_seed()
+        !self.aborted
+            && !self.web_seeds.is_empty()
+            && !self.finished
+            && self.files_checked
+            && !self.is_paused()
+            && !self.is_seed()
+            && !self.upload_mode
     }
 
     /// `set_ssl_cert_buffer` — PEM buffer form (`set_ssl_cert` takes
