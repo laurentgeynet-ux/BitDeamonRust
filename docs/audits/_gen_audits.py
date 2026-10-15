@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Generate per-audit SKILL.md workflows + docs/audits/INDEX.md."""
 import os
+import shutil
 
 PROTOCOL = """## Protocole — deux modes
 
@@ -510,8 +511,8 @@ idx += [
     "## Utilisation",
     "",
     "```",
-    "/audit-06-peer-wire-codec            # mode rapport (défaut)",
-    "/audit-06-peer-wire-codec en mode apply",
+    f"/audit-06-v{WAVE_OF['06']}-peer-wire-codec            # mode rapport (défaut)",
+    f"/audit-06-v{WAVE_OF['06']}-peer-wire-codec en mode apply",
     "```",
     "",
     "Le skill embarque : périmètre, fichiers upstream/Rust, checklist,",
@@ -607,14 +608,23 @@ with open("docs/audits/INDEX.md", "w", encoding="utf-8") as f:
     f.write("\n".join(idx))
 
 # Per-audit skills — ALL audits get a workflow (done ones = re-verify mode)
+# Skills are generated — wipe stale audit-* dirs so renames (e.g. wave
+# tags added to the name) never leave orphans. Never hand-edit them.
+skills_root = os.path.join(".devin", "skills")
+for old in os.listdir(skills_root):
+    p = os.path.join(skills_root, old)
+    if old.startswith("audit-") and os.path.isdir(p):
+        shutil.rmtree(p)
+
 for aid, slug, title, scope, up, rs, chk, traps, status in AUDITS:
-    d = os.path.join(".devin", "skills", f"audit-{aid}-{slug}")
-    os.makedirs(d, exist_ok=True)
     w = WAVE_OF[aid]
     wspec = WAVES[w]
+    sname = f"audit-{aid}-v{w}-{slug}"
+    d = os.path.join(skills_root, sname)
+    os.makedirs(d, exist_ok=True)
     body = [
         "---",
-        f"name: audit-{aid}-{slug}",
+        f"name: {sname}",
         f'description: "[V{w}] Audit sémantique vs libtorrent — {title}"' + (" (re-vérification — déjà passé)" if status else ""),
         "allowed-tools:",
         "  - read",

@@ -39,8 +39,8 @@ Chaque audit = un skill `.devin/skills/audit-NN-<slug>/` lançable via `/audit-N
 ## Utilisation
 
 ```
-/audit-06-peer-wire-codec            # mode rapport (défaut)
-/audit-06-peer-wire-codec en mode apply
+/audit-06-v3-peer-wire-codec            # mode rapport (défaut)
+/audit-06-v3-peer-wire-codec en mode apply
 ```
 
 Le skill embarque : périmètre, fichiers upstream/Rust, checklist,

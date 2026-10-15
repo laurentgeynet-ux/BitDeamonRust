@@ -41,7 +41,7 @@ Dans n'importe quelle session Devin ouverte sur le repo (même
 dossier, plusieurs sessions en même temps — c'est prévu pour) :
 
 ```
-/audit-13-utp-transport
+/audit-13-v1-utp-transport
 ```
 
 Le mode `rapport` est le défaut ; inutile de le préciser. L'agent :
@@ -87,7 +87,7 @@ Puis ouvrez une session Devin **sur ce dossier**
 découverts dans le worktree aussi — et lancez :
 
 ```
-/audit-13-utp-transport en mode apply
+/audit-13-v1-utp-transport en mode apply
 ```
 
 L'agent corrige, porte les tests de régression, fait tourner les gates
