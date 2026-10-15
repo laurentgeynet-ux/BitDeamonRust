@@ -402,7 +402,10 @@ fn oversized_piece_disconnects() {
     assert_eq!(eff.len(), 1, "expected only the disconnect: {eff:?}");
     assert!(matches!(
         eff[0],
-        PeerEffect::Disconnect("packet_too_large", true)
+        PeerEffect::Disconnect(
+            "packet_too_large",
+            bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError
+        )
     ));
     assert_eq!(c.pipeline.download_queue.len(), 1);
     assert_eq!(c.pipeline.desired_queue_size, 4, "no slow-start bump");
@@ -659,6 +662,8 @@ fn request_counters() {
 #[test]
 fn reject_aborts_and_frees_inflight_block() {
     let mut c = conn();
+    // reject/allowed-fast are FAST-extension messages.
+    c.supports_fast = true;
     let b = PieceBlock {
         piece_index: PieceIndex(3),
         block_index: 0,
@@ -700,6 +705,8 @@ fn reject_aborts_and_frees_inflight_block() {
 #[test]
 fn malformed_reject_is_a_noop() {
     let mut c = conn();
+    // reject/allowed-fast are FAST-extension messages.
+    c.supports_fast = true;
     let b = PieceBlock {
         piece_index: PieceIndex(3),
         block_index: 0,
@@ -759,6 +766,8 @@ fn malformed_reject_is_a_noop() {
 #[test]
 fn empty_piece_is_peer_error_only() {
     let mut c = conn();
+    // reject/allowed-fast are FAST-extension messages.
+    c.supports_fast = true;
     let b = PieceBlock {
         piece_index: PieceIndex(3),
         block_index: 0,
@@ -794,6 +803,8 @@ fn empty_piece_is_peer_error_only() {
 #[test]
 fn reject_of_timed_out_block_does_not_reabort() {
     let mut c = conn();
+    // reject/allowed-fast are FAST-extension messages.
+    c.supports_fast = true;
     let b = PieceBlock {
         piece_index: PieceIndex(3),
         block_index: 0,
@@ -833,6 +844,8 @@ fn reject_of_timed_out_block_does_not_reabort() {
 #[test]
 fn parole_reject_requeues_request() {
     let mut c = conn();
+    // reject/allowed-fast are FAST-extension messages.
+    c.supports_fast = true;
     c.on_parole = true;
     let b = PieceBlock {
         piece_index: PieceIndex(3),
@@ -868,4 +881,149 @@ fn parole_reject_requeues_request() {
         Some(b),
         "parole reject requeues at the front"
     );
+}
+
+/// BEP-6 gate — every FAST-extension message on a conn that never
+/// negotiated it is `invalid_*` → `peer_error` disconnect upstream
+/// (`on_reject_request`/`on_have_all`/`on_have_none`/`on_allowed_fast`/
+/// `on_suggest_piece` all check `m_supports_fast` first).
+#[test]
+fn fast_messages_require_fast_negotiation() {
+    use bitdaemon_net::bt_peer_conn::DisconnectSeverity;
+    for msg in [
+        PeerMessage::HaveAll,
+        PeerMessage::HaveNone,
+        PeerMessage::AllowedFast(PieceIndex(0)),
+        PeerMessage::SuggestPiece(PieceIndex(0)),
+        PeerMessage::RejectRequest(PeerRequest {
+            piece: PieceIndex(0),
+            start: 0,
+            length: 0x4000,
+        }),
+    ] {
+        let mut c = conn();
+        let mut eff = Vec::new();
+        c.dispatch(
+            &msg,
+            10,
+            0x4000,
+            0x40000,
+            None,
+            false,
+            0x200000,
+            2000,
+            &bitdaemon_session::counters::Counters::default(),
+            &mut eff,
+        );
+        assert!(
+            matches!(
+                eff.as_slice(),
+                [PeerEffect::Disconnect(_, DisconnectSeverity::PeerError)]
+            ),
+            "{msg:?} without FAST must disconnect with peer_error: {eff:?}"
+        );
+    }
+}
+
+/// The same messages are legal once `supports_fast` is set (the
+/// handshake reserved bit) — none of them disconnect.
+#[test]
+fn fast_messages_accepted_when_negotiated() {
+    let mut c = conn();
+    c.supports_fast = true;
+    for msg in [
+        PeerMessage::HaveAll,
+        PeerMessage::HaveNone,
+        PeerMessage::AllowedFast(PieceIndex(0)),
+        PeerMessage::SuggestPiece(PieceIndex(0)),
+    ] {
+        let mut eff = Vec::new();
+        c.dispatch(
+            &msg,
+            10,
+            0x4000,
+            0x40000,
+            None,
+            false,
+            0x200000,
+            2000,
+            &bitdaemon_session::counters::Counters::default(),
+            &mut eff,
+        );
+        assert!(
+            !eff.iter().any(|e| matches!(e, PeerEffect::Disconnect(..))),
+            "{msg:?} on a FAST conn must not disconnect: {eff:?}"
+        );
+    }
+}
+
+/// `on_choke` upstream: without FAST, a choke is an implicit reject of
+/// every outstanding block — each download_queue entry goes through
+/// `incoming_reject_request` (picker mark freed, bytes returned).
+/// With FAST the queue just stalls.
+#[test]
+fn choke_without_fast_rejects_download_queue() {
+    let mut c = conn();
+    // FAST negotiated → queue stalls, no aborts.
+    c.supports_fast = true;
+    let b = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    c.pipeline
+        .download_queue
+        .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b));
+    c.pipeline.outstanding_bytes = 0x4000;
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Choke,
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert_eq!(
+        c.pipeline.download_queue.len(),
+        1,
+        "FAST choke keeps the dlq entry"
+    );
+    // without FAST the same choke runs `incoming_reject_request` per
+    // dlq entry — the block is aborted back to the picker.
+    let mut c = conn();
+    let b2 = PieceBlock {
+        piece_index: PieceIndex(3),
+        block_index: 0,
+    };
+    c.pipeline
+        .download_queue
+        .push(bitdaemon_session::peer_pipeline::PendingBlock::new(b2));
+    c.pipeline.outstanding_bytes = 0x4000;
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Choke,
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(
+        c.pipeline.download_queue.is_empty(),
+        "non-FAST choke rejects the whole dlq"
+    );
+    assert!(
+        eff.iter()
+            .any(|e| matches!(e, PeerEffect::AbortDownload(bb) if *bb == b2)),
+        "the implicit reject frees the picker mark: {eff:?}"
+    );
+    assert_eq!(c.pipeline.outstanding_bytes, 0);
 }

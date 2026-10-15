@@ -26,8 +26,10 @@ use crate::transport::BoxedPeerStream;
 /// `handshake_len` — 68-byte BT handshake.
 pub use crate::peer_wire::HANDSHAKE_LEN;
 
-/// `MAX_MESSAGE_LEN` — the codec's frame cap.
-const MAX_MESSAGE_LEN: usize = 4 * 1024 * 1024;
+/// `MAX_MESSAGE_LEN` — upstream `on_receive` disconnects
+/// `packet_too_large` when the announced length exceeds 1 MiB
+/// (`packet_size > 1024 * 1024 || packet_size < 0`).
+const MAX_MESSAGE_LEN: usize = 1024 * 1024;
 
 /// Errors from the connection driver (`peer_error` category).
 #[derive(Debug, thiserror::Error)]
@@ -49,6 +51,43 @@ pub enum PeerConnError {
     /// MSE/PE crypto handshake.
     #[error("mse: {0}")]
     Mse(#[from] MseError),
+}
+
+/// `disconnect_severity_t` (`peer_connection_interface.hpp`) — the
+/// severity the initiator attached to `disconnect()`. `Normal` and
+/// `Failure` post `peer_disconnected_alert`; `PeerError` posts
+/// `peer_error_alert` + `error_peers` instead. Anything `> Normal`
+/// stamps `m_failed` (the swarm entry's `failcount` grows).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DisconnectSeverity {
+    /// `peer_connection_interface::normal` (0) — clean close.
+    Normal,
+    /// `failure` (1) — counted as failed, still a
+    /// `peer_disconnected_alert`.
+    Failure,
+    /// `peer_error` (2) — protocol violation, `peer_error_alert`.
+    PeerError,
+}
+
+/// Why a peer's pump task ended — carried on the engine's `gone`
+/// channel so the session can apply upstream `disconnect()` severity
+/// semantics (`peer_error_alert` + `error_peers` for protocol
+/// violations vs a plain `peer_disconnected_alert` for transport
+/// closes).
+#[derive(Debug)]
+pub enum PeerGone {
+    /// Session-initiated `peer_connection::disconnect` — `severity`
+    /// and `reason` mirror the upstream `disconnect(ec, op, sev)`
+    /// args (`reason` is the error name, e.g. `"invalid have index"`).
+    Disconnected {
+        /// `disconnect_severity_t`.
+        severity: DisconnectSeverity,
+        /// Upstream error name.
+        reason: &'static str,
+    },
+    /// Transport/codec failure inside the read pump (`on_receive`
+    /// error path): socket EOF/reset or a malformed frame.
+    Transport(PeerConnError),
 }
 
 /// `bt_peer_connection::on_connected` + handshake read — sends our

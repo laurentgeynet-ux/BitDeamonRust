@@ -195,8 +195,9 @@ pub struct Engine {
     announce_rx: mpsc::UnboundedReceiver<AnnounceDone>,
     announce_tx: mpsc::UnboundedSender<AnnounceDone>,
     /// disconnect events from dead streams.
-    gone_rx: mpsc::UnboundedReceiver<(Sha1Hash, u64)>,
-    gone_tx: mpsc::UnboundedSender<(Sha1Hash, u64)>,
+    gone_rx:
+        mpsc::UnboundedReceiver<(Sha1Hash, u64, Option<bitdaemon_net::bt_peer_conn::PeerGone>)>,
+    gone_tx: mpsc::UnboundedSender<(Sha1Hash, u64, Option<bitdaemon_net::bt_peer_conn::PeerGone>)>,
     /// socket-write completions from peer pumps — upstream's
     /// `on_sent` handler: shrink the peer's send buffer and
     /// re-run `fill_send_buffer`.
@@ -623,11 +624,15 @@ impl Engine {
         while let Ok(m) = self.inbound_rx.try_recv() {
             slock(&self.session).on_peer_message(&m.packet, m.wire_bytes, &mut out);
         }
-        while let Ok((ih, peer)) = self.gone_rx.try_recv() {
+        while let Ok((ih, peer, gone)) = self.gone_rx.try_recv() {
             self.writers.remove(&(ih, peer));
-            // transport-initiated close: no severity of its own —
-            // `peer_disconnected` ORs in the conn's `failed` flag.
-            slock(&self.session).peer_disconnected(&ih, peer, false, &mut out);
+            // `peer_disconnected` applies the upstream severity
+            // semantics — transport deaths classify by io kind,
+            // protocol errors post `peer_error_alert`; a session-
+            // initiated `DisconnectPeer` already ran through it when
+            // the effect routed, so this second pass is a no-op
+            // (`had == false`, no duplicate alert).
+            slock(&self.session).peer_disconnected(&ih, peer, gone, &mut out);
         }
         while let Ok((ih, peer, bytes, payload)) = self.sent_rx.try_recv() {
             slock(&self.session).on_peer_sent(&ih, peer, bytes, payload, &mut out);
@@ -3287,6 +3292,10 @@ impl Engine {
                 std::collections::VecDeque::new();
             let mut rc4 = rc4;
             let gate = write_gates.as_ref().map(|g| g.gate((ih, peer)));
+            // the upstream `disconnect(ec, …)` `ec` — set by whichever
+            // pump leg kills the conn, shipped on `gone_tx` so the
+            // session can classify severity + counters.
+            let mut gone_reason = None;
             'pump: loop {
                 tokio::select! {
                     // `peer_connection::can_read` — while *this* peer
@@ -3371,6 +3380,12 @@ impl Engine {
                         match r {
                             Ok(0) => {
                                 debug!(peer = peer, remote = ?remote, err = %"eof", "peer read error, dropping");
+                                gone_reason = Some(
+                                    bitdaemon_net::bt_peer_conn::PeerGone::Transport(
+                                        std::io::Error::from(std::io::ErrorKind::UnexpectedEof)
+                                            .into(),
+                                    ),
+                                );
                                 break;
                             }
                             Ok(n) => {
@@ -3421,6 +3436,9 @@ impl Engine {
                                     Ok(None) => break,
                                     Err(e) => {
                                         debug!(peer = peer, remote = ?remote, err = %e, "peer read error, dropping");
+                                        gone_reason = Some(
+                                            bitdaemon_net::bt_peer_conn::PeerGone::Transport(e),
+                                        );
                                         break 'pump;
                                     }
                                 }
@@ -3432,6 +3450,9 @@ impl Engine {
                             },
                             Err(e) => {
                                 debug!(peer = peer, remote = ?remote, err = %e, "peer read error, dropping");
+                                gone_reason = Some(
+                                    bitdaemon_net::bt_peer_conn::PeerGone::Transport(e.into()),
+                                );
                                 break;
                             }
                         }
@@ -3557,6 +3578,9 @@ impl Engine {
                         match wres {
                             Err(e) => {
                                 debug!(peer = peer, remote = ?remote, err = %e, "peer write error, dropping");
+                                gone_reason = Some(
+                                    bitdaemon_net::bt_peer_conn::PeerGone::Transport(e),
+                                );
                                 break;
                             }
                             Ok(()) => {
@@ -3590,7 +3614,7 @@ impl Engine {
             if let Some(g) = &write_gates {
                 g.remove(&(ih, peer));
             }
-            let _ = gone_tx.send((ih, peer));
+            let _ = gone_tx.send((ih, peer, gone_reason));
         });
         self.tasks.push(h);
     }

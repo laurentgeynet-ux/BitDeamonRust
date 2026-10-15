@@ -1812,7 +1812,7 @@ impl TorrentHandle {
                         reason: "clear_peers",
                         // `torrent::clear_peers` → `abort` — normal
                         // teardown, no failcount.
-                        failed: false,
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                     },
                 ));
             }

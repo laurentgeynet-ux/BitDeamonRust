@@ -1600,7 +1600,9 @@ impl Session {
                             out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                                 peer,
                                 reason: "repeated disk read failures",
-                                failed: true,
+                                // a storage failure is a local fault,
+                                // not a peer protocol violation.
+                                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                             }));
                         }
                         continue;
@@ -1779,7 +1781,7 @@ impl Session {
                             eff.push(TorrentEffect::DisconnectPeer {
                                 peer,
                                 reason: "torrent_paused",
-                                failed: false,
+                                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                             });
                         }
                         t.disconnect_if_redundant(peer, &mut eff);
@@ -3061,7 +3063,7 @@ impl Session {
                     out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                         peer: *pid,
                         reason: "torrent_paused",
-                        failed: false,
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                     }));
                 }
                 if checking {
@@ -3089,7 +3091,7 @@ impl Session {
                         out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                             peer: *pid,
                             reason: "torrent_paused",
-                            failed: false,
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                         }));
                     }
                 }
@@ -3683,26 +3685,21 @@ impl Session {
             match victim {
                 Some((cih, (v, _rank))) => {
                     // evict the candidate's lowest-ranking conn —
-                    // `peer_disconnected_other` clears our debt.
-                    if let Some(vt) = self.torrents.get_mut(&cih) {
-                        if let Some(r) = vt.peers.get(&v).and_then(|c| c.remote) {
-                            vt.peer_disconnected_addr(r, self.session_time, false);
-                        }
-                        let mut eff = Vec::new();
-                        vt.remove_peer(v, &self.counters, &self.peer_class_pool, &mut eff);
-                        self.route(cih, eff, out);
-                        self.alerts.post(Alert::PeerDisconnected {
-                            ih: cih,
-                            reason: format!("peer {v}: too_many_connections"),
-                        });
+                    // the `DisconnectPeer` effect runs the full
+                    // `peer_connection::disconnect` path through
+                    // `peer_disconnected` (peer-list bookkeeping,
+                    // counters, alert, engine teardown).
+                    if self.torrents.contains_key(&cih) {
                         out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                             peer: v,
                             reason: "too_many_connections",
-                            failed: false,
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                         }));
                         conn.exceeded_limit = false;
                     } else {
-                        // candidate vanished — drop ourselves.
+                        // candidate vanished — drop ourselves. The
+                        // conn isn't in `t.peers` yet, so the teardown
+                        // path can't see it — post the alert here.
                         self.alerts.post(Alert::PeerDisconnected {
                             ih: *ih,
                             reason: format!("peer {peer}: too_many_connections"),
@@ -3710,7 +3707,7 @@ impl Session {
                         out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                             peer,
                             reason: "too_many_connections",
-                            failed: false,
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                         }));
                         return;
                     }
@@ -3723,7 +3720,7 @@ impl Session {
                     out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                         peer,
                         reason: "too_many_connections",
-                        failed: false,
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                     }));
                     return;
                 }
@@ -3774,7 +3771,7 @@ impl Session {
                         out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                             peer: other,
                             reason: "duplicate_peer_id",
-                            failed: false,
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                         }));
                     } else {
                         // kill this conn — never inserted into the
@@ -3786,7 +3783,7 @@ impl Session {
                         out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                             peer,
                             reason: "duplicate_peer_id",
-                            failed: false,
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                         }));
                         return;
                     }
@@ -3815,7 +3812,9 @@ impl Session {
                     out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                         peer,
                         reason: "self_connection",
-                        failed: true,
+                        // upstream `errors::self_connection` uses the
+                        // default (normal) severity.
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                     }));
                     return;
                 }
@@ -3843,7 +3842,7 @@ impl Session {
                 out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                     peer,
                     reason: "banned_by_ip_filter",
-                    failed: false,
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 }));
                 return;
             }
@@ -3857,7 +3856,7 @@ impl Session {
                 out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                     peer,
                     reason: "torrent_not_ready",
-                    failed: false,
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 }));
                 return;
             }
@@ -3869,7 +3868,7 @@ impl Session {
                 out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                     peer,
                     reason: "session_closing",
-                    failed: false,
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 }));
                 return;
             }
@@ -3916,7 +3915,7 @@ impl Session {
                             out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                                 peer: v,
                                 reason: "too_many_connections",
-                                failed: false,
+                                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                             }));
                             // `peer_disconnected_other` — our slack
                             // debt is settled by the eviction.
@@ -3930,7 +3929,7 @@ impl Session {
                             out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                                 peer,
                                 reason: "too_many_connections",
-                                failed: false,
+                                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                             }));
                             return;
                         }
@@ -3952,7 +3951,7 @@ impl Session {
                 out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                     peer,
                     reason: "too_many_connections",
-                    failed: false,
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 }));
                 return;
             }
@@ -3979,7 +3978,7 @@ impl Session {
                         out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                             peer: v,
                             reason: "too_many_connections",
-                            failed: false,
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                         }));
                         conn.exceeded_limit = false;
                     }
@@ -3992,7 +3991,7 @@ impl Session {
                         out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                             peer,
                             reason: "too_many_connections",
-                            failed: false,
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                         }));
                         return;
                     }
@@ -4051,6 +4050,12 @@ impl Session {
                 conn.send_buffer += bitdaemon_net::peer_wire::wire_len(&msg);
                 out.push(SessionOut::ToPeer { ih: *ih, peer, msg });
             }
+            // `write_bitfield` sets `m_sent_bitfield` in every branch
+            // — including the have-none/super-seed legs that send no
+            // bitfield bytes — whenever it ran (i.e. `valid_metadata`).
+            // It gates the `DhtPort` reply leg of `on_dht_port`.
+            conn.sent_bitfield = t.valid_metadata();
+            conn.local_dht_port = self.dht_port;
             // upstream `peer_connection::init` sends `port` when
             // the peer negotiated DHT and our dht is bound.
             if conn.supports_dht
@@ -4108,34 +4113,147 @@ impl Session {
 
     /// a peer disconnected — refcount down + abort in-flight.
     ///
-    /// `failed` is the disconnect severity the initiator recorded
-    /// (`disconnect(ec, op, error >= failure)` → `m_failed`). It is
-    /// OR-ed with `PeerConn::failed` so a protocol error recorded
-    /// earlier in message dispatch cannot be downgraded by a later
-    /// benign teardown — upstream's first `disconnect()` wins.
+    /// `gone` carries the disconnect context: session-initiated
+    /// `disconnect()` severity + reason (`PeerGone::Disconnected`),
+    /// a transport/codec failure from the read pump
+    /// (`PeerGone::Transport`), or a clean/socket close (`None`).
+    ///
+    /// Severity semantics are upstream `peer_connection::disconnect`'s:
+    /// `peer_error` → `peer_error_alert` + `error_peers` (and no
+    /// `peer_disconnected_alert` — they are mutually exclusive);
+    /// `failure`/`normal` → `peer_disconnected_alert`. Anything
+    /// `> normal` sets `m_failed` (failcount bump in
+    /// `connection_closed`) — OR-ed with `PeerConn::failed` so a
+    /// dispatch-time severity cannot be downgraded by a later benign
+    /// teardown.
     pub fn peer_disconnected(
         &mut self,
         ih: &Sha1Hash,
         peer: u64,
-        failed: bool,
+        gone: Option<bitdaemon_net::bt_peer_conn::PeerGone>,
         out: &mut Vec<SessionOut>,
     ) {
+        use bitdaemon_net::bt_peer_conn::{DisconnectSeverity, PeerConnError, PeerGone};
+        use bitdaemon_net::peer_wire::WireError;
+        let (sev, reason, incoming_id) = match &gone {
+            Some(PeerGone::Disconnected { severity, reason }) => {
+                (*severity, Some((*reason).to_string()), None)
+            }
+            Some(PeerGone::Transport(e)) => match e {
+                // socket EOF/reset — `sock_read`/`sock_write` run at
+                // normal severity upstream.
+                PeerConnError::Io(_) => (DisconnectSeverity::Normal, Some(e.to_string()), None),
+                // a complete frame that failed size validation —
+                // upstream counts it in `num_incoming_*` before the
+                // `invalid_*` disconnect (the counter block runs when
+                // the packet finishes; the disconnect is inside the
+                // handler).
+                PeerConnError::Wire(WireError::BadLength { id, .. }) => (
+                    DisconnectSeverity::PeerError,
+                    Some(e.to_string()),
+                    Some(*id),
+                ),
+                // unknown wire id — upstream's dispatch `default` leg
+                // returns *before* the counter block: an
+                // `invalid_message` kill with no `num_incoming_*`.
+                PeerConnError::Wire(WireError::UnknownId(_)) => {
+                    (DisconnectSeverity::PeerError, Some(e.to_string()), None)
+                }
+                // `packet_too_large` (frame > 1 MiB) and friends —
+                // `peer_error` upstream.
+                _ => (DisconnectSeverity::PeerError, Some(e.to_string()), None),
+            },
+            None => (DisconnectSeverity::Normal, None, None),
+        };
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(ih) {
-            if let Some(c) = t.peers.get(&peer)
-                && let Some(remote) = c.remote
-            {
-                t.peer_disconnected_addr(remote, self.session_time, c.failed || failed);
+            if let Some(id) = incoming_id {
+                // same quirky mapping as the dispatch counter block:
+                // ids 0..=9 → `num_incoming_choke + id`, 13..=17 →
+                // `num_incoming_suggest + id`, else `num_incoming_extended`.
+                self.counters
+                    .inc_idx(crate::counters::incoming_counter_idx(id));
+            }
+            let (remote, outgoing, is_utp, conn_failed) =
+                t.peers.get(&peer).map_or((None, false, false, false), |c| {
+                    (c.remote, c.outgoing, c.is_utp, c.failed)
+                });
+            if let Some(r) = remote {
+                t.peer_disconnected_addr(
+                    r,
+                    self.session_time,
+                    conn_failed || sev > DisconnectSeverity::Normal,
+                );
             }
             let had = t.peers.contains_key(&peer);
             t.remove_peer(peer, &self.counters, &self.peer_class_pool, &mut eff);
             if had {
-                // `peer_disconnected_alert` (upstream posts it in
-                // `peer_connection::disconnect` on every close).
-                self.alerts.post(Alert::PeerDisconnected {
-                    ih: *ih,
-                    reason: format!("peer {peer}: disconnected"),
-                });
+                // `peer_connection::disconnect` counter legs —
+                // `disconnected_peers` on every close, then the
+                // per-error legs. Transport kinds come off the io
+                // error; upstream error names off the disconnect
+                // reason.
+                self.counters
+                    .inc(crate::counters::Counter::DisconnectedPeers);
+                let kind_ctr = match &gone {
+                    Some(PeerGone::Transport(PeerConnError::Io(e))) => {
+                        use crate::counters::Counter as C;
+                        use std::io::ErrorKind as K;
+                        match e.kind() {
+                            K::ConnectionReset => Some(C::ConnresetPeers),
+                            K::UnexpectedEof => Some(C::EofPeers),
+                            K::ConnectionRefused => Some(C::ConnrefusedPeers),
+                            K::ConnectionAborted => Some(C::ConnabortedPeers),
+                            K::NotConnected => Some(C::NotconnectedPeers),
+                            K::PermissionDenied => Some(C::PermPeers),
+                            K::BrokenPipe => Some(C::BrokenPipePeers),
+                            K::AddrInUse => Some(C::AddrinusePeers),
+                            K::TimedOut => Some(C::TransportTimeoutPeers),
+                            _ => None,
+                        }
+                    }
+                    Some(PeerGone::Disconnected { reason, .. }) => {
+                        crate::counters::disconnect_reason_counter(reason)
+                    }
+                    _ => None,
+                };
+                if let Some(c) = kind_ctr {
+                    self.counters.inc(c);
+                }
+                if sev > DisconnectSeverity::Normal {
+                    // `error > normal` → transport + direction legs.
+                    self.counters.inc(if is_utp {
+                        crate::counters::Counter::ErrorUtpPeers
+                    } else {
+                        crate::counters::Counter::ErrorTcpPeers
+                    });
+                    self.counters.inc(if outgoing {
+                        crate::counters::Counter::ErrorOutgoingPeers
+                    } else {
+                        crate::counters::Counter::ErrorIncomingPeers
+                    });
+                }
+                if sev == DisconnectSeverity::PeerError {
+                    // upstream posts `peer_error_alert` for severity
+                    // `peer_error` (`error_peers` counter), never
+                    // `peer_disconnected_alert`.
+                    self.counters.inc(crate::counters::Counter::ErrorPeers);
+                    self.alerts.post(Alert::PeerError {
+                        ih: *ih,
+                        remote: remote.map_or_else(String::new, |a| a.to_string()),
+                        op: "bittorrent".into(),
+                        error: reason.unwrap_or_else(|| "peer error".into()),
+                    });
+                } else {
+                    // `peer_disconnected_alert` — normal/failure.
+                    self.alerts.post(Alert::PeerDisconnected {
+                        ih: *ih,
+                        reason: format!(
+                            "peer {peer}: {}",
+                            reason.as_deref().unwrap_or("disconnected")
+                        ),
+                    });
+                }
                 self.alerts.post(Alert::PeerLog {
                     ih: *ih,
                     remote: String::new(),
@@ -4562,7 +4680,7 @@ impl Session {
                 eff.push(TorrentEffect::DisconnectPeer {
                     peer: *id,
                     reason: "banned_by_ip_filter",
-                    failed: false,
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 });
             }
             // erase blocked entries with no live conn (the sweep
@@ -4637,7 +4755,7 @@ impl Session {
                 eff.push(TorrentEffect::DisconnectPeer {
                     peer: *id,
                     reason: "banned_by_port_filter",
-                    failed: false,
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 });
             }
             // erase filtered swarm entries (unconnected leftovers).
@@ -7634,7 +7752,9 @@ impl Session {
                 out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                     peer: p,
                     reason: "out of memory",
-                    failed: true,
+                    // `errors::no_memory` — default (normal) severity
+                    // upstream; a local alloc failure, not a peer fault.
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 }));
             }
             return;
@@ -7758,22 +7878,26 @@ impl Session {
                     }
                     self.route(ih, te, out);
                 }
-                TorrentEffect::DisconnectPeer {
-                    peer,
-                    reason,
-                    failed,
-                } => {
-                    self.peer_disconnected(&ih, peer, failed, out);
-                    self.alerts.post(Alert::PeerDisconnected {
-                        ih,
-                        reason: format!("peer {peer}: {reason}"),
-                    });
+                TorrentEffect::DisconnectPeer { peer, reason, sev } => {
+                    // `peer_connection::disconnect` — teardown +
+                    // severity-correct alert happen inside
+                    // `peer_disconnected` (one site, same for
+                    // transport deaths).
+                    self.peer_disconnected(
+                        &ih,
+                        peer,
+                        Some(bitdaemon_net::bt_peer_conn::PeerGone::Disconnected {
+                            severity: sev,
+                            reason,
+                        }),
+                        out,
+                    );
                     // forward — the engine drops the writer task so
                     // the socket actually closes (`close_connection`).
                     out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                         peer,
                         reason,
-                        failed,
+                        sev,
                     }));
                 }
                 TorrentEffect::PiecePassed(piece) => {

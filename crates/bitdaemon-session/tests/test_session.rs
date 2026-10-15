@@ -81,7 +81,7 @@ fn disconnect_cleans_up() {
     };
     let mut out = Vec::new();
     s.on_peer_message(&p, 0, &mut out);
-    s.peer_disconnected(&ih, 9, false, &mut out);
+    s.peer_disconnected(&ih, 9, None, &mut out);
     assert_eq!(s.num_peers(), 0);
 }
 
@@ -837,4 +837,228 @@ fn peer_class_assignment() {
     let c = &s.torrents[&ih].peers[&3];
     assert!(c.peer_classes.has_class(0));
     assert!(!c.peer_classes.has_class(1));
+}
+
+#[test]
+fn peer_error_disconnect_posts_peer_error_not_disconnected() {
+    // `peer_connection::disconnect(ec, op, peer_error)` — upstream
+    // posts `peer_error_alert`, never `peer_disconnected_alert`, and
+    // bumps `error_peers`/`disconnected_peers`/`error_tcp_peers` +
+    // the direction leg.
+    use bitdaemon_net::bt_peer_conn::{DisconnectSeverity, PeerGone};
+    use bitdaemon_session::alerts::Alert;
+    use bitdaemon_session::counters::Counter;
+    let mut s = Session::new();
+    s.alerts
+        .set_mask(bitdaemon_session::alerts::AlertCategory::ALL);
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+    let mut out = Vec::new();
+    let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
+    c.outgoing = true;
+    s.peer_connected(&ih, 7, c, "127.0.0.1:6881".parse().unwrap(), &mut out);
+    s.pop_alerts();
+    s.peer_disconnected(
+        &ih,
+        7,
+        Some(PeerGone::Disconnected {
+            severity: DisconnectSeverity::PeerError,
+            reason: "invalid have index",
+        }),
+        &mut out,
+    );
+    assert_eq!(s.num_peers(), 0);
+    let alerts = s.pop_alerts();
+    assert!(
+        alerts
+            .iter()
+            .any(|a| matches!(a, Alert::PeerError { error, .. } if error == "invalid have index")),
+        "expected a peer_error alert: {alerts:?}"
+    );
+    assert!(
+        !alerts
+            .iter()
+            .any(|a| matches!(a, Alert::PeerDisconnected { .. })),
+        "peer_error never posts peer_disconnected upstream: {alerts:?}"
+    );
+    assert_eq!(s.counters.value(Counter::ErrorPeers), 1);
+    assert_eq!(s.counters.value(Counter::DisconnectedPeers), 1);
+    assert_eq!(s.counters.value(Counter::ErrorTcpPeers), 1);
+    assert_eq!(s.counters.value(Counter::ErrorOutgoingPeers), 1);
+}
+
+#[test]
+fn normal_disconnect_posts_peer_disconnected_once() {
+    // severity `normal` → `peer_disconnected_alert`; the engine's
+    // `gone` echo (`None`) re-enters `peer_disconnected` and must be
+    // a silent no-op — no duplicate alert, no double counters.
+    use bitdaemon_net::bt_peer_conn::{DisconnectSeverity, PeerGone};
+    use bitdaemon_session::alerts::Alert;
+    use bitdaemon_session::counters::Counter;
+    let mut s = Session::new();
+    s.alerts
+        .set_mask(bitdaemon_session::alerts::AlertCategory::ALL);
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+    let mut out = Vec::new();
+    s.peer_connected(
+        &ih,
+        8,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        "127.0.0.1:6881".parse().unwrap(),
+        &mut out,
+    );
+    s.pop_alerts();
+    s.peer_disconnected(
+        &ih,
+        8,
+        Some(PeerGone::Disconnected {
+            severity: DisconnectSeverity::Normal,
+            reason: "too_many_connections",
+        }),
+        &mut out,
+    );
+    // engine `gone` echo after the writer task exits.
+    s.peer_disconnected(&ih, 8, None, &mut out);
+    let alerts = s.pop_alerts();
+    let disc = alerts
+        .iter()
+        .filter(|a| matches!(a, Alert::PeerDisconnected { .. }))
+        .count();
+    assert_eq!(disc, 1, "exactly one peer_disconnected alert: {alerts:?}");
+    assert!(
+        !alerts.iter().any(|a| matches!(a, Alert::PeerError { .. })),
+        "normal severity never posts peer_error: {alerts:?}"
+    );
+    assert_eq!(s.counters.value(Counter::DisconnectedPeers), 1);
+    assert_eq!(s.counters.value(Counter::TooManyPeers), 1);
+    assert_eq!(s.counters.value(Counter::ErrorPeers), 0);
+}
+
+#[test]
+fn transport_eof_is_normal_close() {
+    // `on_receive` socket EOF — `eof_peers` counter,
+    // `peer_disconnected_alert`, no `error_peers`.
+    use bitdaemon_net::bt_peer_conn::{PeerConnError, PeerGone};
+    use bitdaemon_session::alerts::Alert;
+    use bitdaemon_session::counters::Counter;
+    let mut s = Session::new();
+    s.alerts
+        .set_mask(bitdaemon_session::alerts::AlertCategory::ALL);
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+    let mut out = Vec::new();
+    s.peer_connected(
+        &ih,
+        8,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        "127.0.0.1:6881".parse().unwrap(),
+        &mut out,
+    );
+    s.pop_alerts();
+    s.peer_disconnected(
+        &ih,
+        8,
+        Some(PeerGone::Transport(PeerConnError::Io(
+            std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+        ))),
+        &mut out,
+    );
+    let alerts = s.pop_alerts();
+    assert!(
+        alerts
+            .iter()
+            .any(|a| matches!(a, Alert::PeerDisconnected { .. })),
+        "EOF closes with a peer_disconnected alert: {alerts:?}"
+    );
+    assert!(!alerts.iter().any(|a| matches!(a, Alert::PeerError { .. })));
+    assert_eq!(s.counters.value(Counter::EofPeers), 1);
+    assert_eq!(s.counters.value(Counter::ErrorPeers), 0);
+}
+
+#[test]
+fn wire_bad_length_counts_packet_then_peer_error() {
+    // a complete frame with a bad fixed size is counted in
+    // `num_incoming_*` (upstream bumps the counter once the packet
+    // finished, after the handler's `invalid_*` disconnect) — a
+    // `have` with a wrong length lands on `num_incoming_have`.
+    use bitdaemon_net::bt_peer_conn::{PeerConnError, PeerGone};
+    use bitdaemon_net::peer_wire::WireError;
+    use bitdaemon_session::alerts::Alert;
+    use bitdaemon_session::counters::{Counter, incoming_counter_idx};
+    let mut s = Session::new();
+    s.alerts
+        .set_mask(bitdaemon_session::alerts::AlertCategory::ALL);
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+    let mut out = Vec::new();
+    s.peer_connected(
+        &ih,
+        8,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        "127.0.0.1:6881".parse().unwrap(),
+        &mut out,
+    );
+    s.pop_alerts();
+    s.peer_disconnected(
+        &ih,
+        8,
+        Some(PeerGone::Transport(PeerConnError::Wire(
+            WireError::BadLength { id: 4, len: 6 },
+        ))),
+        &mut out,
+    );
+    assert_eq!(
+        s.counters.value(Counter::NumIncomingHave),
+        1,
+        "the bad frame still counted by packet type"
+    );
+    // the quirky mapping maps id 4 to num_incoming_choke + 4.
+    assert_eq!(incoming_counter_idx(4), Counter::NumIncomingHave as usize);
+    let alerts = s.pop_alerts();
+    assert!(alerts.iter().any(|a| matches!(a, Alert::PeerError { .. })));
+    assert_eq!(s.counters.value(Counter::ErrorPeers), 1);
+}
+
+#[test]
+fn wire_unknown_id_skips_packet_counter() {
+    // upstream's dispatch `default` leg disconnects before the
+    // `num_incoming_*` bump — an unknown id must not count.
+    use bitdaemon_net::bt_peer_conn::{PeerConnError, PeerGone};
+    use bitdaemon_net::peer_wire::WireError;
+    use bitdaemon_session::counters::{Counter, NUM_COUNTERS};
+    let mut s = Session::new();
+    s.alerts
+        .set_mask(bitdaemon_session::alerts::AlertCategory::ALL);
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+    let mut out = Vec::new();
+    s.peer_connected(
+        &ih,
+        8,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        "127.0.0.1:6881".parse().unwrap(),
+        &mut out,
+    );
+    s.peer_disconnected(
+        &ih,
+        8,
+        Some(PeerGone::Transport(PeerConnError::Wire(
+            WireError::UnknownId(0x55),
+        ))),
+        &mut out,
+    );
+    assert_eq!(
+        s.counters.value(Counter::NumIncomingChoke)
+            + s.counters.value(Counter::NumIncomingExtended),
+        0,
+        "unknown ids bypass the packet counter"
+    );
+    assert_eq!(s.counters.value(Counter::ErrorPeers), 1);
+    let _ = NUM_COUNTERS;
 }

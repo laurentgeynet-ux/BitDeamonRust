@@ -358,8 +358,20 @@ pub struct PeerConn {
     /// (reserved byte 7 bit 0x04). Rejects/allowed-fast only exist
     /// when set.
     pub supports_fast: bool,
-    /// `m_supports_dht_port` — remote advertised a DHT port bit.
+    /// `m_supports_dht_port` — remote advertised a DHT port bit
+    /// (handshake) *or* sent us a `DhtPort` message (upstream flips it
+    /// in `on_dht_port`).
     pub supports_dht: bool,
+    /// `m_sent_bitfield` — our post-handshake `write_bitfield` ran
+    /// (set for *every* upstream branch, including the no-send
+    /// have-none/super-seed legs — the flag means "handshake init
+    /// done with metadata", not "bitfield bytes on the wire"). Gates
+    /// the `DhtPort` reply in `on_dht_port`.
+    pub sent_bitfield: bool,
+    /// Our own DHT listen port (`m_ses.dht_port()`) — needed to build
+    /// the `DhtPort` reply when a remote's first announcement arrives
+    /// after our bitfield went out.
+    pub local_dht_port: Option<u16>,
     /// `supports_encryption()` — the connection went through the
     /// MSE/PE handshake (`m_encrypted`), regardless of the negotiated
     /// `crypto_select` (plaintext-select still counts). Feeds the
@@ -545,6 +557,8 @@ impl PeerConn {
             supports_fast: false,
             pre_metadata_all: false,
             supports_dht: false,
+            sent_bitfield: false,
+            local_dht_port: None,
             supports_encryption: false,
             local_dont_have: 7,
             local_share_mode: 8,
@@ -998,6 +1012,43 @@ impl PeerConn {
                 for b in self.on_choke_with_aborts(counters) {
                     eff.push(PeerEffect::AbortDownload(b));
                 }
+                // upstream `on_choke`: without the FAST extension a
+                // choke rejects every outstanding block request —
+                // `incoming_reject_request(to_req(pb.block))` runs per
+                // download_queue entry.
+                if !self.supports_fast {
+                    let blocks: Vec<PieceBlock> = self
+                        .pipeline
+                        .download_queue
+                        .iter()
+                        .map(|b| b.block)
+                        .collect();
+                    for block in blocks {
+                        // `to_req` — start is block-aligned, length is
+                        // the block's tail-clamped size.
+                        let piece_sz =
+                            if block.piece_index.0 >= 0 && block.piece_index.0 < num_pieces {
+                                files.map_or_else(
+                                    || i32::try_from(piece_length).unwrap_or(i32::MAX),
+                                    |f| f.piece_size(block.piece_index),
+                                )
+                            } else {
+                                0
+                            };
+                        let start = block.block_index * block_size;
+                        let r = bitdaemon_common::PeerRequest {
+                            piece: block.piece_index,
+                            start,
+                            length: (piece_sz - start).min(block_size),
+                        };
+                        let (valid, abort) = self.on_reject(&r, block_size, piece_sz, is_seed);
+                        if valid {
+                            if let Some(b) = abort {
+                                eff.push(PeerEffect::AbortDownload(b));
+                            }
+                        }
+                    }
+                }
             }
             M::Unchoke => {
                 if self.peer_choked {
@@ -1060,7 +1111,10 @@ impl PeerConn {
                 // `invalid_have` — out-of-range indexes are a
                 // protocol violation upstream (disconnect).
                 if i.0 < 0 || i.0 as usize >= self.peer_pieces.size() {
-                    eff.push(PeerEffect::Disconnect("invalid have index", true));
+                    eff.push(PeerEffect::Disconnect(
+                        "invalid have index",
+                        bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    ));
                     return;
                 }
                 // a peer sending piece-level messages has metadata
@@ -1078,6 +1132,16 @@ impl PeerConn {
                 }
             }
             M::HaveAll => {
+                // upstream `on_have_all` — FAST messages on a conn
+                // that never negotiated the extension disconnect
+                // (`invalid_have_all`, peer_error).
+                if !self.supports_fast {
+                    eff.push(PeerEffect::Disconnect(
+                        "invalid have_all",
+                        bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    ));
+                    return;
+                }
                 // `incoming_have_all` — a re-announced all-set drops
                 // the previous share first (`peer_lost`).
                 if self.bitfield_received && !self.peer_pieces.none_set() {
@@ -1101,6 +1165,15 @@ impl PeerConn {
                 eff.push(PeerEffect::PeerSeed(true));
             }
             M::HaveNone => {
+                // upstream `on_have_none` — FAST without negotiation
+                // is `invalid_have_none` (peer_error disconnect).
+                if !self.supports_fast {
+                    eff.push(PeerEffect::Disconnect(
+                        "invalid have_none",
+                        bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    ));
+                    return;
+                }
                 // `peer_lost` on the old bitfield — the peer's
                 // previous pieces leave the refcount. have_none
                 // proves the peer has metadata (upstream sets
@@ -1124,7 +1197,10 @@ impl PeerConn {
                     return;
                 }
                 if i.0 as usize >= self.peer_pieces.size() {
-                    eff.push(PeerEffect::Disconnect("invalid dont_have index", true));
+                    eff.push(PeerEffect::Disconnect(
+                        "invalid dont_have index",
+                        bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    ));
                     return;
                 }
                 // piece-level message — the peer has metadata
@@ -1165,7 +1241,10 @@ impl PeerConn {
                         eff.push(PeerEffect::RefcountBulk(bf, true));
                         eff.push(PeerEffect::PeerSeed(seed));
                     }
-                    None => eff.push(PeerEffect::Disconnect("invalid bitfield size", true)),
+                    None => eff.push(PeerEffect::Disconnect(
+                        "invalid bitfield size",
+                        bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    )),
                 }
             }
             M::Request(r) => {
@@ -1234,7 +1313,7 @@ impl PeerConn {
                         if self.num_invalid_requests > 300 && !self.peer_choked {
                             eff.push(PeerEffect::Disconnect(
                                 "too many requests when choked",
-                                true,
+                                bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
                             ));
                             return;
                         }
@@ -1255,7 +1334,7 @@ impl PeerConn {
                         if self.accept_fast_piece_cnt[idx] >= 3 * blocks_per_piece {
                             eff.push(PeerEffect::Disconnect(
                                 "too many requests when choked",
-                                true,
+                                bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
                             ));
                             return;
                         }
@@ -1267,7 +1346,7 @@ impl PeerConn {
                         if self.now_ms - self.last_choke_ms > 2000 {
                             eff.push(PeerEffect::Disconnect(
                                 "too many requests when choked",
-                                true,
+                                bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
                             ));
                             return;
                         }
@@ -1318,7 +1397,10 @@ impl PeerConn {
                 // disconnects on the first fragment, before any
                 // `incoming_piece` state moves.
                 if i64::from(r.length) > i64::from(block_size) {
-                    eff.push(PeerEffect::Disconnect("packet_too_large", true));
+                    eff.push(PeerEffect::Disconnect(
+                        "packet_too_large",
+                        bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    ));
                     return;
                 }
                 // `incoming_piece` — an omitted bitfield reads as
@@ -1422,6 +1504,15 @@ impl PeerConn {
                 )));
             }
             M::RejectRequest(r) => {
+                // upstream `on_reject_request` — FAST without
+                // negotiation is `invalid_reject` (peer_error).
+                if !self.supports_fast {
+                    eff.push(PeerEffect::Disconnect(
+                        "invalid reject",
+                        bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    ));
+                    return;
+                }
                 // `piece_size_for_req` — 0 when the piece is out of
                 // range, which fails validation upstream-style.
                 let piece_sz = if r.piece.0 >= 0 && r.piece.0 < num_pieces {
@@ -1452,8 +1543,33 @@ impl PeerConn {
                     )));
                 }
             }
-            M::AllowedFast(i) => self.on_allowed_fast(i),
-            M::SuggestPiece(i) => eff.push(PeerEffect::SuggestPiece(i)),
+            M::AllowedFast(i) => {
+                // upstream `on_allowed_fast` — `invalid_allow_fast`
+                // when FAST was never negotiated.
+                if !self.supports_fast {
+                    eff.push(PeerEffect::Disconnect(
+                        "invalid allowed_fast",
+                        bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    ));
+                    return;
+                }
+                self.on_allowed_fast(i);
+            }
+            M::SuggestPiece(i) => {
+                // upstream `on_suggest_piece` — `invalid_suggest`
+                // when FAST was never negotiated.
+                if !self.supports_fast {
+                    eff.push(PeerEffect::Disconnect(
+                        "invalid suggest",
+                        bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    ));
+                    return;
+                }
+                eff.push(PeerEffect::SuggestPiece(i));
+            }
+            // upstream `on_piece` swallows a sub-header frame silently
+            // (`packet_finished`, no effect) — never disconnects.
+            M::Malformed { .. } => {}
             M::DhtPort(p) => eff.push(PeerEffect::DhtPort(p)),
             M::Extended { id, ref data } => {
                 if id == 0 {
@@ -1564,7 +1680,13 @@ impl PeerConn {
                     {
                         eff.push(PeerEffect::Holepunch(hp));
                     }
-                } else if id == self.local_dont_have && data.len() == 4 {
+                } else if id == self.local_dont_have {
+                    // `on_extended` upstream: a negotiated id with the
+                    // wrong size is logged and swallowed, NOT a
+                    // disconnect — only unknown ids are fatal.
+                    if data.len() != 4 {
+                        return;
+                    }
                     // `incoming_dont_have` — peer retracted a piece
                     // (same validation as the wire `dont_have` arm).
                     let i = PieceIndex(i32::from_be_bytes([data[0], data[1], data[2], data[3]]));
@@ -1572,13 +1694,24 @@ impl PeerConn {
                         return;
                     }
                     if i.0 as usize >= self.peer_pieces.size() {
-                        eff.push(PeerEffect::Disconnect("invalid dont_have index", true));
+                        eff.push(PeerEffect::Disconnect(
+                            "invalid dont_have index",
+                            bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                        ));
                         return;
                     }
                     if self.on_dont_have(i) {
                         eff.push(PeerEffect::RefcountDec(i));
                         eff.push(PeerEffect::PeerSeed(false));
                     }
+                } else {
+                    // upstream `on_extended` tail — every extension got
+                    // a look (`peer_plugin::on_extended`); unclaimed
+                    // ids are `invalid_message` (peer_error).
+                    eff.push(PeerEffect::Disconnect(
+                        "invalid message",
+                        bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    ));
                 }
             }
             _ => {}
@@ -2037,10 +2170,15 @@ pub enum PeerEffect {
     /// `peer_error_alert` — a non-fatal peer protocol complaint
     /// (e.g. `peer_sent_empty_piece`); posted, no disconnect.
     PeerError(&'static str),
-    /// protocol violation — drop the connection. `failed` mirrors
-    /// upstream `disconnect_severity_t > normal` (drives the
-    /// swarm-entry `failcount` bump in `connection_closed`).
-    Disconnect(&'static str, bool),
+    /// protocol violation — drop the connection. The severity mirrors
+    /// upstream `disconnect_severity_t` (`peer_error` for `invalid_*`
+    /// violations): it picks the teardown alert
+    /// (`peer_error_alert` vs `peer_disconnected_alert`) and drives
+    /// the swarm-entry `failcount` bump in `connection_closed`.
+    Disconnect(
+        &'static str,
+        bitdaemon_net::bt_peer_conn::DisconnectSeverity,
+    ),
 }
 
 #[cfg(test)]

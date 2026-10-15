@@ -9,6 +9,38 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+### Fixed
+
+- **Peer-wire codec & disconnect severity (A06)**: the frame
+  length-prefix cap is now upstream's 1 MiB (`packet_size >
+  1024*1024` → `packet_too_large`); a `piece` frame shorter than the
+  9-byte header is consumed silently like upstream `on_piece` instead
+  of failing the codec. Disconnect severity is typed end-to-end
+  (`disconnect_severity_t`): `peer_error` posts `peer_error_alert` +
+  `error_peers` (never `peer_disconnected_alert` — the alerts are
+  mutually exclusive upstream), while normal/failure closes post
+  `peer_disconnected_alert` exactly once. The engine's `gone`
+  channel now carries the kill reason (`PeerGone`), so socket EOF/
+  reset and codec violations reach the session with their severity —
+  `peer_connection::disconnect`'s counter legs are wired
+  (`disconnected_peers`, per-io-kind `eof`/`connreset`/… peers,
+  per-reason `uninteresting`/`too_many`/`no_memory`/timeout peers,
+  `error_tcp`/`error_utp` + `error_outgoing`/`error_incoming` on
+  `> normal`), and severity mappings were corrected to upstream
+  defaults (`self_connection`, filter bans, `too_many_connections`,
+  `no_memory`, `too_frequent_pex`, `peer_banned`/smart-ban are normal
+  closes, not peer errors). FAST-extension messages
+  (`RejectRequest`/`AllowedFast`/`SuggestPiece`/`HaveAll`/`HaveNone`)
+  now disconnect as `invalid_*` unless the handshake negotiated FAST;
+  a non-FAST `Choke` rejects every download-queue entry through
+  `incoming_reject_request` as upstream does. `incoming_dht_port`
+  adds the announced endpoint unconditionally, flips `supports_dht`,
+  and replies with our DHT port once the post-handshake bitfield step
+  ran (`m_sent_bitfield` now stamped on every `write_bitfield` leg,
+  including have_all/have_none/super-seed that send no bitfield
+  bytes). `disconnect_if_redundant` runs after the extended
+  handshake, matching upstream's `on_extended` tail.
+
 - **rustls crypto provider ambiguity**: HTTPS tracker announces and
   SSL torrent configs no longer panic with "no process-level
   `CryptoProvider` available" when the embedding application

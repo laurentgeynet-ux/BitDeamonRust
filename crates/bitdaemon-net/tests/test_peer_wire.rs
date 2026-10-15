@@ -195,6 +195,34 @@ fn decoder_enforces_max_len() {
 }
 
 #[test]
+fn decoder_default_cap_is_one_mib() {
+    // upstream `bt_peer_connection` kills the conn when the length
+    // prefix announces `packet_size > 1024 * 1024`.
+    let mut codec = PeerWireCodec::default();
+    // exactly 1 MiB body — legal, waits for the frame bytes.
+    let mut ok = BytesMut::from(&[0x00, 0x10, 0x00, 0x00][..]);
+    assert!(codec.decode(&mut ok).expect("dec").is_none());
+    assert_eq!(ok.len(), 4, "prefix stays buffered");
+    // 1 MiB + 1 — `packet_too_large`.
+    let mut over = BytesMut::from(&[0x00, 0x10, 0x00, 0x01][..]);
+    assert!(codec.decode(&mut over).is_err());
+}
+
+#[test]
+fn short_piece_decodes_to_silent_malformed() {
+    // upstream `on_piece` consumes a frame shorter than the 9-byte
+    // header silently — the conn lives and the packet still counts
+    // toward `num_incoming_piece` (the session's counter maps the
+    // stored wire id).
+    let msg = decode(&[MessageId::Piece as u8, 0, 0, 0, 1]).expect("dec");
+    assert_eq!(msg, PeerMessage::Malformed { id: 7 });
+    // exactly 9 bytes parses as a real (empty) piece message — the
+    // empty-piece BitComet quirk is handled by the session, not here.
+    let full = decode(&[MessageId::Piece as u8, 0, 0, 0, 1, 0, 0, 0, 0]).expect("dec");
+    assert!(matches!(full, PeerMessage::Piece { .. }));
+}
+
+#[test]
 fn decode_unit() {
     // upstream packet_type dispatch on the raw payload
     assert_eq!(
@@ -203,6 +231,12 @@ fn decode_unit() {
     );
     assert_eq!(decode(&[]).expect("d"), PeerMessage::Keepalive);
     assert!(decode(&[0x55]).is_err(), "unknown id");
+    // unknown wire id — upstream's `default` leg is an
+    // `invalid_message` disconnect *before* the counter block.
+    match decode(&[0x55]) {
+        Err(bitdaemon_net::peer_wire::WireError::UnknownId(0x55)) => {}
+        other => panic!("expected UnknownId(0x55), got {other:?}"),
+    }
 }
 
 #[test]

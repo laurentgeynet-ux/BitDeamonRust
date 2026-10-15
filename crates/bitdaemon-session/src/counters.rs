@@ -12,6 +12,55 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
+/// `bt_peer_connection::dispatch_message`'s packet counter mapping —
+/// the upstream quirk verbatim: wire ids 0..=9 land on
+/// `num_incoming_choke + id`; the FAST ids 13..=17 land on
+/// `num_incoming_suggest + id` (offsets `num_incoming_suggest+13`
+/// overflows into the `num_outgoing_*` range — kept as-is); every
+/// other decoded type lands on `num_incoming_extended`. Keepalives
+/// carry no id and are never counted; a *complete* frame that fails
+/// size validation still counts (the bump runs after the handler
+/// breaks out), an unknown id does not (the `default` leg returns
+/// early).
+#[must_use]
+pub fn incoming_counter_idx(id: u8) -> usize {
+    if id <= 9 {
+        Counter::NumIncomingChoke as usize + id as usize
+    } else if (13..=17).contains(&id) {
+        Counter::NumIncomingSuggest as usize + id as usize
+    } else {
+        Counter::NumIncomingExtended as usize
+    }
+}
+
+/// `peer_connection::disconnect`'s per-reason counter — the
+/// `ec == errors::*` legs upstream runs on every teardown (in
+/// addition to the transport-kind legs). `reason` is the upstream
+/// error name our disconnect sites emit (`"self_connection"`,
+/// `"too_many_connections"`, …).
+#[must_use]
+pub fn disconnect_reason_counter(reason: &str) -> Option<Counter> {
+    Some(match reason {
+        // `upload_upload_connection || uninteresting_upload_peer ||
+        // torrent_aborted || self_connection || torrent_paused`
+        // upstream — closes that carry no blame.
+        "self_connection"
+        | "upload-upload"
+        | "torrent_paused"
+        | "session_closing"
+        | "torrent_aborted"
+        | "uninteresting_upload_peer" => Counter::UninterestingPeers,
+        "too_many_connections" => Counter::TooManyPeers,
+        "out of memory" => Counter::NoMemoryPeers,
+        "timed_out" | "transport timed out" => Counter::TransportTimeoutPeers,
+        "timed_out_inactivity" | "timed_out_no_request" | "timed_out_no_interest" => {
+            Counter::TimeoutPeers
+        }
+        "timed_out_no_handshake" => Counter::ConnectTimeouts,
+        _ => return None,
+    })
+}
+
 /// `stats_counter_t` + `stats_gauge_t` — the full upstream index set
 /// (`num_stats_counters = 235` splits stats from gauges; the bank is
 /// one flat array like upstream's `counters`).

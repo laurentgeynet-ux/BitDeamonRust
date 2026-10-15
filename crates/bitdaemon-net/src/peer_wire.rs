@@ -206,6 +206,15 @@ pub enum PeerMessage {
     },
     /// `msg_hash_reject`.
     HashReject(HashRequestWire),
+    /// A complete frame whose body is too short to decode — produced
+    /// only by `decode` for `msg_piece` packets with `packet_size < 9`
+    /// (upstream `on_piece`'s `recv_pos < header_size` early return
+    /// consumes them *silently*: counted by packet type, no state
+    /// change, no disconnect). Never constructed for sending.
+    Malformed {
+        /// The wire message id seen on the frame.
+        id: u8,
+    },
 }
 
 /// Codec errors.
@@ -379,6 +388,7 @@ impl PeerMessage {
             Self::HashRequest(_) => MessageId::HashRequest as u8,
             Self::Hashes { .. } => MessageId::Hashes as u8,
             Self::HashReject(_) => MessageId::HashReject as u8,
+            Self::Malformed { id } => *id,
             Self::Keepalive => u8::MAX,
         }
     }
@@ -475,6 +485,12 @@ pub fn encode(msg: &PeerMessage) -> Bytes {
             }
         }
         PeerMessage::HashReject(r) => write_hash_req(&mut out, MessageId::HashReject, r),
+        // decode-only marker — never emitted upstream; serialize as a
+        // bare id frame so a mistaken send is still length-legal.
+        PeerMessage::Malformed { id } => {
+            write_u32(1, &mut out);
+            write_u8(*id, &mut out);
+        }
     }
     out.into()
 }
@@ -502,6 +518,7 @@ pub fn wire_len(msg: &PeerMessage) -> usize {
         PeerMessage::Extended { data, .. } => 6 + data.len(),
         PeerMessage::HashRequest(_) | PeerMessage::HashReject(_) => 53,
         PeerMessage::Hashes { hashes, .. } => 53 + 32 * hashes.len(),
+        PeerMessage::Malformed { .. } => 5,
     }
 }
 
@@ -583,10 +600,14 @@ pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
             PeerMessage::Request(read_request(&mut cur)?)
         }
         Some(MessageId::Piece) => {
-            // id + index + begin ≥ 9; the block-size cap is the
-            // session's (`packet_too_large` > `block_size`).
+            // upstream `on_piece` consumes a frame shorter than the
+            // 9-byte header silently (`recv_pos < header_size` early
+            // return) — the packet finishes, is counted as
+            // `num_incoming_piece`, and the connection lives. The
+            // block-size cap (`packet_too_large` > `block_size`) is
+            // the session's.
             if buf.len() < 9 {
-                return Err(WireError::BadLength { id, len: buf.len() });
+                return Ok(PeerMessage::Malformed { id });
             }
             let piece = PieceIndex(read_u32(&mut cur)? as i32);
             let offset = read_u32(&mut cur)? as i32;
@@ -691,8 +712,9 @@ pub struct PeerWireCodec {
 
 impl Default for PeerWireCodec {
     fn default() -> Self {
-        // upstream default receive cap ~2 MiB
-        Self::new(2 * 1024 * 1024)
+        // upstream `on_receive`: `packet_size > 1024*1024` →
+        // `packet_too_large` disconnect at the length-prefix read.
+        Self::new(1024 * 1024)
     }
 }
 

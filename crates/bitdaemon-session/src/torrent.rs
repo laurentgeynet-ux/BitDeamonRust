@@ -90,13 +90,14 @@ pub enum TorrentEffect {
     FileCompleted(FileIndex),
     /// the torrent just became a seed.
     BecameSeed,
-    /// disconnect a misbehaving peer. `failed` mirrors upstream
-    /// `disconnect_severity_t > normal` — counted against the swarm
-    /// entry's `failcount` in `connection_closed`.
+    /// disconnect a peer — `sev` is upstream `disconnect_severity_t`:
+    /// `PeerError` posts `peer_error_alert` + `error_peers` (protocol
+    /// violations); `Failure`/`Normal` post `peer_disconnected_alert`.
+    /// `sev > Normal` counts against the swarm entry's `failcount`.
     DisconnectPeer {
         peer: u64,
         reason: &'static str,
-        failed: bool,
+        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity,
     },
     /// `yourip` seen in a BEP-10 handshake — routed to the
     /// session's `ip_voter` (`source_peer`).
@@ -1761,7 +1762,7 @@ impl Torrent {
             out.push(TorrentEffect::DisconnectPeer {
                 peer: peer_id,
                 reason: "pex message too large",
-                failed: true,
+                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
             });
             return;
         }
@@ -1777,7 +1778,9 @@ impl Torrent {
             out.push(TorrentEffect::DisconnectPeer {
                 peer: peer_id,
                 reason: "too frequent pex",
-                failed: true,
+                // upstream `too_frequent_pex` disconnects at default
+                // (normal) severity.
+                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
             });
             return;
         }
@@ -1791,7 +1794,7 @@ impl Torrent {
             out.push(TorrentEffect::DisconnectPeer {
                 peer: peer_id,
                 reason: "invalid pex message",
-                failed: true,
+                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
             });
             return;
         };
@@ -1965,12 +1968,18 @@ impl Torrent {
                 }
             }
             crate::i2p_pex::I2pPexVerdict::Disconnect(reason) => {
-                // i2p_pex violations are `peer_error`-class upstream
-                // (`pex_message_too_large` etc.) — `failed`.
+                // upstream severities (i2p_pex.cpp): `too_frequent_pex`
+                // is a normal-severity disconnect; size/format
+                // violations are `peer_error`.
+                let sev = if reason == "too_frequent_pex" {
+                    bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal
+                } else {
+                    bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError
+                };
                 out.push(TorrentEffect::DisconnectPeer {
                     peer: peer_id,
                     reason,
-                    failed: true,
+                    sev,
                 });
             }
             crate::i2p_pex::I2pPexVerdict::Nothing => {}
@@ -3426,7 +3435,9 @@ impl Torrent {
                 out.push(TorrentEffect::DisconnectPeer {
                     peer: id,
                     reason: "too many corrupt pieces",
-                    failed: true,
+                    // torrent.cpp:5200 — default (normal) severity;
+                    // the ban itself is separate.
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 });
             }
         }
@@ -3933,7 +3944,7 @@ impl Torrent {
                         out.push(TorrentEffect::DisconnectPeer {
                             peer: peer_id,
                             reason: "torrent_paused",
-                            failed: false,
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                         });
                     }
                 }
@@ -3957,6 +3968,10 @@ impl Torrent {
                     // v2: peers that know `hash_request` can fill
                     // missing merkle layers (`maybe_send_hash_request`).
                     self.maybe_send_hash_request(peer_id, out);
+                    // upstream `on_extended` tail — the handshake
+                    // carries `upload_only`/`share_mode`, so redundant
+                    // upload-only conns are re-evaluated here.
+                    self.disconnect_if_redundant(peer_id, out);
                 }
                 PeerEffect::MetadataPacket(body) => {
                     self.on_metadata_packet(peer_id, &body, s, counters, out);
@@ -3971,15 +3986,34 @@ impl Torrent {
                     self.on_holepunch(peer_id, hp, out);
                 }
                 PeerEffect::DhtPort(port) => {
-                    // peer's DHT listen port → add the node to the
-                    // routing table (upstream `session_impl::
-                    // on_dht_port` → `m_dht->add_node`).
+                    // upstream `incoming_dht_port` → `add_dht_node`
+                    // runs UNCONDITIONALLY (a peer can announce its
+                    // DHT port without having advertised the
+                    // handshake bit)…
+                    let mut addr = None;
                     if let Some(c) = self.peers.get(&peer_id)
-                        && c.supports_dht
-                        && let Some(mut addr) = c.remote
+                        && let Some(mut a) = c.remote
                     {
-                        addr.set_port(port);
-                        out.push(TorrentEffect::DhtNode(addr));
+                        a.set_port(port);
+                        addr = Some(a);
+                    }
+                    if let Some(a) = addr {
+                        out.push(TorrentEffect::DhtNode(a));
+                    }
+                    // …then `on_dht_port` flips `m_supports_dht_port`
+                    // and answers with our own port when the bitfield
+                    // already went out (`m_sent_bitfield`).
+                    if let Some(c) = self.peers.get_mut(&peer_id)
+                        && !c.supports_dht
+                    {
+                        c.supports_dht = true;
+                        if c.sent_bitfield
+                            && let Some(p) = c.local_dht_port
+                        {
+                            let msg = PeerMessage::DhtPort(p);
+                            c.send_buffer += bitdaemon_net::peer_wire::wire_len(&msg);
+                            out.push(TorrentEffect::SendTo { peer: peer_id, msg });
+                        }
                     }
                 }
                 PeerEffect::YourIp(ip) => {
@@ -4037,17 +4071,17 @@ impl Torrent {
                         c.on_suggest(i, s.max_suggest_pieces);
                     }
                 }
-                PeerEffect::Disconnect(r, failed) => {
+                PeerEffect::Disconnect(r, sev) => {
                     // `m_failed` stamps on the conn so the
                     // `connection_closed` bookkeeping (failcount)
                     // sees it when the teardown lands.
                     if let Some(c) = self.peers.get_mut(&peer_id) {
-                        c.failed |= failed;
+                        c.failed |= sev > bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal;
                     }
                     out.push(TorrentEffect::DisconnectPeer {
                         peer: peer_id,
                         reason: r,
-                        failed,
+                        sev,
                     });
                 }
             }
@@ -4190,23 +4224,15 @@ impl Torrent {
         out: &mut Vec<TorrentEffect>,
     ) {
         // upstream packet accounting (`bt_peer_connection` dispatch):
-        // wire ids 0..=9 → `num_incoming_choke + id`; 13..=17 →
-        // `num_incoming_suggest + id` — an upstream quirk that lands
-        // the FAST messages on `num_outgoing_have..num_outgoing_
-        // cancel` (offsets kept verbatim); everything else —
-        // extended, hash, unknown-but-decoded — lands on
-        // `num_incoming_extended`. Keepalives carry no id and are
-        // never counted.
+        // the counter mapping lives in
+        // `counters::incoming_counter_idx` (ids 0..=9 →
+        // `num_incoming_choke + id`; 13..=17 → `num_incoming_suggest +
+        // id` — the quirk that lands FAST messages on
+        // `num_outgoing_have..cancel` offsets is kept verbatim; every
+        // other type → `num_incoming_extended`). Keepalives carry no
+        // id and are never counted.
         if !matches!(msg, PeerMessage::Keepalive) {
-            let id = msg.wire_id();
-            let idx = if id <= 9 {
-                crate::counters::Counter::NumIncomingChoke as usize + id as usize
-            } else if (13..=17).contains(&id) {
-                crate::counters::Counter::NumIncomingSuggest as usize + id as usize
-            } else {
-                crate::counters::Counter::NumIncomingExtended as usize
-            };
-            counters.inc_idx(idx);
+            counters.inc_idx(crate::counters::incoming_counter_idx(msg.wire_id()));
         }
         // `stat.received_bytes(payload, protocol)` — only `on_piece`
         // counts payload upstream; every other message is protocol.
@@ -4328,25 +4354,15 @@ impl Torrent {
         self.metadata_raw.is_some() && self.peers.get(&peer_id).is_some_and(|c| c.protocol_v2)
     }
 
-    /// `peer_error_alert` + disconnect — upstream
-    /// `peer_connection::disconnect` posts the alert on protocol
-    /// violations before dropping the connection.
+    /// `disconnect(errors::invalid_message, bittorrent, peer_error)`
+    /// — the teardown path (`peer_disconnected`) posts the
+    /// `peer_error_alert` itself, carrying `msg` as the error name;
+    /// posting it here would duplicate the alert.
     fn peer_error_effect(&self, peer_id: u64, msg: &'static str, out: &mut Vec<TorrentEffect>) {
-        let remote = self
-            .peers
-            .get(&peer_id)
-            .and_then(|c| c.remote)
-            .map_or_else(String::new, |ep| ep.to_string());
-        out.push(TorrentEffect::Alert(crate::alerts::Alert::PeerError {
-            ih: self.info_hash,
-            remote,
-            op: "bittorrent".into(),
-            error: msg.into(),
-        }));
         out.push(TorrentEffect::DisconnectPeer {
             peer: peer_id,
-            reason: "invalid message",
-            failed: true,
+            reason: msg,
+            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
         });
     }
 
@@ -4853,7 +4869,7 @@ impl Torrent {
             out.push(TorrentEffect::DisconnectPeer {
                 peer: peer_id,
                 reason: r,
-                failed: false,
+                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
             });
         }
     }
@@ -5635,7 +5651,10 @@ impl Torrent {
                     out.push(TorrentEffect::DisconnectPeer {
                         peer,
                         reason: "smart_ban: corrupt block",
-                        failed: true,
+                        // smart_ban.cpp `disconnect(errors::peer_banned)`
+                        // — default (normal) severity; the ban marks
+                        // the peer-list entry, no peer_error alert.
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                     });
                 }
                 (std::collections::BTreeSet::from([Some(key)]), true)
@@ -5766,7 +5785,9 @@ impl Torrent {
                 out.push(TorrentEffect::DisconnectPeer {
                     peer,
                     reason: "smart_ban: corrupt block",
-                    failed: true,
+                    // smart_ban.cpp —  at default
+                    // (normal) severity; the ban marks the entry.
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 });
             }
         }
@@ -5837,7 +5858,7 @@ impl Torrent {
                 out.push(TorrentEffect::DisconnectPeer {
                     peer: id,
                     reason: "torrent finished",
-                    failed: false,
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 });
             }
             // `stop_when_ready` — pause as soon as the download
@@ -7494,7 +7515,7 @@ impl Torrent {
                 out.push(TorrentEffect::DisconnectPeer {
                     peer: *peer_id,
                     reason,
-                    failed: false,
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 });
                 continue;
             }
@@ -9327,7 +9348,7 @@ impl Torrent {
                 out.push(TorrentEffect::DisconnectPeer {
                     peer: id,
                     reason: "upload-upload",
-                    failed: false,
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 });
             }
         }
@@ -9722,7 +9743,7 @@ impl Torrent {
                 reason,
                 // `too_many_connections`-class teardowns are
                 // normal-severity upstream (no failcount bump).
-                failed: false,
+                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
             });
         }
         n
@@ -9765,7 +9786,7 @@ impl Torrent {
                 out.push(TorrentEffect::DisconnectPeer {
                     peer: id,
                     reason: "banned_by_port_filter",
-                    failed: false,
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 });
             }
         }
