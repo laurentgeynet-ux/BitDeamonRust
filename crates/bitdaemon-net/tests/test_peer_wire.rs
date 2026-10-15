@@ -223,6 +223,23 @@ fn short_piece_decodes_to_silent_malformed() {
 }
 
 #[test]
+fn short_hashes_decodes_to_silent_malformed() {
+    // upstream `on_hashes` consumes a frame shorter than the 49-byte
+    // hash-descriptor header silently (`recv_buffer.size() <
+    // header_size → return`) — the conn lives and the packet still
+    // counts toward `num_incoming_extended`, exactly like `on_piece`'s
+    // sub-9-byte leg.
+    let msg = decode(&[MessageId::Hashes as u8, 0, 0, 0, 1]).expect("dec");
+    assert_eq!(msg, PeerMessage::Malformed { id: 22 });
+    // exactly 49 bytes decodes (descriptor only, count = 0 → the
+    // exact-size check accepts; semantic validation is the session's).
+    let mut full = vec![MessageId::Hashes as u8];
+    full.extend_from_slice(&[0u8; 48]);
+    let msg = decode(&full).expect("dec");
+    assert!(matches!(msg, PeerMessage::Hashes { .. }));
+}
+
+#[test]
 fn decode_unit() {
     // upstream packet_type dispatch on the raw payload
     assert_eq!(

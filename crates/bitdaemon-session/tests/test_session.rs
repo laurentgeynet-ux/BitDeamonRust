@@ -1827,3 +1827,38 @@ fn failed_write_marks_state_updated() {
         "real write failure runs update_gauge"
     );
 }
+
+#[test]
+fn have_message_counts_num_incoming_once() {
+    // upstream bumps `num_incoming_have` exactly once per complete
+    // frame (`dispatch_message` counter block, only when the conn is
+    // attached to a live torrent).
+    use bitdaemon_session::counters::Counter;
+    use bitdaemon_session::session::PeerPacket;
+    let mut s = Session::new();
+    s.alerts
+        .set_mask(bitdaemon_session::alerts::AlertCategory::ALL);
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+    let mut out = Vec::new();
+    s.peer_connected(
+        &ih,
+        8,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        "127.0.0.1:6881".parse().unwrap(),
+        &mut out,
+    );
+    let p = PeerPacket {
+        info_hash: ih,
+        peer: 8,
+        remote: "127.0.0.1:6881".parse().unwrap(),
+        msg: PeerMessage::Have(PieceIndex(0)),
+    };
+    s.on_peer_message(&p, 0, &mut out);
+    assert_eq!(
+        s.counters.value(Counter::NumIncomingHave),
+        1,
+        "one wire `have` = one counter bump"
+    );
+}

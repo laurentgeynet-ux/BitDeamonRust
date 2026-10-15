@@ -1242,3 +1242,166 @@ fn superseed_rejects_before_have_none() {
             .any(|e| matches!(e, PeerEffect::InvalidRequest(_)))
     );
 }
+
+#[test]
+fn oversized_bitfield_disconnects() {
+    // upstream `on_bitfield` — with metadata the frame must be
+    // exactly `ceil(num_pieces/8)` payload bytes; a longer bitfield
+    // is `invalid_bitfield_size` (peer_error), not a truncation.
+    let mut c = conn();
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Bitfield(bytes::Bytes::from(vec![0xff; 3])),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(
+        eff.iter().any(|e| matches!(
+            e,
+            PeerEffect::Disconnect(
+                "invalid bitfield size",
+                bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError
+            )
+        )),
+        "3-byte bitfield for 10 pieces must disconnect: {eff:?}"
+    );
+    assert!(!c.bitfield_received);
+}
+
+#[test]
+fn undersized_bitfield_disconnects() {
+    // 1 byte < ceil(10/8) = 2 — `invalid_bitfield_size` upstream too.
+    let mut c = conn();
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Bitfield(bytes::Bytes::from(vec![0xffu8])),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        false,
+        0x200000,
+        2000,
+        &bitdaemon_session::counters::Counters::default(),
+        &mut eff,
+    );
+    assert!(
+        eff.iter().any(|e| matches!(e, PeerEffect::Disconnect(..))),
+        "short bitfield must disconnect: {eff:?}"
+    );
+}
+
+#[test]
+fn multiple_bitfields_recount_share() {
+    // `test_fast_extension.cpp::multiple_bitfields` — a repeat
+    // bitfield drops the peer's previous share (`peer_lost`) before
+    // the new one is counted.
+    let mut c = conn();
+    let counters = bitdaemon_session::counters::Counters::default();
+    let mut eff = Vec::new();
+    let first = bytes::Bytes::from(vec![0b1100_0000u8, 0]);
+    c.dispatch(
+        &PeerMessage::Bitfield(first),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        false,
+        0x200000,
+        2000,
+        &counters,
+        &mut eff,
+    );
+    eff.clear();
+    let second = bytes::Bytes::from(vec![0b0011_0000u8, 0]);
+    c.dispatch(
+        &PeerMessage::Bitfield(second),
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        false,
+        0x200000,
+        2000,
+        &counters,
+        &mut eff,
+    );
+    let dec = eff
+        .iter()
+        .position(|e| matches!(e, PeerEffect::RefcountBulk(_, false)));
+    let inc = eff
+        .iter()
+        .position(|e| matches!(e, PeerEffect::RefcountBulk(_, true)));
+    assert!(
+        dec.is_some() && inc.is_some() && dec < inc,
+        "old share leaves the refcount before the new one lands: {eff:?}"
+    );
+    assert_eq!(c.num_pieces, 2, "pieces 2 and 3");
+}
+
+#[test]
+fn ext_handshake_counts_only_after_parse() {
+    // upstream bumps `num_incoming_ext_handshake` at the tail of
+    // `on_extended_handshake` — a bdecode-invalid payload on ext id 0
+    // is swallowed without counting.
+    let mut c = conn();
+    let counters = bitdaemon_session::counters::Counters::default();
+    let mut eff = Vec::new();
+    c.dispatch(
+        &PeerMessage::Extended {
+            id: 0,
+            data: bytes::Bytes::from_static(b"not-bencode"),
+        },
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        false,
+        0x200000,
+        2000,
+        &counters,
+        &mut eff,
+    );
+    assert_eq!(
+        counters.value(bitdaemon_session::counters::Counter::NumIncomingExtHandshake),
+        0,
+        "unparseable handshake is not counted"
+    );
+    // `ExtendedHandshake::encode` emits the full wire frame —
+    // dispatch sees only the bencoded body (bytes after `[0x14][0x00]`).
+    let hs = bitdaemon_net::bep10::ExtendedHandshake::default();
+    let frame = hs.encode();
+    c.dispatch(
+        &PeerMessage::Extended {
+            id: 0,
+            data: bytes::Bytes::from(frame[6..].to_vec()),
+        },
+        10,
+        0x4000,
+        0x40000,
+        None,
+        false,
+        false,
+        0x200000,
+        2000,
+        &counters,
+        &mut eff,
+    );
+    assert_eq!(
+        counters.value(bitdaemon_session::counters::Counter::NumIncomingExtHandshake),
+        1,
+        "a parsed handshake counts once"
+    );
+}
