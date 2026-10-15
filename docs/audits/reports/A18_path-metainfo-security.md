@@ -167,3 +167,26 @@ Baseline upstream : `e7381c7bc` (`src/file_storage.cpp`,
 - Le fast-path de `resolve_duplicate_filenames` (hash-only) tombe dans le
   slow-path à la première collision de hash — faux positif CRC inclus,
   comme upstream (`resolve_duplicate_filenames.cpp:174-190`).
+
+## Résultat
+
+Apply `audit/18-path-metainfo-security` — les 5 déviations corrigées :
+
+- `add_file` : `file_size > max_file_size` → `Error::FileTooLarge`
+  (`errc::file_too_large`) ; `filename ≥ 4096` → `Error::FilenameTooLong`
+  (`errc::filename_too_long`) ; seul l'overflow d'offset cumulé reste
+  `torrent_invalid_length` (`file_storage.cpp:819-843`).
+- `from_info_node` : info dict ≥ `i32::MAX` → `TorrentError::MetadataTooLarge`
+  (= 100, valeur upstream).
+- `load_torrent_buffer` : cap `max_buffer_size` → `MetadataTooLarge`
+  (était `InvalidBencoding`).
+- `parse_torrent_file` : fallback `magnet-uri` implémenté
+  (`load_torrent.cpp:159-171`) — `.torrent`-magnet → `Ok(params)`,
+  `ti = None`.
+- Bonus en passant : `TooManyDuplicateFilenames` repr corrigé à la
+  valeur upstream 145 (était 22 implicite).
+
+Tests ajoutés : `add_file_size_and_name_errors`,
+`magnet_uri_torrent_file`, `load_torrent_buffer_size_cap`.
+Gates : fmt ✓ · clippy `-D warnings` ✓ · `cargo test --workspace`
+(113 suites, 0 échec) ✓ · `cargo doc --workspace --no-deps` ✓.

@@ -525,3 +525,37 @@ fn piece_layer_validation() {
     let node = bitdaemon_bencode::bdecode(&buf);
     assert!(parse_piece_layers(&node, &fs).is_err());
 }
+
+#[test]
+fn magnet_uri_torrent_file() {
+    // upstream `parse_torrent_file` (`load_torrent.cpp:159-171`): a
+    // .torrent with a `magnet-uri` key and no `info` parses as a magnet —
+    // Ok(params) with `ti == None` and info_hashes filled
+    let buf = b"d10:magnet-uri60:magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567e";
+    let atp = load_torrent(buf).expect("magnet-uri torrent file must parse");
+    assert!(atp.ti.is_none());
+    assert!(atp.info_hashes.has_v1());
+
+    // without a magnet-uri fallback, missing info → torrent_missing_info
+    let err = load_torrent(b"d4:infai1ee").unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Torrent(TorrentError::TorrentMissingInfo)
+    ));
+}
+
+#[test]
+fn load_torrent_buffer_size_cap() {
+    // upstream `load_file` reports `metadata_too_large` past the cap;
+    // we apply the same cap at buffer entry with the same code
+    let cfg = LoadTorrentLimits {
+        max_buffer_size: 10,
+        ..Default::default()
+    };
+    let err =
+        bitdaemon_core::torrent_info::load_torrent_buffer(b"d0:e1234567890", &cfg).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Torrent(TorrentError::MetadataTooLarge)
+    ));
+}

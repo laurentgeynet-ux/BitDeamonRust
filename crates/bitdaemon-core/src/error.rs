@@ -72,9 +72,13 @@ pub enum TorrentError {
     /// `invalid_file_tag`.
     #[error("invalid file tag")]
     InvalidFileTag,
-    /// `too_many_duplicate_filenames`.
+    /// `metadata_too_large` (100) — also used by `load_file`/`parse_info_section`
+    /// for oversized inputs upstream.
+    #[error("metadata too large")]
+    MetadataTooLarge = 100,
+    /// `too_many_duplicate_filenames` (145).
     #[error("too many duplicate filenames in torrent")]
-    TooManyDuplicateFilenames,
+    TooManyDuplicateFilenames = 145,
 
     /// `torrent_unknown_version` (210).
     #[error("the torrent file has an unknown meta version")]
@@ -138,6 +142,14 @@ pub enum Error {
     /// `lt::errors::missing_info_hash_in_uri`.
     #[error("missing info-hash in magnet URI")]
     MissingInfoHashInUri,
+    /// `boost::system::errc::file_too_large` (generic_category — not an
+    /// `lt::errors` code). `add_file` size cap upstream.
+    #[error("file too large")]
+    FileTooLarge,
+    /// `boost::system::errc::filename_too_long` (generic_category — not an
+    /// `lt::errors` code).
+    #[error("filename too long")]
+    FilenameTooLong,
     /// Wrapper for other errors as `std::io::Error`.
     #[error(transparent)]
     Io(#[from] std::io::Error),

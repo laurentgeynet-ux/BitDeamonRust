@@ -678,3 +678,52 @@ fn test_files_compatible_empty_file_order() {
     // order of empty files does not affect compatibility
     assert!(files_compatible(&fs1, &fs2));
 }
+
+#[test]
+fn add_file_size_and_name_errors() {
+    // upstream `add_file_borrow_impl` (`file_storage.cpp:819-843`):
+    // per-file size cap → `errc::file_too_large`; cumulative offset
+    // overflow → `torrent_invalid_length`; leaf ≥ 4096 → `filename_too_long`
+    use bitdaemon_core::{Error, TorrentError};
+
+    let mut st = FileStorage::new();
+    st.set_piece_length(0x4000);
+
+    let err = st
+        .add_file(
+            None,
+            b"f",
+            FileStorage::MAX_FILE_SIZE + 1,
+            FileFlags::NONE,
+            0,
+            b"",
+            None,
+        )
+        .unwrap_err();
+    assert!(matches!(err, Error::FileTooLarge), "{err:?}");
+
+    add_file(&mut st, b"dir/f", 100);
+    let err = st
+        .add_file(
+            None,
+            b"dir/g",
+            FileStorage::MAX_FILE_OFFSET - 50,
+            FileFlags::NONE,
+            0,
+            b"",
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::Torrent(TorrentError::TorrentInvalidLength)),
+        "{err:?}"
+    );
+
+    let mut st2 = FileStorage::new();
+    st2.set_piece_length(0x4000);
+    let long_name = vec![b'a'; 4096];
+    let err = st2
+        .add_file(None, &long_name, 10, FileFlags::NONE, 0, b"", None)
+        .unwrap_err();
+    assert!(matches!(err, Error::FilenameTooLong), "{err:?}");
+}

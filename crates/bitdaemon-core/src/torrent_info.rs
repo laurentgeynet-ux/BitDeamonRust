@@ -270,6 +270,11 @@ impl TorrentInfo {
         }
 
         let section = info.data_section();
+        // upstream `parse_info_section_impl` caps the info dict at INT_MAX
+        // (m_info_section_size is an int)
+        if section.len() >= i32::MAX as usize {
+            return Err(TorrentError::MetadataTooLarge.into());
+        }
         if section.is_empty() || section[0] != b'd' || section[section.len() - 1] != b'e' {
             return Err(TorrentError::InvalidBencoding.into());
         }
@@ -1166,8 +1171,13 @@ pub fn parse_torrent_file(
     let info = torrent_file.dict_find_dict(b"info");
     let mut out = AddTorrentParams::default();
     if !info.is_valid() {
-        // a `magnet-uri` key means the caller should go through
-        // `magnet_uri` instead — both paths report missing info upstream
+        // a `magnet-uri` key is parsed into `out` upstream
+        // (`load_torrent.cpp`): the params come back without a `ti`
+        let uri = torrent_file.dict_find_string(b"magnet-uri");
+        if uri.is_valid() {
+            crate::magnet_uri::parse_magnet_uri(uri.string_value(), &mut out)?;
+            return Ok(out);
+        }
         return Err(TorrentError::TorrentMissingInfo.into());
     }
 
@@ -1363,8 +1373,10 @@ pub fn load_torrent_buffer(
     buffer: &[u8],
     cfg: &LoadTorrentLimits,
 ) -> Result<AddTorrentParams, Error> {
+    // upstream caps the buffer in `load_file` with `metadata_too_large`;
+    // we apply the same cap at buffer entry since there is no file path
     if buffer.len() > cfg.max_buffer_size {
-        return Err(TorrentError::InvalidBencoding.into());
+        return Err(TorrentError::MetadataTooLarge.into());
     }
     let e = bdecode_limits(buffer, cfg.max_decode_depth, cfg.max_decode_tokens);
     if let Some(err) = e.error() {
