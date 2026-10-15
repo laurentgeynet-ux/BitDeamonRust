@@ -3786,19 +3786,11 @@ impl Session {
             self.counters
                 .add(crate::counters::Counter::RecvBytes, wire_bytes as i64);
         }
-        // `inc_stats_counter` per incoming message class
-        match p.msg {
-            PeerMessage::Bitfield(_) => self.counters.inc(Counter::NumIncomingBitfield),
-            PeerMessage::Have(_) => self.counters.inc(Counter::NumIncomingHave),
-            PeerMessage::Request(_) => self.counters.inc(Counter::NumIncomingRequest),
-            PeerMessage::Piece { .. } => self.counters.inc(Counter::NumIncomingPiece),
-            PeerMessage::Cancel(_) => self.counters.inc(Counter::NumIncomingCancel),
-            PeerMessage::Choke => self.counters.inc(Counter::NumIncomingChoke),
-            PeerMessage::Unchoke => self.counters.inc(Counter::NumIncomingUnchoke),
-            PeerMessage::Interested => self.counters.inc(Counter::NumIncomingInterested),
-            PeerMessage::NotInterested => self.counters.inc(Counter::NumIncomingNotInterested),
-            _ => {}
-        }
+        // `inc_stats_counter` per incoming message class runs inside
+        // `Torrent::on_peer_message` (`incoming_counter_idx`) —
+        // upstream counts in `dispatch_message` only when the conn is
+        // attached to a live torrent; a session-level bump here would
+        // double-count ids 0-8 and count messages on dead torrents.
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(&p.info_hash) {
             // `incoming_request_alert`/`invalid_request_alert` are

@@ -970,3 +970,199 @@ fn check_files_rejected_gates_fastresume_alert() {
     assert!(t.is_paused(), "fatal → pause");
     assert!(!t.auto_managed, "fatal → out of auto-manage");
 }
+
+/// v2 torrent with one 8-block file (piece layer = 2 hashes) —
+/// shared fixture for the wire-level hash-message regressions.
+fn v2_hash_torrent() -> (
+    bitdaemon_session::torrent::Torrent,
+    bitdaemon_common::Sha256Hash,
+    Vec<bitdaemon_common::Sha256Hash>,
+) {
+    use bitdaemon_common::Sha256Hash;
+    use bitdaemon_common::types::{FileIndex, StorageIndex};
+    use bitdaemon_core::create_torrent::{CreateFileEntry, CreateFlags, CreateTorrent};
+    use bitdaemon_core::merkle::merkle_root;
+    use bitdaemon_core::torrent_info::{LoadTorrentLimits, load_torrent_buffer};
+    use bitdaemon_session::torrent::Torrent;
+    use sha2::{Digest as _, Sha256};
+
+    let data: Vec<u8> = (0..8 * 16384).map(|i| (i % 251) as u8).collect();
+    let blocks: Vec<Sha256Hash> = data
+        .chunks(16384)
+        .map(|c| Sha256Hash::from_bytes(&Sha256::digest(c)).unwrap())
+        .collect();
+    let piece_roots: Vec<Sha256Hash> = (0..2)
+        .map(|p| merkle_root(&blocks[p * 4..p * 4 + 4], Sha256Hash::default()))
+        .collect();
+    let root = merkle_root(&piece_roots, Sha256Hash::default());
+    let mut ct = CreateTorrent::new(
+        vec![CreateFileEntry {
+            filename: b"v2f".to_vec(),
+            size: 8 * 16384,
+            flags: bitdaemon_core::file_storage::FileFlags::NONE,
+            mtime: 0,
+            symlink: Vec::new(),
+        }],
+        4 * 16384,
+        CreateFlags::V2_ONLY,
+    )
+    .unwrap();
+    ct.set_hash2(FileIndex(0), 0, piece_roots[0]).unwrap();
+    ct.set_hash2(FileIndex(0), 1, piece_roots[1]).unwrap();
+    let buf = ct.generate_buf().unwrap();
+    let atp = load_torrent_buffer(&buf, &LoadTorrentLimits::default()).unwrap();
+    let t = Torrent::from_params(
+        &atp,
+        StorageIndex(0),
+        &Default::default(),
+        &Default::default(),
+        &mut bitdaemon_net::peer_class::PeerClassPool::new(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    (t, root, piece_roots)
+}
+
+#[test]
+fn v2_hash_request_out_of_range_is_rejected_not_fatal() {
+    // upstream `on_hash_request` runs `validate_hash_request` before
+    // touching the tree — negative/over-range fields get a
+    // `hash_reject`, never a panic or a disconnect.
+    use bitdaemon_common::Sha256Hash;
+    use bitdaemon_net::peer_wire::{HashRequestWire, PeerMessage};
+    use bitdaemon_session::torrent::TorrentEffect;
+
+    let (mut t, root, _piece_roots) = v2_hash_torrent();
+    for (base, index, count, proofs) in [
+        (-1, 0, 2, 0),          // negative base
+        (0, 0, 0x4000_0000, 0), // absurd count
+        (0, 0, -5, 0),          // negative count
+        (2, 99, 2, 0),          // index beyond level size
+        (0, 0, 2, -1),          // negative proof_layers
+        (99, 0, 2, 0),          // base beyond num_layers
+    ] {
+        let req = HashRequestWire {
+            file_root: root,
+            base,
+            index,
+            count,
+            proof_layers: proofs,
+        };
+        let mut out = Vec::new();
+        t.on_hash_request(7, &req, &mut out);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [TorrentEffect::SendTo {
+                    msg: PeerMessage::HashReject(_),
+                    ..
+                }]
+            ),
+            "req {req:?} must be answered by hash_reject: {out:?}"
+        );
+    }
+    // sanity: unknown root also rejects
+    let mut out = Vec::new();
+    t.on_hash_request(
+        7,
+        &HashRequestWire {
+            file_root: Sha256Hash::from_bytes(&[9; 32]).unwrap(),
+            base: 2,
+            index: 0,
+            count: 2,
+            proof_layers: 0,
+        },
+        &mut out,
+    );
+    assert!(matches!(
+        out[0],
+        TorrentEffect::SendTo {
+            msg: PeerMessage::HashReject(_),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn v2_hashes_invalid_descriptor_disconnects() {
+    // upstream `on_hashes` disconnects `invalid_hashes` when
+    // `validate_hash_request` fails — before the outstanding-request
+    // match (a peer can't hide bad descriptors behind "no match").
+    use bitdaemon_net::bt_peer_conn::DisconnectSeverity;
+    use bitdaemon_net::peer_wire::HashRequestWire;
+    use bitdaemon_session::torrent::TorrentEffect;
+
+    let (mut t, root, _piece_roots) = v2_hash_torrent();
+    let req = HashRequestWire {
+        file_root: root,
+        base: 0,
+        index: 0,
+        count: 9000, // > 8192 cap
+        proof_layers: 0,
+    };
+    let mut out = Vec::new();
+    t.on_hashes(
+        7,
+        &req,
+        &[],
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out,
+    );
+    assert!(
+        out.iter().any(|e| matches!(
+            e,
+            TorrentEffect::DisconnectPeer {
+                reason: "invalid_hashes",
+                sev: DisconnectSeverity::PeerError,
+                ..
+            }
+        )),
+        "invalid descriptor must disconnect invalid_hashes: {out:?}"
+    );
+}
+
+#[test]
+fn v2_hash_reject_pokes_all_v2_peers() {
+    // upstream `torrent::hashes_rejected` loops *all* connections —
+    // `maybe_send_hash_request` runs on each v2 conn so an idle peer
+    // takes over the layer the refusing peer dropped.
+    use bitdaemon_common::Bitfield;
+    use bitdaemon_net::peer_wire::{HashRequestWire, PeerMessage};
+    use bitdaemon_session::peer_conn::PeerConn;
+    use bitdaemon_session::peer_pipeline::PeerPipeline;
+    use bitdaemon_session::torrent::TorrentEffect;
+
+    let (mut t, root, _piece_roots) = v2_hash_torrent();
+    let mk_peer = |protocol_v2: bool| {
+        let mut c = PeerConn::new(2, PeerPipeline::new(1000, 30, 250), 0);
+        c.protocol_v2 = protocol_v2;
+        // the peer claims every piece — block layers are servable.
+        let mut bf = Bitfield::with_size(2);
+        bf.set_all();
+        c.on_bitfield(&bf);
+        c
+    };
+    t.peers.insert(7, mk_peer(true));
+    t.peers.insert(8, mk_peer(true));
+    let req = HashRequestWire {
+        file_root: root,
+        base: 0,
+        index: 0,
+        count: 4,
+        proof_layers: 0,
+    };
+    t.peers.get_mut(&7).unwrap().hash_requests.push(req.clone());
+    let mut out = Vec::new();
+    t.on_hash_reject(7, &req, &mut out);
+    assert!(
+        out.iter().any(|e| matches!(
+            e,
+            TorrentEffect::SendTo {
+                peer: 8,
+                msg: PeerMessage::HashRequest(_)
+            }
+        )),
+        "the idle v2 conn must be re-poked for a hash layer: {out:?}"
+    );
+}

@@ -663,8 +663,12 @@ pub fn decode(buf: &[u8]) -> Result<PeerMessage, WireError> {
             PeerMessage::HashRequest(read_hash_req(&mut cur)?)
         }
         Some(MessageId::Hashes) => {
+            // upstream `on_hashes` consumes a sub-header frame
+            // silently (`recv_buffer.size() < header_size → return`)
+            // — same shape as `on_piece`'s < 9 B leg: counted by
+            // packet type, no state change, no disconnect.
             if buf.len() < 49 {
-                return Err(WireError::BadLength { id, len: buf.len() });
+                return Ok(PeerMessage::Malformed { id });
             }
             let req = read_hash_req(&mut cur)?;
             // upstream computes the exact expected size:

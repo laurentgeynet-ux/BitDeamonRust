@@ -5826,6 +5826,21 @@ impl Torrent {
             if usize::try_from(f.0).ok()? >= self.merkle_trees.len() {
                 return None;
             }
+            // upstream `on_hash_request` runs `validate_hash_request`
+            // *before* touching the tree — a negative/over-range
+            // base/index/count gets a `hash_reject`, never a tree
+            // access on wrapped `usize` values
+            // (bt_peer_connection.cpp:1199-1203).
+            let hp_req = bitdaemon_disk::hash_picker::HashRequest {
+                file: f,
+                base: req.base,
+                index: req.index,
+                count: req.count,
+                proof_layers: req.proof_layers,
+            };
+            if !bitdaemon_disk::hash_picker::validate_hash_request(&hp_req, fs) {
+                return None;
+            }
             self.merkle_trees[f.0 as usize].get_hashes(
                 req.base as usize,
                 req.index as usize,
@@ -5855,26 +5870,18 @@ impl Torrent {
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
-        // upstream `on_hashes` — a `hashes` payload that doesn't match
-        // an outstanding `m_hash_requests` entry is dropped (the peer
-        // can't volunteer hash subtrees).
-        let Some(c) = self.peers.get_mut(&peer) else {
-            return;
-        };
-        let Some(pos) = c.hash_requests.iter().position(|r| r == req) else {
-            return;
-        };
-        c.hash_requests.remove(pos);
+        // upstream `on_hashes` order: `validate_hash_request` BEFORE
+        // the `m_hash_requests` match — an out-of-range descriptor is
+        // `invalid_hashes` (peer_error) even when no request is
+        // outstanding (bt_peer_connection.cpp:1262-1266).
         let Some(fs) = self.files.clone() else {
             return;
         };
         let f = fs.file_index_for_root(&req.file_root);
         let Ok(fidx) = usize::try_from(f.0) else {
+            self.peer_error_effect(peer, "invalid_hashes", out);
             return;
         };
-        if fidx >= self.merkle_trees.len() {
-            return;
-        }
         let hp_req = bitdaemon_disk::hash_picker::HashRequest {
             file: f,
             base: req.base,
@@ -5882,12 +5889,34 @@ impl Torrent {
             count: req.count,
             proof_layers: req.proof_layers,
         };
+        if fidx >= self.merkle_trees.len()
+            || !bitdaemon_disk::hash_picker::validate_hash_request(&hp_req, &fs)
+        {
+            self.peer_error_effect(peer, "invalid_hashes", out);
+            return;
+        }
+        // a `hashes` payload that doesn't match an outstanding
+        // `m_hash_requests` entry is dropped (the peer can't
+        // volunteer hash subtrees).
+        let Some(c) = self.peers.get_mut(&peer) else {
+            return;
+        };
+        let Some(pos) = c.hash_requests.iter().position(|r| r == req) else {
+            return;
+        };
+        c.hash_requests.remove(pos);
         let mut picker = bitdaemon_disk::hash_picker::HashPicker::new(
             &fs,
             &mut self.merkle_trees,
             &mut self.hash_picker_state,
         );
         let result = picker.add_hashes(&hp_req, hashes);
+        // upstream `on_hashes` tail — `!t->add_hashes` disconnects
+        // `invalid_hashes` (bt_peer_connection.cpp:1302-1305).
+        if !result.valid {
+            self.peer_error_effect(peer, "invalid_hashes", out);
+            return;
+        }
         let v1_capable = self
             .ti
             .as_ref()
@@ -6026,9 +6055,19 @@ impl Torrent {
             &mut self.hash_picker_state,
         );
         picker.hashes_rejected(&hp_req);
-        // `maybe_send_hash_request` — the refusal freed a request
-        // slot; immediately pick the next layer to fetch.
-        self.maybe_send_hash_request(peer, out);
+        // upstream `torrent::hashes_rejected` pokes *every* peer —
+        // `maybe_send_hash_request` re-fills the freed slot on all
+        // conns (its `!protocol_v2 || >1 outstanding` gate keeps the
+        // poke inert on v1 and busy conns).
+        let v2_peers: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|(_, c)| c.protocol_v2)
+            .map(|(id, _)| *id)
+            .collect();
+        for p in v2_peers {
+            self.maybe_send_hash_request(p, out);
+        }
     }
 
     /// `torrent::get_piece_to_super_seed` — pick the lowest-

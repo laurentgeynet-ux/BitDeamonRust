@@ -371,3 +371,30 @@ de ligne rafraîchis). Passe 1 en `## Historique`.
 `fast_messages_require_fast_negotiation`,
 `fast_messages_accepted_when_negotiated`,
 `choke_without_fast_rejects_download_queue` (test_peer_dispatch).
+
+## Résultat (apply)
+
+**Branche** : `audit/01-peer-wire-codec` — mergée `--no-ff` sur `main`.
+
+| Déviation | Statut | Fix |
+|---|---|---|
+| D1 — `hash_request` sans validation (panic/OOM) | corrigée | `validate_hash_request` gate avant `get_hashes` → `HashReject` (torrent.rs) |
+| D2 — `on_hashes` sans validate ni kill | corrigée | validate → `invalid_hashes` disconnect avant le match ; `!result.valid` → idem après `add_hashes` |
+| D4 — `hashes` < 49 B → disconnect | corrigée | `Malformed{id:22}` silencieux (peer_wire.rs) |
+| D5 — bitfield surdimensionné accepté | corrigée | borne exacte `ceil(n/8)` quand `num_pieces > 0` → `invalid_bitfield_size` (peer_conn.rs) |
+| D6 — double-comptage ids 0-8 | corrigée | bloc `match p.msg` session retiré (session.rs) |
+| D7 — `ext_handshake` compté pré-parse | corrigée | bump déplacé en fin du bloc `Some(hs)` (peer_conn.rs) |
+| D8 — `hash_reject` ne poke qu'une conn | corrigée | `maybe_send_hash_request` sur toutes les conns `protocol_v2` (torrent.rs) |
+
+**Tests ajoutés** : `short_hashes_decodes_to_silent_malformed`
+(test_peer_wire) ; `oversized_bitfield_disconnects`,
+`undersized_bitfield_disconnects`, `multiple_bitfields_recount_share`,
+`ext_handshake_counts_only_after_parse` (test_peer_dispatch) ;
+`have_message_counts_num_incoming_once` (test_session) ;
+`v2_hash_request_out_of_range_is_rejected_not_fatal`,
+`v2_hashes_invalid_descriptor_disconnects`,
+`v2_hash_reject_pokes_all_v2_peers` (test_recheck).
+
+**Gates** : `cargo fmt --all` · `cargo clippy --workspace
+--all-targets -- -D warnings` · `cargo test --workspace` ·
+`cargo doc --workspace --no-deps` — tous verts dans le worktree.

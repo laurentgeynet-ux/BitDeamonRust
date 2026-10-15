@@ -1377,6 +1377,18 @@ impl PeerConn {
                 } else {
                     bits.len() * 8
                 };
+                // upstream `on_bitfield` — with valid metadata the
+                // frame must be `ceil(num_pieces/8)` bytes *exactly*;
+                // over- or under-sized is `invalid_bitfield_size`
+                // (peer_error disconnect). The metadata-less magnet
+                // leg skips the check upstream too.
+                if num_pieces > 0 && bits.len() != expected.div_ceil(8) {
+                    eff.push(PeerEffect::Disconnect(
+                        "invalid bitfield size",
+                        bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    ));
+                    return;
+                }
                 match bitdaemon_common::Bitfield::from_bytes(bits, expected) {
                     Some(bf) => {
                         // repeat bitfield — `peer_lost(m_have_piece)`
@@ -1801,10 +1813,6 @@ impl PeerConn {
             M::DhtPort(p) => eff.push(PeerEffect::DhtPort(p)),
             M::Extended { id, ref data } => {
                 if id == 0 {
-                    // `on_extended` — ext handshake gets its own
-                    // counter on top of the dispatch-level
-                    // `num_incoming_extended`.
-                    counters.inc(crate::counters::Counter::NumIncomingExtHandshake);
                     // BEP-10 handshake — learn the remote's ext ids
                     if let Some(hs) = bitdaemon_net::bep10::ExtendedHandshake::parse(data) {
                         let ids = hs.remote_ids();
@@ -1884,6 +1892,10 @@ impl PeerConn {
                             _ => {}
                         }
                         eff.push(PeerEffect::ExtHandshake);
+                        // `num_incoming_ext_handshake` bumps at the
+                        // tail of upstream's `on_extended_handshake`
+                        // — a bdecode-invalid handshake never counts.
+                        counters.inc(crate::counters::Counter::NumIncomingExtHandshake);
                     }
                 } else if id == self.local_ut_metadata && self.local_ut_metadata != 0 {
                     // `ut_metadata_plugin::on_extended` — a peer that
