@@ -230,6 +230,491 @@ Until `1.0.0`, breaking changes may occur in any release.
   `Choke` runs the implicit-reject tail (graceful check, gated
   re-pick, flush) per download-queue entry instead of just emptying
   it.
+- **MSE wire** : pads B/C tirés `random(512)` = 0..=512 inclusif comme
+  upstream ; `crypto_select` répondeur masqué par `allowed_enc_level`
+  puis réduit à un bit (`prefer_rc4`) ; `len_pad > 512` →
+  `invalid_pad_size`/`peer_error`, `len_ia` hors `0..=68` →
+  `invalid_encrypt_handshake`/`peer_error` ; IA partielle réinjectée en
+  tête du handshake BT (`cut(0,20)` upstream) toujours sous RC4 ; skey
+  `SHA1("req2"‖ih)` sondé sur v1 **et** v2 tronqué (index obfusqué
+  `torrent_list`).
+- **Ordre d'opérations** : la décision crypto se prend sur la socket
+  connectée (`peer_link_up` = `on_connected`), pas au pick —
+  `pe_forced`→MSE, `pe_disabled`→plaintext, `pe_enabled` toggle
+  `pe_support` (probe MSE + clear pessimiste + `fast_reconnect` armé,
+  ou plaintext + set optimiste) ; SSL force `pe_disabled` ;
+  `pe_support` se ré-arme à la fin de PE4 (`mse_done` survit à un
+  échec de jambe BT) et se re-clear sur handshake plaintext réussi,
+  gates `is_outgoing && pe_enabled`.
+- **v2** : le bit réservé `0x10` entrant flippe `protocol_v2` *avant*
+  l'écriture de notre réponse ; `0x10` sur torrent v1-only →
+  `invalid_info_hash`/`failure` ; la réponse porte
+  `associated_info_hash()` = `ih.get(V2)` seulement si
+  `has_v2 && protocol_v2` (un torrent v1-only garde son hash v1) ;
+  swarm v2-only force `pex_lt_v2` à l'ajout (`add_swarm_peer` + PEX).
+- **Sévérité/compteurs** : enveloppe `DialFail`{op, severity, reason,
+  encrypted, rc4, mse_done, utp} reproduisant `disconnect()` —
+  legs `error_{tcp,utp}_peers` + `error_{incoming,outgoing}_peers`,
+  `error_encrypted`/`error_rc4` sous `op==bittorrent` + état crypto,
+  `peer_error` vs `peer_disconnected` exclusifs, alertes postées même
+  sans torrent attaché ; échec inbound post-attach comptabilisé sans
+  bookkeeping peer-entry (`connection_closed(nullptr)`).
+- **Retry uTP→TCP** : échec uTP = `normal`, `supports_utp=false` +
+  `fast_reconnect` + retry TCP différé (pas un échec TCP classique).
+- **Settings** : `sanitize_settings` — `allowed_enc_level` hors
+  {1,2,3} → `pe_both`, `*_enc_policy` hors {0,1,2} → `pe_disabled`
+  (`EncPolicy::from_int` idem) ; `supportcrypto` annoncé sous
+  `in_enc_policy != disabled && announce_crypto_support`.
+- **peer_info** : `rc4_encrypted`/`plaintext_encrypted` rapportés
+  exactement l'un des deux sur conn MSE (`m_rc4_encrypted` gate).
+- **Tracker announces vs upstream `tracker_manager`/`torrent` (audit A04)**:
+  the announce pipeline is now per-(endpoint, info-hash version)
+  like upstream's `announce_state` machine — `TrackerList::due`
+  returns `(entry, version)` picks (hybrid torrents announce v1+v2
+  independently), `failed_version`/`sent_version` write only the
+  announced slot, and `stopped` reaches only `start_sent` slots.
+  Failure semantics match `tracker_request_error`: the failure
+  response's `interval`/`min interval` is honored as
+  `retry_interval` above the quadratic backoff, HTTP 410 sets
+  `dont_try_again` (`fail_limit = 1`), an entry with all supported
+  slots dead is `deprioritize`d within its tier, and each failure
+  re-runs `announce_with_tracker` so a dead tier-0 hands off to the
+  next tier immediately. `tracker_error_alert` carries
+  `times_in_row`/`status_code`/`operation_t` like upstream.
+
+- **Announce parameters**: `uploaded`/`downloaded`/`corrupt`/
+  `redundant` come from the real transfer counters
+  (`report_true_downloaded` subtracts redundant + in-flight
+  progress), `left` is `bytes_left` (total − verified have, tail
+  piece corrected, upstream's 16 KiB no-metadata fallback),
+  `num_want` honors `settings.num_want` (0 on `stopped`), `key` is
+  the per-torrent `tracker_key`, `trackerid` echoes the
+  tracker-assigned id with the `AddTorrentParams.trackerid`
+  (`m_trackerid`) fallback, and `private` marks the request.
+
+- **Tracker I/O deadlines and queue**: HTTP/UDP exchanges run under
+  `tracker_completion_timeout` (or `stop_tracker_timeout` for
+  `stopped`) with `tracker_receive_timeout` per-read deadlines —
+  a silent tracker can no longer pin a slot `updating` forever.
+  HTTP(S) announces respect `max_concurrent_http_announces`
+  (`high_priority` jumps the queue head, `num_queued_tracker_announces`
+  gauge). `AnnounceOptions` are settings-driven (`anonymous_mode`
+  sends a generic UA unless the torrent is private, `announce_ip`,
+  `min_announce_interval`, `announce_crypto_support`,
+  `report_redundant`, `ssrf_mitigation`).
+
+- **HTTP tracker transport**: `User-Agent` and URL-auth
+  `Authorization: Basic` headers are sent like upstream
+  `http_connection`; cross-origin redirects are re-dialed and
+  re-GET verbatim with `Authorization` dropped (≤5 hops). The
+  endpoint legs run in upstream order — resolve-all → SSRF
+  (loopback + non-`/announce` path dropped) → `req.filter`/`ip_filter`
+  → per-endpoint dial loop; UDP retries each resolved address
+  (`udp_tracker_connection::fail`), and the BEP-15 `connection_id`
+  is cached per tracker IP for `udp_tracker_token_expiry`.
+  Tracker wire bytes (incl. UDP/IP overhead) feed
+  `sent_tracker_bytes`/`recv_tracker_bytes`.
+
+- **Response folding**: dict `hostname` peers are resolved locally
+  unless peer connections+hostnames are proxied (dropped like
+  upstream), the tracker `external ip` votes in `ip_voter` keyed by
+  the resolved `tracker_ip`, `trackerid` persists on the entry and
+  posts `trackerid_alert`, `warning message` posts
+  `tracker_warning_alert`, and announce replies refresh the
+  entry's scrape fields. Manual announces/scrapes post their
+  reply/error alerts unconditionally (`triggered_manually` →
+  `sent_manual`).
+
+- **`completed`/`stopped` lifecycle**: `BecameSeed` routes the
+  burst through `tracker_list::completed` + the regular selection
+  with `updating`/`sent_event` instrumented — `completed` is
+  emitted exactly once per version (`m_complete_sent` latch) and
+  `stop_announcing` re-arms per-version `stopped` announces.
+- **Peer lifecycle & admission vs upstream `new_connection`/`incoming_connection`/`attach_to_torrent` (audit A07)**:
+  the inbound accept path now runs upstream's full gate order —
+  session paused → transport enablement (`enable_incoming_tcp`/
+  `enable_incoming_utp`, `peer_blocked_alert`) → outgoing-interface /
+  bound-address verification → `has_incoming_connections` (sticky,
+  non-local remotes only) → session `ip_filter` skipped while
+  `non_filter_torrents > 0` → `m_torrents.empty()` →
+  `connections_limit` + `connections_slack` →
+  `incoming_starts_queued_torrents` / active-torrent check →
+  `incoming_connections` counter + `incoming_connection_alert`.
+  Per-torrent attach adds the `attach_to_torrent` legs: auto-resume
+  of paused+auto-managed torrents, `paused`/`aborted`/`graceful_pause`
+  rejection at `torrent_paused`/`peer_error`, and the SSL-only
+  `requires_ssl_connection` gate.
+
+- **Duplicate & self-connection resolution**: `PeerList::new_connection`
+  is now wired into incoming attach — banned entries reject with
+  `peer_banned`, endpoint self-connections (dialing our own listen
+  address, detected through the pending dial's registered local
+  endpoint) ban the swarm entry and tear down both legs at
+  `self_connection` failure severity, same-direction duplicates are
+  dropped, and cross-direction duplicates resolve by the
+  local-vs-remote port comparison with `m_locked_peer` protecting the
+  entry during the loser conn's synchronous teardown.
+
+- **Per-connection peer ids**: outgoing connections shake hands with
+  a fresh `generate_peer_id` per dial (tracked per torrent in
+  `m_outgoing_pids`-equivalent `outgoing_pids` + per-endpoint
+  `dial_pids`), so the remote no longer sees a `duplicate_peer_id`
+  collision on our parallel dials, and the `is_self_connection`
+  probe can spot a peer claiming one of our in-flight ids.
+
+- **uTP → TCP fallback**: a failed uTP dial clears `supports_utp`,
+  arms `fast_reconnect` (rewinds `last_connected` so the retry is not
+  cooled out), runs `connection_closed` at *normal* severity (no
+  `failcount` bump) and immediately re-dials the same entry over TCP
+  via `pending_out` — matching upstream's
+  `connect_failed → connect_to_peer(pi, ignore_limit)`. `PeerConn`
+  carries `fast_reconnect`/`local`/`our_peer_id`/`conn_key` through
+  `SessionOut::ConnectPeer` → `DialDone`; dial refusals (ip_filter,
+  no transport) and transport failures take their upstream-distinct
+  failcount legs.
+
+- **BEP-10 `p` (listen port) wired**: the extension-handshake port now
+  reaches `PeerList::update_peer_port`, so inbound peers become
+  dialable and collide-merge with tracker/PEX entries; conn↔entry
+  bookkeeping binds by `conn_key` so a port rewrite can't strand a
+  live conn's teardown.
+
+- **`remove_peer` correctness**: in-flight download blocks are only
+  aborted back into the picker when `!timed_out && !not_wanted`
+  (a timed-out block already released once would double-decrement
+  `num_peers`), `prev_amount_*` byte totals are restored at conn
+  creation and folded back at teardown, `outgoing_pids`/`dial_pids`/
+  `dial_locals`/`num_connecting`/`num_seeds` bookkeeping is settled
+  on every mark-teardown path, and the last conn draining under
+  graceful pause completes the pause (`GracefulPauseDone` →
+  `do_pause`) instead of posting `TorrentPaused` at pause initiation.
+  `triggered_unchoke`/`triggered_optimistic` force the next choker
+  pass like upstream's `trigger_unchoke`.
+- `choke_peer` émet `Choke` **avant** de drainer la file d'upload avec
+  des `RejectRequest` — ordre wire aligné sur `send_choke`
+  (`write_choke()` puis boucle de rejects, peer_connection.cpp:3848→3859).
+- Une requête de forme valide pour une pièce non détenue (ni
+  prédictive ni seed_mode) passe désormais par la branche *invalid*
+  complète : `invalid_piece_requests`, `num_invalid_requests`, et le
+  rappel-choke tous les 10 / disconnect >300 (inerte comme upstream,
+  conservé pour l'identité observable) — auparavant seuls
+  `piece_rejects` + alerte étaient produits.
+- `block_uploaded_alert.block` = index de bloc
+  (`start / block_size`), plus l'offset octet.
+- `on_disk_read_complete` ne pousse plus `Piece` ni
+  `BlockUploaded` sur une conn `disconnecting`
+  (early-return upstream sur `m_disconnecting`).
+- Le watermark dynamique de `fill_send_buffer` suit
+  `uploaded_last_second` (octets payload du dernier tick,
+  `stat::last_payload_uploaded()`), plus l'EMA tout-canal
+  `rate_up_speed` — conforme à `buffer_size_watermark` upstream.
+- Le rejet super-seed (`piece not super-seeded`) s'exécute côté
+  `peer_conn` **avant** `incoming_have_none` : une requête rejetée ne
+  ranime plus `m_has_metadata` (ordre upstream
+  peer_connection.cpp:2408→2447).
+- **Piece-lifecycle blame/reward on dead connections (audit A10)**:
+  `penalize_peers` and the `piece_finished` trust loop now resolve a
+  picker's downloader key to its swarm entry even when the peer's
+  connection is already gone — a `downloader_addrs` key→address map
+  remembered at `add_peer` plays the role of upstream's
+  `block_info.peer` being a `torrent_peer*` (which outlives
+  connections, `torrent.cpp:5136-5203`). A lone/disconnected culprit
+  that delivered a hash-failing piece is now still put on parole,
+  docked trust −2 (floor −7), credited a `hashfail` and banned via
+  `ban_peer` + `banned_for_hash_failure` + `update_want_peers` when
+  `known_bad` — with no `DisconnectPeer` emitted since there is
+  nothing left to drop (upstream's `if (p->connection)` gate), and
+  `peer_ban_alert`'s `pid` empty like upstream's. The symmetric pass
+  leg restores the lost `trust_points +1`/parole-clear reward.
+
+- **`Alert::PeerBan` carries `pid`** (`peer_ban_alert` upstream):
+  `Option<PeerId>`, populated from the live conn in
+  `penalize_peers` and the manual `ban_peer` path; `None` when the
+  conn is already gone (upstream's `peer_id()` fallback).
+- **Choker slot accounting vs upstream `unchoke_sort` (audit A11)**:
+  `unchoke_sort` now returns the *uncapped* `upload_slots` like
+  upstream's `return upload_slots` — previously it returned
+  `min(slots, peers.len())`, which under-dimensioned
+  `unchoke_set_size = allowed - num_opt_unchoke` whenever the
+  eligible set was smaller than the quota (e.g. limit 8 with 2
+  eligible peers unchoked only 1, the second waiting for the
+  optimistic rotation). The `num_unchoke_slots` gauge is also exact
+  under the rate-based choker.
+
+- **`ignore_unchoke_slots` conns excluded from the choker**: both
+  `recalculate_unchoke_slots`' eligibility sweep and the optimistic
+  candidate set now skip `ignore_unchoke_slots` conns (conn class
+  set OR the torrent's own set — empty class set exempts, as
+  upstream). Previously exempt conns (e.g. the local/loopback class
+  upstream always flags) could be sorted into a slot, choked by the
+  tail or the uninterested leg, or picked optimistically.
+
+- **Peer-class upload priority orders the unchoke sort**:
+  `ChokePeer.priority` now carries `get_priority(upload_channel)` —
+  the max of `priority[UPLOAD]` over the conn's and the torrent's
+  class sets — instead of a hardcoded 1, so `compare_peers`' first
+  key and `upload_rate_compare` actually discriminate by class.
+
+- **Rate-based choker measures the real round interval**: the rate
+  threshold divide uses `now - m_last_choke` (new `Session::last_choke`
+  stamp) instead of the configured `unchoke_interval`, so an early
+  triggered recalc doesn't inflate peer rates.
+
+- **Choker scaler re-arms restored**: `choke_this_peer`
+  (`NotInterested`) now re-arms `triggered_unchoke` for
+  slot-consuming conns and `triggered_optimistic` when the choked
+  peer held the optimistic bit; the eligibility sweep re-arms the
+  optimistic rotation when it chokes an optimistic-but-ineligible
+  peer; promotion of an optimistic peer into the real unchoke set
+  re-arms it too; and the optimistic pass ends with upstream's
+  `num_unchoke_slots < num_peers_up_unchoked_all → scaler = 0` leg
+  (new `Session::pending_unchoke` consumed by `unchoke_tick`).
+  Freed slots now refill on the next tick instead of the next period.
+
+- **`free_upload_slots` counts only slot-consuming conns**: exempt
+  unchoked conns no longer eat the per-torrent `max_uploads` budget
+  that optimistic candidacy checks (`m_num_uploads` semantics).
+
+- **`incoming_interested` tail ported**: a choked conn re-runs
+  `maybe_unchoke_this_peer` on `Interested` (skipped under
+  `graceful_pause`/`disconnecting`, routed via new
+  `PeerEffect::MaybeUnchoke` → `TorrentEffect::MaybeUnchoke`), and
+  an already-unchoked conn gets upstream's redundant `Unchoke`
+  re-send for clients that missed the handshake unchoke. The
+  `num_have > 0` gate moved from inside `maybe_unchoke_this_peer`
+  to the handshake call site — upstream's `incoming_interested`
+  re-run carries no such gate (exempt conns unchoke on `Interested`
+  even when we hold no pieces).
+- **`request_time_critical_pieces` is the real upstream algorithm
+  (audit A12)**: deadline pieces are now picked in deadline order from
+  peers sorted by `download_queue_time` (bottom decile dropped), with
+  the `avg + 4σ + 1 s` horizon gate, `first_requested`/`last_requested`
+  tracking, and the stall-based busy re-pick (`pick_time_critical_block`
+  — one extra request per block per elapsed `avg + dev/2` window).
+  `can_request_time_critical` filters choked/uninteresting/parole/
+  snubbed/disconnecting conns and deep queues (> 2× desired).
+  `add_request(b, busy, true)` now actually front-inserts into the
+  time-critical prefix, and `m_average_piece_time`/
+  `m_piece_time_deviation` EWMA update on critical-piece completion.
+  Previously the function merely re-drove `drive_peer` per conn and
+  stalled deadline pieces were never re-requested.
+
+- **`cancel_non_critical` deferred like upstream's `post()`**: the
+  first-deadline sweep is armed (`pending_cancel_non_critical`) and
+  runs at the next tick, so several consecutive `set_piece_deadline`
+  calls register before the cancel pass — in-flight blocks on later
+  critical pieces are no longer cancelled (was: extra wire `Cancel`s).
+
+- **`cancel_non_critical` honors `cancel_request`'s `!is_requested`
+  head gate**: blocks the picker no longer tracks (arrived via
+  another peer) are left alone — no `not_wanted` mark, no `Cancel`.
+
+- **Deadlines survive pause**: `on_torrent_paused` no longer clears
+  `m_time_critical_pieces` — upstream `do_pause` keeps them
+  (`torrent_handle::clear_piece_deadlines` is the only erase path).
+
+- **`clear_piece_deadlines` posts `read_piece_alert`
+  (`operation_canceled`)** for `alert_when_available` entries and
+  restores `low_priority` per upstream `clear_time_critical`; it now
+  takes an `out` vec (signature change).
+
+- **Filtered pieces lose their deadlines**: `prioritize_pieces` and
+  `update_piece_priorities` run the
+  `remove_time_critical_pieces` sweep when priorities actually change
+  (`filter_updated`) — a piece set to `dont_download` drops out of
+  `time_critical` with a canceled alert instead of pinning
+  `time_critical_mode` forever.
+
+- **Deadline completion restores `low_priority`**: the
+  piece-verified path goes through `remove_time_critical_piece` —
+  `alert_when_available` readback, EWMA stats, priority drop — like
+  upstream, instead of a bare erase.
+- **`update_piece_state` re-cascades the priority index on every queue
+  move (audit A13)**: upstream calls `update(prio, p.index)` whenever
+  the piece had a bucket entry — a `downloading → full` transition
+  drops it from `m_pieces` entirely (`priority()` → -1) and
+  downloading↔reverse moves shift the `prio_factor` adjustment. The
+  port only handled `-1 → ≥0` additions, leaving stale entries that
+  could re-`add` the piece and let `pick_pieces` hand the same blocks
+  out twice.
+- **`recalc_share_mode` counts `want().num_pieces` like upstream**
+  (audit A13): `num_downloaded` is `max(have, want)` where
+  `want = num_pieces − num_filtered − num_have_filtered`; the port
+  forgot `- num_have_filtered`, making the `share_mode_target` gate
+  slightly too permissive for swarms with filtered-and-owned pieces.
+- **Picker loop counters now reach `session_stats` (audit A13)**:
+  `PickerStats` is implemented for `&Counters` (mapping the 8
+  upstream `piece_picker_*_loops` slots) and all `pick_pieces` /
+  `request_a_block` call sites pass the real session bank instead of
+  `NullPickerStats` — upstream feeds `ses.stats_counters()`.
+  `next_web_seed_blocks` gained a `counters` parameter for this.
+- **`incoming_piece` `is_deleted` leg** : un bloc arrivant pendant le
+  teardown du torrent (`t->is_deleted()` upstream) n'atteint plus le
+  disque et ne marque plus `mark_as_writing` — l'arm
+  `PeerEffect::DiskWrite` consulte désormais `aborted` après le leg
+  redondant, avant l'un-snub, et supprime via `skipped_writes` les
+  effets appariés (`MarkDownloaded`, `GracefulCheck`) comme le early
+  return upstream (`peer_connection.cpp:2990`).
+- **`update_gauge` sur échec d'écriture** : la complétion
+  `DiskCompleted::Write` en erreur appelle `state_updated` pour les
+  échecs aborted *et* réels, avant `handle_disk_error`
+  (`peer_connection.cpp:3255`) — les jauges de pièces ne restent plus
+  périmées jusqu'au prochain tick pour les torrents souscrits.
+- `on_file_priority` error path now runs the full `pause()` machinery
+  (`TorrentEffect::Pause` → `Session::set_paused` → `do_pause`) instead
+  of a bare `paused` flag flip: announce gates off, `disconnect_all`,
+  `stop_announcing` + `stopped` announces and `torrent_paused_alert`
+  like upstream `torrent.cpp` `on_file_priority`.
+- `TorrentHandle::file_priorities()` resizes the stored vector to
+  `num_files` with `default_priority` when metadata is valid
+  (upstream `torrent::file_priorities`).
+- `move_storage` on a metadata-less torrent posts the *requested* path
+  in `storage_moved_alert` while `save_path` stores the `complete()`'d
+  form (upstream posts `save_path`, stores `complete(save_path)`).
+- **Watermark loop drained the entire dirty cache** — `flush_after_insert`
+  re-tested `should_flush(num_cached_blocks)` but the level only drops at
+  flush *completion* (async jobs), so once over the high watermark every
+  insert scheduled Flush jobs for the whole cache instead of stopping at
+  the low watermark (upstream `flush_to_disk` exits its passes once
+  `buffer_level() <= target`, `disk_cache.cpp:1027`). `DiskCache` now
+  tracks `in_flight_blocks` (buffers taken into a Flush job) and the loop
+  stops when the *predicted* post-completion level
+  `write_blocks - in_flight` reaches the low watermark.
+- **Flush level is now global** — the watermark drain evaluated only the
+  inserting storage's `num_cached_blocks` while upstream `buffer_level()`
+  covers all storages + pending writes (`disk_cache.hpp:691`). The loop
+  now tests `write_blocks` (global) and drains `take_coalesced` across
+  every storage's cache.
+- **Duplicate-block write leaked two counters** — `num_cached_blocks`
+  grew unconditionally even when the buffer replaced a filled slot, and
+  the superseded writer's `write_blocks` slot was never released (its
+  `CACHED` flag made `job_done` skip the decrement and no flush would
+  ever retire it) → permanent back-pressure inflation per duplicate.
+  `insert` now counts only freshly-occupied slots, and the superseded
+  writer has `CACHED` cleared so `job_done` releases its own slot.
+- **`remove_torrent`/`abort_jobs` leaked cached-buffer slots** — buffers
+  dying with the cache kept their `write_blocks` charge forever;
+  `abort_all_writers` now returns the resident-buffer count and callers
+  release it (`check_buffer_level` included). Orphaned writers pending
+  in the cache's `orphans` queue are now drained and completed on
+  `remove_torrent` (previously their handlers could be dropped with the
+  cache — upstream requires each handler to run exactly once); the
+  `Drop` impl also drains leftover orphans.
+- **Writer parked on an out-of-range block** is aborted into `orphans`
+  instead of being silently dropped (upstream asserts
+  `block_idx < blocks_in_piece`).
+- **`need_hasher_kick` re-emission** — added upstream's
+  `needs_hasher_kick_flag`: the kick is emitted once per
+  `hasher_cursor` position and re-armed by `hashed_block`.
+- **`v2_pending` dead counter removed** (never decremented/read; the
+  v2-hash-queue deferral it models has no equivalent under the
+  whole-piece hasher).
+- **`StoreBuffer::insert` no longer overwrites** a duplicate key —
+  upstream `unordered_map::insert` keeps the existing buffer and the
+  level stays unchanged.
+- **`file_pool` : ouvertures concurrentes du même fichier** —
+  `m_opening_files` upstream est une *liste* (plusieurs opens en vol
+  par `file_key`, ex. un open write pendant un open read-only) et le
+  join des waiters n'est tenté que si le fichier est absent du pool
+  (`i == key_view.end()`). Le port utilisait une seule entrée
+  `HashMap<FileId, …>` : un second opener pouvait réveiller les waiters
+  du premier avec son résultat — y compris une erreur — alors que
+  l'open encore en cours aurait pu réussir. `opening` est désormais un
+  `Vec<OpeningEntry>` identifié par `id` ; chaque opener ne notifie que
+  ses propres waiters (`notify_file_open` efface `s_iterator_to(ofe)`,
+  `file_pool_impl.cpp:62-98`, `:221-241`). Régression couverte par
+  `parallel_openers_notify_only_own_waiters`,
+  `parallel_opener_failure_does_not_poison_waiters`,
+  `waiter_receives_inflight_result`.
+- **`part_file::move_partfile` propage l'erreur du `remove` post-copy**
+  — le fallback EXDEV `copy_file` + `remove` tolérait ENOENT sur le
+  `remove` ; upstream ne tolère que le ENOENT du `rename` initial et
+  propage l'échec du `remove(old_path, ec)` (`part_file.cpp:316-326`).
+- **Codes d'erreur `add_file` alignés upstream** : dépassement du cap
+  par-fichier (`file_size > max_file_size`) → nouvelle erreur
+  `Error::FileTooLarge` (`errc::file_too_large`, generic_category) au
+  lieu de `torrent_invalid_length`, qui ne s'applique plus qu'à
+  l'overflow d'offset cumulé ; nom de fichier ≥ 4096 →
+  `Error::FilenameTooLong` (`errc::filename_too_long`) au lieu d'un
+  `io::Error` ad-hoc (`file_storage.cpp:819-843`).
+- **`metadata_too_large`** : `from_info_node` rejette un info dict
+  ≥ `i32::MAX` (cap `parse_info_section_impl` upstream), et
+  `load_torrent_buffer` rapporte le dépassement de `max_buffer_size`
+  avec `metadata_too_large` au lieu de `invalid_bencoding`.
+- **Fallback `magnet-uri`** : un `.torrent` sans `info` mais avec une
+  clé `magnet-uri` est désormais parsé comme un magnet
+  (`load_torrent.cpp:159-171`) et retourne des `AddTorrentParams` sans
+  `ti` — auparavant rejeté `torrent_missing_info`.
+- **Valeurs d'énum `TorrentError`** : `TooManyDuplicateFilenames` prend
+  sa vraie valeur upstream 145 (au lieu de 22 implicite) ;
+  `MetadataTooLarge` = 100.
+- **Magnet v2 / hybrid metadata verification (audit A19)**:
+  `set_metadata_verdict` now hashes the raw `info` dict against the
+  *complete* `InfoHash` — SHA-1 when v1 exists (with the upstream
+  truncated-v2-in-v1-slot fallback: SHA-256 whose first 20 bytes match),
+  then full SHA-256 equality when v2 exists (`torrent.cpp:8277-8310`).
+  v2-only and v2-keyed hybrid magnets can now actually resolve their
+  metadata instead of failing hash verification forever.
+
+- **Post-resolution torrent collision detection**: resolving a magnet
+  whose metadata turns out to belong to an already-known torrent now
+  mirrors `torrent::set_metadata`/`update_torrent_info_hash`
+  (`torrent.cpp:8363-8418`) — both torrents are marked conflicting,
+  paused, and a `torrent_conflict_alert`-equivalent is emitted instead
+  of silently keeping the provisional session key.
+
+- **`disconnect_if_redundant` sweep after metadata init**: existing
+  peers are re-evaluated once the picker/storage exist
+  (`torrent.cpp:8445-8447`) — upload-only × upload-only and
+  uninteresting upload peers acquired before metadata resolution are
+  now dropped at resolve time instead of lingering.
+
+- **`prioritize_pieces` seed gate and resume dirtiness**: matching
+  `torrent.cpp:5967-5996`, the call is now a no-op on seeds and only
+  sets `need_save_resume` when priorities actually changed
+  (`filter_updated`) — a stray priority call can no longer corrupt a
+  seed's picker state or dirty resume data on every invocation.
+
+- **`num_total_pieces_added` counter**: now incremented by the resolved
+  piece count at the same points upstream does (`torrent.cpp:458`,
+  `torrent.cpp:8442`) — previously declared but permanently zero.
+
+- **Magnet resume data preserves the full `InfoHash`**: `to_resume_data`
+  no longer writes the (possibly truncated) session-key hash into the
+  v1 `info-hash` slot — v2-only magnets round-trip `info-hash2`,
+  hybrids keep both hashes (`torrent.cpp:7562`). Previously a v2
+  magnet's resume blob was unreadable as anything but a phantom v1
+  torrent keyed by the truncated v2 hash.
+- **`stop_when_ready` — séquence upstream complète** : le flag est
+  désormais restauré depuis `atp.flags`, routé par `set_flags` et le
+  setter handle déclenche immédiatement quand le torrent est déjà dans
+  un état downloading. L'edge checking→downloading (et le passage
+  finished→seeding) exécute la séquence upstream
+  `auto_managed(false)` + `pause()` complète (alerte, stopped
+  announce) puis désarme le flag — au lieu du `self.paused = true` nu
+  à l'edge finished.
+- **Disconnect des seeds à `finished()`** gaté par
+  `close_redundant_connections`, comme upstream.
+- **`need_save_resume` → `ResumeDataFlags` bitmask** : les catégories
+  `if_state_changed`/`if_download_progress`/`if_config_changed`/
+  `if_metadata_changed`/`if_counters_changed` remplacent le booléen ;
+  `save_resume_data(flags)` honore `ONLY_IF_MODIFIED` contre le mask.
+- **Démotion auto-manage** ne marque plus le resume dirty
+  (`set_paused` upstream ne marque pas ; seul `pause()` le fait).
+- **`finished()`** : ajout d'`async_release_files` (→ `CacheFlushed`)
+  et re-trigger `manage_queue` immédiat.
+- **`resume_download`** renvoie le torrent en fin de queue
+  (`queue_position = last_pos`).
+- **`do_resume`/`start_announcing`** : reset `total_failed`/
+  `total_redundant_bytes`/stats torrent, gate `files_checked`, et
+  `high_priority` propagé depuis le connect boost.
+- **`StateChanged` par transition** au lieu du diff de fin de tick —
+  une alerte par edge, ordre upstream préservé.
+- **`TorrentPaused` différé** à la complétion
+  `async_stop_torrent`/drain graceful via `paused_alert_pending`.
+- **Ctor** : restauration des flags `atp.flags` manquants —
+  `pinned`, `apply_ip_filter`, update subscription, sequential /
+  upload / share / super-seeding, disable DHT/LSD/PEX.
 
 ### Added
 
@@ -261,6 +746,12 @@ Until `1.0.0`, breaking changes may occur in any release.
   URL and a real error string through `Session::on_web_seed_error`;
   `url_seed_alert` names the failing seed and message, and
   `Torrent` keeps `web_seed_errors`/`web_seed_outstanding` per URL.
+- `TorrentHandle::get_file_priority(index)` — upstream
+  `torrent::file_priority` getter: `dont_download` for pad files and
+  out-of-range/negative indexes, `default_priority` for unallocated
+  slots.
+- `Alert::FileError` gains the `op` field (upstream
+  `file_error_alert.operation`) at all four construction sites.
 
 ### Changed
 
@@ -2945,3 +3436,19 @@ re-audited against upstream `e7381c7bc`; 19 deviations corrected:
   pure-pad request groups are answered with zeroes without
   dialing; `web_peer_connection` conn lifecycle drives per-seed
   `inc`/`dec_refcount_all`.
+
+### Notes
+
+- `cache_expiry` periodic flush (`flush_expired`) kept as a documented
+  extension — upstream marks the setting `DEPRECATED_SET` (no consumer);
+  ours drains dirty runs older than the configured age once per session
+  tick.
+
+### Tests
+
+- `add_file_size_and_name_errors` : FileTooLarge / TorrentInvalidLength
+  cumulatif / FilenameTooLong (`test_file_storage.cpp` parity).
+- `magnet_uri_torrent_file` : `.torrent`-magnet accepté, `ti == None`,
+  info_hashes remplis ; dict sans `info`/`magnet-uri` →
+  `TorrentMissingInfo`.
+- `load_torrent_buffer_size_cap` : `max_buffer_size` → `MetadataTooLarge`.
