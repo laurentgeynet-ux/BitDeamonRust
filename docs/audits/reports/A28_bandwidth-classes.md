@@ -42,3 +42,68 @@ Baseline upstream `e7381c7bc` (`D:/Projet/libtorrent/libtorrent`).
 - `update_quotas` early-return `queue.is_empty()` → les canaux non sollicités ne re-remplissent pas leur bucket : identique à `bandwidth_manager.cpp:119-120`.
 - Mixed-mode `stat_rate` exclut les conns sans torrent et les bytes *protocol* des web-seeds — ordre de grandeur identique, seul le payload web-seed est déjà replié (`torrent.rs:10039-10046`).
 - `PeerClassPool::new()` seede seulement global+tcp, `local` ajouté par `Session::new` — même résultat que le ctor `session_impl` (ids 0/1/2 stables, `debug_assert_eq!`).
+
+## Résultat
+
+Mode `apply` exécuté dans le worktree dédié
+(`C:/Projet/wt/LibtorrentRust-a28`, branche
+`audit/28-bandwidth-classes`). Commit apply : `c8a2d65` (rebasée sur
+`main` `14f2df0`, mergée en `0664520`).
+
+### Déviation corrigée
+
+**Fetch web-seed hors du bandwidth manager** — upstream
+`web_peer_connection` est un `peer_connection` : ses lectures
+passent par `setup_receive` → `request_bandwidth(download_channel)`
+et consomment le quota des classes comme tout pair. Implémenté :
+
+- `ThrottledWs` (`engine.rs`) — wrapper `AsyncRead`/`AsyncWrite`
+  autour du `BoxedPeerStream` injecté : chaque opération est clampée
+  au quota disponible, un bucket vide file `request_bandwidth_web`
+  et parque la tâche sur le grant (`bw_limit` → `Notify`), chaque
+  chunk transféré accumule l'overhead IP/TCP sur les deux directions
+  (`trancieve_ip_packet`, `(ipv6?40:20)+20` par paquet).
+- `Session::request_bandwidth_web` (`session.rs`) — même corps que
+  `request_bandwidth` : classes conn-side résolues par
+  `peer_class_mask(addr, FilterSocketType::Tcp)` (nom retenu par le
+  proxy → fallback `global|tcp`), canaux pertinents mask + set
+  torrent (cap 10), priorité = `get_priority` max sur les deux.
+- `web_seed_bw` (`torrent.rs`) — registre `(Weak<PeerQuota>, mask)`
+  par torrent : le `second_tick` draine `ip_overhead` via
+  `quota_overhead_mask` + `quota_overhead` (torrent set) et poste
+  `download_limit_too_low`/`upload_limit_too_low` sous
+  `rate_limit_ip_overhead` ; les entrées `disconnecting`/mortes sont
+  purgées (conn effacée de `m_connections` upstream).
+- `WsQuotaGuard` (`engine.rs`) — `Drop` marque `disconnecting` sur
+  toute sortie du task fetch → `update_quotas` supprime la requête
+  en file et rend le quota assigné (`peer_connection::disconnect`).
+- `http_conn`/`fetch_block` généralisés sur `S: AsyncRead +
+  AsyncWrite + Unpin` pour interposer le wrapper (appelants
+  inchangés).
+
+### Tests ajoutés
+
+`test_bandwidth.rs` (+3, 8/8 verts) :
+
+- `web_seed_request_queues_grants_and_registers` — file sur canal
+  throttlé, `bw_limit`, grant à `update_quotas`, registration
+  `web_seed_bw` dedup par `Weak::ptr_eq`.
+- `web_seed_overhead_drains_and_alerts` — drain `use_quota_overhead`
+  (mask conn + set torrent) + `download_limit_too_low` sous
+  `rate_limit_ip_overhead`.
+- `web_seed_disconnect_drops_queued_request` — `disconnecting`
+  supprime la requête en file, refuse `None`, purge du registre.
+
+### Gates
+
+`cargo fmt --all`, `cargo clippy --workspace --all-targets --
+-D warnings`, `cargo test --workspace`, `cargo doc --workspace
+--no-deps` — tous verts (re-run post-rebase : un seul conflit
+`PORTING.md` ligne proxy A24, résolu en gardant les deux lignes).
+
+### Note résiduelle
+
+`request_bandwidth_web` n'applique pas `wanted_transfer` (pas de
+file de requêtes par conn côté pull-model — upstream la calcule sur
+`m_requests`) : la demande est la taille réelle du read HTTP, le
+comportement de quota est identique à granularité de requête près.
