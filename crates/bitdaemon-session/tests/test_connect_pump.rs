@@ -143,11 +143,19 @@ fn prioritized_torrent_dials_first() {
 
 #[test]
 fn connections_limit_blocks_the_pump() {
+    // upstream `update_connections_limit` maps `limit <= 0` to
+    // `max_open_files()` — the unbounded case. A *positive* cap
+    // blocks once `num_connections()` reaches it.
     let mut s = session(SessionSettings {
-        connections_limit: 0,
+        connections_limit: 1,
         ..harness_settings()
     });
-    s.add_torrent(torrent(1, 4));
+    let _ih = s.add_torrent(torrent(1, 4));
+    // occupy the single slot with a half-open connection (upstream
+    // counts `num_connections() + half-open` against the cap).
+    s.counters
+        .set(bitdaemon_session::counters::Counter::NumPeersHalfOpen, 1);
+    assert_eq!(s.num_connections(), 1);
     assert!(s.try_connect_more_peers(0, None).is_empty());
 }
 

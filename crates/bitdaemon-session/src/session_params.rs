@@ -34,7 +34,17 @@ pub fn write_session_params(sp: &SessionParams) -> Entry {
     }
     d.insert(b"extensions".to_vec(), Entry::Dict(m));
 
-    let (v4, v6) = sp.ip_filter.export_filter();
+    write_ip_filter(&sp.ip_filter, &mut d);
+
+    Entry::Dict(d)
+}
+
+/// `write_session_params`'s `save_ip_filter` block — `ip_filter4`
+/// /`ip_filter6` string lists (`addr first ‖ addr last ‖ u32 flags`),
+/// emitted only when the family has rules. Shared with the
+/// `session_state` container.
+pub(crate) fn write_ip_filter(f: &IpFilter, d: &mut bitdaemon_bencode::Dictionary) {
+    let (v4, v6) = f.export_filter();
     if !v4.is_empty() {
         let mut l = Vec::with_capacity(v4.len());
         for r in v4 {
@@ -57,8 +67,6 @@ pub fn write_session_params(sp: &SessionParams) -> Entry {
         }
         d.insert(b"ip_filter6".to_vec(), Entry::List(l));
     }
-
-    Entry::Dict(d)
 }
 
 /// `write_session_params_buf`.
@@ -117,7 +125,10 @@ pub fn read_session_params_node(e: &BdecodeNode<'_>) -> SessionParams {
     params
 }
 
-fn load_ip_filter(e: &BdecodeNode<'_>, filter: &mut IpFilter) {
+/// `read_session_params`'s `save_ip_filter` block — tolerates short
+/// or inverted entries (`first > last` → skipped, like upstream).
+/// Shared with the `session_state` container's `load_state`.
+pub(crate) fn load_ip_filter(e: &BdecodeNode<'_>, filter: &mut IpFilter) {
     for (key, v6) in [(b"ip_filter4".as_slice(), false), (b"ip_filter6", true)] {
         let list = e.dict_find_list(key);
         if list.node_type() != NodeType::List {
@@ -910,10 +921,13 @@ pub fn apply_dht_settings_dict(s: &mut SessionSettings, d: &BdecodeNode<'_>) {
 pub fn apply_settings_dict(s: &mut SessionSettings, n: &BdecodeNode<'_>) {
     use std::time::Duration;
     macro_rules! get {
+        // upstream `load_pack_from_dict` applies any *present* key —
+        // an empty string clears the setting (e.g. `proxy_hostname`
+        // reset via a session file). Presence, not non-vacuity.
         ($f:ident, $k:literal, str) => {
-            let v = n.dict_find_string_value($k, &[]);
-            if !v.is_empty() {
-                s.$f = v.to_vec();
+            let v = n.dict_find_string($k);
+            if v.node_type() == NodeType::String {
+                s.$f = v.string_value().to_vec();
             }
         };
         ($f:ident, $k:literal, boolean) => {
@@ -1443,4 +1457,13 @@ pub fn apply_settings_dict(s: &mut SessionSettings, n: &BdecodeNode<'_>) {
     // BitDaemon extensions
     get!(web_seed_blocks_per_tick, b"web_seed_blocks_per_tick", i32);
     get!(save_resume_data_interval, b"save_resume_data_interval", sec);
+
+    // `setting_by_name` backwards compat — the 1.x name `peer_tos`
+    // aliases `peer_dscp`; the modern key wins when both are present.
+    if n.dict_find_int(b"peer_dscp").node_type() != NodeType::Int {
+        let v = n.dict_find_int_value(b"peer_tos", i64::MIN);
+        if v != i64::MIN {
+            s.peer_dscp = v as i32;
+        }
+    }
 }

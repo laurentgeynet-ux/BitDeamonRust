@@ -292,3 +292,48 @@ ni callback** upstream).
   `read_session_params` applique `apply_deprecated_dht_settings` *avant*
   `load_pack_from_dict`, `session_params.cpp:96-118`). Le `load_state` du
   container BitDaemon ne lit pas `"dht"`-dict → voir déviation.
+
+## Résultat
+
+Apply sur `audit/22-settings-session-state`, commit `ab61626`
+(`fix(bitdaemon-session): apply_settings & .session parity — hot-apply legs`).
+
+### Déviations corrigées
+
+- `reopen_listen_port` : gate ramenée à `listen_interfaces` /
+  `proxy_type` / `proxy_peer_connections` (+ `ssl_listen`, clé encore
+  live chez nous) — `outgoing_interfaces` ne ré-ouvre plus.
+- `apply_settings` : ajout des legs `update_proxy`
+  (`proxy_settings(m_settings)` → tous les purpose-slots),
+  `update_dht_bootstrap_nodes`, `trigger_auto_manage`,
+  `update_auto_sequential`, sanitize `user_agent` (`\n`→`' '`),
+  `connection_speed < 0` → 200, `aio_threads`/`hashing_threads` clamp 0.
+- `update_connections_limit` : `<= 0` → cap non borné
+  (`i32::MAX`, équivalent `max_open_files()`) au lieu de `.max(1)` —
+  plus de sweep destructeur sur `connections_limit = 0`.
+- `update_unchoke_limit` : le cas fini ne fait que réarmer le scaler ;
+  le sweep immédiat reste réservé à `INT_MAX`, le négatif ne déclenche
+  plus d'unchoke intempestif.
+- `.session` / session-params : `SessionState` porte désormais
+  `"dht state"` (dict), `"extensions"`, `ip_filter4`/`6` ;
+  `load_state` accepte un blob `write_session_params` upstream
+  (`"dht"`-dict legacy → `dht_*`, overlay `"settings"`, ip filter
+  restauré via `set_ip_filter`, identité client préservée).
+  `SessionHandle::write_session_params` émet le vrai dict
+  `session_params`.
+- `apply_settings_dict` : applique toute clé string présente (vide
+  incluse — efface le champ) ; alias 1.x `peer_tos` → `peer_dscp`.
+- `set_proxy`/`set_peer_proxy`/`set_tracker_proxy` écrivent les clés
+  `proxy_*` via `apply_settings` ; `proxy()`/`peer_proxy()` renvoient
+  `proxy_settings(m_settings)`.
+
+### Tests
+
+`tests/test_settings_apply_a22.rs` (11 tests) : gate de reopen,
+purpose-slots proxy, sanitizers, `connections_limit <= 0`, bootstrap
+DHT, string vide, alias `peer_tos`, portage `ip_filter`/`dht
+state`/`extensions`, lecture d'un blob `write_session_params`,
+préservation de l'identité, ordre de merge `"dht"`/`"settings"`.
+`test_connect_pump::connections_limit_blocks_the_pump` réécrit pour la
+sémantique upstream (cap positif + half-open). Gates : fmt, clippy
+`-D warnings`, `cargo test --workspace`, `cargo doc --no-deps` — verts.
