@@ -100,13 +100,11 @@ complets dans le worktree (`fmt --all`, `clippy --workspace`,
 `test --workspace`, `doc`), écrit le fragment
 `docs/audits/changelog/A05.md` + `## Résultat` dans le rapport,
 commit sur sa branche et signale « prêt à merger ». **Tout reste
-local — l'agent ne merge ni ne pushe jamais.**
+local — pas de push, pas de PR, pas de GitHub.**
 
-Le merge est votre acte, dans le checkout principal :
-
-```sh
-git merge audit/05-utp-transport
-```
+Le merge est votre **décision** : dites « merge » et l'agent l'exécute
+en local (`git merge audit/05-utp-transport` dans le checkout
+principal + cleanup worktree/branche) — ou faites-le vous-même.
 
 **Cas particulier — un seul audit à la fois** : si rien d'autre ne
 tourne, le checkout principal suffit (branche `audit/NN-<slug>` en
@@ -163,8 +161,8 @@ committer.
 - ❌ Éditer `CHANGELOG.md` ou `PORTING.md` dans une branche apply
   (fragments `changelog/ANN.md` à la place ; `PORTING.md` seulement
   pour les rows du périmètre).
-- ❌ Merger ou pusher depuis une session apply — le merge est
-  l'acte de l'humain ; tout reste local, pas de PR.
+- ❌ Merger sans votre ordre explicite, ou pusher quoi que ce soit —
+  tout reste local ; le merge se fait sur votre « merge ».
 - ❌ Lancer A29 avant la fin des autres (il re-audite les compteurs
   que les fixes précédents auront touchés).
 - ❌ Modifier le checkout upstream — lecture seule, toujours.

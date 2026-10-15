@@ -79,7 +79,8 @@ git worktree add ../LibtorrentRust-aNN -b audit/NN-<slug>
 # l'agent travaille dans ce dossier (target/ isolé → builds parallèles) :
 # gates + changelog fragment + PORTING.md + ## Résultat, commit sur
 # sa branche, puis signale « prêt à merger » — tout reste LOCAL.
-# Le merge est décidé par l'humain, dans le checkout principal :
+# Sur ordre « merge » de l'humain : git merge audit/NN-<slug>
+# dans le checkout principal (un merge à la fois) :
 git merge audit/NN-<slug>
 # après merge :
 git worktree remove ../LibtorrentRust-aNN && git branch -d audit/NN-<slug>

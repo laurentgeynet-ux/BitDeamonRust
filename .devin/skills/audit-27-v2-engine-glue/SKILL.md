@@ -170,18 +170,19 @@ autres).
     rebase + gates comme pour le reste.
 12. Commit `fix(<crate>): <scope> parity — <mot-clé>` **sur la branche
     `audit/27-engine-glue`** — jamais sur `main`. **Tout reste local** :
-    pas de push, pas de PR — le merge est décidé et exécuté par
-    l'humain (`git merge audit/27-engine-glue` dans le checkout
-    principal). Signaler « prêt à merger » et s'arrêter là. Si le
-    merge révèle des conflits (`torrent.rs`/`peer_conn.rs`/
-    `session.rs`/`PORTING.md`) : rebase de la branche sur `main` frais
-    **dans le worktree** + re-run des gates, puis redonner le feu.
+    pas de push, pas de PR, pas de GitHub. Signaler « prêt à merger »
+    et **s'arrêter** — le merge n'a lieu que sur ordre explicite de
+    l'humain (« merge »). Sur cet ordre : `git merge
+    audit/27-engine-glue` dans le checkout principal — **un merge à la
+    fois** ; si conflits (`torrent.rs`/`peer_conn.rs`/`session.rs`/
+    `PORTING.md`), rebase de la branche sur `main` frais **dans le
+    worktree** + re-run des gates, puis nouveau `git merge`.
 13. **Résultat** : ajouter une section `## Résultat` au rapport
     (déviations corrigées, tests ajoutés, hash du commit).
-    **Hygiène post-merge** (après merge par l'humain) : `git worktree
-    remove ../LibtorrentRust-a27` puis `git branch -d
-    audit/27-engine-glue`. Une branche mergée qui traîne encombre la vue
-    et trompe la planification.
+    **Hygiène post-merge** : `git worktree remove
+    ../LibtorrentRust-a27` puis `git branch -d audit/27-engine-glue`.
+    Une branche mergée qui traîne encombre la vue et trompe la
+    planification.
 
 ## Pièges connus (checklists transverses)
 
