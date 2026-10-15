@@ -6055,8 +6055,15 @@ impl Session {
             .map(|(ih, _)| *ih)
             .collect();
         let web_seed_blocks = self.settings.web_seed_blocks_per_tick;
-        // `m_ses.num_connections()` — feeds `timed_out_no_interest`.
-        let session_conns: i64 = self.torrents.values().map(|t| t.peers.len() as i64).sum();
+        // `m_ses.num_connections()` — feeds `timed_out_no_interest`
+        // and the web-seed `connections_limit` gate; in-flight web
+        // fetches count as connections upstream
+        // (`peer_info.connection`).
+        let session_conns: i64 = self
+            .torrents
+            .values()
+            .map(|t| t.peers.len() as i64 + t.web_seed_inflight() as i64)
+            .sum();
         // `disk_observer` gate — stop issuing block requests while
         // the write queue sits above `max_queued_disk_bytes`.
         let disk_bp = self.disk.as_ref().is_some_and(|d| d.write_queue_exceeded());
@@ -6156,6 +6163,10 @@ impl Session {
                         self.alerts.mask(),
                         &mut eff,
                     );
+                    // `web_connection_base::timeout()` — expired
+                    // web-seed batches release their blocks and
+                    // reschedule the seed (`urlseed_wait_retry`).
+                    t.check_web_seed_timeouts(&self.settings, &mut eff);
                     // `peer_connection::second_tick` super-seed
                     // recovery — peers uninterested >10 s get a fresh
                     // leaked piece.
@@ -6205,7 +6216,8 @@ impl Session {
                     // `maybe_connect_web_seeds` — pull-model: the
                     // block pick hands work to the engine's fetch
                     // task instead of keeping a persistent conn.
-                    if let Some((url, reqs)) = t.next_web_seed_blocks(web_seed_blocks)
+                    if let Some((url, reqs)) =
+                        t.next_web_seed_blocks(web_seed_blocks, &self.settings, session_conns)
                         && let Some(fs) = t.files.clone()
                     {
                         let single_file = fs.num_files() == 1;
@@ -8410,7 +8422,7 @@ impl Session {
 
     /// `web_peer_connection::on_body_data` — one web-seed block
     /// arrived; routes to the disk-write path (marks the picker
-    /// block `writing` under `Torrent::WEB_SEED_PEER`). `url`
+    /// block `writing` under the seed's own picker key). `url`
     /// attributes the payload to the seed's per-URL counters.
     pub fn on_web_seed_block(
         &mut self,
@@ -8422,23 +8434,35 @@ impl Session {
     ) {
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(ih) {
-            t.on_web_seed_block(url, req, data, &mut eff);
+            t.on_web_seed_block(url, req, data, &self.settings, &self.counters, &mut eff);
         }
         self.route(*ih, eff, out);
     }
 
-    /// `web_peer_connection` failure — release the picked blocks.
-    /// Upstream posts `url_seed_alert` on web-seed errors, carrying
-    /// the failing seed's URL and the error message.
+    /// end of a fetch batch — frees the seed's conn slot and folds
+    /// the keep-alive verdict into `web_seed_t::supports_keepalive`
+    /// (also the deferred-delete point for `removed` seeds).
+    pub fn on_web_seed_done(&mut self, ih: &Sha1Hash, url: &str, saw_close: bool) {
+        if let Some(t) = self.torrents.get_mut(ih) {
+            t.on_web_seed_done(url, saw_close);
+        }
+    }
+
+    /// `web_peer_connection` failure — release the picked blocks
+    /// and reschedule the seed per `backoff` (`retry_web_seed`,
+    /// `disabled`, or `remove_web_seed_iter`). Upstream posts
+    /// `url_seed_alert` on web-seed errors, carrying the failing
+    /// seed's URL and the error message.
     pub fn on_web_seed_error(
         &mut self,
         ih: &Sha1Hash,
         url: &str,
         reqs: &[bitdaemon_common::types::PeerRequest],
         msg: &str,
+        backoff: crate::torrent::WebSeedBackoff,
     ) {
         if let Some(t) = self.torrents.get_mut(ih) {
-            t.on_web_seed_error(url, reqs, msg);
+            t.on_web_seed_error(url, reqs, msg, backoff, &self.settings);
         }
         self.alerts.post(Alert::UrlSeed {
             ih: *ih,

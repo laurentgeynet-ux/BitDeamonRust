@@ -128,8 +128,24 @@ fn transport_socket_type(k: &bitdaemon_net::instantiate::TransportKind) -> u8 {
 }
 
 /// `Ok` = fetched blocks with data; `Err` = the requests to
-/// release + the human-readable failure for `url_seed_alert`.
-type WebSeedResult = Result<Vec<(PeerRequest, Vec<u8>)>, (Vec<PeerRequest>, String)>;
+/// release + the failure detail for `url_seed_alert` and the
+/// `web_seed_t` rescheduling class.
+type WebSeedResult = Result<Vec<(PeerRequest, Vec<u8>)>, WebSeedFailure>;
+
+/// failure half of [`WebSeedResult`] — the requests to release,
+/// the `url_seed_alert` message, and how the seed reschedules
+/// (`retry_web_seed`'s supplied duration, name-lookup backoff,
+/// `disabled`, or `remove_web_seed_iter`).
+struct WebSeedFailure {
+    /// requests still covered by the failed fetch — the ok prefix
+    /// is reported separately (upstream keeps finished file
+    /// requests across `maybe_reconnect`).
+    reqs: Vec<PeerRequest>,
+    /// `url_seed_alert` message.
+    msg: String,
+    /// how the seed reschedules.
+    backoff: bitdaemon_session::torrent::WebSeedBackoff,
+}
 
 /// A web-seed fetch completion: per-block data or the failed
 /// request list (to release the picked blocks). `url` attributes
@@ -138,6 +154,9 @@ type WebSeedResult = Result<Vec<(PeerRequest, Vec<u8>)>, (Vec<PeerRequest>, Stri
 struct WebSeedDone {
     ih: Sha1Hash,
     url: String,
+    /// a response carried `Connection: close` — feeds
+    /// `web_seed_t::supports_keepalive`.
+    saw_close: bool,
     result: WebSeedResult,
 }
 
@@ -690,10 +709,14 @@ impl Engine {
                         slock(&self.session).on_web_seed_block(&w.ih, &w.url, req, data, &mut out);
                     }
                 }
-                Err((reqs, msg)) => {
-                    slock(&self.session).on_web_seed_error(&w.ih, &w.url, &reqs, &msg);
+                Err(f) => {
+                    slock(&self.session)
+                        .on_web_seed_error(&w.ih, &w.url, &f.reqs, &f.msg, f.backoff);
                 }
             }
+            // batch resolved — free the seed's conn slot and fold
+            // in the keep-alive verdict.
+            slock(&self.session).on_web_seed_done(&w.ih, &w.url, w.saw_close);
         }
         while let Ok(a) = self.dhtnode_rx.try_recv() {
             // upstream resolves `dht_bootstrap_nodes` through the
@@ -1231,10 +1254,14 @@ impl Engine {
     }
 
     /// `web_peer_connection` driver — dial the seed host through
-    /// the injected connector, issue one GET per block via
-    /// `build_piece_request`/`fetch_block`, then feed every block
-    /// back into `Session::on_web_seed_block` (same disk path a
-    /// wire `Piece` takes).
+    /// the injected connector (honoring `web_seed_proxy`, SSRF
+    /// mitigation, `ip_filter`/`port_filter` and `urlseed_timeout`
+    /// like upstream `connect_to_url_seed`/`connect_web_seed`),
+    /// issue one GET per block via `plan_piece_request`/
+    /// `fetch_block`, then feed every block back into
+    /// `Session::on_web_seed_block` (same disk path a wire `Piece`
+    /// takes).
+    #[allow(clippy::too_many_lines)]
     fn spawn_web_seed(
         &mut self,
         ih: Sha1Hash,
@@ -1244,15 +1271,17 @@ impl Engine {
         single_file: bool,
         reqs: Vec<PeerRequest>,
     ) {
-        use bitdaemon_net::web_seed::{WebSeedHeaders, fetch_block};
+        use bitdaemon_net::web_seed::{WebSeedHeaders, fetch_block, normalize_web_seed_url};
+        use bitdaemon_session::torrent::WebSeedBackoff;
         let tx = self.webseed_tx.clone();
         let connector = self.connector.clone();
         let resolver = self.resolver.clone();
-        // upstream `add_headers` sends `User-Agent` on the first
-        // request (or always with `always_send_user_agent`) unless
-        // anonymous_mode is on.
         let session = Arc::clone(&self.session);
-        let (user_agent, anonymous, always_ua, ip_filter) = {
+        // `connect_to_url_seed`/`connect_web_seed` settings snapshot
+        // — upstream reads `m_settings`/`m_ses.proxy()` at connect
+        // time; ours reads them at task spawn (same fidelity: the
+        // session tick that dispatched the fetch used them too).
+        let (user_agent, anonymous, always_ua, ip_filter, timeout, proxy, ssrf, allow_idna, pf) = {
             let s = slock(&self.session);
             (
                 String::from_utf8_lossy(&s.settings.user_agent).into_owned(),
@@ -1262,6 +1291,11 @@ impl Engine {
                 // `m_ip_filter` applies to web seeds unconditionally
                 // (no `m_apply_ip_filter` gate upstream).
                 s.torrents.get(&ih).and_then(|t| t.ip_filter.clone()),
+                s.settings.urlseed_timeout,
+                s.proxies.web_seed.clone(),
+                s.settings.ssrf_mitigation,
+                s.settings.allow_idna,
+                s.port_filter.clone(),
             )
         };
         self.tasks_forget();
@@ -1269,13 +1303,16 @@ impl Engine {
             // report the completed blocks, then release the rest —
             // mirrors `web_peer_connection` keeping finished file
             // requests while retrying the failed tail on a fresh
-            // connection (`maybe_reconnect`).
+            // connection (`maybe_reconnect`). `backoff` is the
+            // `web_seed_t` rescheduling class upstream applies in
+            // `on_disconnect`/`handle_error`/`disable`.
             macro_rules! report {
-                ($done:expr, $rest:expr, $msg:expr) => {{
+                ($done:expr, $rest:expr, $msg:expr, $backoff:expr, $close:expr) => {{
                     if !$done.is_empty() {
                         let _ = tx.send(WebSeedDone {
                             ih,
                             url: url.clone(),
+                            saw_close: $close,
                             result: Ok($done),
                         });
                     }
@@ -1283,42 +1320,136 @@ impl Engine {
                         let _ = tx.send(WebSeedDone {
                             ih,
                             url: url.clone(),
-                            result: Err(($rest, $msg.to_string())),
+                            saw_close: $close,
+                            result: Err(WebSeedFailure {
+                                reqs: $rest,
+                                msg: $msg.to_string(),
+                                backoff: $backoff,
+                            }),
                         });
                     }
                 }};
             }
-            let Ok(c) = bitdaemon_net::parse_url::parse_url_components(&url) else {
-                report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs, "invalid url");
-                return;
-            };
+            let mut saw_close = false;
             let mut done: Vec<(PeerRequest, Vec<u8>)> = Vec::with_capacity(reqs.len());
-            let port = u16::try_from(c.port).unwrap_or(80);
-            let addr = match resolve(&resolver, &c.hostname, port).await {
-                Ok(a) => a,
-                Err(e) => {
-                    report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs, e);
-                    return;
-                }
-            };
-            // upstream `on_name_lookup`/`connect_web_seed` — a
-            // filtered resolved address posts `peer_blocked_alert`
-            // and aborts the connect.
-            if ip_filter
-                .as_ref()
-                .is_some_and(|f| f.access(addr.ip()) == bitdaemon_net::ip_filter::BLOCKED)
+            // `connect_to_url_seed` — upstream gate order: idna →
+            // default port → parse error → protocol → hostname →
+            // port 0 → port filter.
+            let parsed = bitdaemon_net::parse_url::parse_url_components(&url);
+            if !allow_idna
+                && parsed
+                    .as_ref()
+                    .is_ok_and(|c| bitdaemon_net::parse_url::is_idna(&c.hostname))
             {
-                slock(&session).alerts.post(Alert::PeerBlocked {
-                    ih,
-                    remote: addr.to_string(),
-                    reason: "ip_filter".into(),
-                });
-                report!(Vec::<(PeerRequest, Vec<u8>)>::new(), reqs, "ip filter");
+                report!(
+                    Vec::<(PeerRequest, Vec<u8>)>::new(),
+                    reqs,
+                    "blocked by idna",
+                    WebSeedBackoff::Disable,
+                    saw_close
+                );
                 return;
             }
-            // `format_host_header` — omit the default http port
-            let host =
-                bitdaemon_net::string_util::format_host_header(c.hostname.clone(), c.port, 80);
+            let Ok(mut c) = parsed else {
+                report!(
+                    Vec::<(PeerRequest, Vec<u8>)>::new(),
+                    reqs,
+                    "invalid url",
+                    WebSeedBackoff::Remove,
+                    saw_close
+                );
+                return;
+            };
+            let https = c.protocol.eq_ignore_ascii_case("https");
+            if c.port == -1 {
+                c.port = if https { 443 } else { 80 };
+            }
+            if !c.protocol.eq_ignore_ascii_case("http") && !https {
+                report!(
+                    Vec::<(PeerRequest, Vec<u8>)>::new(),
+                    reqs,
+                    "unsupported URL protocol",
+                    WebSeedBackoff::Disable,
+                    saw_close
+                );
+                return;
+            }
+            if c.hostname.is_empty() {
+                report!(
+                    Vec::<(PeerRequest, Vec<u8>)>::new(),
+                    reqs,
+                    "invalid hostname",
+                    WebSeedBackoff::Remove,
+                    saw_close
+                );
+                return;
+            }
+            if c.port == 0 {
+                report!(
+                    Vec::<(PeerRequest, Vec<u8>)>::new(),
+                    reqs,
+                    "invalid port",
+                    WebSeedBackoff::Remove,
+                    saw_close
+                );
+                return;
+            }
+            if pf.access(u16::try_from(c.port).unwrap_or(0)) & bitdaemon_net::ip_filter::BLOCKED
+                != 0
+            {
+                report!(
+                    Vec::<(PeerRequest, Vec<u8>)>::new(),
+                    reqs,
+                    "port blocked",
+                    WebSeedBackoff::Disable,
+                    saw_close
+                );
+                return;
+            }
+            // `web_peer_connection` ctor — normalize `m_path`/`m_url`
+            // (multi-file: trailing `/`; single-file: append the
+            // filename to a directory-style seed).
+            let mut url_norm = url.clone();
+            let mut path = c.path.clone();
+            normalize_web_seed_url(
+                &mut path,
+                &mut url_norm,
+                files.num_files().max(0) as usize,
+                &files.file_path(bitdaemon_common::types::FileIndex(0), b""),
+            );
+            let port = u16::try_from(c.port).unwrap_or(if https { 443 } else { 80 });
+            // `instantiate_connection(m_ses.proxy())` — the web-seed
+            // proxy: http/http_pw → absolute-form GETs (CONNECT only
+            // for https), socks* → `SocksConnector`;
+            // `proxy_hostnames` keeps name resolution on the proxy.
+            let px_ok = proxy.proxy_peer_connections
+                && !matches!(
+                    proxy.proxy_type,
+                    bitdaemon_net::proxy::ProxyType::None | bitdaemon_net::proxy::ProxyType::I2p
+                );
+            let proxy_addr = if px_ok {
+                match resolve(&resolver, &proxy.hostname, proxy.port).await {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        report!(
+                            Vec::<(PeerRequest, Vec<u8>)>::new(),
+                            reqs,
+                            e,
+                            WebSeedBackoff::NameLookup,
+                            saw_close
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            // `format_host_header` — omit the scheme's default port
+            let host = bitdaemon_net::string_util::format_host_header(
+                c.hostname.clone(),
+                c.port,
+                if https { 443 } else { 80 },
+            );
             let mut headers = WebSeedHeaders {
                 host,
                 user_agent,
@@ -1337,15 +1468,46 @@ impl Engine {
                     ))
                 );
             }
+            // `http_stream::set_proxy_authorization` — http proxies
+            // get `Proxy-Authorization` from the proxy credentials.
+            let using_http_proxy = proxy_addr.is_some()
+                && matches!(
+                    proxy.proxy_type,
+                    bitdaemon_net::proxy::ProxyType::Http
+                        | bitdaemon_net::proxy::ProxyType::HttpPassword
+                );
+            if using_http_proxy && !proxy.username.is_empty() {
+                headers.proxy_authorization = format!(
+                    "Basic {}",
+                    String::from_utf8_lossy(&bitdaemon_core::escape_string::base64encode(
+                        format!("{}:{}", proxy.username, proxy.password).as_bytes()
+                    ))
+                );
+            }
             // conn state per base — `web_seed_t` upstream is one
             // connection per seed; 3xx redirects add ephemeral seeds
-            // (`web_seed_t::redirects` routes per file).
-            let default_base = bitdaemon_net::parse_url::split_url(&url)
+            // (`web_seed_t::redirects` routes per file). `endpoints`
+            // holds per-base dial params; SSRF runs at dial time.
+            let default_base = bitdaemon_net::parse_url::split_url(&url_norm)
                 .map(|(b, _)| b)
-                .unwrap_or_else(|_| url.clone());
-            let mut bases: std::collections::HashMap<String, SocketAddr> =
-                [(default_base.clone(), addr)].into_iter().collect();
+                .unwrap_or_else(|_| url_norm.clone());
+            let mut bases: std::collections::HashMap<String, WebSeedDial> = [(
+                default_base.clone(),
+                WebSeedDial {
+                    hostname: c.hostname.clone(),
+                    port,
+                    tls: https,
+                    no_local_ips: false,
+                },
+            )]
+            .into_iter()
+            .collect();
             let mut conns: std::collections::HashMap<String, BoxedPeerStream> =
+                std::collections::HashMap::new();
+            // resolved endpoint per base (`peer_info.addr`
+            // upstream) — `None` when the proxy held the name;
+            // feeds the redirect seed's `no_local_ips` flag.
+            let mut base_addrs: std::collections::HashMap<String, Option<SocketAddr>> =
                 std::collections::HashMap::new();
             let mut redirects: std::collections::HashMap<
                 usize,
@@ -1361,41 +1523,167 @@ impl Engine {
                     r.piece,
                     i64::from(r.start),
                     i64::from(r.length),
-                    &url,
-                    &c.path,
+                    &url_norm,
+                    &path,
                     single_file,
                     &redirects,
                 );
                 let mut data = Vec::with_capacity(r.length as usize);
                 for g in &groups {
+                    // `handle_padfile` — a group with no real GET
+                    // (pure pad files) is answered with zeroes
+                    // upstream *without* touching the socket.
+                    if g.files.iter().all(|f| !f.got_get) {
+                        for f in &g.files {
+                            data.resize(data.len() + f.length as usize, 0);
+                        }
+                        continue;
+                    }
                     // `Connection: close` (incl. implicit HTTP/1.0)
                     // invalidates the stream — upstream reconnects
                     // per request batch; a fresh conn restarts
                     // `m_first_request`.
                     let first = !conns.contains_key(&g.base);
                     if first {
-                        let Some(&baddr) = bases.get(&g.base) else {
+                        let Some(dial) = bases.get(&g.base) else {
                             continue;
                         };
-                        match connector.clone().connect(baddr).await {
-                            Ok(s) => {
-                                conns.insert(g.base.clone(), s);
+                        let dialed = web_seed_dial(
+                            &connector,
+                            &resolver,
+                            &proxy,
+                            proxy_addr,
+                            &dial.hostname,
+                            dial.port,
+                            dial.tls,
+                            timeout,
+                        )
+                        .await;
+                        let (stream, resolved) = match dialed {
+                            Ok(v) => v,
+                            Err(WebSeedDialError::Resolve(e)) => {
+                                report!(
+                                    done,
+                                    reqs[i..].to_vec(),
+                                    e,
+                                    WebSeedBackoff::NameLookup,
+                                    saw_close
+                                );
+                                return;
                             }
-                            Err(e) => {
-                                report!(done, reqs[i..].to_vec(), e);
+                            Err(WebSeedDialError::Io(e)) => {
+                                report!(
+                                    done,
+                                    reqs[i..].to_vec(),
+                                    e,
+                                    WebSeedBackoff::Retry,
+                                    saw_close
+                                );
+                                return;
+                            }
+                            Err(WebSeedDialError::Timeout) => {
+                                report!(
+                                    done,
+                                    reqs[i..].to_vec(),
+                                    "timed out",
+                                    WebSeedBackoff::Retry,
+                                    saw_close
+                                );
+                                return;
+                            }
+                        };
+                        // `connect_web_seed` — a locally-resolved
+                        // address is filtered unconditionally, then
+                        // the SSRF gate: a local seed may not carry
+                        // query parameters.
+                        if let Some(a) = resolved {
+                            if ip_filter.as_ref().is_some_and(|f| {
+                                f.access(a.ip()) == bitdaemon_net::ip_filter::BLOCKED
+                            }) {
+                                slock(&session).alerts.post(Alert::PeerBlocked {
+                                    ih,
+                                    remote: a.to_string(),
+                                    reason: "ip_filter".into(),
+                                });
+                                report!(
+                                    done,
+                                    reqs[i..].to_vec(),
+                                    "ip filter",
+                                    WebSeedBackoff::Retry,
+                                    saw_close
+                                );
+                                return;
+                            }
+                            if ssrf
+                                && bitdaemon_net::ip_helpers::is_local(&a.ip())
+                                && gpath_has_query(g)
+                            {
+                                slock(&session).alerts.post(Alert::PeerBlocked {
+                                    ih,
+                                    remote: a.to_string(),
+                                    reason: "ssrf_mitigation".into(),
+                                });
+                                report!(
+                                    done,
+                                    reqs[i..].to_vec(),
+                                    "ssrf mitigation",
+                                    WebSeedBackoff::Disable,
+                                    saw_close
+                                );
+                                return;
+                            }
+                            // `no_local_ips` — an ephemeral redirect
+                            // seed learned from a global server must
+                            // not resolve locally (upstream drops the
+                            // endpoint; the seed never connects).
+                            if dial.no_local_ips && !bitdaemon_net::ip_helpers::is_global(&a.ip()) {
+                                report!(
+                                    done,
+                                    reqs[i..].to_vec(),
+                                    "redirect to local address blocked",
+                                    WebSeedBackoff::NameLookup,
+                                    saw_close
+                                );
                                 return;
                             }
                         }
+                        base_addrs.insert(g.base.clone(), resolved);
+                        conns.insert(g.base.clone(), stream);
                     }
                     let wreq = bitdaemon_net::web_seed::render_web_request(
-                        &files, g, &headers, false, first,
+                        &files,
+                        g,
+                        &headers,
+                        using_http_proxy,
+                        first,
                     );
                     let Some(s) = conns.get_mut(&g.base) else {
-                        report!(done, reqs[i..].to_vec(), "no connection");
+                        report!(
+                            done,
+                            reqs[i..].to_vec(),
+                            "no connection",
+                            WebSeedBackoff::Retry,
+                            saw_close
+                        );
                         return;
                     };
-                    match fetch_block(s, &wreq, 4 * 1024 * 1024).await {
+                    let fetched =
+                        match timeout_fut(timeout, fetch_block(s, &wreq, 4 * 1024 * 1024)).await {
+                            Ok(r) => r,
+                            Err(()) => {
+                                report!(
+                                    done,
+                                    reqs[i..].to_vec(),
+                                    "timed out",
+                                    WebSeedBackoff::Retry,
+                                    saw_close
+                                );
+                                return;
+                            }
+                        };
+                    match fetched {
                         Ok((segs, close)) => {
+                            saw_close |= close;
                             if close {
                                 conns.remove(&g.base);
                             }
@@ -1419,14 +1707,22 @@ impl Engine {
                             conns.remove(&g.base);
                             num_redirects += 1;
                             if num_redirects > 64 {
-                                report!(done, reqs[i..].to_vec(), "too many redirects");
+                                report!(
+                                    done,
+                                    reqs[i..].to_vec(),
+                                    "too many redirects",
+                                    WebSeedBackoff::Retry,
+                                    saw_close
+                                );
                                 return;
                             }
                             // upstream `handle_redirect`:
                             // resolve → maybe_url_encode → split_url
                             // → new ephemeral seed carrying
                             // `redirects[file_index]`; auth only on
-                            // same origin.
+                            // same origin. A global-origin redirect
+                            // gains `no_local_ips` under
+                            // `ssrf_mitigation`.
                             let loc = bitdaemon_net::parse_url::maybe_url_encode(
                                 &bitdaemon_net::http_parser::resolve_redirect_location(
                                     &url, &location,
@@ -1434,17 +1730,24 @@ impl Engine {
                             );
                             let Ok((rbase, rpath)) = bitdaemon_net::parse_url::split_url(&loc)
                             else {
-                                report!(done, reqs[i..].to_vec(), "invalid redirect url");
+                                report!(
+                                    done,
+                                    reqs[i..].to_vec(),
+                                    "invalid redirect url",
+                                    WebSeedBackoff::Retry,
+                                    saw_close
+                                );
                                 return;
                             };
                             let Ok(rc) = bitdaemon_net::parse_url::parse_url_components(&loc)
                             else {
-                                report!(done, reqs[i..].to_vec(), "invalid redirect url");
-                                return;
-                            };
-                            let rport = u16::try_from(rc.port).unwrap_or(80);
-                            let Ok(raddr) = resolve(&resolver, &rc.hostname, rport).await else {
-                                report!(done, reqs[i..].to_vec(), "redirect resolution failed");
+                                report!(
+                                    done,
+                                    reqs[i..].to_vec(),
+                                    "invalid redirect url",
+                                    WebSeedBackoff::Retry,
+                                    saw_close
+                                );
                                 return;
                             };
                             let auth = if bitdaemon_net::parse_url::same_origin(&url, &loc) {
@@ -1469,11 +1772,51 @@ impl Engine {
                                     authorization: auth,
                                 },
                             );
-                            bases.entry(rbase).or_insert(raddr);
+                            bases.entry(rbase).or_insert(WebSeedDial {
+                                hostname: rc.hostname.clone(),
+                                port: u16::try_from(rc.port).unwrap_or_else(|_| {
+                                    if rc.protocol.eq_ignore_ascii_case("https") {
+                                        443
+                                    } else {
+                                        80
+                                    }
+                                }),
+                                tls: rc.protocol.eq_ignore_ascii_case("https"),
+                                no_local_ips: ssrf && resolved_origin_global(&base_addrs, &g.base),
+                            });
                             continue 'outer;
                         }
+                        Err(bitdaemon_net::web_seed::WebSeedError::Http {
+                            retry_after: Some(d),
+                            ..
+                        }) => {
+                            report!(
+                                done,
+                                reqs[i..].to_vec(),
+                                "server busy",
+                                WebSeedBackoff::Header(d),
+                                saw_close
+                            );
+                            return;
+                        }
+                        Err(e @ bitdaemon_net::web_seed::WebSeedError::InvalidRange) => {
+                            report!(
+                                done,
+                                reqs[i..].to_vec(),
+                                e,
+                                WebSeedBackoff::Disable,
+                                saw_close
+                            );
+                            return;
+                        }
                         Err(e) => {
-                            report!(done, reqs[i..].to_vec(), e);
+                            report!(
+                                done,
+                                reqs[i..].to_vec(),
+                                e,
+                                WebSeedBackoff::Retry,
+                                saw_close
+                            );
                             return;
                         }
                     }
@@ -1481,7 +1824,13 @@ impl Engine {
                 done.push((r, data));
                 i += 1;
             }
-            report!(done, Vec::<PeerRequest>::new(), "");
+            report!(
+                done,
+                Vec::<PeerRequest>::new(),
+                "",
+                WebSeedBackoff::Retry,
+                saw_close
+            );
         });
         self.tasks.push(handle);
     }
@@ -3675,6 +4024,191 @@ fn filter_tracker_addr(
         }
         _ => Ok(addr),
     }
+}
+
+/// per-base dial parameters for a web-seed connection — the
+/// redirect table grows these (`web_seed_t::endpoints` +
+/// `no_local_ips` upstream).
+struct WebSeedDial {
+    /// target hostname the base resolves/connects to.
+    hostname: String,
+    /// target port.
+    port: u16,
+    /// `https://` — wrap the stream in TLS (upstream
+    /// `instantiate_connection` picks `ssl_stream` for it).
+    tls: bool,
+    /// `web_seed_t::no_local_ips` — ephemeral redirect seed that
+    /// must not resolve to a non-global address.
+    no_local_ips: bool,
+}
+
+/// `web_seed_dial` failure classes — mapped onto
+/// [`bitdaemon_session::torrent::WebSeedBackoff`] by the caller.
+enum WebSeedDialError {
+    /// resolver failed — `web_seed_name_lookup_retry` upstream.
+    Resolve(String),
+    /// connect/handshake failed — `urlseed_wait_retry`.
+    Io(String),
+    /// `urlseed_timeout` fired.
+    Timeout,
+}
+
+/// wrap `fut` in `tokio::time::timeout` —
+/// `web_connection_base::timeout()` = `urlseed_timeout`; `0`
+/// means no upstream deadline (leave unwrapped).
+async fn timeout_fut<F: std::future::Future>(
+    dur: std::time::Duration,
+    fut: F,
+) -> Result<F::Output, ()> {
+    if dur.is_zero() {
+        Ok(fut.await)
+    } else {
+        tokio::time::timeout(dur, fut).await.map_err(|_| ())
+    }
+}
+
+/// `instantiate_connection(m_ses.proxy())` + connect + optional
+/// TLS for one web-seed base. Returns the stream and the
+/// locally-resolved target address — `None` when the proxy holds
+/// the name (`proxy_hostnames`) or an http proxy carries it in
+/// the request line; upstream can't SSRF-check what it doesn't
+/// resolve either (`address_known` gate).
+#[allow(clippy::too_many_arguments)]
+async fn web_seed_dial(
+    connector: &Arc<dyn PeerConnector>,
+    resolver: &Option<BoxedResolver>,
+    proxy: &bitdaemon_net::proxy::ProxySettings,
+    proxy_addr: Option<SocketAddr>,
+    hostname: &str,
+    port: u16,
+    tls: bool,
+    timeout: std::time::Duration,
+) -> Result<(BoxedPeerStream, Option<SocketAddr>), WebSeedDialError> {
+    use bitdaemon_net::proxy::{HttpConnectConnector, ProxyType, SocksConnector};
+    let http_px = proxy_addr.is_some()
+        && matches!(proxy.proxy_type, ProxyType::Http | ProxyType::HttpPassword);
+    let socks_px = proxy_addr.is_some()
+        && matches!(
+            proxy.proxy_type,
+            ProxyType::Socks4 | ProxyType::Socks5 | ProxyType::Socks5Password
+        );
+    // `web_seed_hostname_via_proxy` — the proxy resolves the
+    // target name instead of the local resolver.
+    let name_via_proxy = proxy.proxy_hostnames
+        && !bitdaemon_net::ip_helpers::is_ip_address(hostname)
+        && (http_px || socks_px);
+    let dest = format!("{hostname}:{port}");
+    let mut resolved: Option<SocketAddr> = None;
+    let mut stream: BoxedPeerStream = if http_px && !tls {
+        // `http_stream` with `no_connect` — plain GETs in
+        // absolute-form; the proxy resolves the name.
+        let pa =
+            proxy_addr.ok_or_else(|| WebSeedDialError::Io("proxy address missing".to_string()))?;
+        timeout_fut(timeout, connector.clone().connect(pa))
+            .await
+            .map_err(|()| WebSeedDialError::Timeout)?
+            .map_err(|e| WebSeedDialError::Io(e.to_string()))?
+    } else if http_px {
+        // `http_connect_stream` — CONNECT tunnel for https.
+        let pa =
+            proxy_addr.ok_or_else(|| WebSeedDialError::Io("proxy address missing".to_string()))?;
+        let cc = Arc::new(HttpConnectConnector::new(
+            connector.clone(),
+            pa,
+            proxy.username.clone(),
+            proxy.password.clone(),
+        ));
+        if name_via_proxy || proxy.send_host_in_connect {
+            // hostname in CONNECT (`m_dst_name`) — no local resolve.
+            timeout_fut(timeout, cc.connect_dest(&dest))
+                .await
+                .map_err(|()| WebSeedDialError::Timeout)?
+                .map_err(|e| WebSeedDialError::Io(e.to_string()))?
+        } else {
+            let a = resolve(resolver, hostname, port)
+                .await
+                .map_err(WebSeedDialError::Resolve)?;
+            resolved = Some(a);
+            timeout_fut(timeout, cc.connect(a))
+                .await
+                .map_err(|()| WebSeedDialError::Timeout)?
+                .map_err(|e| WebSeedDialError::Io(e.to_string()))?
+        }
+    } else if socks_px {
+        let pa =
+            proxy_addr.ok_or_else(|| WebSeedDialError::Io("proxy address missing".to_string()))?;
+        let sc = Arc::new(SocksConnector::from_settings(connector.clone(), pa, proxy));
+        if name_via_proxy {
+            timeout_fut(timeout, sc.connect_dest(&dest))
+                .await
+                .map_err(|()| WebSeedDialError::Timeout)?
+                .map_err(|e| WebSeedDialError::Io(e.to_string()))?
+        } else {
+            let a = resolve(resolver, hostname, port)
+                .await
+                .map_err(WebSeedDialError::Resolve)?;
+            resolved = Some(a);
+            timeout_fut(timeout, sc.connect(a))
+                .await
+                .map_err(|()| WebSeedDialError::Timeout)?
+                .map_err(|e| WebSeedDialError::Io(e.to_string()))?
+        }
+    } else {
+        let a = resolve(resolver, hostname, port)
+            .await
+            .map_err(WebSeedDialError::Resolve)?;
+        resolved = Some(a);
+        timeout_fut(timeout, connector.clone().connect(a))
+            .await
+            .map_err(|()| WebSeedDialError::Timeout)?
+            .map_err(|e| WebSeedDialError::Io(e.to_string()))?
+    };
+    if tls {
+        // `m_ses.ssl_ctx()` — the tracker/web client context
+        // (real PKI), same SNI as the request host.
+        let cfg = tracker_tls_config()
+            .ok_or_else(|| WebSeedDialError::Io("no TLS client config".to_string()))?;
+        let peer_name = resolved.unwrap_or_else(|| {
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port)
+        });
+        let s = timeout_fut(
+            timeout,
+            bitdaemon_net::ssl_stream::ssl_connect(stream, hostname, peer_name, cfg),
+        )
+        .await
+        .map_err(|()| WebSeedDialError::Timeout)?
+        .map_err(|e| WebSeedDialError::Io(e.to_string()))?;
+        stream = Box::new(s);
+    }
+    Ok((stream, resolved))
+}
+
+/// `connect_web_seed`'s SSRF test target — the request path that
+/// would actually be sent. Redirected files check the redirect
+/// path (upstream re-runs `connect_to_url_seed` on the ephemeral
+/// seed's own URL).
+fn gpath_has_query(g: &bitdaemon_net::web_seed::WebSeedPlan) -> bool {
+    g.files
+        .iter()
+        .zip(g.redirs.iter())
+        .filter(|(f, _)| f.got_get)
+        .any(|(_, r)| {
+            r.as_ref()
+                .map_or_else(|| g.path.contains('?'), |r| r.path.contains('?'))
+                || r.as_ref().is_some_and(|r| r.url.contains('?'))
+        })
+}
+
+/// was the address this base dialed global? (`remote().address()`
+/// upstream — feeds the redirect seed's `no_local_ips` flag).
+fn resolved_origin_global(
+    base_addrs: &std::collections::HashMap<String, Option<SocketAddr>>,
+    base: &str,
+) -> bool {
+    base_addrs
+        .get(base)
+        .and_then(|a| *a)
+        .is_some_and(|a| bitdaemon_net::ip_helpers::is_global(&a.ip()))
 }
 
 async fn resolve(

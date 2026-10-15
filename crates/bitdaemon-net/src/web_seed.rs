@@ -383,9 +383,18 @@ pub enum WebSeedError {
     /// stream / parser failure.
     #[error("transport: {0}")]
     Transport(#[from] crate::http_conn::HttpError),
-    /// non-2xx status with the server's message.
-    #[error("http {0}: {1}")]
-    Http(i32, String),
+    /// non-2xx status with the server's message. `retry_after`
+    /// carries a parsed `Retry-After` header when present —
+    /// upstream feeds it to `retry_web_seed` verbatim.
+    #[error("http {status}: {message}")]
+    Http {
+        /// response status code.
+        status: i32,
+        /// `Server` header (or status text upstream interpolates).
+        message: String,
+        /// `Retry-After` seconds → `Duration`, when sent.
+        retry_after: Option<std::time::Duration>,
+    },
     /// 3xx — upstream `handle_redirect` stores a per-file redirect
     /// (`web_seed_t::redirects`) and reconnects; the caller can
     /// re-request `file_index` at `location` (resolve it with
@@ -404,6 +413,27 @@ pub enum WebSeedError {
         got: i64,
         /// requested.
         want: i64,
+    },
+    /// `errors::invalid_range` on the *advertised* range — a 206
+    /// with malformed/missing `Content-Range`, or a 200 without
+    /// `Content-Length` (`errors::no_content_length`). Upstream
+    /// `disable()`s the seed — the caller treats this as terminal
+    /// for the session.
+    #[error("invalid response range metadata")]
+    InvalidRange,
+    /// the advertised range parses but isn't the requested one —
+    /// upstream `disconnect(errors::invalid_range)` — retryable,
+    /// the seed is not disabled.
+    #[error("range mismatch: got {start}-{end}, want {want_start}-{want_end}")]
+    RangeMismatch {
+        /// response `Content-Range` start (0 for non-206).
+        start: i64,
+        /// response end, exclusive.
+        end: i64,
+        /// requested file offset.
+        want_start: i64,
+        /// requested end, exclusive.
+        want_end: i64,
     },
 }
 
@@ -439,12 +469,42 @@ pub async fn fetch_block(
             });
         }
         if !crate::http_parser::is_ok_status(r.status()) {
-            return Err(WebSeedError::Http(
-                r.status(),
-                r.header("server").unwrap_or("").to_string(),
-            ));
+            return Err(WebSeedError::Http {
+                status: r.status(),
+                message: r.header("server").unwrap_or("").to_string(),
+                retry_after: crate::http_parser::header_duration(&r.parser, "retry-after"),
+            });
         }
         close = r.parser.connection_close();
+        // `get_range` — a 206 must carry a well-formed
+        // `Content-Range` (malformed/missing → `invalid_range` →
+        // `disable()`); any other ok status must carry
+        // `Content-Length` (`no_content_length` → `disable()`).
+        let (mut range_start, mut range_end) = r.parser.content_range();
+        if r.status() == 206 {
+            if range_start < 0 || range_end < range_start {
+                return Err(WebSeedError::InvalidRange);
+            }
+            // the http range is inclusive — exclusive-ify
+            range_end += 1;
+        } else {
+            range_start = 0;
+            range_end = r.parser.content_length();
+            if range_end < 0 {
+                return Err(WebSeedError::InvalidRange);
+            }
+        }
+        // the byte range the server answered must match the file
+        // request exactly — a mismatch is a retryable disconnect
+        // upstream, not a disable.
+        if range_start != f.start || range_end != f.start + f.length {
+            return Err(WebSeedError::RangeMismatch {
+                start: range_start,
+                end: range_end,
+                want_start: f.start,
+                want_end: f.start + f.length,
+            });
+        }
         let body = r.body();
         if body.len() as i64 != f.length {
             return Err(WebSeedError::ShortBody {

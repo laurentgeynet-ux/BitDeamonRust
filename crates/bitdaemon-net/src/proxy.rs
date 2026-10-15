@@ -208,6 +208,58 @@ impl PeerConnector for SocksConnector {
             .map_err(|e| crate::NetError::Transport(std::io::Error::other(e.to_string())))?
         })
     }
+
+    /// `proxy_hostnames` — connect by destination name
+    /// (`SocksTarget::Name`); the proxy resolves the hostname
+    /// itself instead of leaking it to the local resolver
+    /// (upstream `m_dst_name`). `host:port` strings that parse as
+    /// `SocketAddr` still go through `Addr`.
+    fn connect_dest(
+        self: Arc<Self>,
+        dest: &str,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync + '_>> {
+        let inner = self.inner.clone();
+        let (proxy, v, user, pass) = (
+            self.proxy,
+            self.version,
+            self.user.clone(),
+            self.password.clone(),
+        );
+        // split at the last ':' — keeps v6 literals intact
+        // (`[::1]:8080` → name `::1` won't occur here unbracketed;
+        // callers pass hostnames).
+        let target = dest
+            .parse::<SocketAddr>()
+            .map(SocksTarget::Addr)
+            .ok()
+            .or_else(|| {
+                dest.rsplit_once(':').and_then(|(h, p)| {
+                    p.parse::<u16>().ok().map(|port| SocksTarget::Name {
+                        name: h.trim_matches(|c| c == '[' || c == ']').to_string(),
+                        port,
+                    })
+                })
+            });
+        Box::pin(async move {
+            let target = target.ok_or_else(|| {
+                crate::NetError::Transport(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("bad destination {dest}"),
+                ))
+            })?;
+            tokio::spawn(async move {
+                let mut s = inner.connect(proxy).await?;
+                socks_connect(&mut s, v, &user, &pass, &target, SocksCommand::Connect)
+                    .await
+                    .map_err(|e| {
+                        crate::NetError::Transport(std::io::Error::other(format!("socks: {e}")))
+                    })?;
+                Ok(s)
+            })
+            .await
+            .map_err(|e| crate::NetError::Transport(std::io::Error::other(e.to_string())))?
+        })
+    }
 }
 
 /// `http_stream` as a connector — HTTP `CONNECT` tunnel through
@@ -271,6 +323,54 @@ impl PeerConnector for HttpConnectConnector {
             tokio::spawn(async move {
                 let mut s = inner.connect_with_bind(proxy, bind).await?;
                 crate::http_stream::http_connect(&mut s, addr, None, &user, &pass)
+                    .await
+                    .map_err(|e| {
+                        crate::NetError::Transport(std::io::Error::other(format!("connect: {e}")))
+                    })?;
+                Ok(s)
+            })
+            .await
+            .map_err(|e| crate::NetError::Transport(std::io::Error::other(e.to_string())))?
+        })
+    }
+
+    /// `proxy_hostnames`/`send_host_in_connect` — CONNECT by
+    /// destination name (`m_dst_name`): the proxy resolves the
+    /// target. Only names reach `http_connect`'s `host` override;
+    /// literal `SocketAddr` dests go through `connect`.
+    fn connect_dest(
+        self: Arc<Self>,
+        dest: &str,
+    ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync + '_>> {
+        let inner = self.inner.clone();
+        let (proxy, user, pass) = (self.proxy, self.user.clone(), self.password.clone());
+        let parsed = dest
+            .parse::<SocketAddr>()
+            .map(|a| (None, a))
+            .ok()
+            .or_else(|| {
+                dest.rsplit_once(':').and_then(|(h, p)| {
+                    p.parse::<u16>().ok().map(|port| {
+                        (
+                            Some(h.trim_matches(|c| c == '[' || c == ']').to_string()),
+                            SocketAddr::new(
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                                port,
+                            ),
+                        )
+                    })
+                })
+            });
+        Box::pin(async move {
+            let (host, addr) = parsed.ok_or_else(|| {
+                crate::NetError::Transport(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("bad destination {dest}"),
+                ))
+            })?;
+            tokio::spawn(async move {
+                let mut s = inner.connect(proxy).await?;
+                crate::http_stream::http_connect(&mut s, addr, host.as_deref(), &user, &pass)
                     .await
                     .map_err(|e| {
                         crate::NetError::Transport(std::io::Error::other(format!("connect: {e}")))

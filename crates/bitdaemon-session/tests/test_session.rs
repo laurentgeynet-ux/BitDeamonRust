@@ -597,6 +597,8 @@ fn web_seed_tick_and_block() {
     let mut s = Session::new();
     let mut t = mk_torrent(4);
     t.init_picker(true);
+    // `maybe_connect_web_seeds` gates on `m_files_checked`.
+    t.files_checked = true;
     t.web_seeds.push("http://seed.example/file.bin".into());
     let mut fs = FileStorage::new();
     fs.add_file(
@@ -653,9 +655,588 @@ fn web_seed_tick_and_block() {
 
     // a failed fetch releases the blocks for re-pick
     let rest: Vec<PeerRequest> = reqs[1..].to_vec();
-    s.on_web_seed_error(&ih(1), "http://seed.example/file.bin", &rest, "test error");
+    s.on_web_seed_error(
+        &ih(1),
+        "http://seed.example/file.bin",
+        &rest,
+        "test error",
+        bitdaemon_session::torrent::WebSeedBackoff::Retry,
+    );
     let t2 = &s.torrents[&ih(1)];
     assert!(t2.web_seed_outstanding.len() <= 1);
+}
+
+/// `maybe_connect_web_seeds` exits when `!m_files_checked` — a
+/// torrent that hasn't run the storage check must not fetch from
+/// web seeds at all.
+#[test]
+fn web_seed_gated_on_files_checked() {
+    use bitdaemon_core::FileStorage;
+    use bitdaemon_session::session::SessionOut;
+
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.web_seeds.push("http://seed.example/file.bin".into());
+    let mut fs = FileStorage::new();
+    fs.add_file(
+        Some(b"file.bin"),
+        b"file.bin",
+        4 * 0x40000,
+        bitdaemon_core::FileFlags::NONE,
+        0,
+        b"",
+        None,
+    )
+    .unwrap();
+    fs.set_piece_length(0x40000);
+    fs.set_num_pieces(4);
+    t.files = Some(std::sync::Arc::new(fs));
+    // `files_checked` stays false — no fetch may be emitted.
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    assert!(
+        !out.iter()
+            .any(|e| matches!(e, SessionOut::WebSeedFetch { .. })),
+        "unchecked torrent must not fetch web seeds: {out:?}"
+    );
+
+    // after the check lands, picks resume.
+    s.torrents.get_mut(&ih(1)).unwrap().files_checked = true;
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    assert!(
+        out.iter()
+            .any(|e| matches!(e, SessionOut::WebSeedFetch { .. })),
+        "checked torrent should fetch: {out:?}"
+    );
+}
+
+/// `web_seed_t::retry` — a failed seed is not re-picked until
+/// `now + urlseed_wait_retry`; other seeds keep serving.
+#[test]
+fn web_seed_error_backs_off_per_seed() {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_core::FileStorage;
+    use bitdaemon_session::session::SessionOut;
+    use bitdaemon_session::torrent::WebSeedBackoff;
+
+    let mut s = Session::new();
+    s.settings.urlseed_wait_retry = std::time::Duration::from_secs(30);
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.files_checked = true;
+    t.web_seeds.push("http://a.example/file.bin".into());
+    t.web_seeds.push("http://b.example/file.bin".into());
+    let mut fs = FileStorage::new();
+    fs.add_file(
+        Some(b"file.bin"),
+        b"file.bin",
+        4 * 0x40000,
+        bitdaemon_core::FileFlags::NONE,
+        0,
+        b"",
+        None,
+    )
+    .unwrap();
+    fs.set_piece_length(0x40000);
+    fs.set_num_pieces(4);
+    t.files = Some(std::sync::Arc::new(fs));
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    let first_url = out
+        .iter()
+        .find_map(|e| match e {
+            SessionOut::WebSeedFetch { url, .. } => Some(url.clone()),
+            _ => None,
+        })
+        .expect("first fetch");
+
+    // fail it — the seed backs off; the batch's blocks release.
+    let reqs = out
+        .iter()
+        .find_map(|e| match e {
+            SessionOut::WebSeedFetch { reqs, .. } => Some(reqs.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    s.on_web_seed_error(&ih(1), &first_url, &reqs, "boom", WebSeedBackoff::Retry);
+    s.on_web_seed_done(&ih(1), &first_url, false);
+
+    let st = &s.torrents[&ih(1)].web_seed_state[&first_url];
+    assert!(st.retry_ms > 0, "failed seed must carry a retry deadline");
+    assert!(!st.busy);
+    assert!(s.torrents[&ih(1)].web_seed_outstanding.is_empty());
+
+    // next tick must pick the *other* seed — the failed one is
+    // inside its retry window.
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    let next_url = out.iter().find_map(|e| match e {
+        SessionOut::WebSeedFetch { url, .. } => Some(url.clone()),
+        _ => None,
+    });
+    assert_ne!(next_url.as_deref(), Some(first_url.as_str()));
+    assert!(next_url.is_some(), "the healthy seed still serves");
+
+    // finishing that fetch frees its slot; the *failed* seed stays
+    // ineligible until the retry deadline passes.
+    s.on_web_seed_done(&ih(1), next_url.as_deref().unwrap_or(""), false);
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    let third = out.iter().find_map(|e| match e {
+        SessionOut::WebSeedFetch { url, .. } => Some(url.clone()),
+        _ => None,
+    });
+    assert_ne!(
+        third.as_deref(),
+        Some(first_url.as_str()),
+        "seed inside retry window must not be re-picked"
+    );
+
+    // past the deadline the seed is eligible again.
+    let t = s.torrents.get_mut(&ih(1)).unwrap();
+    t.now_ms += 31_000;
+    let _ = PeerRequest {
+        piece: PieceIndex(0),
+        start: 0,
+        length: 0,
+    };
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    // the fetch may land on either seed (round-robin order), but
+    // the previously-failed one is no longer filtered out.
+    let eligible = !s.torrents[&ih(1)]
+        .web_seed_state
+        .get(&first_url)
+        .is_some_and(|st| st.retry_ms > s.torrents[&ih(1)].now_ms);
+    assert!(eligible, "retry deadline must expire");
+}
+
+/// `web->disabled` — `WebSeedBackoff::Disable` (invalid range,
+/// SSRF, banned, bad protocol) never retries.
+#[test]
+fn web_seed_disable_is_terminal() {
+    use bitdaemon_core::FileStorage;
+    use bitdaemon_session::session::SessionOut;
+    use bitdaemon_session::torrent::WebSeedBackoff;
+
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.files_checked = true;
+    t.web_seeds.push("http://seed.example/file.bin".into());
+    let mut fs = FileStorage::new();
+    fs.add_file(
+        Some(b"file.bin"),
+        b"file.bin",
+        4 * 0x40000,
+        bitdaemon_core::FileFlags::NONE,
+        0,
+        b"",
+        None,
+    )
+    .unwrap();
+    fs.set_piece_length(0x40000);
+    fs.set_num_pieces(4);
+    t.files = Some(std::sync::Arc::new(fs));
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    s.on_web_seed_error(
+        &ih(1),
+        "http://seed.example/file.bin",
+        &[],
+        "invalid range",
+        WebSeedBackoff::Disable,
+    );
+    s.on_web_seed_done(&ih(1), "http://seed.example/file.bin", false);
+    assert!(s.torrents[&ih(1)].web_seed_state["http://seed.example/file.bin"].disabled);
+
+    // far future — a disabled seed still never picks.
+    s.torrents.get_mut(&ih(1)).unwrap().now_ms += 10_000_000;
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    assert!(
+        !out.iter()
+            .any(|e| matches!(e, SessionOut::WebSeedFetch { .. })),
+        "disabled seed must never serve again: {out:?}"
+    );
+}
+
+/// `web_connection_base::timeout()` — an in-flight batch that
+/// outlives `urlseed_timeout` is swept: blocks release, the seed
+/// backs off, a `url_seed_alert` posts.
+#[test]
+fn web_seed_timeout_sweep_releases() {
+    use bitdaemon_core::FileStorage;
+    use bitdaemon_session::session::SessionOut;
+
+    let mut s = Session::new();
+    s.settings.urlseed_timeout = std::time::Duration::from_millis(500);
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.files_checked = true;
+    t.web_seeds.push("http://seed.example/file.bin".into());
+    let mut fs = FileStorage::new();
+    fs.add_file(
+        Some(b"file.bin"),
+        b"file.bin",
+        4 * 0x40000,
+        bitdaemon_core::FileFlags::NONE,
+        0,
+        b"",
+        None,
+    )
+    .unwrap();
+    fs.set_piece_length(0x40000);
+    fs.set_num_pieces(4);
+    t.files = Some(std::sync::Arc::new(fs));
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    assert!(
+        out.iter()
+            .any(|e| matches!(e, SessionOut::WebSeedFetch { .. }))
+    );
+    let t = &s.torrents[&ih(1)];
+    assert!(!t.web_seed_outstanding.is_empty());
+
+    // the engine task never reports — the torrent clock walks past
+    // the deadline and the sweep frees the picker blocks.
+    let t = s.torrents.get_mut(&ih(1)).unwrap();
+    t.now_ms += 600;
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    let t = &s.torrents[&ih(1)];
+    assert!(
+        t.web_seed_outstanding.is_empty(),
+        "timed-out batch must release its blocks"
+    );
+    let st = &t.web_seed_state["http://seed.example/file.bin"];
+    assert!(!st.busy);
+    assert!(st.retry_ms > 0);
+    assert_eq!(st.status.last_error.as_deref(), Some("timed out"));
+}
+
+/// `max_web_seed_connections` — an in-flight fetch occupies the
+/// seed's conn slot; with the cap at 1 the second seed doesn't
+/// start until the first resolves.
+#[test]
+fn web_seed_conn_cap() {
+    use bitdaemon_core::FileStorage;
+    use bitdaemon_session::session::SessionOut;
+
+    let mut s = Session::new();
+    s.settings.max_web_seed_connections = 1;
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.files_checked = true;
+    t.web_seeds.push("http://a.example/file.bin".into());
+    t.web_seeds.push("http://b.example/file.bin".into());
+    let mut fs = FileStorage::new();
+    fs.add_file(
+        Some(b"file.bin"),
+        b"file.bin",
+        4 * 0x40000,
+        bitdaemon_core::FileFlags::NONE,
+        0,
+        b"",
+        None,
+    )
+    .unwrap();
+    fs.set_piece_length(0x40000);
+    fs.set_num_pieces(4);
+    t.files = Some(std::sync::Arc::new(fs));
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    let n = out
+        .iter()
+        .filter(|e| matches!(e, SessionOut::WebSeedFetch { .. }))
+        .count();
+    assert_eq!(n, 1, "one batch per pick");
+
+    // still in flight — the cap keeps the second seed off.
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    assert!(
+        !out.iter()
+            .any(|e| matches!(e, SessionOut::WebSeedFetch { .. })),
+        "busy seed must hold the conn slot"
+    );
+
+    // batch resolved → the other seed may connect.
+    let url = out.iter().find_map(|e| match e {
+        SessionOut::WebSeedFetch { url, .. } => Some(url.clone()),
+        _ => None,
+    });
+    let _ = url;
+    s.on_web_seed_done(&ih(1), "http://a.example/file.bin", false);
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    let url = out
+        .iter()
+        .find_map(|e| match e {
+            SessionOut::WebSeedFetch { url, .. } => Some(url.clone()),
+            _ => None,
+        })
+        .expect("post-done fetch");
+    assert_eq!(url, "http://b.example/file.bin");
+}
+
+/// `report_web_seed_downloads` — web-seed payload folds into the
+/// torrent's download counters (`m_stat` channels upstream); with
+/// the flag off it must not.
+#[test]
+fn web_seed_bytes_count_toward_download() {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_core::FileStorage;
+    use bitdaemon_session::session::SessionOut;
+
+    for report in [true, false] {
+        let mut s = Session::new();
+        s.settings.report_web_seed_downloads = report;
+        let mut t = mk_torrent(4);
+        t.init_picker(true);
+        t.files_checked = true;
+        t.web_seeds.push("http://seed.example/file.bin".into());
+        let mut fs = FileStorage::new();
+        fs.add_file(
+            Some(b"file.bin"),
+            b"file.bin",
+            4 * 0x40000,
+            bitdaemon_core::FileFlags::NONE,
+            0,
+            b"",
+            None,
+        )
+        .unwrap();
+        fs.set_piece_length(0x40000);
+        fs.set_num_pieces(4);
+        t.files = Some(std::sync::Arc::new(fs));
+        s.add_torrent(t);
+
+        let mut out = Vec::new();
+        s.tick(&mut out);
+        let reqs = out
+            .iter()
+            .find_map(|e| match e {
+                SessionOut::WebSeedFetch { reqs, .. } => Some(reqs.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let r0: PeerRequest = reqs[0];
+        let mut out2 = Vec::new();
+        s.on_web_seed_block(
+            &ih(1),
+            "http://seed.example/file.bin",
+            r0,
+            vec![0xAB; r0.length as usize],
+            &mut out2,
+        );
+        let t = &s.torrents[&ih(1)];
+        if report {
+            assert_eq!(
+                t.total_download(),
+                i64::from(r0.length),
+                "web-seed payload must count"
+            );
+            assert_eq!(t.web_seed_payload_downloaded, i64::from(r0.length));
+        } else {
+            assert_eq!(t.total_download(), 0, "report off → no accounting");
+        }
+    }
+}
+
+/// a block delivered *after* its batch was released (timeout,
+/// remove) is stale — it must not write again; upstream's conn
+/// teardown discards it, we count `redundant_bytes`.
+#[test]
+fn web_seed_stale_block_is_redundant() {
+    use bitdaemon_core::FileStorage;
+    use bitdaemon_session::session::SessionOut;
+    use bitdaemon_session::torrent::WebSeedBackoff;
+
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.files_checked = true;
+    t.web_seeds.push("http://seed.example/file.bin".into());
+    let mut fs = FileStorage::new();
+    fs.add_file(
+        Some(b"file.bin"),
+        b"file.bin",
+        4 * 0x40000,
+        bitdaemon_core::FileFlags::NONE,
+        0,
+        b"",
+        None,
+    )
+    .unwrap();
+    fs.set_piece_length(0x40000);
+    fs.set_num_pieces(4);
+    t.files = Some(std::sync::Arc::new(fs));
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    let reqs = out
+        .iter()
+        .find_map(|e| match e {
+            SessionOut::WebSeedFetch { reqs, .. } => Some(reqs.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let r0 = reqs[0];
+    // release the whole batch (as a timeout would).
+    s.on_web_seed_error(
+        &ih(1),
+        "http://seed.example/file.bin",
+        &reqs,
+        "released",
+        WebSeedBackoff::Retry,
+    );
+    s.on_web_seed_done(&ih(1), "http://seed.example/file.bin", false);
+
+    // the late task still reports its payload — stale, not written.
+    let mut out2 = Vec::new();
+    s.on_web_seed_block(
+        &ih(1),
+        "http://seed.example/file.bin",
+        r0,
+        vec![0xAB; r0.length as usize],
+        &mut out2,
+    );
+    let t = &s.torrents[&ih(1)];
+    assert!(
+        t.redundant_bytes >= i64::from(r0.length),
+        "stale block must count as redundant"
+    );
+    assert!(
+        !out2.iter().any(|e| matches!(
+            e,
+            SessionOut::Torrent(
+                bitdaemon_session::torrent::TorrentEffect::DiskWrite { req, .. }
+            ) if req.piece == r0.piece && req.start == r0.start
+        )),
+        "stale block must not re-write"
+    );
+}
+
+/// `remove_url_seed` frees the seed's in-flight blocks (upstream's
+/// conn teardown does the same on `remove_web_seed_iter`).
+#[test]
+fn remove_url_seed_releases_blocks() {
+    use bitdaemon_core::FileStorage;
+    use bitdaemon_session::session::SessionOut;
+
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.files_checked = true;
+    t.web_seeds.push("http://seed.example/file.bin".into());
+    let mut fs = FileStorage::new();
+    fs.add_file(
+        Some(b"file.bin"),
+        b"file.bin",
+        4 * 0x40000,
+        bitdaemon_core::FileFlags::NONE,
+        0,
+        b"",
+        None,
+    )
+    .unwrap();
+    fs.set_piece_length(0x40000);
+    fs.set_num_pieces(4);
+    t.files = Some(std::sync::Arc::new(fs));
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    assert!(
+        out.iter()
+            .any(|e| matches!(e, SessionOut::WebSeedFetch { .. }))
+    );
+
+    let t = s.torrents.get_mut(&ih(1)).unwrap();
+    t.remove_url_seed("http://seed.example/file.bin");
+    assert!(t.web_seed_outstanding.is_empty());
+    assert!(t.web_seeds.is_empty());
+    // the in-flight entry is tombstoned until its task reports.
+    assert!(
+        t.web_seed_state["http://seed.example/file.bin"].removed
+            || !t
+                .web_seed_state
+                .contains_key("http://seed.example/file.bin")
+    );
+
+    // `on_web_seed_done` GCs the tombstone.
+    s.on_web_seed_done(&ih(1), "http://seed.example/file.bin", false);
+    assert!(
+        !s.torrents[&ih(1)]
+            .web_seed_state
+            .contains_key("http://seed.example/file.bin")
+    );
+
+    // the virtual `peer_has` refcount released with the last seed —
+    // the picker no longer sees every piece available.
+    let t = &s.torrents[&ih(1)];
+    assert_eq!(t.picker.as_ref().map(|p| p.num_have()), Some(0));
+}
+
+/// `urlseed_max_request_bytes` — the contiguous merge stops at the
+/// cap instead of growing one unbounded request.
+#[test]
+fn web_seed_merge_capped_by_max_request_bytes() {
+    use bitdaemon_core::FileStorage;
+    use bitdaemon_session::session::SessionOut;
+
+    let mut s = Session::new();
+    // block_size is min(piece_length, 0x4000)=0x4000 here; cap at
+    // exactly one block → no merging.
+    s.settings.urlseed_max_request_bytes = 0x4000;
+    s.settings.web_seed_blocks_per_tick = 4;
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.files_checked = true;
+    t.web_seeds.push("http://seed.example/file.bin".into());
+    let mut fs = FileStorage::new();
+    fs.add_file(
+        Some(b"file.bin"),
+        b"file.bin",
+        4 * 0x40000,
+        bitdaemon_core::FileFlags::NONE,
+        0,
+        b"",
+        None,
+    )
+    .unwrap();
+    fs.set_piece_length(0x40000);
+    fs.set_num_pieces(4);
+    t.files = Some(std::sync::Arc::new(fs));
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.tick(&mut out);
+    let reqs = out
+        .iter()
+        .find_map(|e| match e {
+            SessionOut::WebSeedFetch { reqs, .. } => Some(reqs.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    assert!(
+        reqs.iter().all(|r| i64::from(r.length) <= 0x4000),
+        "merged request must not exceed urlseed_max_request_bytes: {reqs:?}"
+    );
 }
 
 #[test]
