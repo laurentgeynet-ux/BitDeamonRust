@@ -70,7 +70,8 @@ checklist` : chaque item doit avoir un verdict ET une preuve
 bâclé, pas un audit propre. Puis chaque déviation listée doit être
 confirmée ou contestée :
 
-- Confirmée → reste dans `## Déviations`.
+- Confirmée → reste dans `## Déviations` avec son **sketch de fix**
+  (diff hunk ou edit-spec — exécutable tel quel en apply).
 - Contestée / écart volontaire → déplacez-la dans `## Non-bugs
   tranchés` avec la justification, et commitez la correction du
   rapport.

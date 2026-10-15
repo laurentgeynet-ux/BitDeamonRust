@@ -85,9 +85,18 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
    - peer_class filters dans le calcul des slots — verdict : … — preuve : …
 
    ## Déviations
+   Chaque déviation porte un **sketch de fix concret** — hunk de diff
+   ou edit-spec exacte (quel symbole, quel code à la place, réf.
+   upstream à la ligne près). Un « fix proposé » vague (« ajouter une
+   vérif ») est incomplet : l'apply doit pouvoir l'exécuter sans
+   re-designer. Le sketch n'est PAS un patch garanti : il date de
+   l'analyse, le contexte peut avoir bougé — l'apply l'applique en
+   sémantique et boucle les gates. Format :
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
-     (`src/foo.cpp`, fonction) — fix proposé — sévérité
-     (wire-visible / état / cosmétique)
+     (`src/foo.cpp`, fonction) — sévérité (wire-visible / état /
+     cosmétique)
+     - **sketch** : `avant → après` minimal (diff ou edit-spec) +
+       réf. upstream `src/foo.cpp:ligne` + test de régression suggéré
 
    ## Fichiers du fix
    Fichiers Rust que les corrections toucheront (planification des vagues).
