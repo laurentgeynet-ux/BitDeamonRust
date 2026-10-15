@@ -388,6 +388,20 @@ struct PortmapTarget {
     local_addr: String,
 }
 
+/// A pending LSD announce resend — upstream's `m_broadcast_timer`
+/// re-arms `announce_impl` at `2 * retry_count` s until 3 sends.
+#[derive(Debug)]
+struct LsdResend {
+    /// info-hash hex strings (v1 + truncated v2 for hybrids).
+    hexes: Vec<String>,
+    /// listen port to announce (external/mapped when known).
+    port: u16,
+    /// `retry_count` — next send is number `retry` of 3.
+    retry: u8,
+    /// when to emit.
+    due: Instant,
+}
+
 /// `session_impl` — all state owned on one thread.
 /// Per-purpose proxy settings (`m_peer_proxy`/`m_tracker_proxy`/
 /// `m_web_seed_proxy`/`m_dht_proxy`/`m_i2p_proxy` upstream).
@@ -495,6 +509,10 @@ pub struct Session {
     /// `m_next_lsd_torrent` — round-robin cursor into the sorted
     /// torrent set for LSD announces.
     lsd_rr_cursor: usize,
+    /// `m_broadcast_timer` re-arms — upstream resends each announce
+    /// at +2 s and +4 s (`lsd::announce_impl` retry loop); we queue
+    /// the rendered payloads here and drain them in `lsd_tick`.
+    lsd_resends: std::collections::VecDeque<LsdResend>,
     /// millisecond budget pacing for `lsd_tick` — the announce
     /// timer upstream fires every `local_service_announce_interval/
     /// N` ms; our 1 s tick accrues 1000 ms and spends it in
@@ -1027,6 +1045,7 @@ impl Default for Session {
             lsd_cookie: rand::random::<u32>(),
             lsd_queue: std::collections::VecDeque::new(),
             lsd_rr_cursor: 0,
+            lsd_resends: std::collections::VecDeque::new(),
             lsd_budget_ms: 0,
             next_queue_seq: 0,
             last_disk_reap: None,
@@ -1217,23 +1236,7 @@ impl Session {
     #[must_use]
     pub fn peer_list_state(&self) -> bitdaemon_net::peer_list::PeerListState {
         let s = &self.settings;
-        let mut ext = bitdaemon_net::ip_voter::ExternalIp::default();
-        if let Some(ip) = self.ip_voter.external_address() {
-            ext = match ip {
-                std::net::IpAddr::V4(v4) => bitdaemon_net::ip_voter::ExternalIp::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    std::net::IpAddr::V4(v4),
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                ),
-                std::net::IpAddr::V6(v6) => bitdaemon_net::ip_voter::ExternalIp::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    std::net::IpAddr::V6(v6),
-                ),
-            };
-        }
+        let ext = self.external_ip_agg();
         bitdaemon_net::peer_list::PeerListState {
             is_finished: false,
             external_ip: ext,
@@ -4853,18 +4856,24 @@ impl Session {
         {
             return;
         }
-        let hex = bitdaemon_common::hex::to_hex(t.info_hash.as_bytes());
-        for v6 in [false, true] {
-            let pkt =
-                bitdaemon_net::lsd::render_lsd_packet(self.listen_port, &hex, self.lsd_cookie, v6);
-            let to = if v6 {
-                SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR6.into(), 6771)
-            } else {
-                SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR4.into(), 6771)
-            };
-            out.push(SessionOut::UdpPacket(pkt, to));
-        }
-        t.lsd_announcing = true;
+        let (ssl, hexes) = {
+            let mut hexes = Vec::new();
+            t.info_hashes
+                .for_each(|h, _| hexes.push(bitdaemon_common::hex::to_hex(h.as_bytes())));
+            if hexes.is_empty() {
+                hexes.push(bitdaemon_common::hex::to_hex(t.info_hash.as_bytes()));
+            }
+            t.lsd_announcing = true;
+            (t.is_ssl_torrent(), hexes)
+        };
+        let port = self.lsd_announce_port(ssl);
+        self.lsd_emit(&hexes, port, out);
+        self.lsd_resends.push_back(LsdResend {
+            hexes,
+            port,
+            retry: 1,
+            due: Instant::now() + std::time::Duration::from_secs(2),
+        });
     }
 
     /// `torrent_handle::add_piece` — inject user-supplied piece
@@ -6238,19 +6247,88 @@ impl Session {
     }
 
     /// `ip_voter::cast_vote` + `external_ip_alert` when the elected
-    /// address changes (upstream `session_impl` posts the alert at
-    /// every cast-vote site).
+    /// address changes. Upstream votes are *per listen socket*
+    /// (`listen_socket_t::external_address`) — the voter is the
+    /// socket of the same family, preferring `accept_incoming`
+    /// ones; the session-level `ip_voter` is the fallback for
+    /// sessions without recorded listen sockets.
     pub fn vote_external(
         &mut self,
         ip: std::net::IpAddr,
         source: bitdaemon_net::ip_voter::IpSourceFlags,
         source_ip: &std::net::IpAddr,
     ) {
-        if self.ip_voter.cast_vote(ip, source, source_ip)
-            && let Some(addr) = self.ip_voter.external_address()
-        {
-            self.alerts.post(Alert::ExternalIp { addr });
+        use crate::listen::ListenSocketFlags;
+        let idx = self
+            .listen_sockets
+            .iter()
+            .position(|s| {
+                s.flags.contains(ListenSocketFlags::ACCEPT_INCOMING)
+                    && s.local_endpoint.is_ipv4() == ip.is_ipv4()
+            })
+            .or_else(|| {
+                self.listen_sockets
+                    .iter()
+                    .position(|s| s.local_endpoint.is_ipv4() == ip.is_ipv4())
+            });
+        let changed = match idx {
+            Some(i) => self.listen_sockets[i]
+                .external_address
+                .cast_vote(ip, source, source_ip),
+            None => self.ip_voter.cast_vote(ip, source, source_ip),
+        };
+        if !changed {
+            return;
         }
+        let addr = idx
+            .and_then(|i| self.listen_sockets[i].external_address.external_address())
+            .or_else(|| self.ip_voter.external_address());
+        let Some(addr) = addr else {
+            return;
+        };
+        self.alerts.post(Alert::ExternalIp { addr });
+        // `new_external_ip` — BEP-40 peer ranks were computed against
+        // the old external address; upstream clears the cache on
+        // every torrent (`peer_list::clear_peer_prio`).
+        for t in self.torrents.values_mut() {
+            t.peer_list.clear_peer_prio();
+        }
+        // a new external IP means a new BEP-42 node id on the
+        // affected family — upstream restarts the DHT node.
+        self.dht.update_node_id(addr.is_ipv6(), addr);
+    }
+
+    /// `session_impl::external_address()` — the `[local|global] ×
+    /// [v4|v6]` aggregate over the per-socket elected addresses and
+    /// bound local endpoints (first entry per cell wins).
+    #[must_use]
+    pub fn external_ip_agg(&self) -> bitdaemon_net::ip_voter::ExternalIp {
+        use std::net::IpAddr;
+        let mut ips: [[Option<IpAddr>; 2]; 2] = [[None; 2]; 2];
+        for s in &self.listen_sockets {
+            if let Some(ext) = s.external_address.external_address()
+                && ips[0][usize::from(ext.is_ipv6())].is_none()
+            {
+                ips[0][usize::from(ext.is_ipv6())] = Some(ext);
+            }
+            let local = s.local_endpoint.ip();
+            let l = usize::from(bitdaemon_net::ip_helpers::is_local(&local));
+            if ips[l][usize::from(local.is_ipv6())].is_none() {
+                ips[l][usize::from(local.is_ipv6())] = Some(local);
+            }
+        }
+        if ips[0][0].is_none()
+            && ips[0][1].is_none()
+            && let Some(ip) = self.ip_voter.external_address()
+        {
+            ips[0][usize::from(ip.is_ipv6())] = Some(ip);
+        }
+        bitdaemon_net::ip_voter::ExternalIp::new(
+            ips[1][0].unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            ips[0][0].unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            ips[1][1].unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+            ips[0][1].unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
+        )
     }
 
     /// `apply_settings_pack` — hot-swap the settings bag. Upstream
@@ -7034,14 +7112,28 @@ impl Session {
                 }
             }
         }
-        if let Some(a) = bitdaemon_net::lsd::process_packet(buf, from, self.lsd_cookie) {
+        // `match_addr_mask` gate — the packet is only relevant when
+        // the sender sits on the listen socket's subnet (upstream
+        // `lsd::process_packet` drops out-of-network announces).
+        let listen_net = self
+            .listen_sockets
+            .iter()
+            .find(|s| s.local_endpoint.is_ipv4() == from.is_ipv4())
+            .map(|s| (s.local_endpoint.ip(), s.netmask));
+        if let Some(a) = bitdaemon_net::lsd::process_packet(buf, from, self.lsd_cookie, listen_net)
+        {
             let mut lsd_found = Vec::new();
             for ih_raw in a.info_hashes {
                 let Some(ih) = Sha1Hash::from_bytes(&ih_raw) else {
                     continue;
                 };
+                let mut boost = false;
                 if let Some(t) = self.torrents.get_mut(&ih) {
-                    if t.private {
+                    // private torrents and i2p torrents (without
+                    // mixed swarms) ignore LSD peers — upstream
+                    // `on_lsd_peer`.
+                    let i2p = t.ti.as_ref().is_some_and(|ti| ti.is_i2p());
+                    if t.private || (i2p && !self.settings.allow_i2p_mixed) {
                         continue;
                     }
                     let ep = SocketAddr::new(from.ip(), a.port);
@@ -7053,6 +7145,13 @@ impl Session {
                         }
                     }
                     lsd_found.push(ih);
+                    boost = true;
+                }
+                // `do_connect_boost` — upstream dials the freshly
+                // discovered LAN peer right away instead of waiting
+                // for the regular connection pump.
+                if boost {
+                    self.do_connect_boost(&ih, out);
                 }
             }
             // `lsd_peer_alert` — one per torrent the broadcast
@@ -7076,15 +7175,33 @@ impl Session {
     /// `prioritize_lsd` at `start_announcing`) first, else
     /// round-robin `m_next_lsd_torrent`. Our 1 s tick models the
     /// timer with a millisecond budget.
-    pub fn lsd_tick(&mut self, _now: Instant, out: &mut Vec<SessionOut>) {
+    pub fn lsd_tick(&mut self, now: Instant, out: &mut Vec<SessionOut>) {
         // anonymous sessions must not broadcast info-hashes to the LAN
         if self.settings.anonymous_mode || !self.services.lsd {
             self.lsd_queue.clear();
+            self.lsd_resends.clear();
             return;
+        }
+        // `lsd::resend_announce` — upstream re-sends each announce at
+        // +2 s then +4 s (3 datagrams total) through a dedicated
+        // timer; our 1 s tick drains the due entries.
+        let mut resend = std::collections::VecDeque::new();
+        std::mem::swap(&mut resend, &mut self.lsd_resends);
+        for mut r in resend {
+            if r.due > now {
+                self.lsd_resends.push_back(r);
+                continue;
+            }
+            self.lsd_emit(&r.hexes, r.port, out);
+            if r.retry < 2 {
+                r.retry += 1;
+                r.due = now + std::time::Duration::from_secs(2 * u64::from(r.retry));
+                self.lsd_resends.push_back(r);
+            }
         }
         // prioritized announces drain first.
         while let Some(ih) = self.lsd_queue.pop_front() {
-            self.lsd_announce_one(ih, out);
+            self.lsd_announce_one(ih, now, out);
         }
         let n_torrents = self.torrents.len().max(1) as i64;
         let cost =
@@ -7102,16 +7219,37 @@ impl Session {
             let ih = ihs[self.lsd_rr_cursor % len];
             self.lsd_rr_cursor = (self.lsd_rr_cursor + 1) % len;
             steps += 1;
-            self.lsd_announce_one(ih, out);
+            self.lsd_announce_one(ih, now, out);
         }
         self.lsd_rr_cursor %= len;
+    }
+
+    /// `session_impl::listen_port` for LSD announces — the first
+    /// `accept_incoming` socket's `tcp_external_port()` (the
+    /// NAT-mapped port wins over the bound one); SSL torrents pick
+    /// an SSL socket like `ssl_listen_port`.
+    fn lsd_announce_port(&self, ssl: bool) -> u16 {
+        use crate::listen::ListenSocketFlags;
+        let pick = |ssl_want: bool| {
+            self.listen_sockets
+                .iter()
+                .find(|s| s.flags.contains(ListenSocketFlags::ACCEPT_INCOMING) && s.ssl == ssl_want)
+                .map(crate::listen::ListenSocket::tcp_external_port)
+        };
+        if ssl {
+            pick(true).unwrap_or(self.ssl_listen_port)
+        } else {
+            pick(false)
+                .or_else(|| pick(true))
+                .unwrap_or(self.listen_port)
+        }
     }
 
     /// `torrent::lsd_announce` — eligibility + one broadcast per
     /// address family. Ineligible torrents still consume their
     /// pacing slot upstream (the round-robin cursor advances past
     /// them).
-    fn lsd_announce_one(&mut self, ih: Sha1Hash, out: &mut Vec<SessionOut>) {
+    fn lsd_announce_one(&mut self, ih: Sha1Hash, now: Instant, out: &mut Vec<SessionOut>) {
         let Some(t) = self.torrents.get_mut(&ih) else {
             return;
         };
@@ -7126,16 +7264,39 @@ impl Session {
             return;
         }
         t.lsd_announcing = true;
-        let hex = bitdaemon_common::hex::to_hex(ih.as_bytes());
-        for v6 in [false, true] {
-            let pkt =
-                bitdaemon_net::lsd::render_lsd_packet(self.listen_port, &hex, self.lsd_cookie, v6);
-            let to = if v6 {
-                SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR6.into(), 6771)
-            } else {
-                SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR4.into(), 6771)
-            };
-            out.push(SessionOut::UdpPacket(pkt, to));
+        let ssl = t.is_ssl_torrent();
+        // `info_hashes().for_each` — upstream announces every hash:
+        // v1 and the truncated v2 for hybrid torrents.
+        let mut hexes = Vec::new();
+        t.info_hashes
+            .for_each(|h, _| hexes.push(bitdaemon_common::hex::to_hex(h.as_bytes())));
+        if hexes.is_empty() {
+            hexes.push(bitdaemon_common::hex::to_hex(ih.as_bytes()));
+        }
+        let port = self.lsd_announce_port(ssl);
+        self.lsd_emit(&hexes, port, out);
+        // upstream resends at +2 s and +4 s (`announce_impl`).
+        self.lsd_resends.push_back(LsdResend {
+            hexes,
+            port,
+            retry: 1,
+            due: now + std::time::Duration::from_secs(2),
+        });
+    }
+
+    /// `lsd::announce_impl` send leg — one datagram per hex per
+    /// multicast group.
+    fn lsd_emit(&self, hexes: &[String], port: u16, out: &mut Vec<SessionOut>) {
+        for hex in hexes {
+            for v6 in [false, true] {
+                let pkt = bitdaemon_net::lsd::render_lsd_packet(port, hex, self.lsd_cookie, v6);
+                let to = if v6 {
+                    SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR6.into(), 6771)
+                } else {
+                    SocketAddr::new(bitdaemon_net::lsd::LSD_ADDR4.into(), 6771)
+                };
+                out.push(SessionOut::UdpPacket(pkt, to));
+            }
         }
     }
 

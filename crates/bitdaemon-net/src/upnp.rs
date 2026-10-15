@@ -649,8 +649,17 @@ impl UpnpDriver {
 
     /// `upnp::close` — queue `DeletePortMapping` for every mapped
     /// slot (pending adds are dropped *without* a delete, verbatim),
-    /// then kick slot 0. The caller still owns slot retirement.
+    /// then kick slot 0. Devices that never yielded a `control_url`
+    /// are skipped upstream (`upnp.cpp` close loop). The caller
+    /// still owns slot retirement.
     pub fn close(&mut self) -> Vec<UpnpOut> {
+        if self.dev.control_url.is_empty() {
+            for m in &mut self.mappings {
+                m.act = MappingAction::None;
+                m.protocol = None;
+            }
+            return Vec::new();
+        }
         for m in &mut self.mappings {
             if m.protocol.is_none() {
                 continue;

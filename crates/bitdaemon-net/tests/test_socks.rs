@@ -536,13 +536,19 @@ fn lsd_parse() {
     let pkt = render_lsd_packet(51413, &"ab".repeat(20), 0x99, false);
     let from = std::net::SocketAddr::from(([192, 168, 1, 5], 6771));
     // cookie differs → accepted
-    let a = process_packet(&pkt, from, 0x11).unwrap();
+    let a = process_packet(&pkt, from, 0x11, None).unwrap();
     assert_eq!(a.port, 51413);
     assert_eq!(a.info_hashes[0][0], 0xab);
     // our own cookie → ignored
-    assert!(process_packet(&pkt, from, 0x99).is_none());
+    assert!(process_packet(&pkt, from, 0x99, None).is_none());
     // not BT-SEARCH → ignored
-    assert!(process_packet(b"GET / HTTP/1.1\r\n\r\n", from, 0x99).is_none());
+    assert!(process_packet(b"GET / HTTP/1.1\r\n\r\n", from, 0x99, None).is_none());
+    // netmask gate — inside the subnet accepted, outside dropped
+    // (`match_addr_mask` upstream `lsd.cpp`)
+    let listen = ([192, 168, 1, 20].into(), [255, 255, 255, 0].into());
+    assert!(process_packet(&pkt, from, 0x11, Some(listen)).is_some());
+    let outside = std::net::SocketAddr::from(([10, 9, 8, 7], 6771));
+    assert!(process_packet(&pkt, outside, 0x11, Some(listen)).is_none());
 }
 
 // ---------- socks_udp (SOCKS5 datagram framing) ----------

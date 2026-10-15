@@ -97,6 +97,25 @@ pub fn is_teredo(a: &IpAddr) -> bool {
     }
 }
 
+/// `in_local_network` approximation — do `a` and `b` share a
+/// subnet? Upstream enumerates interfaces and their netmasks
+/// (`enum_net::match_addr_mask` is the masked compare); with
+/// injected transports we don't see netmasks, so the caller passes
+/// its bound address as `a` and this uses the common LAN masks
+/// (v4 /24, v6 /64).
+#[must_use]
+pub fn same_subnet(a: &IpAddr, b: &IpAddr) -> bool {
+    match (a, b) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => crate::enum_net::match_addr_mask(
+            a,
+            b,
+            &IpAddr::V4(std::net::Ipv4Addr::new(255, 255, 255, 0)),
+        ),
+        (IpAddr::V6(a6), IpAddr::V6(b6)) => a6.octets()[..8] == b6.octets()[..8],
+        _ => false,
+    }
+}
+
 /// `hash_address` — SHA-1 over the raw address bytes, used to key
 /// voter identities in bloom filters.
 #[must_use]

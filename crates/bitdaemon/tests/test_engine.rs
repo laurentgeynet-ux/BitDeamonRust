@@ -489,12 +489,38 @@ async fn natpmp_map_and_ip_vote() {
     let gw: SocketAddr = "192.168.0.1:5351".parse().unwrap();
     eng.start_natpmp(gw, 6881, 7200).await;
 
-    // 3 datagrams sent: tcp map, udp map, ip query
-    for _ in 0..3 {
+    // upstream starts PCP-first: 2 datagrams (tcp map, udp map),
+    // each a 60-byte PCP MAP request — no opcode-0 ip query yet.
+    for _ in 0..2 {
         let (data, to) = dg.sent.lock().await.try_recv().expect("map request");
         assert_eq!(to, gw);
-        assert_eq!(data[0], 0);
+        assert_eq!(data[0], 2); // PCP
+        assert_eq!(data.len(), 60);
     }
+
+    // the gateway doesn't speak PCP → `pcp_unsupp_version` reply
+    // (v2, opcode masked, result 1) flips us to NAT-PMP and the
+    // public-IP query goes out now.
+    let mut unsupp = [0u8; 24];
+    unsupp[0] = 2;
+    unsupp[1] = 0x81; // MAP reply
+    unsupp[3] = 1; // unsupported version
+    eng.start_udp_pump();
+    dg.inbound_tx.send((gw, unsupp.to_vec())).unwrap();
+    tokio::task::yield_now().await;
+    eng.tick(std::time::Instant::now()).await;
+    tokio::task::yield_now().await; // the ip query is spawned, not inline
+
+    // drain resent maps + the ip query — all NAT-PMP now
+    let mut saw_ip_query = false;
+    while let Ok((data, to)) = dg.sent.lock().await.try_recv() {
+        assert_eq!(to, gw);
+        assert_eq!(data[0], 0); // NAT-PMP
+        if data.len() == 2 {
+            saw_ip_query = true;
+        }
+    }
+    assert!(saw_ip_query, "NAT-PMP fallback sends the ip query");
 
     // gateway answers the TCP map + public IP
     let mut map = [0u8; 16];
@@ -505,17 +531,23 @@ async fn natpmp_map_and_ip_vote() {
     let mut ipq = [0u8; 12];
     ipq[1] = 0x80; // public-address response opcode (cmd 0 + 0x80)
     ipq[8..12].copy_from_slice(&[203, 0, 113, 42]);
-    eng.start_udp_pump();
-    dg.inbound_tx.send((gw, map.to_vec())).unwrap();
+    // ip reply first — the router vote rides the *map* success
+    // upstream (`m_external_ip` stored, consumed by
+    // `on_port_mapping`).
     dg.inbound_tx.send((gw, ipq.to_vec())).unwrap();
+    dg.inbound_tx.send((gw, map.to_vec())).unwrap();
     tokio::task::yield_now().await;
     eng.tick(std::time::Instant::now()).await;
 
     let n = eng.natpmp.as_ref().expect("natpmp state");
-    assert_eq!(n.mappings[0].2, 44123); // external tcp port
+    assert_eq!(n.mappings[0].external_port, 44123); // external tcp port
+    // router vote landed on the per-socket voter — read the
+    // `external_address()` aggregate like `session_impl` does.
     assert_eq!(
-        lock(&eng.session).ip_voter.external_address(),
-        Some(std::net::IpAddr::from([203, 0, 113, 42]))
+        lock(&eng.session)
+            .external_ip_agg()
+            .external_address(&std::net::IpAddr::from([8, 8, 8, 8])),
+        std::net::IpAddr::from([203, 0, 113, 42])
     );
 }
 
@@ -596,16 +628,24 @@ async fn upnp_map_cycle() {
         }
     });
 
+    // router votes land on the per-listen-socket voter (upstream
+    // `listen_socket_t::external_address`) — the aggregate is what
+    // `session_impl::external_address()` reports.
+    let observer = std::net::IpAddr::from([8, 8, 8, 8]);
     for _ in 0..50 {
         tokio::task::yield_now().await;
         eng.tick(std::time::Instant::now()).await;
-        if lock(&eng.session).ip_voter.external_address().is_some() {
+        if !lock(&eng.session)
+            .external_ip_agg()
+            .external_address(&observer)
+            .is_unspecified()
+        {
             break;
         }
     }
     assert_eq!(
-        lock(&eng.session).ip_voter.external_address(),
-        Some(std::net::IpAddr::from([203, 0, 113, 9]))
+        lock(&eng.session).external_ip_agg().external_address(&observer),
+        std::net::IpAddr::from([203, 0, 113, 9])
     );
 }
 
