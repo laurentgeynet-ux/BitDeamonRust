@@ -1098,6 +1098,39 @@ impl Counters {
     }
 }
 
+/// `ses.stats_counters()` — the picker stats sink. Upstream's
+/// `pick_pieces` bumps `counters::piece_picker_*_loops` directly;
+/// here `pick_pieces` takes `&mut dyn PickerStats`, so `&Counters`
+/// bridges into the bank. `PickerCounter` variants with no upstream
+/// `counters` slot (kept for the alert-flag taxonomy) are dropped.
+impl crate::piece_picker::PickerStats for &Counters {
+    fn inc(&mut self, c: crate::piece_picker::PickerCounter) {
+        use crate::piece_picker::PickerCounter as P;
+        let counter = match c {
+            P::PartialLoops => Counter::PiecePickerPartialLoops,
+            P::SuggestLoops => Counter::PiecePickerSuggestLoops,
+            P::SequentialLoops => Counter::PiecePickerSequentialLoops,
+            P::ReverseRareLoops => Counter::PiecePickerReverseRareLoops,
+            P::RareLoops => Counter::PiecePickerRareLoops,
+            P::RandStartLoops => Counter::PiecePickerRandStartLoops,
+            P::RandLoops => Counter::PiecePickerRandLoops,
+            P::BusyLoops => Counter::PiecePickerBusyLoops,
+            // no `counters::` slot upstream (2.x keeps only the 8
+            // picker loop counters above)
+            P::ReverseSequentialLoops
+            | P::BreakLoops
+            | P::RejectedLoops
+            | P::QueuedLoops
+            | P::FloodLoops
+            | P::ReverseLoops
+            | P::ReverseRandLoops
+            | P::ExtdLoops
+            | P::PartialPieceLoops => return,
+        };
+        Counters::inc(self, counter);
+    }
+}
+
 /// `utp_socket_manager::inc_stats_counter` bridge — builds the
 /// `UtpConfig::counter_sink` that lands uTP stat increments in this
 /// bank. `UtpStat::StateGauge(s)` resolves to `num_utp_idle + s`,

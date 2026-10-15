@@ -7046,9 +7046,12 @@ impl Session {
                     // `maybe_connect_web_seeds` — pull-model: the
                     // block pick hands work to the engine's fetch
                     // task instead of keeping a persistent conn.
-                    if let Some((url, reqs)) =
-                        t.next_web_seed_blocks(web_seed_blocks, &self.settings, session_conns)
-                        && let Some(fs) = t.files.clone()
+                    if let Some((url, reqs)) = t.next_web_seed_blocks(
+                        web_seed_blocks,
+                        &self.settings,
+                        session_conns,
+                        &self.counters,
+                    ) && let Some(fs) = t.files.clone()
                     {
                         let single_file = fs.num_files() == 1;
                         out.push(SessionOut::WebSeedFetch {

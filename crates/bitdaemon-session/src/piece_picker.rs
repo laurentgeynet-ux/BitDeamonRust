@@ -1532,9 +1532,20 @@ impl PiecePicker {
         let npos = nq.partition_point(|d| d.index < index);
         nq.insert(npos, dp);
 
-        if !self.dirty && prio == -1 && self.piece_map[index.0 as usize].priority(self.seeds) != -1
-        {
-            self.add(index);
+        // upstream `update_piece_state`: a state change can alter
+        // `priority()` without crossing -1 (e.g. downloading → full
+        // removes the piece from `m_pieces` entirely, and
+        // downloading ↔ reverse shifts the adjustment) — the bucket
+        // index must be re-cascaded, not only `add`ed on -1 → ≥0.
+        if !self.dirty {
+            if prio == -1 {
+                if self.piece_map[index.0 as usize].priority(self.seeds) != -1 {
+                    self.add(index);
+                }
+            } else {
+                let elem = self.piece_map[index.0 as usize].index;
+                self.update(prio as usize, elem);
+            }
         }
         let _ = old_state;
         (new_queue, npos)

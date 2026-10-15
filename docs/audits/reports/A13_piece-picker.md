@@ -161,3 +161,34 @@ Upstream : `src/piece_picker.cpp`, `src/request_blocks.cpp`,
   de rareté si `dl_queue == 0` — cas quasi impossible : 0 pièces
   détenues ni voulues. Gardé comme divergent-bénin à aligner si le
   fix #2 touche la zone.)
+
+## Résultat
+
+Branche `audit/13-piece-picker` (worktree `C:/Projet/wt/LibtorrentRust-a13`).
+
+Déviations corrigées :
+
+- `piece_picker.rs::update_piece_state` — re-cascade `update(prio,
+  index)` sur tout changement de queue avec `prio != -1`, plus
+  `add` sur l'edge `-1 → ≥0` (miroir `piece_picker.cpp:3048-3052`).
+- `torrent.rs::recalc_share_mode` — `num_downloaded` = `max(have,
+  want().num_pieces)` (avec `- num_have_filtered`) ; le garde
+  supplémentaire `num_downloaded <= 0` a été retiré pour suivre la
+  forme upstream (`dl_queue > num_downloaded / 20` seulement).
+- Compteurs picker — `impl PickerStats for &Counters` dans
+  `counters.rs` (8 slots upstream `piece_picker_*_loops`) ;
+  `NullPickerStats` remplacé par `&Counters` aux 4 call sites ;
+  `next_web_seed_blocks` a gagné un param `counters`.
+
+Tests ajoutés (`tests/test_piece_picker.rs`) :
+
+- `full_piece_readded_once` — Downloading→Full→abort→re-add ; un
+  pick couvrant tout le torrent ne duplique aucun bloc.
+- `want_excludes_have_filtered` — `want().num_pieces` exclut les
+  pièces had+filtered.
+- `picker_counters_wired` — `pick_pieces` incrémente
+  `PiecePickerRareLoops` dans la banque `Counters` réelle.
+
+Gates : `cargo fmt --all` · `cargo clippy --workspace --all-targets
+-D warnings` · `cargo test --workspace` (33/33 picker, workspace
+vert) · `cargo doc --workspace --no-deps` — toutes passées.

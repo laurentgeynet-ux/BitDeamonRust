@@ -817,3 +817,95 @@ fn smart_ban_on_piece_passed() {
             .is_empty()
     );
 }
+
+/// A13 regression — `update_piece_state` must re-cascade the priority
+/// index when a queue move changes `priority()` without crossing -1
+/// (upstream `piece_picker.cpp:3048-3052` calls `update(prio, p.index)`
+//  whenever the old prio was >= 0, not just on the -1 -> >=0 edge).
+/// A piece going Downloading -> Full must leave `m_pieces`; otherwise
+/// the stale entry duplicates it in the index and `pick_pieces`
+/// hands the same blocks out twice once the piece re-opens.
+#[test]
+fn full_piece_readded_once() {
+    let mut picker = PiecePicker::new(i64::from(4 * PIECE_SIZE), PIECE_SIZE);
+    let have = all_have(4);
+    picker.inc_refcount_bitfield(&have);
+
+    // drive piece 0 to `piece_full` (every block requested)
+    for b in 0..BLOCKS_PER_PIECE {
+        assert!(picker.mark_as_downloading(pb(0, b), Some(1), PickerOptions::NONE));
+    }
+    assert_eq!(picker.piece_stats(p(0)).priority, -1);
+
+    // abort every request -> downloading_piece erased, piece re-added
+    // to the priority index exactly once
+    for b in 0..BLOCKS_PER_PIECE {
+        picker.abort_download(pb(0, b), Some(1));
+    }
+    assert!(!picker.is_downloading(p(0)));
+
+    let mut picked = Vec::new();
+    let mut stats = Stats([0; 16]);
+    picker.pick_pieces(
+        &have,
+        &mut picked,
+        4 * BLOCKS_PER_PIECE,
+        0,
+        None,
+        PickerOptions::RAREST_FIRST,
+        &[],
+        100,
+        &mut stats,
+    );
+    assert_eq!(picked.len() as i32, 4 * BLOCKS_PER_PIECE);
+    let mut sorted = picked.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), picked.len(), "duplicate picks");
+}
+
+/// A13 regression — `recalc_share_mode` consumes `want().num_pieces`;
+/// pieces both had and filtered must not count as wanted (upstream
+/// `piece_picker::want()` = num_pieces - filtered - have_filtered).
+#[test]
+fn want_excludes_have_filtered() {
+    let mut picker = PiecePicker::new(i64::from(4 * PIECE_SIZE), PIECE_SIZE);
+    let have = all_have(4);
+    picker.inc_refcount_bitfield(&have);
+
+    // have piece 0, then filter it: it moves to num_have_filtered
+    picker.piece_flushed(p(0));
+    assert!(picker.set_piece_priority(p(0), DownloadPriority(0)));
+    assert_eq!(picker.num_have_filtered(), 1);
+    assert_eq!(picker.num_filtered(), 0);
+    assert_eq!(picker.want().num_pieces, 3);
+}
+
+/// A13 regression — `PickerStats` for `&Counters` lands the picker
+/// loop counters in the session bank (upstream `ses.stats_counters()`).
+#[test]
+fn picker_counters_wired() {
+    use bitdaemon_session::counters::{Counter, Counters};
+
+    let mut picker = PiecePicker::new(i64::from(4 * PIECE_SIZE), PIECE_SIZE);
+    let have = all_have(4);
+    picker.inc_refcount_bitfield(&have);
+
+    let counters = Counters::default();
+    let mut picked = Vec::new();
+    {
+        let mut pc = &counters;
+        picker.pick_pieces(
+            &have,
+            &mut picked,
+            BLOCKS_PER_PIECE,
+            0,
+            None,
+            PickerOptions::RAREST_FIRST,
+            &[],
+            100,
+            &mut pc,
+        );
+    }
+    assert!(counters.value(Counter::PiecePickerRareLoops) > 0);
+}
