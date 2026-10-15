@@ -9,7 +9,8 @@ PROTOCOL = """## Protocole — deux modes
 L'invocation précise le mode ; **défaut : `rapport`**. Le découpage existe
 parce que plusieurs audits peuvent tourner en parallèle : la phase
 d'analyse est read-only sur le repo (zéro conflit), la phase de
-correction s'exécute dans un worktree + branche dédiés, mergée via PR.
+correction s'exécute dans un worktree + branche dédiés ; le merge est
+local et décidé par l'humain.
 
 ### Analyse commune (mode A l'exécute, mode B s'appuie sur le rapport)
 
@@ -132,13 +133,19 @@ autres).
     quasi nuls entre apply parallèles ; en cas de conflit au merge,
     rebase + gates comme pour le reste.
 12. Commit `fix(<crate>): <scope> parity — <mot-clé>` **sur la branche
-    `audit/{aid}-{slug}`** — jamais sur `main`. Push la branche,
-    `gh pr create`. Merges séquentiels (un audit à la fois) ; si conflit
-    sur les fichiers chauds (`torrent.rs`/`peer_conn.rs`/`session.rs`),
-    rebaser sur `main` frais puis re-run les gates avant merge.
+    `audit/{aid}-{slug}`** — jamais sur `main`. **Tout reste local** :
+    pas de push, pas de PR — le merge est décidé et exécuté par
+    l'humain (`git merge audit/{aid}-{slug}` dans le checkout
+    principal). Signaler « prêt à merger » et s'arrêter là. Si le
+    merge révèle des conflits (`torrent.rs`/`peer_conn.rs`/
+    `session.rs`/`PORTING.md`) : rebase de la branche sur `main` frais
+    **dans le worktree** + re-run des gates, puis redonner le feu.
 13. **Résultat** : ajouter une section `## Résultat` au rapport
-    (déviations corrigées, tests ajoutés, hash du commit, lien PR).
-    Après merge : `git worktree remove ../LibtorrentRust-a{aid}`.
+    (déviations corrigées, tests ajoutés, hash du commit).
+    **Hygiène post-merge** (après merge par l'humain) : `git worktree
+    remove ../LibtorrentRust-a{aid}` puis `git branch -d
+    audit/{aid}-{slug}`. Une branche mergée qui traîne encombre la vue
+    et trompe la planification.
 
 ## Pièges connus (checklists transverses)
 
@@ -608,21 +615,24 @@ idx += [
     "`## Non-bugs tranchés`. Un `apply` sur rapport brut applique des",
     "faux positifs possibles en branche.",
     "",
-    "### Phase 2 — application (worktrees + PRs)",
+    "### Phase 2 — application (worktrees, merge local par l'humain)",
     "",
     "Mode `apply` par audit — prérequis : rapport commité + validé :",
     "",
     "```sh",
     "git worktree add ../LibtorrentRust-aNN -b audit/NN-<slug>",
-    "# l'agent travaille dans ce dossier (target/ isolé → builds parallèles)",
-    "# gates complets, fragment docs/audits/changelog/ANN.md, puis :",
-    "git push -u origin audit/NN-<slug> && gh pr create",
+    "# l'agent travaille dans ce dossier (target/ isolé → builds parallèles) :",
+    "# gates + changelog fragment + PORTING.md + ## Résultat, commit sur",
+    "# sa branche, puis signale « prêt à merger » — tout reste LOCAL.",
+    "# Le merge est décidé par l'humain, dans le checkout principal :",
+    "git merge audit/NN-<slug>",
     "# après merge :",
-    "git worktree remove ../LibtorrentRust-aNN",
+    "git worktree remove ../LibtorrentRust-aNN && git branch -d audit/NN-<slug>",
     "```",
     "",
     "Merges **séquentiels** ; en cas de conflit sur les fichiers chauds,",
-    "rebase sur `main` frais + re-run des gates avant merge.",
+    "rebase de la branche dans son worktree + re-run des gates, puis",
+    "nouveau `git merge`.",
     "",
     "### Vagues d'application conseillées (recouvrement de fichiers,",
     "pas de numéros de crate : A02 et A13 sont tous deux dans",
@@ -643,8 +653,8 @@ idx += [
     "source est la section `## Fichiers du fix` de chaque rapport.",
     "",
     "A16+A17 partagent `bitdaemon-disk` mais des modules disjoints — OK",
-    "ensemble. Dans la vague 4, préférer des paires et merger une PR",
-    "avant d'en appliquer une autre sur le même fichier.",
+    "ensemble. Dans la vague 4, préférer des paires et merger une",
+    "branche avant d'en appliquer une autre sur le même fichier.",
     "",
     "### Agrégation changelog",
     "",
@@ -664,7 +674,8 @@ idx += [
     "  (PowerShell).",
     "- 2-4 builds workspace concurrents max en local (cargo utilise déjà tous",
     "  les cœurs). Pour du parallélisme massif : sessions cloud séparées,",
-    "  une par audit — chacune a sa machine, son checkout, sa PR.",
+    "  une par audit — chacune a sa machine et son checkout ; l'agent",
+    "  push juste sa branche pour que l'humain la merge en local.",
     "",
     "## Ordre — les numéros SONT l'ordre conseillé",
     "",

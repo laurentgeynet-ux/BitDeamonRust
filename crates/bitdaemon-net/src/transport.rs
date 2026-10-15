@@ -59,6 +59,11 @@ impl DatagramSendFlags {
         self.0 & flag.0 != 0
     }
 }
+/// Result of [`PeerConnector::connect_with_bind_report`] — the stream
+/// plus its bound local endpoint when the transport reports it.
+pub type ConnectReportFut = Pin<
+    Box<dyn Future<Output = crate::Result<(BoxedPeerStream, Option<SocketAddr>)>> + Send + Sync>,
+>;
 
 /// Object-safe datagram transport — the subset of `tokio::net::UdpSocket`
 /// used by the DHT, UDP tracker clients, uTP socket manager and LSD.
@@ -133,6 +138,19 @@ pub trait PeerConnector: Send + Sync + Debug + 'static {
     ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>> {
         let _ = bind;
         self.connect(addr)
+    }
+
+    /// `connect_with_bind` + the socket's `local_endpoint()` —
+    /// upstream's conn object reads it off the socket after connect
+    /// (the `new_connection` self-connection legs resolve pending
+    /// dials through it). Transports that know their bound endpoint
+    /// report it; the default reports `None`.
+    fn connect_with_bind_report(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        bind: Option<SocketAddr>,
+    ) -> ConnectReportFut {
+        Box::pin(async move { self.connect_with_bind(addr, bind).await.map(|s| (s, None)) })
     }
 
     /// Connect by destination string — `"host:port"`, an I2P base64/

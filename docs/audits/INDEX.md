@@ -12,7 +12,7 @@ Chaque audit = un skill `.devin/skills/audit-NN-vW-<slug>/` lançable via `/audi
 | A04 | Trackers (HTTP/UDP announce, scrape, backoff, tiers) | Cycle announce complet : events, backoff, failover tiers, scrape, réponses, erreurs. | done — commit `bea03c0` |
 | A05 | Transport uTP | utp_stream : paquets, états connexion, resend, delay/rtt, MTU, buffers out-of-order, fermeture. | à faire |
 | A06 | Web seeds (HTTP peer) | web_peer_connection/http_seed_connection : GET ranges, keep-alive, erreurs, retry, comptabilité par seed. | à faire |
-| A07 | Cycle de vie des pairs & admission | attach/detach, états de connexion, limites half-open, taxonomie des disconnects, admission entrante. | à faire |
+| A07 | Cycle de vie des pairs & admission | attach/detach, états de connexion, limites half-open, taxonomie des disconnects, admission entrante. | done — commit `05fbb80` |
 | A08 | Chemin download (request→write) & rejects | request_a_block → add_request → send_block_requests → Piece → on_reject → timeouts/snub/endgame | done — commit `cbee65c` |
 | A09 | Chemin upload/read (Request → fill_send_buffer → async_read) | Request entrant → validation → upload queue → read disque → Piece ; choke drain, rejects, compteurs | done — commit `b518598` (DontHave wire fix) |
 | A10 | Cycle de vie des pièces | incoming_piece → flush → hash → piece_verified → Have → hash_failed → restore | done — commit `e957a83` |
@@ -70,21 +70,24 @@ validé par un humain ; les déviations contestées basculent dans
 `## Non-bugs tranchés`. Un `apply` sur rapport brut applique des
 faux positifs possibles en branche.
 
-### Phase 2 — application (worktrees + PRs)
+### Phase 2 — application (worktrees, merge local par l'humain)
 
 Mode `apply` par audit — prérequis : rapport commité + validé :
 
 ```sh
 git worktree add ../LibtorrentRust-aNN -b audit/NN-<slug>
-# l'agent travaille dans ce dossier (target/ isolé → builds parallèles)
-# gates complets, fragment docs/audits/changelog/ANN.md, puis :
-git push -u origin audit/NN-<slug> && gh pr create
+# l'agent travaille dans ce dossier (target/ isolé → builds parallèles) :
+# gates + changelog fragment + PORTING.md + ## Résultat, commit sur
+# sa branche, puis signale « prêt à merger » — tout reste LOCAL.
+# Le merge est décidé par l'humain, dans le checkout principal :
+git merge audit/NN-<slug>
 # après merge :
-git worktree remove ../LibtorrentRust-aNN
+git worktree remove ../LibtorrentRust-aNN && git branch -d audit/NN-<slug>
 ```
 
 Merges **séquentiels** ; en cas de conflit sur les fichiers chauds,
-rebase sur `main` frais + re-run des gates avant merge.
+rebase de la branche dans son worktree + re-run des gates, puis
+nouveau `git merge`.
 
 ### Vagues d'application conseillées (recouvrement de fichiers,
 pas de numéros de crate : A02 et A13 sont tous deux dans
@@ -96,15 +99,15 @@ traverse net/dht/disk/core).
 | 1 — isolés | A05, A16, A17, A18, A24, A25, A26 | modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat) |
 | 2 — session-edge | A06, A13, A21, A22, A23, A27, A28 | fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés |
 | 3 — net-peer | A01, A03 | `peer_wire.rs` commun aux deux → séquentiels entre eux |
-| 4 — session-core | A07, A11, A12, A19, A20 | tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels |
+| 4 — session-core | A11, A12, A19, A20 | tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels |
 | 5 — final | A29 | transverse (sweep compteurs), seul, en dernier |
 
 La description de chaque skill porte son préfixe `[Vn]`. La vraie
 source est la section `## Fichiers du fix` de chaque rapport.
 
 A16+A17 partagent `bitdaemon-disk` mais des modules disjoints — OK
-ensemble. Dans la vague 4, préférer des paires et merger une PR
-avant d'en appliquer une autre sur le même fichier.
+ensemble. Dans la vague 4, préférer des paires et merger une
+branche avant d'en appliquer une autre sur le même fichier.
 
 ### Agrégation changelog
 
@@ -124,7 +127,8 @@ supprime les fragments. Commit : `docs(changelog): aggregate audit entries`.
   (PowerShell).
 - 2-4 builds workspace concurrents max en local (cargo utilise déjà tous
   les cœurs). Pour du parallélisme massif : sessions cloud séparées,
-  une par audit — chacune a sa machine, son checkout, sa PR.
+  une par audit — chacune a sa machine et son checkout ; l'agent
+  push juste sa branche pour que l'humain la merge en local.
 
 ## Ordre — les numéros SONT l'ordre conseillé
 

@@ -138,6 +138,15 @@ pub enum SessionOut {
         ep: SocketAddr,
         /// dial MSE-encrypted (`bt_peer_connection` policy pick).
         encrypted: bool,
+        /// `m_fast_reconnect` — this dial is a pe_enabled/uTP
+        /// retry arm: the peer-list entry was already rewound, the
+        /// conn carries the flag so `connection_closed` keeps the
+        /// stamp.
+        fast_reconnect: bool,
+        /// the peer-id generated for this conn's handshake
+        /// (`create_peer_connection` — per-conn `generate_peer_id`,
+        /// tracked in the torrent's `outgoing_pids`).
+        our_pid: bitdaemon_common::PeerId,
     },
     /// `scrape_tracker` — user-triggered scrape of one tracker
     /// entry; the driver runs the scrape exchange and reports via
@@ -452,6 +461,10 @@ pub struct Session {
     /// `m_ssl_listen_port` — advertised SSL listen port
     /// (`ssl_listen_port` upstream; SSL sockets share the listen set).
     pub ssl_listen_port: u16,
+    /// `m_cached_interfaces` — lazily filled interface enumeration
+    /// for `verify_bound_address` (`outgoing_interfaces` device-name
+    /// matching); refreshed when a lookup misses.
+    pub cached_interfaces: Vec<bitdaemon_net::enum_net::IpInterface>,
     /// `m_listen_sockets` — one per listen interface; the session's
     /// single-socket default holds the bound port. Handles resolve
     /// against this vec (`weak_ptr<listen_socket_t>` upstream).
@@ -959,6 +972,7 @@ impl Default for Session {
                 );
                 vec![s]
             },
+            cached_interfaces: Vec::new(),
             udp_sockets: Vec::new(),
             paused: false,
             peer_class_pool: bitdaemon_net::peer_class::PeerClassPool::new(),
@@ -1234,8 +1248,11 @@ impl Session {
         session_time: i32,
         out_policy: bitdaemon_net::pe_crypto::EncPolicy,
         speed_override: Option<i32>,
-    ) -> Vec<(Sha1Hash, SocketAddr, bool)> {
+    ) -> Vec<(Sha1Hash, SocketAddr, bool, bool, bitdaemon_common::PeerId)> {
         let mut dials = Vec::new();
+        // `peer_fingerprint` — per-conn `generate_peer_id` seed for
+        // the dial pid (`create_peer_connection`).
+        let fp = self.settings.peer_fingerprint.clone();
         let connections_limit = i64::from(self.settings.connections_limit);
         let live = self.num_connections();
         if live >= connections_limit {
@@ -1363,11 +1380,11 @@ impl Session {
                 }
                 continue;
             }
-            match t.try_connect_peer(session_time, &st, out_policy) {
-                Some((ep, enc)) => {
+            match t.try_connect_peer(session_time, &st, out_policy, &fp) {
+                Some((ep, enc, fast, pid)) => {
                     self.counters
                         .inc(crate::counters::Counter::ConnectionAttempts);
-                    dials.push((ih, ep, enc));
+                    dials.push((ih, ep, enc, fast, pid));
                     max_connections -= 1;
                     steps_since_last_connect = 0;
                 }
@@ -1409,15 +1426,30 @@ impl Session {
         if t.connect_boost_counter == 0 {
             return;
         }
-        let dials = t.do_connect_boost(self.session_time, &st, policy, nconn, &self.settings);
+        let dials = t.do_connect_boost(
+            self.session_time,
+            &st,
+            policy,
+            nconn,
+            &self.settings,
+            &self.settings.peer_fingerprint,
+        );
         for _ in &dials {
             self.inc_boost_connections();
         }
-        for (ep, enc) in dials {
+        for (ep, enc, fast, pid) in dials {
+            // `peer_connect_alert` — upstream posts it at dial for
+            // outgoing conns (`peer_connection::start`).
+            self.alerts.post(Alert::PeerConnect {
+                ih: *ih,
+                remote: ep.to_string(),
+            });
             out.push(SessionOut::ConnectPeer {
                 ih: *ih,
                 ep,
                 encrypted: enc,
+                fast_reconnect: fast,
+                our_pid: pid,
             });
         }
         if self
@@ -2607,6 +2639,11 @@ impl Session {
         if self.services.lsd && !t.is_paused() {
             self.lsd_queue.push_back(ih);
         }
+        // `non_filter_torrents` — upstream incs the gauge at
+        // torrent construction when `!m_apply_ip_filter`.
+        if !t.apply_ip_filter {
+            self.counters.inc(Counter::NonFilterTorrents);
+        }
         self.torrents.insert(ih, t);
         if has_peers {
             let mut tmp = std::mem::take(&mut self.pending_out);
@@ -2856,6 +2893,11 @@ impl Session {
         // (`torrent_ptr->set_ip_filter(m_ip_filter)`).
         t.ip_filter = Some(std::sync::Arc::clone(&self.ip_filter));
         t.port_filter = Some(std::sync::Arc::clone(&self.port_filter));
+        // `non_filter_torrents` — incs at construction when
+        // `!m_apply_ip_filter`.
+        if !t.apply_ip_filter {
+            self.counters.inc(Counter::NonFilterTorrents);
+        }
         self.torrents.insert(ih, t);
         // upstream `trigger_auto_manage` — an add forces the next
         // tick into a queue pass (newly added default-flagged
@@ -2923,6 +2965,10 @@ impl Session {
         self.lsd_queue.retain(|k| k != ih);
         let mut removed = self.torrents.remove(ih);
         if let Some(t) = &mut removed {
+            // `~torrent` — `non_filter_torrents` drops back out.
+            if !t.apply_ip_filter {
+                self.counters.add(Counter::NonFilterTorrents, -1);
+            }
             // `~torrent`/`abort` — release the torrent's peer class
             // (`remove_class` + `decref` drop both references).
             t.release_peer_class(&mut self.peer_class_pool);
@@ -3089,7 +3135,11 @@ impl Session {
             } else {
                 // graceful: peers with data in flight get their
                 // unsent requests cancelled (`clear_request_queue`)
-                // and are choked; idle peers disconnect.
+                // and are choked; idle peers disconnect. Upstream
+                // posts NO alert here — the last peer to drain runs
+                // `do_pause` again (mode cleared) and posts it
+                // (`GracefulPauseDone` below).
+                post_alert = false;
                 for (pid, c) in &mut t.peers {
                     if c.disconnecting {
                         continue;
@@ -3652,12 +3702,30 @@ impl Session {
         self.pending_out = tmp;
     }
 
-    /// a peer connected — register it on the torrent. Upstream order:
-    /// `peer_connection` ctor (`set_peer_classes`) → `on_receive`
-    /// (`peer_connect_alert`, peer-id dedup, `m_exceeded_limit`
-    /// re-eval) → `torrent::connect_to_peer` (`ip_filter`,
-    /// `torrent_not_ready`, `session_closing`, conn-cap ladder,
-    /// `new_connection`, `maybe_replace_peer`).
+    /// a peer connected — register it on the torrent.
+    ///
+    /// Upstream order by direction:
+    ///
+    /// * **INCOMING** — `peer_connection::attach_to_torrent`
+    ///   (`is_aborted` → `invalid_info_hash`@failure; auto-resume of
+    ///   auto-managed queued torrents under
+    ///   `incoming_starts_queued_torrents`; `paused||aborted||graceful`
+    ///   → `torrent_paused`@`peer_error`), then `torrent::attach_peer`
+    ///   (ssl gate → `m_has_incoming` → `ip_filter` →
+    ///   `torrent_not_ready` → conn-cap ladder →
+    ///   `peer_list::new_connection` legs → `maybe_replace`), then
+    ///   `peer_connect_alert`, `protocol_v2`, the `m_exceeded_limit`
+    ///   re-eval + global eviction.
+    /// * **OUTGOING** — attached at `connect_to_peer` (the dial
+    ///   mark); post-handshake it just binds the entry
+    ///   (`peer_connected_outgoing`, restoring `prev_amount`) — a
+    ///   stolen mark means the conn died upstream.
+    ///
+    /// Both then run the `read_peer_id` legs — pid dedup
+    /// (`(pid < our_pid) == is_outgoing`, `duplicate_peer_id`),
+    /// `is_self_connection` via `m_outgoing_pids` (kill + ban) — and
+    /// `init()` (upload_only, bitfield, allowed-fast, unchoke).
+    #[allow(clippy::too_many_lines)]
     pub fn peer_connected(
         &mut self,
         ih: &Sha1Hash,
@@ -3671,64 +3739,396 @@ impl Session {
         }
         let mut conn = conn;
         conn.remote = Some(remote);
-        // `peer_connection::init` → `session_impl::set_peer_classes`
+        // `peer_connection` ctor → `session_impl::set_peer_classes`
         // — class membership is fixed for the conn's lifetime.
         let st = conn_socket_type(&conn);
         self.set_peer_classes(&mut conn, remote.ip(), st);
-        // `peer_connect_alert` — the connection is registered
-        // (upstream posts it on a completed BT handshake).
-        self.alerts.post(Alert::PeerConnect {
-            ih: *ih,
-            remote: remote.to_string(),
-        });
-        // `m_exceeded_limit` re-eval (`peer_connection::on_receive`):
-        // the session may have dipped back under the cap between
-        // accept and handshake.
-        if conn.exceeded_limit
-            && self
-                .counters
-                .value(crate::counters::Counter::NumPeersConnected)
-                + self
-                    .counters
-                    .value(crate::counters::Counter::NumPeersHalfOpen)
-                <= i64::from(self.settings.connections_limit)
-        {
-            conn.exceeded_limit = false;
+        let session_time = self.session_time;
+        // `sent_syn`/`received_synack` IP overhead — outgoing TCP
+        // conns carry the handshake overhead on their stat channels
+        // and the session counters; accepts aren't charged upstream.
+        if conn.outgoing && !conn.is_utp {
+            let oh = i64::from(if remote.is_ipv6() { 60 } else { 40 });
+            conn.stat_up_ip += oh; // sent_syn
+            conn.stat_up_ip += oh; // received_synack's ACK
+            conn.stat_down_ip += oh; // the SYN-ACK itself
+            self.counters
+                .add(crate::counters::Counter::SentIpOverheadBytes, oh * 2);
+            self.counters
+                .add(crate::counters::Counter::RecvIpOverheadBytes, oh);
         }
-        if conn.exceeded_limit {
-            // `find_disconnect_candidate_torrent` — prefer a torrent
-            // with peers, finished first, largest swarm; it must hold
-            // strictly more conns than ours, else we drop ourselves.
-            let cand = self.find_disconnect_candidate_torrent();
-            let this_n = self.torrents.get(ih).map_or(0, |t| t.peers.len());
-            let cand_n = cand
-                .and_then(|cih| self.torrents.get(&cih))
-                .map_or(0, |t| t.peers.len());
-            let victim = if let Some(cih) = cand
-                && cand_n > this_n
-            {
-                self.torrents[&cih].lowest_ranking_peer().map(|v| (cih, v))
-            } else {
-                None
+        let was_utp = matches!(conn.sock_type, 3 | 9);
+        if conn.outgoing {
+            // OUTGOING — `connect_to_peer` marked the entry at dial;
+            // bind it. `prev_amount` folds into the conn's stats
+            // (`add_stat(prev*1024)` in `create_peer_connection`).
+            let t = self.torrents.get_mut(ih);
+            let Some(t) = t else {
+                return;
             };
-            match victim {
-                Some((cih, (v, _rank))) => {
-                    // evict the candidate's lowest-ranking conn —
-                    // the `DisconnectPeer` effect runs the full
-                    // `peer_connection::disconnect` path through
-                    // `peer_disconnected` (peer-list bookkeeping,
-                    // counters, alert, engine teardown).
-                    if self.torrents.contains_key(&cih) {
+            match t.peer_connected_outgoing(
+                remote,
+                conn.supports_encryption,
+                session_time,
+                peer,
+                conn.fast_reconnect,
+                was_utp,
+                conn.our_peer_id,
+            ) {
+                Some((_, dl, ul)) => {
+                    conn.stat_down_total += dl;
+                    conn.stat_up_total += ul;
+                }
+                None => {
+                    // the dial mark was stolen by `new_connection`
+                    // (the incoming side won the dup resolution) or
+                    // already failed — upstream's conn object was
+                    // destructed; ours dies here.
+                    self.alerts.post(Alert::PeerDisconnected {
+                        ih: *ih,
+                        reason: format!("peer {peer}: duplicate_peer_id"),
+                    });
+                    out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                        peer,
+                        reason: "duplicate_peer_id",
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                    }));
+                    // `num_connecting`/`num_seeds` bookkeeping — only
+                    // when the dial mark is still open (an entry
+                    // erased out from under the dial). A mark consumed
+                    // by `new_connection`/`peer_connect_failed`
+                    // already settled these counters.
+                    t.dial_locals.remove(&remote);
+                    if let Some(pid) = t.dial_pids.remove(&remote) {
+                        t.outgoing_pids.remove(&pid);
+                        t.num_connecting = t.num_connecting.saturating_sub(1);
+                        if let Some(i) = t.peer_index(remote)
+                            && t.peer_list.peers()[i].seed
+                        {
+                            t.num_connecting_seeds = t.num_connecting_seeds.saturating_sub(1);
+                            t.num_seeds = t.num_seeds.saturating_sub(1);
+                        }
+                    }
+                    return;
+                }
+            }
+        } else {
+            // INCOMING — `attach_to_torrent` session-level legs.
+            let (aborted, auto_resume) = {
+                let t = self.torrents.get_mut(ih);
+                match t {
+                    Some(t) => (
+                        t.is_aborted(),
+                        t.is_paused()
+                            && t.auto_managed
+                            && self.settings.incoming_starts_queued_torrents,
+                    ),
+                    None => return,
+                }
+            };
+            if aborted {
+                // upstream resets the torrent pointer on abort →
+                // the lookup misses → `invalid_info_hash` at
+                // **failure** (the DHT secret-id `ban_ip` leg is the
+                // engine's unknown-hash path).
+                self.alerts.post(Alert::PeerDisconnected {
+                    ih: *ih,
+                    reason: format!("peer {peer}: invalid_info_hash"),
+                });
+                out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                    peer,
+                    reason: "invalid_info_hash",
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Failure,
+                }));
+                return;
+            }
+            if auto_resume {
+                self.resume_torrent(ih, out);
+            }
+            {
+                let Some(t) = self.torrents.get_mut(ih) else {
+                    return;
+                };
+                if t.is_paused() || t.is_aborted() || t.graceful_pause {
+                    // `errors::torrent_paused` at **peer_error** —
+                    // alert + `error_peers`; the severity feeds
+                    // `m_failed` through `peer_disconnected`.
+                    self.counters.inc(crate::counters::Counter::ErrorPeers);
+                    self.alerts.post(Alert::PeerError {
+                        ih: *ih,
+                        remote: remote.to_string(),
+                        op: "bittorrent".into(),
+                        error: "torrent_paused".into(),
+                    });
+                    out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                        peer,
+                        reason: "torrent_paused",
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                    }));
+                    return;
+                }
+                // `attach_peer` — SSL torrents refuse non-SSL conns
+                // (`requires_ssl_connection`; `invalid_ssl_cert`
+                // when we hold no cert — same refusal path).
+                if t.is_ssl_torrent() && !matches!(conn.sock_type, 6..=9) {
+                    out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                        peer,
+                        reason: "requires_ssl_connection",
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                    }));
+                    return;
+                }
+                // `m_has_incoming` — sticky flag.
+                t.has_incoming = true;
+                // `m_apply_ip_filter` gate → `peer_blocked_alert` +
+                // `banned_by_ip_filter` at default severity.
+                if t.apply_ip_filter
+                    && t.ip_filter
+                        .as_ref()
+                        .is_some_and(|f| f.access(remote.ip()) == bitdaemon_net::ip_filter::BLOCKED)
+                {
+                    self.alerts.post(Alert::PeerBlocked {
+                        ih: *ih,
+                        remote: remote.to_string(),
+                        reason: "ip_filter".into(),
+                    });
+                    out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                        peer,
+                        reason: "banned_by_ip_filter",
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                    }));
+                    return;
+                }
+                // `!is_downloading_state(m_state) && valid_metadata`
+                // — checking torrents refuse conns (`torrent_not_ready`).
+                if t.checking && t.valid_metadata() {
+                    self.alerts.post(Alert::PeerDisconnected {
+                        ih: *ih,
+                        reason: format!("peer {peer}: torrent_not_ready"),
+                    });
+                    out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                        peer,
+                        reason: "torrent_not_ready",
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                    }));
+                    return;
+                }
+                // `has_connection`/`session_closing` are structural
+                // non-bugs here (actor ownership; session teardown
+                // kills the accepts wholesale).
+                // conn-cap ladder — `limit = m_max_connections * 100 /
+                // connection_limit_factor` (max factor across the
+                // conn's classes; `0` → 100 upstream).
+                let max_conn = if t.max_connections <= 0 {
+                    0xff_ffff_i64
+                } else {
+                    i64::from(t.max_connections)
+                };
+                let mut factor = 0i32;
+                conn.peer_classes.for_each(|pc| {
+                    if let Some(p) = self.peer_class_pool.at(pc) {
+                        factor = factor.max(p.connection_limit_factor);
+                    }
+                });
+                let factor = i64::from(if factor == 0 { 100 } else { factor });
+                let limit = max_conn * 100 / factor;
+                let mut maybe_replace = false;
+                if t.peers.len() as i64 >= limit {
+                    // >10% still-connecting → the longest-waiting
+                    // half-open conn yields its slot instead.
+                    if i64::from(t.num_connecting) > max_conn / 10 {
+                        let victim = t
+                            .peers
+                            .iter()
+                            .filter(|(_, c)| c.connecting && !c.disconnecting)
+                            .min_by_key(|(_, c)| c.connect_ms)
+                            .map(|(id, _)| *id);
+                        match victim {
+                            Some(v) => {
+                                if let Some(r) = t.peers.get(&v).and_then(|c| c.remote) {
+                                    t.peer_disconnected_addr(r, self.session_time, false, false, v);
+                                }
+                                let mut eff = Vec::new();
+                                t.remove_peer(v, &self.counters, &self.peer_class_pool, &mut eff);
+                                debug_assert!(eff.is_empty());
+                                self.alerts.post(Alert::PeerDisconnected {
+                                    ih: *ih,
+                                    reason: format!("peer {v}: too_many_connections"),
+                                });
+                                out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                                    peer: v,
+                                    reason: "too_many_connections",
+                                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                                }));
+                                // `peer_disconnected_other` — the
+                                // slack debt is settled.
+                                conn.exceeded_limit = false;
+                            }
+                            None => {
+                                self.alerts.post(Alert::PeerDisconnected {
+                                    ih: *ih,
+                                    reason: format!("peer {peer}: too_many_connections"),
+                                });
+                                out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                                    peer,
+                                    reason: "too_many_connections",
+                                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                                }));
+                                return;
+                            }
+                        }
+                    } else {
+                        maybe_replace = true;
+                    }
+                }
+                // `peer_list::new_connection` — banned / endpoint
+                // self-conn / same-direction / cross-direction
+                // port-rule legs; `coin` is the equal-port tiebreak.
+                let coin = rand::random::<bool>();
+                match t.peer_connected_incoming(remote, conn.local, coin) {
+                    bitdaemon_net::peer_list::NewConnVerdict::Attach(i) => {
+                        let (dl, ul) = t.peer_connected_attach(
+                            i,
+                            conn.supports_encryption,
+                            session_time,
+                            peer,
+                            conn.fast_reconnect,
+                            was_utp,
+                            false,
+                        );
+                        conn.stat_down_total += dl;
+                        conn.stat_up_total += ul;
+                    }
+                    bitdaemon_net::peer_list::NewConnVerdict::Banned => {
+                        self.alerts.post(Alert::PeerDisconnected {
+                            ih: *ih,
+                            reason: format!("peer {peer}: peer_banned"),
+                        });
                         out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
-                            peer: v,
-                            reason: "too_many_connections",
+                            peer,
+                            reason: "peer_banned",
                             sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                         }));
-                        conn.exceeded_limit = false;
-                    } else {
-                        // candidate vanished — drop ourselves. The
-                        // conn isn't in `t.peers` yet, so the teardown
-                        // path can't see it — post the alert here.
+                        return;
+                    }
+                    bitdaemon_net::peer_list::NewConnVerdict::SelfConnect {
+                        index,
+                        other_key,
+                        other_remote,
+                    } => {
+                        // `self_connection` at **failure** on both
+                        // conns; `disconnect` bans the entry
+                        // (`ec == self_connection` → `ban_peer`) —
+                        // by index, not endpoint (`update_peer_port`
+                        // may have rewritten the stored port).
+                        t.peer_list.ban_peer(index);
+                        if other_key != 0 {
+                            t.peer_disconnected_addr(
+                                other_remote,
+                                session_time,
+                                true,
+                                false,
+                                other_key,
+                            );
+                            let mut eff = Vec::new();
+                            t.remove_peer(
+                                other_key,
+                                &self.counters,
+                                &self.peer_class_pool,
+                                &mut eff,
+                            );
+                            debug_assert!(eff.is_empty());
+                            self.alerts.post(Alert::PeerDisconnected {
+                                ih: *ih,
+                                reason: format!("peer {other_key}: self_connection"),
+                            });
+                            out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                                peer: other_key,
+                                reason: "self_connection",
+                                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Failure,
+                            }));
+                        } else {
+                            // pending outbound dial — clear its mark
+                            // (failcount bump like upstream's conn
+                            // teardown); its `DialDone` lands on the
+                            // zombie path.
+                            t.peer_disconnected_addr(other_remote, session_time, true, false, 0);
+                        }
+                        self.alerts.post(Alert::PeerDisconnected {
+                            ih: *ih,
+                            reason: format!("peer {peer}: self_connection"),
+                        });
+                        out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                            peer,
+                            reason: "self_connection",
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Failure,
+                        }));
+                        return;
+                    }
+                    bitdaemon_net::peer_list::NewConnVerdict::KillSelf => {
+                        self.alerts.post(Alert::PeerDisconnected {
+                            ih: *ih,
+                            reason: format!("peer {peer}: duplicate_peer_id"),
+                        });
+                        out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                            peer,
+                            reason: "duplicate_peer_id",
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                        }));
+                        return;
+                    }
+                    bitdaemon_net::peer_list::NewConnVerdict::KillOther {
+                        index,
+                        other_key,
+                        other_remote,
+                    } => {
+                        // `m_locked_peer` — the synchronous teardown
+                        // can't erase/shift the entry we rebind to.
+                        t.peer_list.lock_peer(index);
+                        if other_key != 0 {
+                            t.peer_disconnected_addr(
+                                other_remote,
+                                session_time,
+                                false,
+                                false,
+                                other_key,
+                            );
+                            let mut eff = Vec::new();
+                            t.remove_peer(
+                                other_key,
+                                &self.counters,
+                                &self.peer_class_pool,
+                                &mut eff,
+                            );
+                            debug_assert!(eff.is_empty());
+                            self.alerts.post(Alert::PeerDisconnected {
+                                ih: *ih,
+                                reason: format!("peer {other_key}: duplicate_peer_id"),
+                            });
+                            out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                                peer: other_key,
+                                reason: "duplicate_peer_id",
+                                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                            }));
+                        } else {
+                            // pending dial — clear the mark; its
+                            // `DialDone` lands on the zombie path.
+                            t.peer_disconnected_addr(other_remote, session_time, false, false, 0);
+                        }
+                        t.peer_list.unlock_peer();
+                        let (dl, ul) = t.peer_connected_attach(
+                            index,
+                            conn.supports_encryption,
+                            session_time,
+                            peer,
+                            conn.fast_reconnect,
+                            was_utp,
+                            false,
+                        );
+                        conn.stat_down_total += dl;
+                        conn.stat_up_total += ul;
+                    }
+                    bitdaemon_net::peer_list::NewConnVerdict::Full => {
                         self.alerts.post(Alert::PeerDisconnected {
                             ih: *ih,
                             reason: format!("peer {peer}: too_many_connections"),
@@ -3741,198 +4141,17 @@ impl Session {
                         return;
                     }
                 }
-                None => {
-                    self.alerts.post(Alert::PeerDisconnected {
-                        ih: *ih,
-                        reason: format!("peer {peer}: too_many_connections"),
-                    });
-                    out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
-                        peer,
-                        reason: "too_many_connections",
-                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                    }));
-                    return;
-                }
-            }
-        }
-        if let Some(t) = self.torrents.get_mut(ih) {
-            // `sent_syn` (at `connect()`) + `received_synack` (at
-            // `on_connection_complete`) — outgoing TCP conns carry
-            // the handshake IP overhead on their stat channels and
-            // the session's `*_ip_overhead_bytes` counters. Incoming
-            // accepts aren't charged upstream (the OS did the
-            // handshake).
-            if conn.outgoing && !conn.is_utp {
-                let oh = i64::from(if remote.is_ipv6() { 60 } else { 40 });
-                conn.stat_up_ip += oh; // sent_syn
-                conn.stat_up_ip += oh; // received_synack's ACK
-                conn.stat_down_ip += oh; // the SYN-ACK itself
-                self.counters
-                    .add(crate::counters::Counter::SentIpOverheadBytes, oh * 2);
-                self.counters
-                    .add(crate::counters::Counter::RecvIpOverheadBytes, oh);
-            }
-            if let Some(rpid) = conn.peer_id {
-                // `find_peer` + `allow_multiple_connections_per_pid` —
-                // a second conn carrying a peer-id we already serve is
-                // a duplex loopback: the conn initiated by the greater
-                // pid wins (`errors::duplicate_peer_id`).
-                if !self.settings.allow_multiple_connections_per_pid
-                    && let Some(other) = t
-                        .peers
-                        .iter()
-                        .find_map(|(id, c)| (c.peer_id == Some(rpid)).then_some(*id))
-                {
-                    if (rpid < self.peer_id) == conn.outgoing {
-                        // kill the existing conn — this one survives.
-                        // `duplicate_peer_id` runs at default
-                        // severity upstream — no failcount bump.
-                        if let Some(r) = t.peers.get(&other).and_then(|c| c.remote) {
-                            t.peer_disconnected_addr(r, self.session_time, false);
-                        }
-                        let mut eff = Vec::new();
-                        t.remove_peer(other, &self.counters, &self.peer_class_pool, &mut eff);
-                        debug_assert!(eff.is_empty());
-                        self.alerts.post(Alert::PeerDisconnected {
-                            ih: *ih,
-                            reason: format!("peer {other}: duplicate_peer_id"),
-                        });
-                        out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
-                            peer: other,
-                            reason: "duplicate_peer_id",
-                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                        }));
-                    } else {
-                        // kill this conn — never inserted into the
-                        // swarm; the effect drops its wire stream.
-                        self.alerts.post(Alert::PeerDisconnected {
-                            ih: *ih,
-                            reason: format!("peer {peer}: duplicate_peer_id"),
-                        });
-                        out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
-                            peer,
-                            reason: "duplicate_peer_id",
-                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                        }));
-                        return;
-                    }
-                }
-                // BitComet (`-BC…-`) pids cap the request queue at 50
-                // (upstream `on_receive` peer_id).
-                {
-                    let b = rpid.as_bytes();
-                    if b[0] == b'-'
-                        && b[1] == b'B'
-                        && b[2] == b'C'
-                        && b[7] == b'-'
-                        && conn.pipeline.max_out_request_queue > 50
-                    {
-                        conn.pipeline.max_out_request_queue = 50;
-                    }
-                }
-                // `is_self_connection` — the remote claims a peer-id
-                // we generated (single session pid ⇒ literal equality
-                // is upstream's `m_outgoing_pids` membership).
-                if rpid == self.peer_id {
-                    self.alerts.post(Alert::PeerDisconnected {
-                        ih: *ih,
-                        reason: format!("peer {peer}: self_connection"),
-                    });
-                    out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
-                        peer,
-                        reason: "self_connection",
-                        // upstream `errors::self_connection` uses the
-                        // default (normal) severity.
-                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                    }));
-                    return;
-                }
-            }
-            // `peer_info::protocol_v2` — the handshake came in keyed
-            // by the torrent's v2 (SHA-256, truncated) info-hash.
-            conn.protocol_v2 =
-                t.ti.as_ref()
-                    .and_then(|ti| ti.info_hash_v2())
-                    .is_some_and(|v2| v2.as_bytes()[..20] == ih.as_bytes()[..]);
-            // `torrent::connect_to_peer` — an attaching conn on a
-            // filtered address is refused up front:
-            // `peer_blocked_alert(ip_filter)` + `disconnect`
-            // (`banned_by_ip_filter`, default severity).
-            if t.apply_ip_filter
-                && t.ip_filter
-                    .as_ref()
-                    .is_some_and(|f| f.access(remote.ip()) == bitdaemon_net::ip_filter::BLOCKED)
-            {
-                self.alerts.post(Alert::PeerBlocked {
-                    ih: *ih,
-                    remote: remote.to_string(),
-                    reason: "ip_filter".into(),
-                });
-                out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
-                    peer,
-                    reason: "banned_by_ip_filter",
-                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                }));
-                return;
-            }
-            // `!is_downloading_state(m_state) && valid_metadata` —
-            // checking torrents refuse conns (`torrent_not_ready`).
-            if t.checking && t.valid_metadata() {
-                self.alerts.post(Alert::PeerDisconnected {
-                    ih: *ih,
-                    reason: format!("peer {peer}: torrent_not_ready"),
-                });
-                out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
-                    peer,
-                    reason: "torrent_not_ready",
-                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                }));
-                return;
-            }
-            if t.is_aborted() {
-                self.alerts.post(Alert::PeerDisconnected {
-                    ih: *ih,
-                    reason: format!("peer {peer}: session_closing"),
-                });
-                out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
-                    peer,
-                    reason: "session_closing",
-                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                }));
-                return;
-            }
-            // conn-cap ladder — `limit = m_max_connections * 100 /
-            // connection_limit_factor` (max factor across the conn's
-            // classes; `0` → 100 upstream). `max_connections <= 0` is
-            // upstream's `(1 << 24) - 1` unlimited.
-            let max_conn = if t.max_connections <= 0 {
-                0xff_ffff_i64
-            } else {
-                i64::from(t.max_connections)
-            };
-            let mut factor = 0i32;
-            conn.peer_classes.for_each(|pc| {
-                if let Some(p) = self.peer_class_pool.at(pc) {
-                    factor = factor.max(p.connection_limit_factor);
-                }
-            });
-            let factor = i64::from(if factor == 0 { 100 } else { factor });
-            let limit = max_conn * 100 / factor;
-            let mut maybe_replace = false;
-            if t.peers.len() as i64 >= limit {
-                // >10% still-connecting → the longest-waiting
-                // half-open conn yields its slot instead.
-                if i64::from(t.num_connecting) > max_conn / 10 {
-                    let victim = t
-                        .peers
-                        .iter()
-                        .filter(|(_, c)| c.connecting && !c.disconnecting)
-                        .min_by_key(|(_, c)| c.connect_ms)
-                        .map(|(id, _)| *id);
+                // `maybe_replace_peer` — at-cap attaches evict the
+                // lowest-ranking conn only if they outrank it;
+                // otherwise the newcomer drops (its fresh swarm
+                // entry still needs `connection_closed` bookkeeping).
+                if maybe_replace {
+                    let new_rank = t.rank_of_addr(remote);
+                    let victim = t.lowest_ranking_peer();
                     match victim {
-                        Some(v) => {
+                        Some((v, rank)) if rank < new_rank => {
                             if let Some(r) = t.peers.get(&v).and_then(|c| c.remote) {
-                                t.peer_disconnected_addr(r, self.session_time, false);
+                                t.peer_disconnected_addr(r, self.session_time, false, false, v);
                             }
                             let mut eff = Vec::new();
                             t.remove_peer(v, &self.counters, &self.peer_class_pool, &mut eff);
@@ -3946,11 +4165,10 @@ impl Session {
                                 reason: "too_many_connections",
                                 sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                             }));
-                            // `peer_disconnected_other` — our slack
-                            // debt is settled by the eviction.
                             conn.exceeded_limit = false;
                         }
-                        None => {
+                        _ => {
+                            t.peer_disconnected_addr(remote, self.session_time, false, false, peer);
                             self.alerts.post(Alert::PeerDisconnected {
                                 ih: *ih,
                                 reason: format!("peer {peer}: too_many_connections"),
@@ -3963,47 +4181,58 @@ impl Session {
                             return;
                         }
                     }
-                } else {
-                    maybe_replace = true;
                 }
             }
-            // `new_connection` — a full peer list refuses the insert.
-            // `conn.sock_type` 3|9 = uTP → the connect confirmed
-            // uTP support upstream (`confirmed_supports_utp`).
-            let was_utp = matches!(conn.sock_type, 3 | 9);
-            if !t.peer_connected_addr(remote, conn.supports_encryption, self.session_time, was_utp)
+            // `peer_connect_alert` — post-attach for incoming
+            // conns (outgoing conns posted it at dial).
+            self.alerts.post(Alert::PeerConnect {
+                ih: *ih,
+                remote: remote.to_string(),
+            });
+            // `peer_info::protocol_v2` — the handshake came in keyed
+            // by the torrent's v2 (SHA-256, truncated) info-hash.
+            conn.protocol_v2 = self
+                .torrents
+                .get(ih)
+                .and_then(|t| t.ti.as_ref())
+                .and_then(|ti| ti.info_hash_v2())
+                .is_some_and(|v2| v2.as_bytes()[..20] == ih.as_bytes()[..]);
+            // `m_exceeded_limit` re-eval — the session may have
+            // dipped back under the cap between accept and attach.
+            if conn.exceeded_limit
+                && self
+                    .counters
+                    .value(crate::counters::Counter::NumPeersConnected)
+                    + self
+                        .counters
+                        .value(crate::counters::Counter::NumPeersHalfOpen)
+                    <= i64::from(self.settings.connections_limit)
             {
-                self.alerts.post(Alert::PeerDisconnected {
-                    ih: *ih,
-                    reason: format!("peer {peer}: too_many_connections"),
-                });
-                out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
-                    peer,
-                    reason: "too_many_connections",
-                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                }));
-                return;
+                conn.exceeded_limit = false;
             }
-            // `maybe_replace_peer` — at-cap attaches evict the
-            // lowest-ranking conn only if they outrank it; otherwise
-            // the newcomer drops (its fresh swarm entry still needs
-            // `connection_closed` bookkeeping — `remove_peer` on a
-            // conn never inserted upstream).
-            if maybe_replace {
-                let new_rank = t.rank_of_addr(remote);
-                let victim = t.lowest_ranking_peer();
+            if conn.exceeded_limit {
+                // `find_disconnect_candidate_torrent` — prefer a
+                // torrent with peers, finished first, largest swarm;
+                // it must hold strictly more conns than ours, else
+                // we drop ourselves.
+                let cand = self.find_disconnect_candidate_torrent();
+                let this_n = self.torrents.get(ih).map_or(0, |t| t.peers.len());
+                let cand_n = cand
+                    .and_then(|cih| self.torrents.get(&cih))
+                    .map_or(0, |t| t.peers.len());
+                let victim = if let Some(cih) = cand
+                    && cand_n > this_n
+                {
+                    self.torrents[&cih].lowest_ranking_peer().map(|v| (cih, v))
+                } else {
+                    None
+                };
                 match victim {
-                    Some((v, rank)) if rank < new_rank => {
-                        if let Some(r) = t.peers.get(&v).and_then(|c| c.remote) {
-                            t.peer_disconnected_addr(r, self.session_time, false);
-                        }
-                        let mut eff = Vec::new();
-                        t.remove_peer(v, &self.counters, &self.peer_class_pool, &mut eff);
-                        debug_assert!(eff.is_empty());
-                        self.alerts.post(Alert::PeerDisconnected {
-                            ih: *ih,
-                            reason: format!("peer {v}: too_many_connections"),
-                        });
+                    Some((cih, (v, _rank))) if self.torrents.contains_key(&cih) => {
+                        // evict the candidate's lowest-ranking conn —
+                        // the `DisconnectPeer` effect runs the full
+                        // `peer_connection::disconnect` path through
+                        // `peer_disconnected`.
                         out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                             peer: v,
                             reason: "too_many_connections",
@@ -4012,7 +4241,6 @@ impl Session {
                         conn.exceeded_limit = false;
                     }
                     _ => {
-                        t.peer_disconnected_addr(remote, self.session_time, false);
                         self.alerts.post(Alert::PeerDisconnected {
                             ih: *ih,
                             reason: format!("peer {peer}: too_many_connections"),
@@ -4026,137 +4254,226 @@ impl Session {
                     }
                 }
             }
-            // `write_handshake` — `send_upload_only(is_upload_only &&
-            // !super_seeding)` precedes the bitfield (skipped under
-            // `share_mode`); the conn-side ext id is only known once
-            // the peer's own BEP-10 handshake arrived, so this is a
-            // no-op for connections still mid-handshake.
-            if !t.share_mode && !t.super_seeding && t.is_upload_only() && conn.ext_upload_only != 0
-            {
-                let msg = PeerMessage::Extended {
-                    id: conn.ext_upload_only,
-                    data: bytes::Bytes::copy_from_slice(&[1]),
-                };
-                conn.send_buffer += bitdaemon_net::peer_wire::wire_len(&msg);
-                out.push(SessionOut::ToPeer { ih: *ih, peer, msg });
-            }
-            // upstream `write_bitfield` on connect — super-seeding
-            // hides the real bitfield (`have_none` under FAST) and
-            // bootstraps by leaking *two* pieces via `have`.
-            let msgs: Vec<PeerMessage> = if t.super_seeding {
-                let mut v = Vec::new();
-                if conn.supports_fast {
-                    v.push(PeerMessage::HaveNone);
-                }
-                for _ in 0..2 {
-                    // the conn isn't in `t.peers` yet — its own
-                    // leaked slots still bias the second pick
-                    // (`get_piece_to_super_seed_ex`).
-                    if let Some(p) = t.get_piece_to_super_seed_ex(&conn.peer_pieces, Some(&conn)) {
-                        conn.superseed_pieces[1] = conn.superseed_pieces[0];
-                        conn.superseed_pieces[0] = Some(p);
-                        v.push(PeerMessage::Have(p));
-                    }
-                }
-                v
-            } else if conn.supports_fast && t.is_seed() {
-                // BEP-6: `have_all` replaces a full bitfield.
-                vec![PeerMessage::HaveAll]
-            } else if conn.supports_fast && t.have.count() == 0 {
-                vec![PeerMessage::HaveNone]
-            } else {
-                let bits: Vec<u8> = t.have.bytes().into();
-                if bits.is_empty() || t.have.count() == 0 {
-                    Vec::new()
-                } else {
-                    vec![PeerMessage::Bitfield(bits.into())]
-                }
-            };
-            for msg in msgs {
-                // the conn isn't registered yet — charge its
-                // send_buffer directly (fill_send_buffer's watermark
-                // counts it).
-                conn.send_buffer += bitdaemon_net::peer_wire::wire_len(&msg);
-                out.push(SessionOut::ToPeer { ih: *ih, peer, msg });
-            }
-            // `write_bitfield` sets `m_sent_bitfield` in every branch
-            // — including the have-none/super-seed legs that send no
-            // bitfield bytes — whenever it ran (i.e. `valid_metadata`).
-            // It gates the `DhtPort` reply leg of `on_dht_port`.
-            conn.sent_bitfield = t.valid_metadata();
-            conn.local_dht_port = self.dht_port;
-            // `bt_peer_connection` ctor — the local plugin ids are
-            // `find_plugin`-assigned: a missing plugin leaves its
-            // index at 0 so `on_extended`'s fixed-id dispatch can't
-            // be claimed by a peer that guesses the numeric id.
-            // `ut_metadata`: absent only for a private torrent that
-            // already has metadata — a private *magnet* still needs
-            // the plugin to fetch it (`valid_metadata && priv`).
-            // `ut_pex`: `!priv` and never on a pure-i2p torrent.
-            // `i2p_pex`: torrent `!priv && i2p`, and upstream only
-            // attaches the peer plugin on i2p sockets (the SAM
-            // transport isn't implemented yet — `conn.i2p` is never
-            // set in production).
-            let is_priv = t.ti.as_ref().is_some_and(|ti| ti.is_private());
-            let torrent_i2p = t.ti.as_ref().is_some_and(|ti| ti.is_i2p());
-            conn.local_ut_metadata = u8::from(!(is_priv && t.valid_metadata())) * 2;
-            conn.local_ut_pex = u8::from(!is_priv && !torrent_i2p);
-            conn.local_i2p_pex = u8::from((!is_priv && torrent_i2p) || conn.i2p.is_some())
-                * crate::i2p_pex::I2P_PEX_ID;
-            // `set_holepunch_mode` — upstream flags the conn right
-            // after `connect_to_peer`; our dial is async so the
-            // swarm entry carried the flag to this attach.
-            if let Some(i) = t.peer_index(remote) {
-                if let Some(p) = t.peer_list.peers_mut().get_mut(i)
-                    && std::mem::take(&mut p.holepunch)
-                {
-                    conn.holepunch_mode = true;
-                }
-            }
-            // upstream `peer_connection::init` sends `port` when
-            // the peer negotiated DHT and our dht is bound.
-            if conn.supports_dht
-                && let Some(port) = self.dht_port
-            {
-                let msg = PeerMessage::DhtPort(port);
-                conn.send_buffer += bitdaemon_net::peer_wire::wire_len(&msg);
-                out.push(SessionOut::ToPeer { ih: *ih, peer, msg });
-            }
-            self.alerts.post(Alert::PeerLog {
-                ih: *ih,
-                remote: remote.to_string(),
-                msg: "peer connected".into(),
-            });
-            t.add_peer(peer, conn);
-            {
-                let mut eff = Vec::new();
-                // upstream `attach_peer` tail — a new swarm member
-                // changes the share-mode rebalance inputs.
-                if t.share_mode {
-                    t.recalc_share_mode(&self.settings, &self.counters, &mut eff);
-                }
-                // upstream does NOT `send_allowed_set` at attach —
-                // it fires once on the first inbound `Interested`
-                // (`m_sent_allowed_fast` in `on_interested`).
-                // `write_handshake` tail — `maybe_send_hash_request`
-                // on a v2 conn starts fetching missing merkle layers
-                // immediately.
-                t.maybe_send_hash_request(peer, &mut eff);
-                // `maybe_unchoke_this_peer` — exempt conns unchoke
-                // on the spot; normal ones do when the fixed-slots
-                // choker has free slots (`preemptive_unchoke`).
-                t.maybe_unchoke_this_peer(
-                    peer,
-                    &self.settings,
-                    &self.counters,
-                    &self.peer_class_pool,
-                    Instant::now(),
-                    &mut eff,
-                );
-                self.route(*ih, eff, out);
-            }
-            self.sync_connected_peers();
         }
+        // `read_peer_id` legs — both directions.
+        if let Some(rpid) = conn.peer_id {
+            let t = self.torrents.get_mut(ih);
+            let Some(t) = t else { return };
+            // `find_peer` + `allow_multiple_connections_per_pid` —
+            // a second conn carrying a peer-id we already serve is
+            // a duplex loopback: the conn initiated by the greater
+            // pid wins (`errors::duplicate_peer_id`). `our` is THIS
+            // conn's generated pid (`m_our_peer_id`).
+            let our = conn.our_peer_id.unwrap_or(self.peer_id);
+            if !self.settings.allow_multiple_connections_per_pid
+                && let Some(other) = t
+                    .peers
+                    .iter()
+                    .find_map(|(id, c)| (c.peer_id == Some(rpid)).then_some(*id))
+            {
+                if (rpid < our) == conn.outgoing {
+                    // kill the existing conn — this one survives.
+                    // `duplicate_peer_id` at default severity — no
+                    // failcount bump.
+                    if let Some(r) = t.peers.get(&other).and_then(|c| c.remote) {
+                        t.peer_disconnected_addr(r, self.session_time, false, false, other);
+                    }
+                    let mut eff = Vec::new();
+                    t.remove_peer(other, &self.counters, &self.peer_class_pool, &mut eff);
+                    debug_assert!(eff.is_empty());
+                    self.alerts.post(Alert::PeerDisconnected {
+                        ih: *ih,
+                        reason: format!("peer {other}: duplicate_peer_id"),
+                    });
+                    out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                        peer: other,
+                        reason: "duplicate_peer_id",
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                    }));
+                } else {
+                    // kill this conn — its attach already bound the
+                    // swarm entry, so `connection_closed` runs to
+                    // clear the mark.
+                    t.peer_disconnected_addr(remote, self.session_time, false, false, peer);
+                    self.alerts.post(Alert::PeerDisconnected {
+                        ih: *ih,
+                        reason: format!("peer {peer}: duplicate_peer_id"),
+                    });
+                    out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                        peer,
+                        reason: "duplicate_peer_id",
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                    }));
+                    return;
+                }
+            }
+            // BitComet (`-BC…-`) pids cap the request queue at 50
+            // (upstream `on_receive` peer_id).
+            {
+                let b = rpid.as_bytes();
+                if b[0] == b'-'
+                    && b[1] == b'B'
+                    && b[2] == b'C'
+                    && b[7] == b'-'
+                    && conn.pipeline.max_out_request_queue > 50
+                {
+                    conn.pipeline.max_out_request_queue = 50;
+                }
+            }
+            // `is_self_connection` — the remote claims a peer-id we
+            // generated for an OUTGOING conn (`m_outgoing_pids`);
+            // mark-less manual dials still shake hands with the
+            // session pid, so a literal echo counts too.
+            // `disconnect` → `ban_peer(m_peer_info)` upstream: the
+            // entry stops being a candidate and rejects re-attach.
+            if t.outgoing_pids.contains(&rpid) || rpid == self.peer_id {
+                t.ban_peer(remote);
+                t.peer_disconnected_addr(remote, self.session_time, false, false, peer);
+                self.alerts.post(Alert::PeerDisconnected {
+                    ih: *ih,
+                    reason: format!("peer {peer}: self_connection"),
+                });
+                out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
+                    peer,
+                    reason: "self_connection",
+                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                }));
+                return;
+            }
+        }
+        // `init()` — handshake sends + attach tail.
+        let Some(t) = self.torrents.get_mut(ih) else {
+            return;
+        };
+        // `write_handshake` — `send_upload_only(is_upload_only &&
+        // !super_seeding)` precedes the bitfield (skipped under
+        // `share_mode`); the conn-side ext id is only known once
+        // the peer's own BEP-10 handshake arrived, so this is a
+        // no-op for connections still mid-handshake.
+        if !t.share_mode && !t.super_seeding && t.is_upload_only() && conn.ext_upload_only != 0 {
+            let msg = PeerMessage::Extended {
+                id: conn.ext_upload_only,
+                data: bytes::Bytes::copy_from_slice(&[1]),
+            };
+            conn.send_buffer += bitdaemon_net::peer_wire::wire_len(&msg);
+            out.push(SessionOut::ToPeer { ih: *ih, peer, msg });
+        }
+        // upstream `write_bitfield` on connect — super-seeding
+        // hides the real bitfield (`have_none` under FAST) and
+        // bootstraps by leaking *two* pieces via `have`.
+        let msgs: Vec<PeerMessage> = if t.super_seeding {
+            let mut v = Vec::new();
+            if conn.supports_fast {
+                v.push(PeerMessage::HaveNone);
+            }
+            for _ in 0..2 {
+                // the conn isn't in `t.peers` yet — its own
+                // leaked slots still bias the second pick
+                // (`get_piece_to_super_seed_ex`).
+                if let Some(p) = t.get_piece_to_super_seed_ex(&conn.peer_pieces, Some(&conn)) {
+                    conn.superseed_pieces[1] = conn.superseed_pieces[0];
+                    conn.superseed_pieces[0] = Some(p);
+                    v.push(PeerMessage::Have(p));
+                }
+            }
+            v
+        } else if conn.supports_fast && t.is_seed() {
+            // BEP-6: `have_all` replaces a full bitfield.
+            vec![PeerMessage::HaveAll]
+        } else if conn.supports_fast && t.have.count() == 0 {
+            vec![PeerMessage::HaveNone]
+        } else {
+            let bits: Vec<u8> = t.have.bytes().into();
+            if bits.is_empty() || t.have.count() == 0 {
+                Vec::new()
+            } else {
+                vec![PeerMessage::Bitfield(bits.into())]
+            }
+        };
+        for msg in msgs {
+            // the conn isn't registered yet — charge its
+            // send_buffer directly (fill_send_buffer's watermark
+            // counts it).
+            conn.send_buffer += bitdaemon_net::peer_wire::wire_len(&msg);
+            out.push(SessionOut::ToPeer { ih: *ih, peer, msg });
+        }
+        // `write_bitfield` sets `m_sent_bitfield` in every branch
+        // — including the have-none/super-seed legs that send no
+        // bitfield bytes — whenever it ran (i.e. `valid_metadata`).
+        // It gates the `DhtPort` reply leg of `on_dht_port`.
+        conn.sent_bitfield = t.valid_metadata();
+        conn.local_dht_port = self.dht_port;
+        // `bt_peer_connection` ctor — the local plugin ids are
+        // `find_plugin`-assigned: a missing plugin leaves its
+        // index at 0 so `on_extended`'s fixed-id dispatch can't
+        // be claimed by a peer that guesses the numeric id.
+        // `ut_metadata`: absent only for a private torrent that
+        // already has metadata — a private *magnet* still needs
+        // the plugin to fetch it (`valid_metadata && priv`).
+        // `ut_pex`: `!priv` and never on a pure-i2p torrent.
+        // `i2p_pex`: torrent `!priv && i2p`, and upstream only
+        // attaches the peer plugin on i2p sockets (the SAM
+        // transport isn't implemented yet — `conn.i2p` is never
+        // set in production).
+        let is_priv = t.ti.as_ref().is_some_and(|ti| ti.is_private());
+        let torrent_i2p = t.ti.as_ref().is_some_and(|ti| ti.is_i2p());
+        conn.local_ut_metadata = u8::from(!(is_priv && t.valid_metadata())) * 2;
+        conn.local_ut_pex = u8::from(!is_priv && !torrent_i2p);
+        conn.local_i2p_pex = u8::from((!is_priv && torrent_i2p) || conn.i2p.is_some())
+            * crate::i2p_pex::I2P_PEX_ID;
+        // `set_holepunch_mode` — upstream flags the conn right
+        // after `connect_to_peer`; our dial is async so the
+        // swarm entry carried the flag to this attach.
+        if let Some(i) = t.peer_index(remote) {
+            if let Some(p) = t.peer_list.peers_mut().get_mut(i)
+                && std::mem::take(&mut p.holepunch)
+            {
+                conn.holepunch_mode = true;
+            }
+        }
+        // upstream `peer_connection::init` sends `port` when
+        // the peer negotiated DHT and our dht is bound.
+        if conn.supports_dht
+            && let Some(port) = self.dht_port
+        {
+            let msg = PeerMessage::DhtPort(port);
+            conn.send_buffer += bitdaemon_net::peer_wire::wire_len(&msg);
+            out.push(SessionOut::ToPeer { ih: *ih, peer, msg });
+        }
+        self.alerts.post(Alert::PeerLog {
+            ih: *ih,
+            remote: remote.to_string(),
+            msg: "peer connected".into(),
+        });
+        t.add_peer(peer, conn);
+        {
+            let mut eff = Vec::new();
+            // upstream `attach_peer` tail — a new swarm member
+            // changes the share-mode rebalance inputs.
+            if t.share_mode {
+                t.recalc_share_mode(&self.settings, &self.counters, &mut eff);
+            }
+            // upstream does NOT `send_allowed_set` at attach —
+            // it fires once on the first inbound `Interested`
+            // (`m_sent_allowed_fast` in `on_interested`).
+            // `write_handshake` tail — `maybe_send_hash_request`
+            // on a v2 conn starts fetching missing merkle layers
+            // immediately.
+            t.maybe_send_hash_request(peer, &mut eff);
+            // `maybe_unchoke_this_peer` — exempt conns unchoke
+            // on the spot; normal ones do when the fixed-slots
+            // choker has free slots (`preemptive_unchoke`).
+            t.maybe_unchoke_this_peer(
+                peer,
+                &self.settings,
+                &self.counters,
+                &self.peer_class_pool,
+                Instant::now(),
+                &mut eff,
+            );
+            self.route(*ih, eff, out);
+        }
+        self.sync_connected_peers();
     }
 
     /// `num_peers_connected` gauge — recomputed over all torrents
@@ -4231,15 +4548,21 @@ impl Session {
                 self.counters
                     .inc_idx(crate::counters::incoming_counter_idx(id));
             }
-            let (remote, outgoing, is_utp, conn_failed) =
-                t.peers.get(&peer).map_or((None, false, false, false), |c| {
-                    (c.remote, c.outgoing, c.is_utp, c.failed)
+            let (remote, outgoing, is_utp, conn_failed, conn_fast) = t
+                .peers
+                .get(&peer)
+                .map_or((None, false, false, false, false), |c| {
+                    (c.remote, c.outgoing, c.is_utp, c.failed, c.fast_reconnect)
                 });
             if let Some(r) = remote {
+                // `peer` IS the conn's `conn_key` — the bound-entry
+                // lookup survives `update_peer_port` rewrites.
                 t.peer_disconnected_addr(
                     r,
                     self.session_time,
                     conn_failed || sev > DisconnectSeverity::Normal,
+                    conn_fast,
+                    peer,
                 );
             }
             let had = t.peers.contains_key(&peer);
@@ -4336,7 +4659,8 @@ impl Session {
                 .map(|(id, _)| *id);
             if let Some(id) = conn_id {
                 // `peer_banned` is `peer_error` upstream → failed.
-                t.peer_disconnected_addr(remote, self.session_time, true);
+                let fast = t.peers.get(&id).is_some_and(|c| c.fast_reconnect);
+                t.peer_disconnected_addr(remote, self.session_time, true, fast, id);
                 t.remove_peer(id, &self.counters, &self.peer_class_pool, &mut eff);
                 self.alerts.post(Alert::PeerDisconnected {
                     ih: *ih,
@@ -4440,13 +4764,70 @@ impl Session {
     }
 
     /// `peer_connect_failed` — an outbound dial never completed the
-    /// handshake; report it so the swarm entry backs off.
-    /// `peer_connect_failed` — an outbound dial never completed the
-    /// handshake. `was_utp` marks uTP sockets (upstream clears
-    /// `supports_utp` + fast-reconnects → immediate TCP retry).
-    pub fn peer_connect_failed(&mut self, ih: &Sha1Hash, remote: SocketAddr, was_utp: bool) {
+    /// handshake. `was_utp` marks uTP sockets: upstream clears
+    /// `supports_utp`, fast-reconnects the entry (no failcount,
+    /// normal severity) and immediately re-dials it over TCP —
+    /// the returned retry rides `pending_out` as a `ConnectPeer`.
+    /// `conn_fast` is the failed conn's own `m_fast_reconnect` (an
+    /// MSE retry keeps the dial-time `last_connected` stamp).
+    pub fn peer_connect_failed(
+        &mut self,
+        ih: &Sha1Hash,
+        remote: SocketAddr,
+        was_utp: bool,
+        conn_fast: bool,
+    ) {
+        let Some(t) = self.torrents.get_mut(ih) else {
+            return;
+        };
+        if let Some((ep, enc, fast, pid)) = t.peer_connect_failed(
+            remote,
+            self.session_time,
+            was_utp,
+            conn_fast,
+            self.settings.out_enc_policy,
+            &self.settings.peer_fingerprint,
+        ) {
+            // `connect_to_peer(pi, ignore_limit)` — the retry
+            // bypasses the connect-pump budget (the dial mark was
+            // re-armed, not refunded).
+            self.alerts.post(Alert::PeerConnect {
+                ih: *ih,
+                remote: ep.to_string(),
+            });
+            self.pending_out.push(SessionOut::ConnectPeer {
+                ih: *ih,
+                ep,
+                encrypted: enc,
+                fast_reconnect: fast,
+                our_pid: pid,
+            });
+        }
+    }
+
+    /// `connect_to_peer` mark for a caller-specified endpoint —
+    /// the engine's manual `connect_peer`: insert + pending mark +
+    /// `outgoing_pids`/`dial_pids` registration for the conn's
+    /// generated peer-id. `false` when already connected/dialing.
+    pub fn register_dial(
+        &mut self,
+        ih: &Sha1Hash,
+        remote: SocketAddr,
+        pid: bitdaemon_common::PeerId,
+    ) -> bool {
+        self.torrents
+            .get_mut(ih)
+            .is_some_and(|t| t.register_manual_dial(remote, self.session_time, pid))
+    }
+
+    /// pending-dial local endpoint — the engine reports the bound
+    /// socket address the moment a dial's connect lands (upstream's
+    /// half-open conn object carries `local_endpoint()`); the
+    /// `new_connection` self-connection check resolves pending
+    /// dials through it.
+    pub fn register_dial_local(&mut self, ih: &Sha1Hash, remote: SocketAddr, local: SocketAddr) {
         if let Some(t) = self.torrents.get_mut(ih) {
-            t.peer_connect_failed(remote, self.session_time, was_utp);
+            t.dial_locals.insert(remote, local);
         }
     }
 
@@ -4707,6 +5088,12 @@ impl Session {
             // `torrent::set_ip_filter` — the torrent holds the same
             // shared filter (`m_ip_filter`) for `add_peer` gates.
             t.ip_filter = Some(std::sync::Arc::clone(&f));
+            // `torrent::ip_filter_updated` early-returns when
+            // `!m_apply_ip_filter` — opted-out torrents
+            // (`non_filter_torrents`) are exempt from the sweep.
+            if !t.apply_ip_filter {
+                continue;
+            }
             // upstream `apply_ip_filter` sweeps blocked entries and
             // disconnects their linked conns first — `disconnect`
             // runs `remove_peer`/`connection_closed` bookkeeping
@@ -4731,7 +5118,13 @@ impl Session {
                     banned.push(remote.ip());
                     // `banned_by_ip_filter` runs at default severity
                     // upstream — no failcount bump.
-                    t.peer_disconnected_addr(remote, self.session_time, false);
+                    t.peer_disconnected_addr(
+                        remote,
+                        self.session_time,
+                        false,
+                        c.fast_reconnect,
+                        *id,
+                    );
                 }
                 t.remove_peer(*id, &self.counters, &self.peer_class_pool, &mut eff);
                 eff.push(TorrentEffect::DisconnectPeer {
@@ -4762,6 +5155,17 @@ impl Session {
         for (ih, eff) in pending {
             self.route(ih, eff, out);
         }
+    }
+
+    /// `torrent_handle::apply_ip_filter` routed through the
+    /// session — the torrent setter emits conn teardown + alerts
+    /// via `TorrentEffect` like `set_ip_filter` does.
+    pub(crate) fn apply_ip_filter(&mut self, ih: &Sha1Hash, on: bool, out: &mut Vec<SessionOut>) {
+        let mut eff = Vec::new();
+        if let Some(t) = self.torrents.get_mut(ih) {
+            t.set_apply_ip_filter(on, &self.counters, &mut eff);
+        }
+        self.route(*ih, eff, out);
     }
 
     /// current access rule for `addr` (`ip_filter::access`).
@@ -4801,7 +5205,13 @@ impl Session {
                 if let Some(c) = t.peers.get(id)
                     && let Some(remote) = c.remote
                 {
-                    t.peer_disconnected_addr(remote, self.session_time, false);
+                    t.peer_disconnected_addr(
+                        remote,
+                        self.session_time,
+                        false,
+                        c.fast_reconnect,
+                        *id,
+                    );
                     self.alerts.post(Alert::PeerBlocked {
                         ih: t.info_hash,
                         remote: remote.to_string(),
@@ -5174,15 +5584,100 @@ impl Session {
 
     /// `incoming_connection_alert` — an inbound peer stream was
     /// accepted (`socket_type` kind).
-    /// `session_impl::on_incoming_connection` — the pre-accept gates:
-    /// conn-cap (peer-class `connection_limit_factor` scaled) +
-    /// `connections_slack`, the no-active-torrents short-circuit, then
-    /// `incoming_connections` + `incoming_connection_alert`. The engine
-    /// owns the socket, so the verdict travels back:
-    /// `Reject` drops it, `AcceptExceeded` sets `m_exceeded_limit`
-    /// (eviction is re-evaluated when the handshake lands).
+    /// `session_impl::incoming_connection` — the pre-attach gates,
+    /// in upstream order: `m_paused` drop → transport enablement
+    /// (`utp_disabled`/`tcp_disabled`) → `outgoing_interfaces`
+    /// binding (`verify_incoming_interface` + `verify_bound_address`)
+    /// → `has_incoming_connections` (counter, non-local remotes)
+    /// → session `ip_filter` (skipped while `non_filter_torrents`
+    /// is nonzero) → empty-torrents drop → conn-cap
+    /// (`connection_limit_factor`-scaled + `connections_slack`) →
+    /// no-active-torrents drop → `incoming_connections` +
+    /// `incoming_connection_alert`. The engine owns the socket, so
+    /// the verdict travels back: `Reject` drops it, `AcceptExceeded`
+    /// sets `m_exceeded_limit` (re-evaluated at attach).
+    ///
+    /// `local` is the acceptor's bound endpoint (upstream reads
+    /// `s.local_endpoint()`); `kind` is the listener's
+    /// `socket_type` index.
     #[must_use]
-    pub fn on_incoming_connection(&mut self, remote: SocketAddr, kind: u8) -> IncomingVerdict {
+    pub fn on_incoming_connection(
+        &mut self,
+        remote: SocketAddr,
+        local: Option<SocketAddr>,
+        kind: u8,
+    ) -> IncomingVerdict {
+        // `m_paused` — a paused session refuses every accept before
+        // any gate runs (`incoming_connection` upstream).
+        if self.paused {
+            return IncomingVerdict::Reject;
+        }
+        let is_utp = matches!(kind, 3 | 9);
+        if is_utp && !self.settings.enable_incoming_utp {
+            self.alerts.post(Alert::PeerBlocked {
+                ih: Sha1Hash::default(),
+                remote: remote.to_string(),
+                reason: "utp_disabled".into(),
+            });
+            return IncomingVerdict::Reject;
+        }
+        // `enable_incoming_tcp` — plain `tcp::socket` only upstream;
+        // ssl-listener/uTP kinds are their own socket types.
+        if kind == 0 && !self.settings.enable_incoming_tcp {
+            self.alerts.post(Alert::PeerBlocked {
+                ih: Sha1Hash::default(),
+                remote: remote.to_string(),
+                reason: "tcp_disabled".into(),
+            });
+            return IncomingVerdict::Reject;
+        }
+        // `outgoing_interfaces` gates — the socket's local endpoint
+        // must sit on an `accept_incoming` listen socket AND on an
+        // allowed outgoing interface.
+        if !self.settings.outgoing_interfaces.is_empty() {
+            let Some(l) = local else {
+                return IncomingVerdict::Reject;
+            };
+            let accept = self.listen_sockets.iter().any(|s| {
+                s.local_endpoint.ip() == l.ip()
+                    && s.flags
+                        .contains(crate::listen::ListenSocketFlags::ACCEPT_INCOMING)
+            });
+            if !accept || !self.verify_bound_address(l.ip()) {
+                self.alerts.post(Alert::PeerBlocked {
+                    ih: Sha1Hash::default(),
+                    remote: remote.to_string(),
+                    reason: "invalid_local_interface".into(),
+                });
+                return IncomingVerdict::Reject;
+            }
+        }
+        // `has_incoming_connections` — a non-local inbound proves the
+        // listen port is reachable; local conns don't count upstream.
+        if !bitdaemon_net::ip_helpers::is_local(&remote.ip()) {
+            self.counters
+                .set(crate::counters::Counter::HasIncomingConnections, 1);
+        }
+        // session-level `ip_filter` — skipped while any torrent opts
+        // out (`non_filter_torrents` gauge; the peer may belong to it).
+        if self
+            .counters
+            .value(crate::counters::Counter::NonFilterTorrents)
+            == 0
+            && self.ip_filter.access(remote.ip()) == bitdaemon_net::ip_filter::BLOCKED
+        {
+            self.alerts.post(Alert::PeerBlocked {
+                ih: Sha1Hash::default(),
+                remote: remote.to_string(),
+                reason: "ip_filter".into(),
+            });
+            return IncomingVerdict::Reject;
+        }
+        // `m_torrents.empty()` — no want-on-unknown-torrent extension
+        // slot exists on our side.
+        if self.torrents.is_empty() {
+            return IncomingVerdict::Reject;
+        }
         // the conn object doesn't exist yet — upstream rolls up the
         // limit factor over a throwaway `peer_class_set`.
         let mask = self.peer_class_mask(remote.ip(), socket_type_to_filter(kind));
@@ -5219,6 +5714,37 @@ impl Session {
         } else {
             IncomingVerdict::Accept
         }
+    }
+
+    /// `session_impl::verify_bound_address` — `addr` must be one of
+    /// the configured `outgoing_interfaces` (by literal IP) or sit on
+    /// a device named in the list (resolved through the cached
+    /// interface enumeration).
+    fn verify_bound_address(&mut self, addr: std::net::IpAddr) -> bool {
+        let list = String::from_utf8_lossy(&self.settings.outgoing_interfaces);
+        for entry in list.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            if entry.parse::<std::net::IpAddr>().is_ok_and(|ip| ip == addr) {
+                return true;
+            }
+        }
+        // the addr isn't a listed literal — map it to a device name
+        // via the interface cache and match on that.
+        if self.cached_interfaces.is_empty() {
+            self.cached_interfaces = bitdaemon_net::enum_net::enum_interfaces();
+        }
+        let Some(iface) = self
+            .cached_interfaces
+            .iter()
+            .find(|i| i.interface_address == addr)
+        else {
+            return false;
+        };
+        let device = iface.name.clone();
+        list.split(',').any(|s| s.trim() == device)
     }
 
     /// `session_impl::ban_ip` — insert a host rule into
@@ -6363,11 +6889,19 @@ impl Session {
         // dispatches the dials.
         let policy = self.settings.out_enc_policy;
         let stime = self.session_time;
-        for (ih, ep, enc) in self.try_connect_more_peers(stime, policy, None) {
+        for (ih, ep, enc, fast, pid) in self.try_connect_more_peers(stime, policy, None) {
+            // `peer_connect_alert` — upstream posts it at dial for
+            // outgoing conns.
+            self.alerts.post(Alert::PeerConnect {
+                ih,
+                remote: ep.to_string(),
+            });
             out.push(SessionOut::ConnectPeer {
                 ih,
                 ep,
                 encrypted: enc,
+                fast_reconnect: fast,
+                our_pid: pid,
             });
         }
         self.unchoke_tick(out);
@@ -7460,8 +7994,20 @@ impl Session {
     fn unchoke_tick(&mut self, out: &mut Vec<SessionOut>) {
         let unchoke_every = self.settings.unchoke_interval.as_secs().max(1) as i32;
         let opt_every = self.settings.optimistic_unchoke_interval.as_secs().max(1) as i32;
-        let run_unchoke = self.session_time % unchoke_every == 0;
-        let run_optimistic = self.session_time % opt_every == 0;
+        // `trigger_unchoke`/`trigger_optimistic_unchoke` — upstream
+        // zeroes the time scaler when a vacated slot should refill
+        // immediately (conn removed while unchoked / optimistic).
+        // The flag aggregates over torrents and re-arms the tick.
+        let mut trigger_unchoke = false;
+        let mut trigger_optimistic = false;
+        for t in self.torrents.values_mut() {
+            trigger_unchoke |= t.triggered_unchoke;
+            trigger_optimistic |= t.triggered_optimistic;
+            t.triggered_unchoke = false;
+            t.triggered_optimistic = false;
+        }
+        let run_unchoke = self.session_time % unchoke_every == 0 || trigger_unchoke;
+        let run_optimistic = self.session_time % opt_every == 0 || trigger_optimistic;
         if !run_unchoke && !run_optimistic {
             return;
         }
@@ -7965,6 +8511,15 @@ impl Session {
                         t.choke_peer(peer, &self.counters, &self.peer_class_pool, &mut te);
                     }
                     self.route(ih, te, out);
+                }
+                TorrentEffect::GracefulPauseDone => {
+                    // `set_paused(true)` on a graceful-paused torrent
+                    // — `m_graceful_pause_mode` clears and `do_pause`
+                    // runs (posts `TorrentPaused`, `stop_announcing`).
+                    if let Some(t) = self.torrents.get_mut(&ih) {
+                        t.graceful_pause = false;
+                    }
+                    self.do_pause(&ih, out);
                 }
                 TorrentEffect::DisconnectPeer { peer, reason, sev } => {
                     // `peer_connection::disconnect` — teardown +

@@ -151,3 +151,77 @@ pub fn error_to_close_reason(ec: LtError) -> CloseReason {
         _ => CloseReason::None,
     }
 }
+
+/// `reason` is the upstream error *name* carried on our
+/// `DisconnectPeer`/`PeerGone` paths (e.g. `"self_connection"`,
+/// `"too_many_connections"`) — mapped to the same `close_reason_t`
+/// `disconnect(ec, …)` would send on the wire. Unmapped names return
+/// `None` (upstream's catch-all).
+#[must_use]
+pub fn reason_to_close_reason(reason: &str) -> CloseReason {
+    match reason {
+        "self_connection" => CloseReason::SelfConnection,
+        "duplicate_peer_id" | "duplicate peer id" => CloseReason::DuplicatePeerId,
+        "invalid_info_hash" | "mismatching_info_hash" => CloseReason::InvalidInfoHash,
+        "too_many_connections" => CloseReason::TooManyConnections,
+        "banned_by_port_filter" | "port_filter" => CloseReason::PortBlocked,
+        "banned_by_ip_filter"
+        | "ip_filter"
+        | "peer_banned"
+        | "address_filter"
+        | "requires_ssl_connection"
+        | "invalid_ssl_cert"
+        | "not_an_ssl_torrent" => CloseReason::Blocked,
+        "tcp_disabled" | "utp_disabled" | "invalid_local_interface" | "protocol_blocked" => {
+            CloseReason::ProtocolBlocked
+        }
+        "torrent_paused" | "torrent_removed" | "torrent_aborted" | "session_closing"
+        | "stopping_torrent" | "torrent_not_ready" | "clear_peers" => CloseReason::TorrentRemoved,
+        "upload-upload" | "upload_upload_connection" | "torrent finished" | "torrent_finished" => {
+            CloseReason::UploadToUpload
+        }
+        "uninteresting_upload_peer" => CloseReason::NotInterestedUploadOnly,
+        "timed_out" => CloseReason::Timeout,
+        "timed_out_no_interest" => CloseReason::TimedOutInterest,
+        "timed_out_inactivity" => CloseReason::TimedOutActivity,
+        "timed_out_no_handshake" => CloseReason::TimedOutHandshake,
+        "timed_out_no_request" => CloseReason::TimedOutRequest,
+        "invalid_have" | "invalid have index" => CloseReason::InvalidHaveMessage,
+        "invalid_bitfield_size" | "invalid_bitfield" | "invalid bitfield" => {
+            CloseReason::InvalidBitfieldMessage
+        }
+        "too_many_requests_when_choked" | "request_when_choked" => CloseReason::RequestWhenChoked,
+        "out of memory" | "no_memory" => CloseReason::NoMemory,
+        "invalid_choke" | "invalid choke" => CloseReason::InvalidChokeMessage,
+        "invalid_unchoke" | "invalid unchoke" => CloseReason::InvalidUnchokeMessage,
+        "invalid_interested" => CloseReason::InvalidInterestedMessage,
+        "invalid_not_interested" => CloseReason::InvalidNotInterestedMessage,
+        "invalid_request" | "invalid request" | "invalid piece index" | "invalid piece size" => {
+            CloseReason::InvalidRequestMessage
+        }
+        "invalid piece" | "invalid_piece" | "invalid_piece_size" => {
+            CloseReason::InvalidPieceMessage
+        }
+        "invalid_cancel" | "invalid cancel" => CloseReason::InvalidCancelMessage,
+        "invalid_dht_port" | "invalid dht port" => CloseReason::InvalidDhtPortMessage,
+        "invalid_suggest" | "invalid suggest" => CloseReason::InvalidSuggestMessage,
+        "invalid_have_all" => CloseReason::InvalidHaveAllMessage,
+        "invalid_have_none" => CloseReason::InvalidHaveNoneMessage,
+        "invalid_reject" | "invalid reject" => CloseReason::InvalidRejectMessage,
+        "invalid_allow_fast" | "invalid allow fast" => CloseReason::InvalidAllowFastMessage,
+        "invalid_extended" | "invalid extended" => CloseReason::InvalidExtendedMessage,
+        "invalid_message" | "invalid message id" => CloseReason::InvalidMessageId,
+        "packet_too_large" | "message_too_big" => CloseReason::MessageTooBig,
+        "optimistic_disconnect" => CloseReason::PeerChurn,
+        "too_many_corrupt_pieces" | "smart_ban: corrupt block" => CloseReason::CorruptPieces,
+        "metadata_too_large" | "invalid_metadata_size" => CloseReason::MetadataTooBig,
+        "invalid_metadata_request" => CloseReason::InvalidMetadataRequestMessage,
+        "invalid_metadata_offset" => CloseReason::InvalidMetadataOffset,
+        "invalid_metadata_message" | "invalid_metadata" => CloseReason::InvalidMetadataMessage,
+        "pex message too large" | "pex_message_too_large" => CloseReason::PexMessageTooBig,
+        "invalid pex message" | "invalid_pex_message" => CloseReason::InvalidPexMessage,
+        "too frequent pex" | "too_frequent_pex" => CloseReason::PexTooFrequent,
+        "invalid_dont_have" => CloseReason::InvalidDontHaveMessage,
+        _ => CloseReason::None,
+    }
+}

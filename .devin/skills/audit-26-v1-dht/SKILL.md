@@ -43,7 +43,8 @@ affiner avec la section `## Fichiers du fix` du rapport.
 L'invocation précise le mode ; **défaut : `rapport`**. Le découpage existe
 parce que plusieurs audits peuvent tourner en parallèle : la phase
 d'analyse est read-only sur le repo (zéro conflit), la phase de
-correction s'exécute dans un worktree + branche dédiés, mergée via PR.
+correction s'exécute dans un worktree + branche dédiés ; le merge est
+local et décidé par l'humain.
 
 ### Analyse commune (mode A l'exécute, mode B s'appuie sur le rapport)
 
@@ -174,13 +175,19 @@ autres).
     quasi nuls entre apply parallèles ; en cas de conflit au merge,
     rebase + gates comme pour le reste.
 12. Commit `fix(<crate>): <scope> parity — <mot-clé>` **sur la branche
-    `audit/26-dht`** — jamais sur `main`. Push la branche,
-    `gh pr create`. Merges séquentiels (un audit à la fois) ; si conflit
-    sur les fichiers chauds (`torrent.rs`/`peer_conn.rs`/`session.rs`),
-    rebaser sur `main` frais puis re-run les gates avant merge.
+    `audit/26-dht`** — jamais sur `main`. **Tout reste local** :
+    pas de push, pas de PR — le merge est décidé et exécuté par
+    l'humain (`git merge audit/26-dht` dans le checkout
+    principal). Signaler « prêt à merger » et s'arrêter là. Si le
+    merge révèle des conflits (`torrent.rs`/`peer_conn.rs`/
+    `session.rs`/`PORTING.md`) : rebase de la branche sur `main` frais
+    **dans le worktree** + re-run des gates, puis redonner le feu.
 13. **Résultat** : ajouter une section `## Résultat` au rapport
-    (déviations corrigées, tests ajoutés, hash du commit, lien PR).
-    Après merge : `git worktree remove ../LibtorrentRust-a26`.
+    (déviations corrigées, tests ajoutés, hash du commit).
+    **Hygiène post-merge** (après merge par l'humain) : `git worktree
+    remove ../LibtorrentRust-a26` puis `git branch -d
+    audit/26-dht`. Une branche mergée qui traîne encombre la vue
+    et trompe la planification.
 
 ## Pièges connus (checklists transverses)
 

@@ -398,6 +398,12 @@ fn magnet_metadata_creates_storage() {
     assert!(s.torrents[&ih].magnet);
     assert_eq!(s.torrents[&ih].storage, StorageIndex::INVALID);
 
+    // default_flags add torrents paused — resume first (upstream
+    // `attach_to_torrent` rejects incoming conns to paused torrents
+    // unless the auto-managed queue activated it; a real client
+    // resumes the magnet right away).
+    s.set_paused(&ih, false, &mut out);
+
     // peer 1 connects BEFORE metadata and sends its bitfield while
     // our num_pieces is still unknown — it must be stored raw, not
     // truncated to zero bits

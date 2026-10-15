@@ -65,7 +65,7 @@ fn pump_capped_by_connection_speed() {
     let ih = s.add_torrent(torrent(1, 8));
     let dials = s.try_connect_more_peers(0, EncPolicy::Enabled, None);
     assert_eq!(dials.len(), 3);
-    assert!(dials.iter().all(|(i, _, _)| *i == ih));
+    assert!(dials.iter().all(|(i, ..)| *i == ih));
     // a second pass keeps handing out (candidates left).
     assert_eq!(
         s.try_connect_more_peers(1, EncPolicy::Enabled, None).len(),
@@ -87,7 +87,7 @@ fn boost_dials_deduct_from_speed() {
     }
     let dials = s.try_connect_more_peers(0, EncPolicy::Enabled, None);
     assert_eq!(dials.len(), 6);
-    assert!(dials.iter().all(|(i, _, _)| *i == ih));
+    assert!(dials.iter().all(|(i, ..)| *i == ih));
     // boost consumed — next pass is the full budget again.
     assert_eq!(
         s.try_connect_more_peers(1, EncPolicy::Enabled, None).len(),
@@ -126,8 +126,8 @@ fn finished_torrents_share_via_ratio() {
     let fin = s.add_torrent(fin);
     let dials = s.try_connect_more_peers(0, EncPolicy::Enabled, None);
     assert_eq!(dials.len(), 4);
-    let by_dl = dials.iter().filter(|(i, _, _)| *i == dl).count();
-    let by_fin = dials.iter().filter(|(i, _, _)| *i == fin).count();
+    let by_dl = dials.iter().filter(|(i, ..)| *i == dl).count();
+    let by_fin = dials.iter().filter(|(i, ..)| *i == fin).count();
     assert_eq!((by_dl, by_fin), (2, 2));
 }
 
@@ -144,7 +144,7 @@ fn prioritized_torrent_dials_first() {
     // get 10 tickets ahead of the round-robin.
     s.prioritize_connections(b);
     let dials = s.try_connect_more_peers(0, EncPolicy::Enabled, None);
-    assert!(dials.iter().all(|(i, _, _)| *i == b));
+    assert!(dials.iter().all(|(i, ..)| *i == b));
     let _ = a;
 }
 
@@ -252,18 +252,23 @@ fn utp_flags_follow_dial_outcome() {
     let st = s.peer_list_state();
     // drain one candidate manually so we control the outcome.
     let t = s.torrents.get_mut(&ih).unwrap();
-    let (ep1, _) = t.try_connect_peer(0, &st, EncPolicy::Enabled).unwrap();
-    // uTP failure → supports_utp cleared, no cooldown: an immediate
-    // re-dial at the same session_time succeeds (TCP pick upstream).
-    s.peer_connect_failed(&ih, ep1, true);
+    let (ep1, ..) = t.try_connect_peer(0, &st, EncPolicy::Enabled, &[]).unwrap();
+    // uTP failure → supports_utp cleared, no cooldown: upstream
+    // `connect_failed` re-dials the SAME entry over TCP right away
+    // (`connect_to_peer(pi, ignore_limit)`) — the retry rides
+    // `pending_out`, bypassing the candidate scan.
+    s.peer_connect_failed(&ih, ep1, true, false);
     let i = s.torrents[&ih].peer_list.find_peer(ep1.ip()).unwrap();
     assert!(!s.torrents[&ih].peer_list.peers()[i].supports_utp);
+    assert!(s.pending_out.iter().any(|o| matches!(
+        o,
+        SessionOut::ConnectPeer { ep, .. } if *ep == ep1
+    )));
+    // the other candidate still dials normally through the pump.
     let t = s.torrents.get_mut(&ih).unwrap();
-    assert!(t.try_connect_peer(1, &st, EncPolicy::Enabled).is_some());
-    // uTP success on the other peer → confirmed + supports cleared.
-    let (ep2, _) = t.try_connect_peer(1, &st, EncPolicy::Enabled).unwrap();
+    let (ep2, ..) = t.try_connect_peer(1, &st, EncPolicy::Enabled, &[]).unwrap();
     let t = s.torrents.get_mut(&ih).unwrap();
-    t.peer_connected_addr(ep2, false, 1, true);
+    t.peer_connected_outgoing(ep2, false, 1, 1, false, true, None);
     let i = t.peer_list.find_peer(ep2.ip()).unwrap();
     let p = &t.peer_list.peers()[i];
     assert!(p.confirmed_supports_utp);

@@ -407,6 +407,21 @@ pub struct PeerConn {
     pub we_sent_interested: bool,
     /// remote endpoint (`m_remote`) — needed for `ut_pex` diffs.
     pub remote: Option<std::net::SocketAddr>,
+    /// `local_endpoint()` — our socket's local endpoint; `None`
+    /// when the transport doesn't report one. Drives the
+    /// `peer_list::new_connection` self-connection legs
+    /// (`i->connection->remote() == c.local_endpoint()`).
+    pub local: Option<std::net::SocketAddr>,
+    /// `m_our_pid` — the peer-id WE sent in *this* conn's handshake.
+    /// Upstream generates one per connection (`generate_peer_id`
+    /// at `create_peer_connection`) and tracks outgoing ones in
+    /// `m_outgoing_pids` for `is_self_connection`.
+    pub our_peer_id: Option<PeerId>,
+    /// `m_fast_reconnect` — this conn is an MSE/plaintext retry
+    /// (`fast_reconnect(true)` at the `pe_enabled` toggle leg):
+    /// `connection_closed` keeps the dial-time `last_connected`
+    /// stamp so the fallback isn't cooled out.
+    pub fast_reconnect: bool,
     /// pex update bookkeeping — the set we last sent this peer.
     pub pex_sent: std::collections::BTreeSet<std::net::SocketAddr>,
     /// `m_peers`/`m_peers6` — endpoints this peer has told us about
@@ -549,6 +564,9 @@ impl PeerConn {
             last_seen_complete: 0,
 
             remote: None,
+            local: None,
+            our_peer_id: None,
+            fast_reconnect: false,
             pex_sent: std::collections::BTreeSet::new(),
             pex_known: std::collections::BTreeSet::new(),
             pex_rx_times: std::collections::VecDeque::new(),
@@ -1780,6 +1798,7 @@ impl PeerConn {
                         {
                             self.received_listen_port = true;
                             self.peer_listen_port = Some(p);
+                            eff.push(PeerEffect::ListenPort(p));
                         }
                         // `reqq` — the peer's max tolerated request
                         // queue (upstream `max_out_request_queue(reqq)`);
@@ -2034,6 +2053,21 @@ impl PeerConn {
             .iter()
             .chain(self.pipeline.request_queue.iter())
             .map(|b| b.block)
+            .collect()
+    }
+
+    /// The queued entries themselves (download + request queues) —
+    /// `remove_peer`'s abort loop needs `timed_out`/`not_wanted`
+    /// because upstream only releases picker state for entries that
+    /// are neither (`!b.timed_out && !b.not_wanted` — a timed-out or
+    /// unwanted block already lost its picker refcount).
+    #[must_use]
+    pub fn outstanding_entries(&self) -> Vec<crate::peer_pipeline::PendingBlock> {
+        self.pipeline
+            .download_queue
+            .iter()
+            .chain(self.pipeline.request_queue.iter())
+            .copied()
             .collect()
     }
 
@@ -2313,6 +2347,12 @@ pub enum PeerEffect {
     /// `yourip` from the BEP-10 handshake — the peer's view of our
     /// external address (`ip_voter` `source_peer`).
     YourIp(std::net::IpAddr),
+    /// `p` port from the BEP-10 handshake — the peer's real listen
+    /// port (upstream `peer_list::update_peer_port`; an inbound
+    /// conn's source port is ephemeral, so this makes the entry
+    /// dialable). `false` back from `update_peer_port` drops the
+    /// conn — the endpoint now collides with another live peer.
+    ListenPort(u16),
     /// `torrent::seen_complete` — a peer proved a complete copy
     /// exists (upstream marks it on `have_all` with prior payload,
     /// and on every `piece` a seed delivers).

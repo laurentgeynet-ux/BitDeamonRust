@@ -58,6 +58,18 @@ impl PeerConnector for TokioTcpConnector {
         addr: SocketAddr,
         bind: Option<SocketAddr>,
     ) -> Pin<Box<dyn Future<Output = crate::Result<BoxedPeerStream>> + Send + Sync>> {
+        Box::pin(async move { self.connect_with_bind_report(addr, bind).await.map(|r| r.0) })
+    }
+
+    fn connect_with_bind_report(
+        self: Arc<Self>,
+        addr: SocketAddr,
+        bind: Option<SocketAddr>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = crate::Result<(BoxedPeerStream, Option<SocketAddr>)>> + Send + Sync,
+        >,
+    > {
         Box::pin(async move {
             let s = match bind {
                 None => TcpStream::connect(addr).await?,
@@ -81,7 +93,8 @@ impl PeerConnector for TokioTcpConnector {
                 }
             };
             let _ = s.set_nodelay(true);
-            Ok(Box::new(s) as BoxedPeerStream)
+            let local = s.local_addr().ok();
+            Ok((Box::new(s) as BoxedPeerStream, local))
         })
     }
 }

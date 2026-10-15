@@ -103,7 +103,12 @@ fn verified_piece_emits_have_to_peers() {
         &ih,
         2,
         PeerConn::new(2, PeerPipeline::new(1000, 30, 250), 0),
-        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 6881),
+        // distinct IP — `new_connection` drops same-IP incoming dups
+        // (`allow_multiple_connections_per_ip` off by default).
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 2)),
+            6881,
+        ),
         &mut out,
     );
 
@@ -327,16 +332,16 @@ fn connect_candidates_backoff_on_failure() {
         s.torrents
             .get_mut(&ih)
             .unwrap()
-            .try_connect_peer(0, &st, pol)
+            .try_connect_peer(0, &st, pol, &[])
             .is_none()
     );
     // dial fails → backoff window blocks re-dial at t=1
-    s.peer_connect_failed(&ih, ep, false);
+    s.peer_connect_failed(&ih, ep, false, false);
     assert!(
         s.torrents
             .get_mut(&ih)
             .unwrap()
-            .try_connect_peer(1, &st, pol)
+            .try_connect_peer(1, &st, pol, &[])
             .is_none()
     );
     // after min_reconnect_time*(failcount+1)=120s it's a candidate again
@@ -344,9 +349,9 @@ fn connect_candidates_backoff_on_failure() {
         .torrents
         .get_mut(&ih)
         .unwrap()
-        .try_connect_peer(200, &st, pol);
+        .try_connect_peer(200, &st, pol, &[]);
     // the failed plaintext dial left pe_support armed → MSE retry.
-    assert_eq!(c, Some((ep, true)));
+    assert_eq!(c.map(|x| (x.0, x.1)), Some((ep, true)));
 }
 
 #[test]
@@ -1278,7 +1283,8 @@ fn unchoke_tick_unchokes_top_peer() {
             &ih,
             pid,
             PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
-            "127.0.0.1:6881".parse().unwrap(),
+            // distinct IPs — same-IP incoming dups are dropped.
+            format!("127.0.0.{}:6881", pid).parse().unwrap(),
             &mut out,
         );
         // mark them interested + give pid 1 the best upload rate

@@ -1,7 +1,7 @@
 # Guide utilisateur — audits de parité BitDaemon vs libtorrent
 
 Mode d'emploi du système d'audits en deux phases (rapports parallèles,
-puis corrections en worktrees + PRs). Le registre et les vagues sont
+puis corrections en worktrees + merges locaux). Le registre et les vagues sont
 dans [`INDEX.md`](INDEX.md) ; ce guide explique **comment les
 opérer**, pas ce qu'ils contiennent.
 
@@ -14,7 +14,7 @@ audits `done` (A08–A10, A14–A15) gardent leur place.
 | Mode | Ce qu'il fait | Parallélisable ? |
 |---|---|---|
 | `rapport` | Analyse C++ vs Rust, écrit `docs/audits/reports/ANN_<slug>.md`, le commit sur `main` | **Oui, totalement** — read-only, un seul fichier écrit |
-| `apply` | Corrige le code dans un worktree + branche `audit/NN-<slug>`, gates, fragment changelog, PR | Oui, **par worktree**, merges séquentiels |
+| `apply` | Corrige le code dans un worktree + branche `audit/NN-<slug>`, gates, fragment changelog, signale « prêt à merger » | Oui, **par worktree** ; le merge local est l'acte de l'humain |
 
 Pourquoi ce découpage : la phase coûteuse (lire le C++ upstream) est
 read-only → elle scale à l'infini. La phase dangereuse (modifier le
@@ -27,8 +27,6 @@ code, compiler, commiter) est isolée par worktree → pas de verrous
 - [ ] `main` propre : aucun travail non commité dans le checkout
       principal (les worktrees `apply` partent de `main` — le
       non-commité n'est ni propagé ni protégé).
-- [ ] `gh` CLI installé et authentifié (les PRs sont ouvertes par
-      `gh pr create`).
 - [ ] Checkout upstream C++ résolvable : `$LIBTORRENT_ROOT` défini, ou
       `D:/Projet/libtorrent/libtorrent` présent. En session cloud, le
       skill clone `arvidn/libtorrent` au baseline `e7381c7bc` tout seul.
@@ -78,10 +76,10 @@ confirmée ou contestée :
 
 Un rapport brut contient des faux positifs possibles (logique déplacée
 dans une crate inférieure, legs intentionnellement divergents). C'est
-10 minutes par rapport et ça évite des PRs qui "corrigent" du
+10 minutes par rapport et ça évite des merges qui "corrigent" du
 comportement correct.
 
-## Phase 2 — apply (worktrees + PRs)
+## Phase 2 — apply (worktrees, merge local par vous)
 
 Pour chaque rapport validé :
 
@@ -100,7 +98,15 @@ découverts dans le worktree aussi — et lancez :
 L'agent corrige, porte les tests de régression, fait tourner les gates
 complets dans le worktree (`fmt --all`, `clippy --workspace`,
 `test --workspace`, `doc`), écrit le fragment
-`docs/audits/changelog/A05.md`, push la branche et ouvre la PR.
+`docs/audits/changelog/A05.md` + `## Résultat` dans le rapport,
+commit sur sa branche et signale « prêt à merger ». **Tout reste
+local — l'agent ne merge ni ne pushe jamais.**
+
+Le merge est votre acte, dans le checkout principal :
+
+```sh
+git merge audit/05-utp-transport
+```
 
 **Cas particulier — un seul audit à la fois** : si rien d'autre ne
 tourne, le checkout principal suffit (branche `audit/NN-<slug>` en
@@ -118,10 +124,13 @@ place). Le worktree n'est obligatoire que pour la concurrence.
 
 ### Merges
 
-- **Une PR à la fois.** En cas de conflit sur `torrent.rs` /
-  `peer_conn.rs` / `session.rs` : l'agent rebase sur `main` frais,
-  re-run des gates, puis merge.
-- Après merge : `git worktree remove ../LibtorrentRust-aNN`.
+- **Une branche à la fois.** En cas de conflit sur `torrent.rs` /
+  `peer_conn.rs` / `session.rs` / `PORTING.md` : l'agent rebase sa
+  branche sur `main` frais **dans son worktree**, re-run des gates,
+  puis vous re-`git merge`.
+- Après merge : `git worktree remove ../LibtorrentRust-aNN` +
+  `git branch -d audit/NN-<slug>` — ne pas laisser traîner les
+  branches mergées.
 
 ### Limites machine
 
@@ -132,7 +141,7 @@ dédiés, zéro contention).
 
 ## Phase 3 — agrégation changelog (une fois, à la fin)
 
-Après merge des PRs :
+Après merge des branches :
 
 ```sh
 python docs/audits/_aggregate_changelog.py
@@ -154,7 +163,8 @@ committer.
 - ❌ Éditer `CHANGELOG.md` ou `PORTING.md` dans une branche apply
   (fragments `changelog/ANN.md` à la place ; `PORTING.md` seulement
   pour les rows du périmètre).
-- ❌ Push sur `main` depuis un apply — toujours branche + PR.
+- ❌ Merger ou pusher depuis une session apply — le merge est
+  l'acte de l'humain ; tout reste local, pas de PR.
 - ❌ Lancer A29 avant la fin des autres (il re-audite les compteurs
   que les fixes précédents auront touchés).
 - ❌ Modifier le checkout upstream — lecture seule, toujours.
@@ -175,8 +185,8 @@ révèle un recouvrement chaud, re-planifiez-le vers la vague 4.
 
 **Conflit de merge sur `torrent.rs` ?**
 Normal en vague 4 — c'est pour ça que les merges sont séquentiels.
-`git checkout main && git pull && git rebase main` dans la branche,
-re-run gates, merge.
+`git rebase main` dans le worktree de la branche, re-run gates, puis
+vous re-`git merge` dans le checkout principal.
 
 **Une session cloud n'a pas `D:\` ?**
 Le skill résout upstream via `$LIBTORRENT_ROOT` puis clone

@@ -165,7 +165,7 @@ fn candidates_and_failcount() {
     let key_of = |l: &PeerList, i: usize| (l.peers()[i].addr.clone(), l.peers()[i].port);
     assert!(!cands.contains(&key_of(&l, i)));
     // connected peer isn't a candidate
-    l.set_connected(l.find_peer(ep(2, 6881).ip()).unwrap(), 900, false);
+    l.set_connected(l.find_peer(ep(2, 6881).ip()).unwrap(), 900, false, 7);
     assert_eq!(l.num_connect_candidates(), 3);
     l.connection_closed(
         l.find_peer(ep(2, 6881).ip()).unwrap(),
@@ -189,11 +189,11 @@ fn connection_closed_fast_reconnect_keeps_stamp() {
     let st = PeerListState::default();
     let mut l = PeerList::new(&st);
     let (i, _) = add(&mut l, ep(1, 6881), PeerSourceFlags::TRACKER).unwrap();
-    l.set_connected(i, 100, true);
+    l.set_connected(i, 100, true, 7);
     assert_eq!(l.peers()[i].last_connected, 0);
     l.connection_closed(i, 500, true, false, &st);
     assert_eq!(l.peers()[i].last_connected, 0);
-    l.set_connected(i, 600, false);
+    l.set_connected(i, 600, false, 7);
     assert_eq!(l.peers()[i].last_connected, 600);
 }
 
@@ -208,7 +208,7 @@ fn connection_closed_multi_conn_evicts_anonymous() {
     let mut l = PeerList::new(&st);
     let i = l.add_incoming(ep(1, 40000), &st).unwrap();
     assert!(!l.peers()[i].connectable);
-    l.set_connected(i, 10, false);
+    l.set_connected(i, 10, false, 7);
     l.connection_closed(i, 20, false, false, &st);
     assert_eq!(l.num_peers(), 0);
 }
@@ -222,7 +222,7 @@ fn set_connected_clears_maybe_upload_only() {
         .add_peer(ep(1, 6881), PeerSourceFlags::PEX, PexFlags::SEED, &st)
         .unwrap();
     assert!(l.peers()[i].maybe_upload_only);
-    l.set_connected(i, 0, false);
+    l.set_connected(i, 0, false, 7);
     assert!(!l.peers()[i].maybe_upload_only);
 }
 
@@ -424,7 +424,7 @@ fn ban_and_filter() {
 
     // a connected filtered peer is reported *and* its entry erased
     let (j, _) = add(&mut l, ep(3, 6881), PeerSourceFlags::TRACKER).unwrap();
-    l.set_connected(j, 0, false);
+    l.set_connected(j, 0, false, 7);
     let banned = l.apply_ip_filter(|a| a == ep(3, 6881).ip());
     assert_eq!(banned, vec![ep(3, 6881).ip()]);
     assert!(l.find_peer(ep(3, 6881).ip()).is_none());
@@ -461,4 +461,202 @@ fn set_seed_and_upload_only() {
     // BEP-21 upload_only is not a full seed — num_seeds untouched
     l.set_upload_only(i, true);
     assert_eq!(l.num_seeds(), 1);
+}
+
+// ---------------------------------------------------------------------
+// A07 — `peer_list::new_connection` admission legs (upstream
+// `peer_list::new_connection`, src/peer_list.cpp).
+
+use bitdaemon_net::peer_list::{AttachedConn, NewConnVerdict};
+
+fn conn(
+    remote: SocketAddr,
+    local: Option<SocketAddr>,
+    outgoing: bool,
+    failed: bool,
+) -> AttachedConn {
+    AttachedConn {
+        remote,
+        local,
+        outgoing,
+        failed,
+        key: 7,
+    }
+}
+
+#[test]
+fn new_connection_unknown_and_banned() {
+    let st = PeerListState::default();
+    let mut l = PeerList::new(&st);
+
+    // unknown endpoint → incoming entry, attach index returned
+    let v = l.new_connection(ep(9, 40000), None, &st, &|_| None, false);
+    let NewConnVerdict::Attach(i) = v else {
+        panic!("unknown endpoint must attach");
+    };
+    assert!(!l.peers()[i].connectable);
+    assert!(l.peers()[i].source.contains(PeerSourceFlags::INCOMING));
+
+    // banned entries are refused before anything else
+    let (j, _) = add(&mut l, ep(1, 6881), PeerSourceFlags::TRACKER).unwrap();
+    l.ban_peer(j);
+    let v = l.new_connection(ep(1, 6881), None, &st, &|_| None, false);
+    assert!(matches!(v, NewConnVerdict::Banned));
+}
+
+#[test]
+fn new_connection_same_direction_dup() {
+    let st = PeerListState::default();
+    let mut l = PeerList::new(&st);
+    let i = l.add_incoming(ep(1, 40000), &st).unwrap();
+    l.set_connected(i, 0, false, 7);
+    // a second *incoming* conn to an entry with an incoming conn is
+    // dropped unconditionally (upstream `c->is_outgoing()` leg).
+    let oc = conn(ep(1, 40000), Some(ep(0, 6881)), false, false);
+    let v = l.new_connection(ep(1, 40000), Some(ep(0, 6881)), &st, &|_| Some(oc), false);
+    assert!(matches!(v, NewConnVerdict::KillSelf));
+}
+
+#[test]
+fn new_connection_cross_direction_ports() {
+    let st = PeerListState::default();
+    let mut l = PeerList::new(&st);
+    // entry dialed out to ep(1, 40000) — live outgoing conn bound.
+    let (i, _) = add(&mut l, ep(1, 40000), PeerSourceFlags::TRACKER).unwrap();
+    l.set_connected(i, 0, false, 7);
+
+    // our listen port is *lower* than the existing conn's remote port
+    // → upstream `our_port < other_port` keeps their outgoing conn,
+    // drops our incoming one.
+    let oc = conn(ep(1, 40000), Some(ep(2, 5000)), true, false);
+    let v = l.new_connection(ep(1, 9000), Some(ep(0, 6000)), &st, &|_| Some(oc), false);
+    assert!(matches!(v, NewConnVerdict::KillSelf));
+
+    // our listen port is *higher* → we keep our outgoing conn and the
+    // incoming one replaces it (`m_locked_peer` swap → KillOther).
+    let oc = conn(ep(1, 40000), Some(ep(2, 5000)), true, false);
+    let v = l.new_connection(ep(1, 9000), Some(ep(0, 50000)), &st, &|_| Some(oc), false);
+    assert!(matches!(v, NewConnVerdict::KillOther { index, other_key: 7, .. } if index == i));
+
+    // equal ports → `random(1)` tiebreak: coin=true drops the new conn.
+    let v = l.new_connection(ep(1, 9000), Some(ep(0, 40000)), &st, &|_| Some(oc), true);
+    assert!(matches!(v, NewConnVerdict::KillSelf));
+    let v = l.new_connection(ep(1, 9000), Some(ep(0, 40000)), &st, &|_| Some(oc), false);
+    assert!(matches!(v, NewConnVerdict::KillOther { .. }));
+
+    // a *failed* existing conn loses regardless of port order
+    // (`disconnect1 &= !i->connection->failed()`).
+    let oc_failed = conn(ep(1, 40000), Some(ep(2, 5000)), true, true);
+    let v = l.new_connection(
+        ep(1, 9000),
+        Some(ep(0, 6000)),
+        &st,
+        &|_| Some(oc_failed),
+        false,
+    );
+    assert!(matches!(v, NewConnVerdict::KillOther { .. }));
+}
+
+#[test]
+fn new_connection_self_detect() {
+    let st = PeerListState::default();
+    let mut l = PeerList::new(&st);
+    // outgoing conn to ep(5, 6881) whose LOCAL endpoint is ep(5, 9000):
+    // an inbound conn FROM ep(5,9000) is us connecting to ourselves.
+    let (i, _) = add(&mut l, ep(5, 6881), PeerSourceFlags::TRACKER).unwrap();
+    l.set_connected(i, 0, false, 7);
+    let oc = conn(ep(5, 6881), Some(ep(5, 9000)), true, false);
+    let v = l.new_connection(ep(5, 9000), None, &st, &|_| Some(oc), false);
+    assert!(matches!(
+        v,
+        NewConnVerdict::SelfConnect { index, other_key: 7, .. } if index == i
+    ));
+
+    // mirror leg: our inbound conn's LOCAL endpoint equals the
+    // existing outgoing conn's remote — we dialed out to our own
+    // listen address and the SYN just came back in.
+    let oc2 = conn(ep(5, 6881), Some(ep(3, 1111)), true, false);
+    let v = l.new_connection(ep(5, 9000), Some(ep(5, 6881)), &st, &|_| Some(oc2), false);
+    assert!(matches!(v, NewConnVerdict::SelfConnect { .. }));
+}
+
+#[test]
+fn new_connection_stale_mark_attaches() {
+    let st = PeerListState::default();
+    let mut l = PeerList::new(&st);
+    let (i, _) = add(&mut l, ep(7, 6881), PeerSourceFlags::TRACKER).unwrap();
+    // `connection` marked but the conn is gone (dial slot cleared
+    // without unwind) — upstream clears the pointer and attaches.
+    l.set_connected(i, 0, false, 7);
+    assert_eq!(l.num_connect_candidates(), 0);
+    let v = l.new_connection(ep(7, 6881), None, &st, &|_| None, false);
+    assert!(matches!(v, NewConnVerdict::Attach(index) if index == i));
+    // clearing the stale mark restores candidacy (the mark's
+    // `set_connected` had deducted it); the attach-side
+    // `set_connected` will deduct it again — net zero.
+    assert_eq!(l.num_connect_candidates(), 1);
+    let _ = l.set_connected(i, 0, false, 9);
+    assert_eq!(l.num_connect_candidates(), 0);
+    assert_eq!(l.peers()[i].conn_key, 9);
+}
+
+#[test]
+fn new_connection_full_list() {
+    // cap=1, single entry *connected* so `erase_peers(force)` can't
+    // evict it → a new inbound endpoint is Full (upstream
+    // `too_many_connections`).
+    let st = PeerListState {
+        max_peerlist_size: 1,
+        ..Default::default()
+    };
+    let mut l = PeerList::new(&st);
+    let (i, _) = add(&mut l, ep(1, 6881), PeerSourceFlags::TRACKER).unwrap();
+    l.set_connected(i, 0, false, 7);
+    let v = l.new_connection(ep(9, 40000), None, &st, &|_| None, false);
+    assert!(matches!(v, NewConnVerdict::Full));
+}
+
+#[test]
+fn set_connected_transfers_prev_amount() {
+    let st = PeerListState::default();
+    let mut l = PeerList::new(&st);
+    let (i, _) = add(&mut l, ep(1, 6881), PeerSourceFlags::TRACKER).unwrap();
+    l.peers_mut()[i].prev_amount_download = 5;
+    l.peers_mut()[i].prev_amount_upload = 3;
+    // a real conn (conn_key != 0) collects the parked KiB as bytes.
+    let (dl, ul) = l.set_connected(i, 10, false, 7);
+    assert_eq!((dl, ul), (5 * 1024, 3 * 1024));
+    assert_eq!(l.peers()[i].prev_amount_download, 0);
+    assert_eq!(l.peers()[i].prev_amount_upload, 0);
+    // conn_key survives a `update_peer_port` rewrite — bookkeeping
+    // (`connection_closed`) still finds the entry.
+    l.peers_mut()[i].prev_amount_download = 2;
+    let _ = l.update_peer_port(9000, i, PeerSourceFlags::DHT, &st);
+    assert_eq!(l.peers()[i].conn_key, 7);
+    assert_eq!(l.peers()[i].port, 9000);
+    // a pending-dial mark (conn_key 0) does NOT collect — totals stay.
+    l.connection_closed(i, 20, false, false, &st);
+    let (dl0, _) = l.set_connected(i, 30, false, 0);
+    assert_eq!(dl0, 0);
+    assert_eq!(l.peers()[i].prev_amount_download, 2);
+}
+
+#[test]
+fn fast_reconnect_rewinds_last_connected() {
+    let st = PeerListState {
+        min_reconnect_time: 60,
+        max_failcount: 3,
+        ..Default::default()
+    };
+    let mut l = PeerList::new(&st);
+    let (i, _) = add(&mut l, ep(1, 6881), PeerSourceFlags::TRACKER).unwrap();
+    l.set_connected(i, 1000, false, 7);
+    l.connection_closed(i, 1000, false, true, &st);
+    // rewind by min_reconnect_time * max_failcount → dialable now.
+    assert!(l.fast_reconnect(i, 1000, &st));
+    assert_eq!(l.peers()[i].last_connected, 1000 - 180);
+    assert_eq!(l.peers()[i].failcount, 1);
+    // upstream ignores further fast reconnects past the cap leg.
+    l.fast_reconnect(i, 1000, &st);
+    assert!(!l.fast_reconnect(i, 1000, &st));
 }

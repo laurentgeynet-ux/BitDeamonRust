@@ -465,3 +465,78 @@ Côté Rust : `crates/bitdaemon-session/src/{session,torrent,peer_conn,counters,
   d'`i2p_alert`).
 - **Alerte `TorrentPaused` checking** — `post_alert` différé au
   dernier `checking_pieces` (`session.rs:3069-3075`) conforme.
+
+## Résultat
+
+### Déviations corrigées
+
+- **D1** — `update_peer_port` appelé depuis le handshake étendu `p`
+  (BEP-10) via `PeerEffect::ListenPort` ; la lookup conn↔entrée passe
+  par `conn_key`, robuste à la réécriture de port.
+- **D2** — `peer_list::new_connection` porté à l'attach entrant :
+  banned → `peer_banned`, self-conn par endpoint (incl. local endpoint
+  des dials en vol via `dial_locals`), dedup same-direction, règle
+  cross-direction par comparaison de ports (tiebreak `random(1)`),
+  `m_locked_peer` autour du teardown du perdant.
+- **D3** — `prev_amount_*` restaurés à la création de conn
+  (`create_peer_connection`) et repliés dans les accumulateurs du
+  torrent à la fermeture.
+- **D4** — `peer_connect_failed` upstream : échec uTP →
+  `supports_utp` clear, `fast_reconnect` armé, `connection_closed`
+  normal (pas de failcount), retry TCP immédiat du même peer via
+  `pending_out`. Refus de dial (ip_filter, transport absent) gardent
+  leur leg séparé.
+- **D5** — `on_incoming_connection` reproduit l'ordre upstream :
+  paused → enable tcp/utp (`peer_blocked`) → interface sortante +
+  bound address → `has_incoming_connections` → ip_filter
+  (`non_filter_torrents` exempte la session) → torrents vides → cap
+  `connections_limit` + `slack` → `incoming_starts_queued_torrents` /
+  torrent actif → compteur `incoming_connections` + alerte.
+- **D6** — attach par torrent : auto-resume paused+auto_managed,
+  rejet `paused`/`aborted`/`graceful_pause` à `torrent_paused`
+  peer_error, gate SSL `requires_ssl_connection`.
+- **D7** — `generate_peer_id` par connexion sortante,
+  `outgoing_pids`/`dial_pids` par torrent, fallback session-pid pour
+  la détection self-conn.
+- **D8** — `remove_peer` n'aborte au picker que les blocs
+  `!timed_out && !not_wanted` (double-release de `num_peers`
+  impossible).
+- **D9** — l'éviction `find_disconnect_candidate_torrent` +
+  `lowest_ranking_peer` tourne après les gates d'attach (conforme à
+  `exceeded_limit` upstream).
+- **D10** — `triggered_unchoke`/`triggered_optimistic` consommés par
+  `unchoke_tick` au prochain passage.
+- **D11** — `self_connection` banne l'entrée par index (pas par
+  endpoint — `update_peer_port` peut l'avoir réécrit) et tue les deux
+  legs à sévérité failure.
+- **D14** — `GracefulPauseDone` route la complétion : `do_pause` ne
+  poste `TorrentPaused` que quand le dernier pair a drainé.
+- **D15** — `reason → close_reason_t` mapper + propagation jusqu'au
+  socket uTP (`set_close_reason` à chaque tour du socket pump).
+
+### Tests ajoutés
+
+- `crates/bitdaemon-session/tests/test_peer_lifecycle_a07.rs` — 13
+  cas : gates paused/transport/interface/ip_filter-`non_filter_torrents`/
+  empty/cap, banned, self-conn via `dial_locals`, résolution
+  cross-direction dans les deux sens, pids distincts par dial +
+  lifecycle `outgoing_pids`, fallback uTP sans failcount + retry
+  `pending_out`, `conn_key` survivant à `update_peer_port`, drain
+  graceful pause, gate d'abort `!timed_out`.
+- `crates/bitdaemon-net/tests/test_peer_list.rs` — legs
+  `new_connection` (banned, self-conn endpoint, same-direction,
+  cross-direction port rule, locked_peer).
+- `test_connect_pump`/`test_session`/`test_bandwidth`/
+  `test_dht_results`/`test_magnet`/`test_swarm_list`/
+  `test_engine` — fixtures migrées : signatures à 5 tuples, conns
+  multi-IP (dedup same-IP actif), boost désactivé dans les tests de
+  dial manuel, mask d'alertes activé, magnet resumed avant attach
+  (le gate paused upstream le refuse sinon).
+
+### Livraison
+
+- Branche `audit/07-peer-lifecycle`, worktree `LibtorrentRust-a07`.
+- Commit apply : `05fbb80`
+  `fix(peer-lifecycle): upstream-fidelity apply of audit A07`
+- PR : https://github.com/laurentgeynet-ux/BitDeamonRust/pull/6
+- Fragment changelog : `docs/audits/changelog/A07.md`.
