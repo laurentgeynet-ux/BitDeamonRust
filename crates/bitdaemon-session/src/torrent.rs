@@ -126,6 +126,13 @@ pub enum TorrentEffect {
     /// clears the graceful bit and posts `torrent_paused_alert`.
     /// Session-side the handler completes `do_pause`.
     GracefulPauseDone,
+    /// `torrent::pause()` — an in-torrent error path (e.g.
+    /// `on_file_priority`'s `file_error` leg) asks the session to run
+    /// `set_paused(true, 0)` → `do_pause` rather than flipping
+    /// `paused` directly: announce gates, `disconnect_all`,
+    /// `stop_announcing` and `torrent_paused_alert` all live
+    /// session-side.
+    Pause,
 }
 
 /// The `PipelineTorrent` view `send_block_requests` needs — the
@@ -8617,13 +8624,14 @@ impl Torrent {
             out.push(TorrentEffect::Alert(crate::alerts::Alert::FileError {
                 ih: self.info_hash,
                 path: self.resolve_filename(file.0),
+                op: e.operation.name().to_string(),
                 error: e.to_string(),
             }));
             self.set_error(&e.to_string(), file.0);
-            // `pause()` — hard pause (upstream calls it on any
-            // file-priority failure).
-            self.paused = true;
-            self.state_updated();
+            // `pause()` — hard pause; upstream runs the full
+            // `do_pause` machinery (disconnect_all, stop_announcing,
+            // `torrent_paused_alert`), routed through the session.
+            out.push(TorrentEffect::Pause);
         } else {
             out.push(TorrentEffect::Alert(crate::alerts::Alert::FilePrio {
                 ih: self.info_hash,

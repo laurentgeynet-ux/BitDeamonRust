@@ -409,6 +409,7 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
             Alert::FileError {
                 ih: ih(),
                 path: "p".into(),
+                op: "file_stat".into(),
                 error: "e".into(),
             },
             43,
