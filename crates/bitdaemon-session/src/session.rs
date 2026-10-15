@@ -9,7 +9,7 @@
 //! for all torrents, the disk backend and the DHT tracker; a thin
 //! async actor (mpsc commands) wraps this in the daemon.
 //!
-//! `SessionImpl` upstream runs on the io thread; [`Session`] is
+//! `SessionImpl` upstream runs on the io thread; `Session` is
 //! transport-agnostic — sockets/streams are fed by the caller and
 //! effects drained after each call, identical to the rest of the
 //! port (ADR-0008 injected transport).
@@ -930,6 +930,10 @@ pub enum DiskCompleted {
         hash: bitdaemon_common::Sha1Hash,
         /// computed per-block SHA-256s (v2 pieces; empty for v1).
         block_hashes: Vec<bitdaemon_common::Sha256Hash>,
+        /// computed per-16KiB-block SHA-1 digests (v1 hash jobs;
+        /// empty otherwise) — the `smart_ban` block CRCs upstream
+        /// re-reads off disk per block.
+        block_digests: Vec<bitdaemon_common::Sha1Hash>,
         /// `picker_gen` — the torrent's picker generation at dispatch;
         /// a reset between dispatch and completion makes the result
         /// stale (upstream drops it before touching picker state).
@@ -1902,7 +1906,7 @@ impl Session {
                             if let Some(t) = self.torrents.get_mut(&ih) {
                                 t.hashing_started(req.piece);
                             }
-                            self.on_piece_verified(&ih, req.piece, true, out);
+                            self.on_piece_verified(&ih, req.piece, true, &[], out);
                         } else if let (Some(disk), Some(t)) =
                             (self.disk.clone(), self.torrents.get_mut(&ih))
                         {
@@ -1919,12 +1923,13 @@ impl Session {
                                 req.piece,
                                 v2,
                                 hflags,
-                                Box::new(move |piece, hash, block_hashes, err| {
+                                Box::new(move |piece, hash, block_hashes, block_digests, err| {
                                     let _ = tx.send(DiskCompleted::Hash {
                                         ih,
                                         piece,
                                         hash,
                                         block_hashes,
+                                        block_digests,
                                         picker_gen,
                                         err,
                                     });
@@ -2252,6 +2257,7 @@ impl Session {
                     piece,
                     hash,
                     block_hashes,
+                    block_digests,
                     picker_gen,
                     err,
                 } => {
@@ -2361,8 +2367,12 @@ impl Session {
                         }
                     } else {
                         match v1.or(v2) {
-                            Some(true) => self.on_piece_verified(&ih, piece, true, out),
-                            Some(false) => self.on_piece_verified(&ih, piece, false, out),
+                            Some(true) => {
+                                self.on_piece_verified(&ih, piece, true, &block_digests, out);
+                            }
+                            Some(false) => {
+                                self.on_piece_verified(&ih, piece, false, &block_digests, out);
+                            }
                             None => {
                                 if let Some(t) = self.torrents.get_mut(&ih) {
                                     t.mark_piece_finished_unchecked(piece);
@@ -2645,7 +2655,7 @@ impl Session {
                         piece,
                         v2,
                         hflags,
-                        Box::new(move |piece, hash, block_hashes, err| {
+                        Box::new(move |piece, hash, block_hashes, _digests, err| {
                             let _ = tx.send(DiskCompleted::SeedModeHash {
                                 ih,
                                 peer,
@@ -2676,12 +2686,13 @@ impl Session {
                         piece,
                         v2,
                         hflags,
-                        Box::new(move |piece, hash, block_hashes, err| {
+                        Box::new(move |piece, hash, block_hashes, block_digests, err| {
                             let _ = tx.send(DiskCompleted::Hash {
                                 ih,
                                 piece,
                                 hash,
                                 block_hashes,
+                                block_digests,
                                 picker_gen,
                                 err,
                             });
@@ -4562,9 +4573,15 @@ impl Session {
         let is_priv = t.ti.as_ref().is_some_and(|ti| ti.is_private());
         let torrent_i2p = t.ti.as_ref().is_some_and(|ti| ti.is_i2p());
         conn.local_ut_metadata = u8::from(!(is_priv && t.valid_metadata())) * 2;
-        conn.local_ut_pex = u8::from(!is_priv && !torrent_i2p);
+        // `create_ut_pex_plugin` — `priv() || (i2p() &&
+        // !allow_i2p_mixed)` refuses the plugin; a mixed-mode i2p
+        // torrent still gossips on clearnet conns.
+        conn.local_ut_pex = u8::from(!is_priv && !(torrent_i2p && !self.settings.allow_i2p_mixed));
+        // `i2p_pex_plugin::new_connection` — the peer plugin exists
+        // only on i2p sockets of a non-private i2p torrent
+        // (`is_i2p(c->get_socket())` upstream).
         conn.local_i2p_pex =
-            u8::from((!is_priv && torrent_i2p) || conn.i2p.is_some()) * crate::i2p_pex::I2P_PEX_ID;
+            u8::from(!is_priv && torrent_i2p && conn.i2p.is_some()) * crate::i2p_pex::I2P_PEX_ID;
         // `set_holepunch_mode` — upstream flags the conn right
         // after `connect_to_peer`; our dial is async so the
         // swarm entry carried the flag to this attach.
@@ -5291,23 +5308,25 @@ impl Session {
     }
 
     /// a disk write/read/hash completed for `ih`.
-    /// `piece_verified` when a hash job reports.
+    /// `piece_verified` when a hash job reports. `digests` carries
+    /// the hash job's per-16KiB-block SHA-1s — the same bytes
+    /// upstream's `smart_ban` plugin re-reads off disk per block;
+    /// an empty slice behaves like upstream's read-error leg
+    /// (the suspicious peer goes unbanned until a later piece
+    /// exposes it).
     pub fn on_piece_verified(
         &mut self,
         ih: &Sha1Hash,
         piece: bitdaemon_common::types::PieceIndex,
         passed: bool,
+        digests: &[bitdaemon_common::Sha1Hash],
         out: &mut Vec<SessionOut>,
     ) {
         let mut eff = Vec::new();
         let recheck_drained = if let Some(t) = self.torrents.get_mut(ih) {
             // `smart_ban` bookkeeping rides the same path as upstream
             // `on_piece_finished`/`on_piece_failed`: `addr` resolves a
-            // downloader's IP from its live connection; `read_digest`
-            // would re-read the block hash from disk — the disk job is
-            // async here, so we pass `None` (upstream treats a failed
-            // re-read identically: the suspicious peer goes unbanned
-            // until a later piece exposes it).
+            // downloader's IP from its live connection.
             // downloader keys are `peer_key()` values (first 8 bytes
             // of the remote peer-id), not conn ids — resolve through
             // the conn's key, not its slot in `peers`.
@@ -5329,7 +5348,7 @@ impl Session {
                         .copied()
                         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
                 },
-                |_| None,
+                |pb| digests.get(pb.block_index.max(0) as usize).copied(),
             );
             t.recheck_piece_done(&self.settings, &mut eff)
         } else {

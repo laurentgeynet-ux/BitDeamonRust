@@ -579,8 +579,6 @@ pub struct Torrent {
     /// (distinct from user `paused`, like upstream
     /// `graceful_pause` vs the queue state).
     pub queued: bool,
-    /// last `ut_pex` broadcast (`m_last_pex` timing state).
-    pub last_pex: Option<Instant>,
     /// `m_added_time`.
     pub added_time: std::time::SystemTime,
     /// `m_save_path`.
@@ -993,18 +991,16 @@ impl Torrent {
     /// choked peers can actually claim the offered pieces.
     pub fn send_allowed_set(&mut self, peer_id: u64, set_size: i32, out: &mut Vec<TorrentEffect>) {
         // upstream gates: `!valid_metadata`, `super_seeding`,
-        // `upload_only()` — OUR upload-only state, not the peer's.
-        if self.super_seeding
-            || !self.valid_metadata()
-            || self.num_pieces <= 0
-            || self.is_upload_only()
-        {
+        // `upload_only()` — the *peer_connection's*, i.e. the remote's
+        // `m_upload_only || is_seed() || m_have_all` (a peer that can't
+        // take pieces has no use for an allowed-fast set).
+        if self.super_seeding || !self.valid_metadata() || self.num_pieces <= 0 {
             return;
         }
         let Some(c) = self.peers.get_mut(&peer_id) else {
             return;
         };
-        if !c.supports_fast {
+        if !c.supports_fast || c.remote_upload_only || c.is_seed() {
             return;
         }
         let msgs = c.send_allowed_set(
@@ -1105,7 +1101,6 @@ impl Torrent {
             auto_managed: true,
             state_subscription: false,
             needs_state_update: false,
-            last_pex: None,
             queued: false,
             added_time: std::time::SystemTime::now(),
             save_path: String::new(),
@@ -1951,13 +1946,16 @@ impl Torrent {
                     .map_or(0i64, |md| md.len().div_ceil(16 * 1024) as i64);
                 if self.metadata_raw.is_none() || piece < 0 || piece >= npieces {
                     // `write_metadata_packet` no-ops when the peer
-                    // never advertised an id (`m_message_index == 0`).
+                    // never advertised an id (`m_message_index == 0`);
+                    // `total_size` rides along whenever we hold the
+                    // info dict (upstream writes it on `dont_have`
+                    // too, not only on `piece`).
                     if ext_id != 0 {
                         let resp = crate::ut_metadata::metadata_packet(
                             crate::ut_metadata::MetadataMsg::Reject,
                             piece as i32,
-                            false,
-                            &[],
+                            self.metadata_raw.is_some(),
+                            self.metadata_raw.as_deref().unwrap_or(&[]),
                         );
                         out.push(TorrentEffect::SendTo {
                             peer,
@@ -2209,7 +2207,10 @@ impl Torrent {
     /// sent_requests < 2 && has_metadata()` (advertised
     /// `metadata_size` or expired retry limit).
     fn maybe_send_metadata_request(&mut self, peer: u64, out: &mut Vec<TorrentEffect>) {
-        if self.piece_hashes.is_some() {
+        // `!valid_metadata` — a v2-only torrent has `ti` without a
+        // v1 `piece_hashes` vec, so gating on hashes kept asking
+        // for metadata upstream never requests.
+        if self.valid_metadata() {
             return;
         }
         let Some(conn) = self.peers.get(&peer) else {
@@ -2318,17 +2319,28 @@ impl Torrent {
         };
         for ep in dropped {
             c.pex_known.remove(&ep);
+            c.pex_known6.remove(&ep);
         }
         let mut peers_added = false;
         for p in added {
-            if c.pex_known.len() >= max_pex_peers {
-                break;
+            // upstream caps `m_peers` and `m_peers6` separately at
+            // `max_pex_peers` — a v6 flood can't consume v4 capacity.
+            let known = if p.addr.is_ipv4() {
+                &mut c.pex_known
+            } else {
+                &mut c.pex_known6
+            };
+            // `continue`, not `break` — upstream runs `added` and
+            // `added6` in separate loops, so a v4 set at cap can't
+            // starve v6 entries that share this merged list.
+            if known.len() >= max_pex_peers {
+                continue;
             }
             // ignore local addresses unless the sender is local
             if crate::ut_pex::is_local(&p.addr.ip()) && !remote_local {
                 continue;
             }
-            if !c.pex_known.insert(p.addr) {
+            if !known.insert(p.addr) {
                 continue;
             }
             // `added.f` flows through as `pex_flags` (upstream
@@ -2366,17 +2378,13 @@ impl Torrent {
     }
 
     /// `second_tick`'s pex section — every `PEX_INTERVAL` send each
-    /// `ut_pex`-capable peer a diff of our connected endpoints.
+    /// `ut_pex`-capable peer a diff of our connected endpoints. The
+    /// cadence is per conn (upstream `ut_pex_peer_plugin::m_last_msg`,
+    /// init `min_time()`): a fresh conn gets its first full list at
+    /// its next tick once `num_peers() > 1`, not up to 60 s later.
     pub fn pex_tick(&mut self, now: Instant, out: &mut Vec<TorrentEffect>) {
         const PEX_INTERVAL: Duration = Duration::from_secs(60);
         let disable = !self.enable_pex;
-        if self
-            .last_pex
-            .is_some_and(|t| now.duration_since(t) < PEX_INTERVAL)
-        {
-            return;
-        }
-        self.last_pex = Some(now);
         // upstream `send_peer`: advertise only bittorrent conns that
         // either we dialed or that shared their listen port — and are
         // past the handshake. Inbound endpoints get their advertised
@@ -2394,7 +2402,11 @@ impl Torrent {
                 {
                     ep.set_port(p);
                 }
-                let mut flags = if c.peer_pieces.count() == c.num_pieces as usize {
+                // `pex_seed` — `p->is_seed()` upstream:
+                // `m_num_pieces == m_have_piece.size()` under
+                // `t->valid_metadata()` (a metadata-less peer with an
+                // empty bitfield is not a seed).
+                let mut flags = if self.valid_metadata() && c.is_seed() {
                     crate::ut_pex::flags::PEX_SEED
                 } else {
                     0
@@ -2416,7 +2428,9 @@ impl Torrent {
             })
             .collect();
         // upstream peer tick: `num_peers() <= 1 → return` — don't
-        // gossip the swarm back to the only peer in it.
+        // gossip the swarm back to the only peer in it. The gate sits
+        // before the per-conn stamp: a lone-peer phase does not
+        // consume the conn's 60 s window.
         if !disable && self.peers.len() > 1 {
             let ids: Vec<(u64, u8)> = self
                 .peers
@@ -2429,13 +2443,23 @@ impl Torrent {
                     Some(c) => c,
                     None => continue,
                 };
+                // `!m_message_index` is already gated by `ext_ut_pex`;
+                // the per-conn 60 s window (`m_last_msg`) comes next.
+                if c.pex_last_msg
+                    .is_some_and(|t| now.duration_since(t) < PEX_INTERVAL)
+                {
+                    continue;
+                }
+                c.pex_last_msg = Some(now);
                 let first_time = c.pex_first_time;
                 let (body, sent, in_msg) =
                     crate::ut_pex::build_pex_message(&connected, &c.pex_sent);
                 // upstream `send_ut_peer_diff`: a diff with no
                 // added/dropped entries is never sent
                 // (`peers_in_msg() == 0 → return`). The first
-                // (full-list) message always goes out.
+                // (full-list) message always goes out — but the
+                // stamp still advances (upstream stamps before
+                // deciding).
                 if !first_time && in_msg == 0 {
                     continue;
                 }
@@ -2514,7 +2538,11 @@ impl Torrent {
                     sev,
                 });
             }
-            crate::i2p_pex::I2pPexVerdict::Nothing => {}
+            // upstream counts every successfully parsed dict at the
+            // handler tail — `added` present or not.
+            crate::i2p_pex::I2pPexVerdict::Nothing => {
+                counters.inc(crate::counters::Counter::NumIncomingPex);
+            }
         }
     }
 
@@ -3264,7 +3292,7 @@ impl Torrent {
         // upstream `finished()` → `send_upload_only()` on the
         // transition into finished (`is_upload_only` just went true).
         if became_finished {
-            self.send_upload_only(out);
+            self.send_upload_only(counters, out);
         }
         // remaining leg — `files_checked` lands in `downloading`
         // when nothing finished (emit covers that transition; the
@@ -5460,9 +5488,14 @@ impl Torrent {
                     out.push(TorrentEffect::ChokePeer { peer: peer_id });
                 }
                 PeerEffect::MaybeUnchoke => {
-                    // `incoming_interested` tail — session-side for
-                    // counters/settings/pool like `ChokePeer`.
-                    out.push(TorrentEffect::MaybeUnchoke { peer: peer_id });
+                    // `incoming_interested` tail —
+                    // `disconnect_if_redundant` first (a peer that
+                    // became interested may now be redundant), the
+                    // unchoke leg only while still alive; session-side
+                    // for counters/settings/pool like `ChokePeer`.
+                    if !self.disconnect_if_redundant(peer_id, out) {
+                        out.push(TorrentEffect::MaybeUnchoke { peer: peer_id });
+                    }
                 }
                 PeerEffect::SeenComplete => {
                     self.seen_complete();
@@ -6320,25 +6353,33 @@ impl Torrent {
     /// once our files are verified (`uninteresting_upload_peer`).
     /// Skipped while metadata is unresolved on either side — the
     /// peer may still want our metadata — and in share mode.
-    pub fn disconnect_if_redundant(&mut self, peer_id: u64, out: &mut Vec<TorrentEffect>) {
-        if !self.close_redundant_connections {
-            return;
-        }
-        if !self.valid_metadata() || self.share_mode {
-            return;
-        }
+    /// Returns whether a disconnect was queued (upstream's `bool`).
+    /// `m_need_interest_update` has no equivalent: our interest is
+    /// computed eagerly before this call site.
+    pub fn disconnect_if_redundant(&mut self, peer_id: u64, out: &mut Vec<TorrentEffect>) -> bool {
         let Some(c) = self.peers.get(&peer_id) else {
-            return;
+            return false;
         };
-        // `!has_metadata()` — the peer advertised ut_metadata
-        // without a `metadata_size` and hasn't sent any piece-level
-        // message: it may still need ours.
-        if !c.has_metadata {
-            return;
+        // upstream `m_disconnecting` early-out — a conn mid-teardown
+        // never gets a second DisconnectPeer.
+        if c.disconnecting {
+            return false;
+        }
+        if !self.close_redundant_connections {
+            return false;
+        }
+        // `!valid_metadata || !has_metadata` — the peer advertised
+        // ut_metadata without a `metadata_size` and hasn't sent any
+        // piece-level message: it may still need ours.
+        if !self.valid_metadata() || !c.has_metadata {
+            return false;
+        }
+        if self.share_mode {
+            return false;
         }
         let peer_upload_only = c.remote_upload_only || c.is_seed();
         if !peer_upload_only {
-            return;
+            return false;
         }
         let reason = if self.is_upload_only() {
             Some("upload-upload connection")
@@ -6347,15 +6388,20 @@ impl Torrent {
         } else {
             None
         };
-        if let Some(r) = reason {
-            // `disconnect_if_redundant` runs at default severity
-            // (`upload_upload_connection`/`peer_no_support` — normal).
-            out.push(TorrentEffect::DisconnectPeer {
-                peer: peer_id,
-                reason: r,
-                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-            });
+        // `can_disconnect(ec)` — consulted inside each leg's
+        // condition upstream; a plugin veto keeps the conn
+        // (`peer_plugin::can_disconnect`, default true).
+        if reason.is_none() || c.plugins.iter().any(|p| !p.can_disconnect()) {
+            return false;
         }
+        // `disconnect_if_redundant` runs at default severity
+        // (`upload_upload_connection`/`peer_no_support` — normal).
+        out.push(TorrentEffect::DisconnectPeer {
+            peer: peer_id,
+            reason: reason.unwrap_or("upload-upload connection"),
+            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+        });
+        true
     }
 
     /// `peer_connection::update_interest` broadcast — after our own
@@ -8518,7 +8564,7 @@ impl Torrent {
                 self.emit_state_change(out);
             }
             out.push(TorrentEffect::BecameSeed);
-            self.send_upload_only(out);
+            self.send_upload_only(counters, out);
             self.state_updated();
         } else if was_finished && !finished {
             // upstream `resume_download()` — a `seed_mode` promise
@@ -8535,7 +8581,7 @@ impl Torrent {
             self.finished_at = None;
             self.emit_state_change(out);
             out.push(TorrentEffect::QueueTail);
-            self.send_upload_only(out);
+            self.send_upload_only(counters, out);
             self.state_updated();
         }
     }
@@ -11195,7 +11241,7 @@ impl Torrent {
         // upstream `set_need_save_resume(if_state_changed)`.
         self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_STATE_CHANGED;
         self.state_updated();
-        self.send_upload_only(out);
+        self.send_upload_only(counters, out);
         if b {
             let ids: Vec<u64> = self.peers.keys().copied().collect();
             for pid in ids {
@@ -11262,7 +11308,11 @@ impl Torrent {
     /// `is_upload_only() && !super_seeding` (a finished torrent
     /// leaving upload mode still reports upload-only). Each conn
     /// gets `send_not_interested` first, then the ext message.
-    fn send_upload_only(&mut self, out: &mut Vec<TorrentEffect>) {
+    fn send_upload_only(
+        &mut self,
+        counters: &crate::counters::Counters,
+        out: &mut Vec<TorrentEffect>,
+    ) {
         if self.share_mode || self.super_seeding || !self.close_redundant_connections {
             return;
         }
@@ -11270,18 +11320,29 @@ impl Torrent {
         let ids: Vec<u64> = self.peers.keys().copied().collect();
         for pid in ids {
             // `send_not_interested`: an uninterested conn runs
-            // `disconnect_if_redundant` instead of emitting a msg.
-            if self.peers.get(&pid).is_some_and(|c| c.we_sent_interested) {
+            // `disconnect_if_redundant` instead of emitting a msg;
+            // an interested one clears `m_interesting`, drops the
+            // `num_peers_down_interested` gauge, leaves slow start,
+            // then re-checks redundancy — the `NotInterested` only
+            // goes on the wire when the conn survives.
+            if !self.peers.get(&pid).is_some_and(|c| c.we_sent_interested) {
+                self.disconnect_if_redundant(pid, out);
+            } else if self.connections_initialized {
+                // `ready_for_connections` gate upstream — the flag
+                // stays set while the torrent can't serve.
                 if let Some(c) = self.peers.get_mut(&pid) {
                     c.we_sent_interested = false;
+                    c.interesting = false;
                     c.became_uninteresting_ms = c.now_ms;
+                    c.pipeline.slow_start = false;
                 }
-                out.push(TorrentEffect::SendTo {
-                    peer: pid,
-                    msg: PeerMessage::NotInterested,
-                });
-            } else {
-                self.disconnect_if_redundant(pid, out);
+                counters.add(crate::counters::Counter::NumPeersDownInterested, -1);
+                if !self.disconnect_if_redundant(pid, out) {
+                    out.push(TorrentEffect::SendTo {
+                        peer: pid,
+                        msg: PeerMessage::NotInterested,
+                    });
+                }
             }
             // `peer_connection::send_upload_only` skips conns still
             // in handshake; `write_upload_only` no-ops when the peer

@@ -44,7 +44,7 @@ fn force_recheck_queues_hash_per_piece() {
 
     // all 3 hashes come back good → checking clears, piece back
     for p in 0..3 {
-        s.on_piece_verified(&ih, PieceIndex(p), true, &mut Vec::new());
+        s.on_piece_verified(&ih, PieceIndex(p), true, &[], &mut Vec::new());
     }
     let t = s.torrents.get(&ih).unwrap();
     assert!(!t.checking);
@@ -86,6 +86,7 @@ fn recheck_eof_skips_file_without_error() {
             piece: PieceIndex(1),
             hash: Sha1Hash::default(),
             block_hashes: Vec::new(),
+            block_digests: Vec::new(),
             picker_gen: pgen,
             err: eof,
         })
@@ -102,8 +103,8 @@ fn recheck_eof_skips_file_without_error() {
     assert!(!t.have.get_bit(1));
 
     // the other pieces still complete the pass normally
-    s.on_piece_verified(&ih, PieceIndex(0), true, &mut Vec::new());
-    s.on_piece_verified(&ih, PieceIndex(2), true, &mut Vec::new());
+    s.on_piece_verified(&ih, PieceIndex(0), true, &[], &mut Vec::new());
+    s.on_piece_verified(&ih, PieceIndex(2), true, &[], &mut Vec::new());
     let t = s.torrents.get(&ih).unwrap();
     assert!(!t.checking);
     assert!(t.have.get_bit(0) && t.have.get_bit(2));
@@ -141,6 +142,7 @@ fn recheck_fatal_error_pauses_and_drops_automanage() {
             piece: PieceIndex(0),
             hash: Sha1Hash::default(),
             block_hashes: Vec::new(),
+            block_digests: Vec::new(),
             picker_gen: pgen,
             err: perm,
         })
@@ -221,7 +223,7 @@ fn save_resume_data_alert_and_interval() {
             );
         }
     }
-    s.on_piece_verified(&ih, PieceIndex(0), true, &mut Vec::new());
+    s.on_piece_verified(&ih, PieceIndex(0), true, &[], &mut Vec::new());
     s.pop_alerts();
     s.save_resume_data(
         &ih,

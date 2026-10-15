@@ -70,14 +70,16 @@ pub trait DiskIo: Send + Sync {
 
     /// `async_hash` — `v2` pre-sizes the out block-hash vec; the
     /// computed per-16KiB SHA-256s are handed back (upstream keeps a
-    /// caller-owned span). SHA-1 only when `flags & V1_HASH`.
+    /// caller-owned span). SHA-1 only when `flags & V1_HASH` — the
+    /// fourth handler arg is the per-16KiB-block SHA-1 digest vec
+    /// (the `smart_ban` ledger's block CRCs), empty otherwise.
     fn async_hash(
         &self,
         storage: StorageIndex,
         piece: PieceIndex,
         v2: Vec<Sha256Hash>,
         flags: u8,
-        handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, Vec<Sha256Hash>, StorageError) + Send>,
+        handler: crate::disk_job::HashHandler,
     );
 
     /// `async_hash2` — single-block SHA-256.
@@ -441,11 +443,12 @@ impl DiskIo for DisabledDiskIo {
         piece: PieceIndex,
         _v2: Vec<Sha256Hash>,
         _f: u8,
-        handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, Vec<Sha256Hash>, StorageError) + Send>,
+        handler: crate::disk_job::HashHandler,
     ) {
         handler(
             piece,
             Sha1Hash::default(),
+            Vec::new(),
             Vec::new(),
             StorageError::default(),
         );

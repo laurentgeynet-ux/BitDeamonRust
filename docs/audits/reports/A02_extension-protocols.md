@@ -471,7 +471,66 @@ régression des merges A08–A10/A14–A15 sur les jambes extension.
 
 ## Résultat
 
-### Round 3 (cette passe)
+### Round 3 — apply (cette passe)
+
+Apply exécuté sur `audit/02-extension-protocols` (worktree
+`../LibtorrentRust-a02`). **Toutes les déviations round-2 + round-3
+corrigées** — N1–N4, N6–N18 (N5 retiré en tant que faux positif).
+
+Correctifs notables :
+
+- **N15 smart_ban opérationnel** : `HashJob`/`async_hash` émettent
+  désormais les SHA-1 par bloc 16 Kio (`block_digests`) — les octets
+  sont déjà lus pour le hash de pièce, zéro I/O disque additionnel
+  vs le `async_read` par bloc upstream — propagés via
+  `DiskCompleted::Hash` → `on_piece_verified` → `read_digest`.
+- **N14 cadence PEX par conn** : `pex_last_msg` par connexion
+  (init `min_time()`), suppression du stamp torrent-global.
+- **N13 allowed-fast** : gate sur `upload_only()` du pair distant
+  (`remote_upload_only || is_seed()`), plus sur le nôtre.
+- **N8 caps PEX** : `pex_known`/`pex_known6` bornés séparément, un
+  ledger v4 saturé `continue` au lieu de `break` (les boucles
+  upstream `added`/`added6` sont indépendantes).
+- **N7 `send_upload_only`** : jambes `send_not_interested`
+  complètes (gauge `num_peers_down_interested`, `became_uninteresting`,
+  slow-start, `disconnect_if_redundant` avant l'émission wire).
+- **N18** : garde `m_disconnecting` + nouveau hook
+  `PeerPlugin::can_disconnect` (veto upstream des extensions sur le
+  teardown redondant).
+- **N2/N4** : `local_ut_pex` honore `allow_i2p_mixed` ;
+  `local_i2p_pex` uniquement sur sockets I2P.
+- **N16/N17** : `has_metadata` posé sur `Interested` (pas
+  `DontHave`) ; `is_disconnecting` early-out avant
+  `invalid_dont_have` sur les deux chemins.
+- **N1/N6/N9/N10/N11/N12** : flag `pex_seed` sous `valid_metadata`,
+  gate `valid_metadata()` sur les requêtes metadata, compteur
+  ext-handshake post-parse, `num_incoming_pex` sur dicts i2p_pex
+  sans `added`, `update_peer_port` → `update_want_peers`,
+  `dont_have` embarque `total_size`+dict.
+
+Tests de régression ajoutés (upstream-derived) :
+`cap_tripper_marked_seen_not_readded` (N3, test_ut_pex),
+`pex_tick_per_conn_first_list` (N14), `pex_seed_flag_uses_valid_metadata`
+(N1), `pex_known_capped_per_family` (N8),
+`allowed_set_gates_on_remote_upload_only` (N13),
+`interested_sets_has_metadata_donthave_doesnt` (N16),
+`dont_have_on_disconnecting_conn_is_silent` (N17),
+`send_upload_only_full_not_interested_legs` (N7),
+`disconnect_if_redundant_honors_plugin_veto` (N18),
+`smart_ban_fed_by_hash_job_digests` (N15 — chemin production via
+`Session::on_piece_verified`).
+
+Limites structurelles conservées : `PeerPlugin` n'expose toujours
+pas `on_extended`/`on_suggest`/`on_dont_have`/`on_unknown_message`
+(hooks upstream non atteignables — voir N18) ; seul
+`can_disconnect` a été ajouté.
+
+Gates : `cargo fmt --all` ✓ · `cargo clippy --workspace
+--all-targets -- -D warnings` ✓ · `cargo test --workspace` ✓ ·
+`cargo doc --workspace --no-deps` ✓. Commit `461f305` — merge
+`--no-ff` sur `main`.
+
+### Round 3 — audit (historique)
 
 Re-audit report-only — **aucune correction appliquée**. Les verdicts
 round-2 tiennent sauf **N5 retiré** (faux positif :

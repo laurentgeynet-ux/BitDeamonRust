@@ -2166,6 +2166,19 @@ fn hash_job(
         Ok(_) => {
             if h.v1_hash {
                 h.piece_hash = Sha1Hash::from_bytes(&sha1.finalize()).unwrap_or_default();
+                // per-block SHA-1 digests — upstream's `smart_ban`
+                // re-reads each block off disk after the verdict;
+                // the whole piece is already in `buf`, so the same
+                // values are emitted here (empty on read error —
+                // the `error → skip` leg upstream).
+                h.block_digests = buf
+                    .chunks(BS)
+                    .map(|b| {
+                        let mut d = Sha1::new();
+                        d.update(b);
+                        Sha1Hash::from_bytes(&d.finalize()).unwrap_or_default()
+                    })
+                    .collect();
             }
             // `store_precomputed_v2` — v2 block hashes are kept on the
             // storage so later `hash2` piece-layer requests answer
@@ -2504,7 +2517,9 @@ impl DiskIo for PreadDiskIo {
         piece: PieceIndex,
         mut v2: Vec<Sha256Hash>,
         flags: u8,
-        handler: Box<dyn FnOnce(PieceIndex, Sha1Hash, Vec<Sha256Hash>, StorageError) + Send>,
+        handler: Box<
+            dyn FnOnce(PieceIndex, Sha1Hash, Vec<Sha256Hash>, Vec<Sha1Hash>, StorageError) + Send,
+        >,
     ) {
         // upstream wipes the v2 span on entry: non-zero entries are the
         // internal "already known" marker, a caller that chained pieces
@@ -2516,6 +2531,7 @@ impl DiskIo for PreadDiskIo {
             handler,
             piece,
             block_hashes: v2,
+            block_digests: Vec::new(),
             piece_hash: Sha1Hash::default(),
             v1_hash: flags & io_flags::V1_HASH != 0,
             volatile: flags & io_flags::VOLATILE_READ != 0,

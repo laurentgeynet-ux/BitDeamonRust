@@ -399,12 +399,13 @@ fn hash_job_computes_piece_sha1() {
             ret: 0,
             error: Default::default(),
             action: JobKind::Hash(bitdaemon_disk::disk_job::HashJob {
-                handler: Box::new(move |_, h, _v2, _| {
+                handler: Box::new(move |_, h, _v2, _digests, _| {
                     *g2.lock().unwrap() = h;
                     d2.fetch_add(1, Ordering::Relaxed);
                 }),
                 piece: PieceIndex(0),
                 block_hashes: Vec::new(),
+                block_digests: Vec::new(),
                 piece_hash: Sha1Hash::default(),
                 v1_hash: true,
                 volatile: false,
@@ -455,12 +456,13 @@ fn hash_parked_behind_inflight_write_is_released() {
             ret: 0,
             error: Default::default(),
             action: JobKind::Hash(bitdaemon_disk::disk_job::HashJob {
-                handler: Box::new(move |_, h, _v2, _| {
+                handler: Box::new(move |_, h, _v2, _digests, _| {
                     *g2.lock().unwrap() = h;
                     d2.fetch_add(1, Ordering::Relaxed);
                 }),
                 piece: PieceIndex(0),
                 block_hashes: Vec::new(),
+                block_digests: Vec::new(),
                 piece_hash: Sha1Hash::default(),
                 v1_hash: true,
                 volatile: false,
@@ -1460,7 +1462,7 @@ fn hash_v2_blocks_stop_at_file_boundary() {
         PieceIndex(0),
         vec![Sha256Hash::default(); 2],
         flags::V1_HASH,
-        Box::new(move |_, h, blocks, e| {
+        Box::new(move |_, h, blocks, _digests, e| {
             assert!(!e.is_err(), "hash must succeed: {e:?}");
             *s2.lock().unwrap() = h;
             *b2.lock().unwrap() = blocks;
@@ -1576,7 +1578,7 @@ fn flush_after_hash_with_pad() {
         PieceIndex(0),
         Vec::new(),
         flags::V1_HASH,
-        Box::new(move |_, h, _, e| {
+        Box::new(move |_, h, _, _digests, e| {
             assert!(!e.is_err(), "hash must succeed: {e:?}");
             *g2.lock().unwrap() = h;
             h2.fetch_add(1, Ordering::Relaxed);
@@ -1759,7 +1761,7 @@ fn stop_torrent_aborts_queued_volatile_hash() {
         PieceIndex(0),
         Vec::new(),
         flags::V1_HASH,
-        Box::new(move |_, _h, _b, e| {
+        Box::new(move |_, _h, _b, _d, e| {
             assert!(!e.is_err(), "in-flight hash must complete: {e:?}");
             ad.fetch_add(1, Ordering::Relaxed);
         }),
@@ -1781,7 +1783,7 @@ fn stop_torrent_aborts_queued_volatile_hash() {
         PieceIndex(1),
         Vec::new(),
         flags::V1_HASH | flags::VOLATILE_READ,
-        Box::new(move |_, _h, _b, e| {
+        Box::new(move |_, _h, _b, _d, e| {
             if e.is_err() {
                 be.fetch_add(1, Ordering::Relaxed);
             }

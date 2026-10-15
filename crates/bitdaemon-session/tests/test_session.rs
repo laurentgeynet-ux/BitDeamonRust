@@ -133,7 +133,7 @@ fn verified_piece_emits_have_to_peers() {
         }
     }
     let mut out = Vec::new();
-    s.on_piece_verified(&ih, PieceIndex(0), true, &mut out);
+    s.on_piece_verified(&ih, PieceIndex(0), true, &[], &mut out);
     let haves = out
         .iter()
         .filter(|o| {
@@ -168,6 +168,7 @@ fn hash_mismatch_fails_piece() {
             piece: PieceIndex(0),
             hash: bad,
             block_hashes: Vec::new(),
+            block_digests: Vec::new(),
             picker_gen: 0,
             err: Default::default(),
         })

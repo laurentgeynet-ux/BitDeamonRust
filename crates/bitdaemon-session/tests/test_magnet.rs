@@ -262,6 +262,9 @@ fn pex_advertises_only_completed_dialable_peers() {
 
     let ih = Sha1Hash::from_bytes(&[4; 20]).unwrap();
     let mut t = Torrent::new(ih, 4, 16384, Bitfield::with_size(4), StorageIndex(0));
+    // upstream `is_seed()` requires `t->valid_metadata()` — the
+    // picker stands in for `m_torrent_file.is_valid()` here.
+    t.init_picker(false);
 
     // recipient conn — speaks ut_pex but stays "connecting" so it is
     // not itself advertised
@@ -290,7 +293,11 @@ fn pex_advertises_only_completed_dialable_peers() {
         c.remote = Some(remote);
         c.connecting = false;
         c.handshake_done = true;
-        c.num_pieces = 4; // post-handshake conns have seen a bitfield
+        // `num_pieces` is upstream `m_num_pieces` — the have-*count*,
+        // not the bitfield size; a conn that sent an empty bitfield
+        // claims 0 (a nonzero claim with clear bits is a state
+        // `is_seed()` can't distinguish upstream either).
+        c.num_pieces = 0;
         c
     };
     let seed_ep = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 9, 9, 1)), 6881);

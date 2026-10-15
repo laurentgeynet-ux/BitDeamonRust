@@ -69,6 +69,13 @@ pub fn build_pex_message(
 
     for (ep, fl) in peers {
         let is_new = !prev.contains(ep);
+        // `m_old_peers.insert` precedes the `max_peer_entries` break
+        // upstream: every visited conn is marked seen — including the
+        // one that trips the cap — so a still-connected peer is never
+        // emitted as a phantom `dropped` and never oscillates
+        // added↔dropped across ticks.
+        prev.remove(ep);
+        sent.insert(*ep);
         // already-sent peers stay in `sent` but aren't re-listed;
         // they're also not dropped
         let is_v4 = matches!(ep, SocketAddr::V4(_));
@@ -86,8 +93,6 @@ pub fn build_pex_message(
             num_added += 1;
             peers_in_msg += 1;
         }
-        prev.remove(ep);
-        sent.insert(*ep);
     }
     // whatever remains in `prev` was sent last time but is gone
     for ep in prev {
