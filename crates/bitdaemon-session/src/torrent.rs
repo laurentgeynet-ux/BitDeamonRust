@@ -3749,17 +3749,19 @@ impl Torrent {
     /// clears it again). SSL transports force `pe_disabled`
     /// upstream (`is_ssl` streams are already encrypted).
     ///
-    /// Returns `(wire_ih, protocol_v2, has_v2, encrypted)` — the
-    /// `associated_info_hash` to put on the wire (and into the MSE
-    /// SKEY), the conn's protocol version, the v2 reserved-bit
-    /// advertise, and whether to run MSE.
+    /// Returns `(kt, encrypted)` — the conn's
+    /// [`KnownTorrent`](bitdaemon_net::bt_peer_conn::KnownTorrent)
+    /// view (`associated_info_hash()` on `wire_ih` — also the MSE
+    /// SKEY — plus `protocol_v2`/`has_v2`/`v2_ih` for the reply
+    /// advertise and the echoed-hash re-validation), and whether to
+    /// run MSE.
     pub fn peer_link_up(
         &mut self,
         remote: std::net::SocketAddr,
         out_policy: bitdaemon_net::pe_crypto::EncPolicy,
         is_ssl: bool,
         session_time: i32,
-    ) -> Option<(Sha1Hash, bool, bool, bool)> {
+    ) -> Option<(bitdaemon_net::bt_peer_conn::KnownTorrent, bool)> {
         use bitdaemon_net::pe_crypto::EncPolicy;
         let i = self.peer_index(remote)?;
         let policy = if is_ssl {
@@ -3802,10 +3804,20 @@ impl Torrent {
                 st.max_failcount,
             );
         }
+        let wire_ih = self.wire_ih(proto_v2);
+        use bitdaemon_common::info_hash::ProtocolVersion as PV;
         Some((
-            self.wire_ih(proto_v2),
-            proto_v2,
-            self.info_hashes.has_v2(),
+            bitdaemon_net::bt_peer_conn::KnownTorrent {
+                ih: self.info_hashes.get_best(),
+                wire_ih,
+                protocol_v2: proto_v2,
+                has_v2: self.info_hashes.has_v2(),
+                v2_ih: self
+                    .info_hashes
+                    .has_v2()
+                    .then(|| self.info_hashes.get(PV::V2)),
+                valid_metadata: self.valid_metadata(),
+            },
             encrypted,
         ))
     }

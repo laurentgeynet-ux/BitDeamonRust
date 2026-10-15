@@ -445,6 +445,24 @@ impl Default for ServiceSwitches {
     }
 }
 
+/// `connect_to_peer`'s SSL-context material for an outbound dial on
+/// an SSL torrent — cert chain, trust root and the SNI the TLS
+/// ClientHello carries (`Session::ssl_dial_params`).
+#[derive(Debug, Clone)]
+pub struct SslDialParams {
+    /// `atp.root_certificate` or the embedded `ssl-cert` — the trust
+    /// root the peer's cert is verified against.
+    pub root: Vec<u8>,
+    /// torrent name — the cert CN/SAN match upstream checks.
+    pub name: String,
+    /// our client cert PEM, when the torrent carries one.
+    pub cert: Option<String>,
+    /// our client key PEM, paired with `cert`.
+    pub key: Option<String>,
+    /// hex of `info_hashes().get(peerinfo->protocol())` — the SNI.
+    pub sni: String,
+}
+
 pub struct Session {
     /// `m_torrents` by info_hash.
     pub torrents: BTreeMap<Sha1Hash, Torrent>,
@@ -4714,11 +4732,19 @@ impl Session {
                 self.counters
                     .inc_idx(crate::counters::incoming_counter_idx(id));
             }
-            let (remote, outgoing, is_utp, conn_failed, conn_fast) = t
+            let (remote, outgoing, is_utp, conn_failed, conn_fast, supports_enc, rc4_enc) = t
                 .peers
                 .get(&peer)
-                .map_or((None, false, false, false, false), |c| {
-                    (c.remote, c.outgoing, c.is_utp, c.failed, c.fast_reconnect)
+                .map_or((None, false, false, false, false, false, false), |c| {
+                    (
+                        c.remote,
+                        c.outgoing,
+                        c.is_utp,
+                        c.failed,
+                        c.fast_reconnect,
+                        c.supports_encryption,
+                        c.rc4_encrypted,
+                    )
                 });
             if let Some(r) = remote {
                 // `peer` IS the conn's `conn_key` — the bound-entry
@@ -4778,6 +4804,18 @@ impl Session {
                     } else {
                         crate::counters::Counter::ErrorIncomingPeers
                     });
+                    // crypto legs (`type() == bittorrent && op !=
+                    // connect` — an attached teardown is never a
+                    // connect op): `supports_encryption()` →
+                    // `error_encrypted_peers`, plus `rc4_encrypted()`
+                    // → `error_rc4_peers`.
+                    if supports_enc {
+                        self.counters
+                            .inc(crate::counters::Counter::ErrorEncryptedPeers);
+                        if rc4_enc {
+                            self.counters.inc(crate::counters::Counter::ErrorRc4Peers);
+                        }
+                    }
                 }
                 if sev == DisconnectSeverity::PeerError {
                     // upstream posts `peer_error_alert` for severity
@@ -5104,16 +5142,18 @@ impl Session {
     /// the `fast_reconnect` arm both live at this point upstream).
     /// `is_ssl` forces `pe_disabled` (SSL streams never run MSE).
     ///
-    /// Returns `(wire_ih, protocol_v2, has_v2, encrypted)` — the
-    /// `associated_info_hash` for the wire + SKEY, the conn's
-    /// protocol version, the v2 reserved-bit advertise, and whether
-    /// to run MSE. `None` when the peer entry vanished mid-dial.
+    /// Returns `(kt, encrypted)` — the conn's
+    /// [`KnownTorrent`](bitdaemon_net::bt_peer_conn::KnownTorrent)
+    /// view (`associated_info_hash` on `wire_ih` for the wire + MSE
+    /// SKEY, `protocol_v2`/`has_v2`/`v2_ih` for the reply advertise
+    /// and the echoed-hash re-validation) and whether to run MSE.
+    /// `None` when the peer entry vanished mid-dial.
     pub fn peer_link_up(
         &mut self,
         ih: &Sha1Hash,
         remote: SocketAddr,
         is_ssl: bool,
-    ) -> Option<(Sha1Hash, bool, bool, bool)> {
+    ) -> Option<(bitdaemon_net::bt_peer_conn::KnownTorrent, bool)> {
         let policy = self.settings.out_enc_policy;
         let stime = self.session_time;
         self.torrents
@@ -5195,6 +5235,46 @@ impl Session {
         self.torrents
             .get_mut(ih)
             .is_some_and(|t| t.register_manual_dial(remote, self.session_time, pid))
+    }
+
+    /// `connect_to_peer`'s SSL-context pick for an outbound dial —
+    /// the SNI is the hex of `info_hashes().get(peerinfo->protocol())`
+    /// (v2 when the swarm entry is `protocol_v2`-flagged). `None`
+    /// for non-SSL torrents or when metadata/cert material is
+    /// missing.
+    #[must_use]
+    pub fn ssl_dial_params(&self, ih: &Sha1Hash, remote: SocketAddr) -> Option<SslDialParams> {
+        let t = self.torrents.get(ih)?;
+        if !t.is_ssl_torrent() {
+            return None;
+        }
+        let ti = t.ti.as_ref()?;
+        // `atp.root_certificate` overrides the embedded `ssl-cert`
+        // (`torrent.cpp:1977-1979`).
+        let root: Vec<u8> = t.ssl_root_cert().unwrap_or(&[]).to_vec();
+        let name: String = String::from_utf8_lossy(ti.name()).into_owned();
+        let cert: Option<String> = t.ssl_pem_pair().map(|(c, _)| c.to_string());
+        let key: Option<String> = t.ssl_pem_pair().map(|(_, k)| k.to_string());
+        let peer_v2 = t
+            .peer_list
+            .find_peer(remote.ip())
+            .map(|i| &t.peer_list.peers()[i])
+            .is_some_and(|p| p.protocol_v2);
+        let h = if peer_v2 && t.info_hashes.has_v2() {
+            t.info_hashes
+                .get(bitdaemon_common::info_hash::ProtocolVersion::V2)
+        } else {
+            t.info_hashes
+                .get(bitdaemon_common::info_hash::ProtocolVersion::V1)
+        };
+        let sni = bitdaemon_common::hex::to_hex(h.as_bytes());
+        Some(SslDialParams {
+            root,
+            name,
+            cert,
+            key,
+            sni,
+        })
     }
 
     /// pending-dial local endpoint — the engine reports the bound

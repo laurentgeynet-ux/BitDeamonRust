@@ -16,8 +16,8 @@ static P2: std::sync::LazyLock<PeerId> =
     std::sync::LazyLock::new(|| PeerId::from_bytes(&[2; 20]).unwrap());
 use bitdaemon_net::bep10::ExtendedHandshake;
 use bitdaemon_net::bt_peer_conn::{
-    DisconnectSeverity, KnownTorrent, PeerConnError, read_extended_handshake, read_message,
-    run_handshake, run_handshake_responder, send_extended_handshake, write_message,
+    DisconnectSeverity, HandshakeState, KnownTorrent, PeerConnError, read_extended_handshake,
+    read_message, run_handshake, run_handshake_responder, send_extended_handshake, write_message,
 };
 use bitdaemon_net::peer_wire::{PeerMessage, parse_handshake, write_handshake};
 use bitdaemon_net::transport::BoxedPeerStream;
@@ -31,9 +31,10 @@ fn pair() -> (BoxedPeerStream, BoxedPeerStream) {
 #[tokio::test]
 async fn handshake_round_trip() {
     let (mut a, mut b) = pair();
+    let (mut ka, mut kb) = (kt_v1(*IH), kt_v1(*IH));
     let h = tokio::join!(
-        run_handshake(&mut a, &IH, &P1, true, false, false),
-        run_handshake(&mut b, &IH, &P2, true, false, false),
+        run_handshake(&mut a, &mut ka, &P1, true, false),
+        run_handshake(&mut b, &mut kb, &P2, true, false),
     );
     let (ha, hb) = (h.0.unwrap(), h.1.unwrap());
     assert_eq!(ha.peer_id, *P2);
@@ -43,27 +44,28 @@ async fn handshake_round_trip() {
 
 #[tokio::test]
 async fn wrong_info_hash_rejected() {
-    // upstream: the initiator never re-validates the echoed
-    // info_hash (the `read_info_hash` ih block sits under `if (!t)`,
-    // and outgoing conns have `m_torrent` from `init()`); an
-    // *unknown* hash on the responder leg fails the attach with
-    // `invalid_info_hash` (failure).
+    // upstream `read_info_hash`'s `else` branch: an *attached* conn
+    // (the dial side) still re-validates the echoed info_hash — a
+    // mismatch disconnects `invalid_info_hash` at *failure*
+    // (`bt_peer_connection.cpp:3484-3503`). On the responder leg an
+    // unknown hash fails the attach the same way.
     let (mut a, mut b) = pair();
     let other = Sha1Hash::from_bytes(&[0xCD; 20]).unwrap();
+    let (mut ka, mut kb) = (kt_v1(*IH), kt_v1(other));
     let h = tokio::join!(
-        run_handshake(&mut a, &IH, &P1, false, false, false),
-        run_handshake(&mut b, &other, &P2, false, false, false),
+        run_handshake(&mut a, &mut ka, &P1, false, false),
+        run_handshake(&mut b, &mut kb, &P2, false, false),
     );
-    assert!(matches!(h.0, Ok(ref hs) if hs.info_hash == other));
+    assert!(matches!(h.0, Err(PeerConnError::WrongInfoHash(ih)) if ih == other));
 
     // responder rejects the unknown hash → `invalid_info_hash`;
     // dropping its stream EOFs the initiator.
     let (mut a, mut b) = pair();
-    let resp =
-        tokio::spawn(
-            async move { run_handshake_responder(&mut b, &P2, false, false, |_| None).await },
-        );
-    let init = run_handshake(&mut a, &other, &P1, false, false, false).await;
+    let resp = tokio::spawn(async move {
+        let mut st = HandshakeState::default();
+        run_handshake_responder(&mut b, &P2, false, false, |_| None, &mut st).await
+    });
+    let init = run_handshake(&mut a, &mut kt_v1(other), &P1, false, false).await;
     assert!(matches!(init, Err(PeerConnError::Io(_))));
     let r = resp.await.unwrap();
     assert!(matches!(r, Err(PeerConnError::WrongInfoHash(ih)) if ih == other));
@@ -78,6 +80,53 @@ fn kt_v1(wire: Sha1Hash) -> KnownTorrent {
         v2_ih: None,
         valid_metadata: true,
     }
+}
+
+#[tokio::test]
+async fn dial_v2_echo_flips_protocol_v2() {
+    // `read_info_hash`'s `else` branch on an *attached* conn: the
+    // remote echoes the truncated v2 hash on a conn we dialed with
+    // v1 — upstream flips `protocol_v2` (the conn's
+    // `associated_info_hash` becomes the v2 hash from here on)
+    // instead of rejecting (`bt_peer_connection.cpp:3484-3503`).
+    let v2w = Sha1Hash::from_bytes(&[0x33; 20]).unwrap();
+    let mut kt = KnownTorrent {
+        v2_ih: Some(v2w),
+        has_v2: true,
+        ..kt_v1(*IH)
+    };
+    let (mut a, mut b) = pair();
+    let peer = tokio::spawn(async move {
+        let mut theirs = [0u8; 68];
+        b.read_exact(&mut theirs).await.unwrap();
+        // echoes the truncated v2 hash — the dialer must accept it.
+        let reply = write_handshake(&v2w, &P2, false, true, false, false);
+        b.write_all(&reply).await.unwrap();
+    });
+    let hs = run_handshake(&mut a, &mut kt, &P1, false, false)
+        .await
+        .unwrap();
+    assert_eq!(hs.info_hash, v2w);
+    assert!(kt.protocol_v2);
+    assert_eq!(kt.wire_ih, v2w);
+    peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn dial_zero_echo_rejected() {
+    // upstream also refuses an all-zero echoed info-hash on an
+    // attached conn (`ih == sha1_hash()` → invalid_info_hash).
+    let mut kt = kt_v1(*IH);
+    let (mut a, mut b) = pair();
+    let peer = tokio::spawn(async move {
+        let mut theirs = [0u8; 68];
+        b.read_exact(&mut theirs).await.unwrap();
+        let reply = write_handshake(&Sha1Hash::default(), &P2, false, true, false, false);
+        b.write_all(&reply).await.unwrap();
+    });
+    let r = run_handshake(&mut a, &mut kt, &P1, false, false).await;
+    assert!(matches!(r, Err(PeerConnError::WrongInfoHash(ih)) if ih == Sha1Hash::default()));
+    peer.await.unwrap();
 }
 
 #[tokio::test]
@@ -102,9 +151,16 @@ async fn responder_v2_bit_flips_before_reply() {
             ..kt_v1(*ih)
         })
     };
-    let (hs, kt) = run_handshake_responder(&mut b, &P2, false, false, lookup)
-        .await
-        .unwrap();
+    let (hs, kt) = run_handshake_responder(
+        &mut b,
+        &P2,
+        false,
+        false,
+        lookup,
+        &mut HandshakeState::default(),
+    )
+    .await
+    .unwrap();
     assert!(hs.supports_v2());
     assert!(kt.protocol_v2);
     assert_eq!(kt.wire_ih, v2w);
@@ -125,7 +181,15 @@ async fn responder_rejects_v2_claim_on_v1_only() {
         a.write_all(&bytes).await.unwrap();
     });
     let lookup = |ih: &Sha1Hash| (*ih == *IH).then(|| kt_v1(*ih));
-    let r = run_handshake_responder(&mut b, &P2, false, false, lookup).await;
+    let r = run_handshake_responder(
+        &mut b,
+        &P2,
+        false,
+        false,
+        lookup,
+        &mut HandshakeState::default(),
+    )
+    .await;
     assert!(matches!(r, Err(PeerConnError::V2OnV1)));
     let (sev, _, reason) = PeerConnError::V2OnV1.handshake_fail(false);
     assert_eq!(sev, DisconnectSeverity::Normal);
@@ -147,9 +211,16 @@ async fn responder_rejects_v2_claim_on_v1_only() {
             ..kt_v1(*ih)
         })
     };
-    let (_, kt) = run_handshake_responder(&mut b, &P2, false, false, lookup)
-        .await
-        .unwrap();
+    let (_, kt) = run_handshake_responder(
+        &mut b,
+        &P2,
+        false,
+        false,
+        lookup,
+        &mut HandshakeState::default(),
+    )
+    .await
+    .unwrap();
     assert!(kt.protocol_v2);
     // `associated_info_hash` = `get(has_v2 && protocol_v2 ? V2 :
     // V1)` — no v2 hash → the wire hash stays v1.
@@ -160,9 +231,10 @@ async fn responder_rejects_v2_claim_on_v1_only() {
 #[tokio::test]
 async fn extended_and_message_loop() {
     let (mut a, mut b) = pair();
+    let (mut ka, mut kb) = (kt_v1(*IH), kt_v1(*IH));
     let _ = tokio::join!(
-        run_handshake(&mut a, &IH, &P1, false, false, false),
-        run_handshake(&mut b, &IH, &P2, false, false, false),
+        run_handshake(&mut a, &mut ka, &P1, false, false),
+        run_handshake(&mut b, &mut kb, &P2, false, false),
     );
 
     // both send ext handshake

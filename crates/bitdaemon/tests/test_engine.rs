@@ -364,6 +364,7 @@ async fn spawn_dial_connects_peer() {
                     valid_metadata: true,
                 })
             },
+            &mut bitdaemon_net::bt_peer_conn::HandshakeState::default(),
         )
         .await;
         let mut tmp = [0u8; 512];
@@ -425,8 +426,14 @@ async fn acceptor_pump_registers_peer() {
     let remote = tokio::spawn(async move {
         let mut b: BoxedPeerStream = Box::new(theirs);
         let pid = bitdaemon_common::PeerId::default();
-        let _ = bitdaemon_net::bt_peer_conn::run_handshake(&mut b, &ih, &pid, false, false, false)
-            .await;
+        let _ = bitdaemon_net::bt_peer_conn::run_handshake(
+            &mut b,
+            &mut bitdaemon_net::bt_peer_conn::KnownTorrent::v1(ih),
+            &pid,
+            false,
+            false,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         b
     });
