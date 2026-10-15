@@ -255,3 +255,46 @@ recommandés.
   `peer_conn.rs:2001-2002` couvre le cas où le compteur dépasserait la
   file (borne défensive ; upstream a un `TORRENT_ASSERT` équivalent à
   `peer_connection.cpp:6560`).
+
+## Résultat
+
+Apply effectué dans le worktree `LibtorrentRust-a12` (branche
+`audit/12-time-critical`), toutes déviations corrigées :
+
+- **D1** : `time_critical` devient `BTreeMap<PieceIndex,
+  TimeCriticalPiece>` (deadline triée à la consommation, champs
+  `first_requested`/`last_requested`/`alert_when_available`) ;
+  `average_piece_time_ms`/`piece_time_deviation_ms` EWMA portés et
+  alimentés dans `remove_time_critical_piece(piece, finished=true)` ;
+  `PeerConn::can_request_time_critical` ajouté
+  (`peer_conn.rs`) ; `request_time_critical_pieces` réécrit —
+  candidats filtrés, tri `download_queue_time`, décile inférieur
+  tronqué, itération deadline-croissante avec horizon
+  `avg + 4σ + 1 s`, `pick_time_critical_block` porté (free blocks
+  `state_none`, `busy_mode` sur `timed_out > 0` avec
+  `pick_busy_blocks` trié par `num_peers`, doublons → `ignore_peers`,
+  promotion `make_time_critical`, `add_request(b, busy, true)`,
+  re-tri bulle, reinsertion+re-tri des ignorés), commit batché via
+  `send_block_requests`.
+- **D2** : `pending_cancel_non_critical` drainé en tête de
+  `request_time_critical_pieces` (remplace le `post()` upstream).
+- **D3** : `on_torrent_paused` conserve `time_critical` (commentaire
+  corrigé — upstream ne purge pas au pause).
+- **D4** : `clear_time_critical` porté (alertes `operation_canceled`
+  + `low_priority`) ; `clear_piece_deadlines` prend un `out` —
+  changement d'API sur `TorrentHandle`.
+- **D5** : `cancel_non_critical` saute les blocs `!is_requested`
+  (les deux files).
+- **D6** : `remove_filtered_time_critical_pieces` appelé depuis
+  `prioritize_pieces` et `update_piece_priorities` sous
+  `filter_updated`.
+- Bonus constaté en apply : le chemin de complétion utilisait un
+  `remove` brut — passe désormais par `remove_time_critical_piece`
+  (alerte + stats + restauration `low_priority`, comme upstream).
+
+**Tests** : `tests/test_time_critical_a12.rs` — 8 régressions (defer
+cancel, busy re-pick, exclusion pair choked, sweep dont_download,
+clear alertes+priorités, survie au pause, gate `is_requested`, EWMA).
+**Gates** : `fmt`, `clippy -D warnings`, `cargo test --workspace`
+(112 suites, 0 échec), `cargo doc --no-deps` — tous verts.
+**Commit** : branche `audit/12-time-critical` (post-rebase sur `main` 40f920e, merge `--no-ff`).

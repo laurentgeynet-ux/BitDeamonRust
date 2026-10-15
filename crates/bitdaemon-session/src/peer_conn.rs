@@ -2048,6 +2048,28 @@ impl PeerConn {
         true
     }
 
+    /// `peer_connection::can_request_time_critical` — eligibility for
+    /// deadline picks (`peer_connection.cpp:3572-3588`): unchoked and
+    /// interesting, shallow combined queues (≤ 2× the raw
+    /// `m_desired_queue_size` member — the snub/endgame collapse
+    /// doesn't apply here), not on parole, not disconnecting, torrent
+    /// not in upload mode, not snubbed.
+    #[must_use]
+    pub fn can_request_time_critical(&self, torrent_upload_mode: bool) -> bool {
+        if self.peer_choked || !self.interesting {
+            return false;
+        }
+        if self.pipeline.download_queue.len() + self.pipeline.request_queue.len()
+            > i32::from(self.pipeline.desired_queue_size) as usize * 2
+        {
+            return false;
+        }
+        if self.on_parole || self.disconnecting || torrent_upload_mode {
+            return false;
+        }
+        !self.pipeline.snubbed
+    }
+
     /// `peer_connection::make_time_critical` — move an unsent
     /// request-queue block into the time-critical prefix. Returns
     /// false when the block isn't queued or is already critical.
