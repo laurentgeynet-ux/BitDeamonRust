@@ -93,7 +93,7 @@ fn leaf_name_matches(cert: &rustls::pki_types::CertificateDer<'_>, expected: &st
 /// `ssl::set_trust_certificate` + `verify_peer` — the trust anchors
 /// of one SSL torrent (the embedded `ssl-cert` root, or
 /// `add_torrent_params::root_certificate`).
-fn anchors_from_pem(pem: &[u8]) -> io::Result<Vec<rustls::pki_types::TrustAnchor<'static>>> {
+pub fn anchors_from_pem(pem: &[u8]) -> io::Result<Vec<rustls::pki_types::TrustAnchor<'static>>> {
     use rustls::pki_types::pem::PemObject;
     let mut out = Vec::new();
     for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pem).flatten() {
@@ -312,6 +312,93 @@ impl rustls::server::danger::ClientCertVerifier for TorrentClientVerifier {
     }
 }
 
+/// `set_context`-pinned client-cert verify — once the SNI callback
+/// resolved a torrent, upstream swaps the stream into that torrent's
+/// `ssl_ctx` (`ssl.cpp` `set_context`), so the peer's chain must
+/// verify against *that* torrent's root and its leaf name must match
+/// *that* torrent's name (or `"*"`). Used per-connection by
+/// [`ssl_accept_torrent`].
+#[derive(Debug)]
+pub struct PinnedClientVerifier {
+    anchors: Vec<rustls::pki_types::TrustAnchor<'static>>,
+    expected: String,
+    subjects: Vec<rustls::DistinguishedName>,
+}
+
+impl PinnedClientVerifier {
+    /// ctor — the resolved torrent's `(anchors, expected leaf name,
+    /// hint subjects)` from [`SslTorrentRoots::lookup`].
+    #[must_use]
+    pub fn new(
+        anchors: Vec<rustls::pki_types::TrustAnchor<'static>>,
+        expected: String,
+        subjects: Vec<rustls::DistinguishedName>,
+    ) -> Self {
+        Self {
+            anchors,
+            expected,
+            subjects,
+        }
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for PinnedClientVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &self.subjects
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        cert_chain(
+            end_entity,
+            intermediates,
+            &self.anchors,
+            now,
+            webpki::KeyUsage::client_auth(),
+        )?;
+        if !leaf_name_matches(end_entity, &self.expected) {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName,
+            ));
+        }
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, d, &sig_algs())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, d, &sig_algs())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        sig_algs().supported_schemes()
+    }
+}
+
 /// per-torrent trust roots for the acceptor's client-cert verify —
 /// `torrent` name → embedded root anchors + expected leaf name.
 /// Shared with [`SniResolver`] so `register_ssl_torrent` sets up
@@ -334,6 +421,29 @@ impl SslTorrentRoots {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// the resolved SNI's `(anchors, expected leaf name, hint
+    /// subjects)` — the per-connection pin upstream gets from
+    /// `set_context` into the torrent's `ssl_ctx`.
+    #[must_use]
+    #[allow(clippy::type_complexity)]
+    pub fn lookup(
+        &self,
+        sni: &str,
+    ) -> Option<(
+        Vec<rustls::pki_types::TrustAnchor<'static>>,
+        String,
+        Vec<rustls::DistinguishedName>,
+    )> {
+        let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let v = map.get(sni)?;
+        Some((v.anchors.clone(), v.expected.clone(), v.subjects.clone()))
+    }
+
+    /// drop every registration (refresh rebuilds the set).
+    pub fn clear(&self) {
+        self.map.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -441,6 +551,35 @@ pub fn tracker_client_config(
     Ok(Arc::new(cfg))
 }
 
+/// `use_certificate`/`use_private_key` error legs — validate a
+/// PEM cert-chain + private-key pair without building a config.
+/// `Err` carries the upstream `torrent_error_alert` `file` tag
+/// (`"[certificate]"` / `"[private key]"`).
+pub fn validate_pem_pair(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), &'static str> {
+    use rustls::pki_types::pem::PemObject;
+    let certs: Vec<_> = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem).collect();
+    if certs.is_empty() || certs.iter().any(|c| c.is_err()) {
+        return Err("[certificate]");
+    }
+    if rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem).is_err() {
+        return Err("[private key]");
+    }
+    Ok(())
+}
+
+/// tracker-facing client config with `validate_https_trackers =
+/// false` — `m_ssl_ctx.set_verify_mode(verify_none)`
+/// (`update_validate_https`, `session_impl.cpp:6970`).
+pub fn tracker_no_verify_config() -> io::Result<Arc<rustls::ClientConfig>> {
+    let cfg = rustls::ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(VerifyNone))
+        .with_no_client_auth();
+    Ok(Arc::new(cfg))
+}
+
 /// `set_trust_certificate` — load PEM certs/keys into a root store.
 /// Returns how many certs were processed (upstream returns the
 /// count or a negative error).
@@ -544,6 +683,50 @@ where
     })
 }
 
+/// `async_accept_handshake` for SSL-torrent listeners —
+/// `ssl_server_name_callback` + `set_context` in one leg: peek the
+/// ClientHello SNI, fail when it isn't a registered torrent
+/// (`SSL_TLSEXT_ERR_ALERT_FATAL` upstream), then finish the
+/// handshake with a config pinned to *that* torrent — its cert for
+/// the server side, its root + expected name for the client cert
+/// (`verify_peer | verify_fail_if_no_peer_cert`). Returns the
+/// stream and the resolved SNI name (hex info-hash — the attach
+/// gate compares it to the handshake's, `has_context` upstream).
+pub async fn ssl_accept_torrent<S>(
+    stream: S,
+    remote: SocketAddr,
+    resolver: Arc<SniResolver>,
+    roots: Arc<SslTorrentRoots>,
+) -> io::Result<(SslStream<S>, String)>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let start =
+        tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream).await?;
+    let sni = start.client_hello().server_name().unwrap_or("").to_string();
+    let (anchors, expected, subjects) = roots
+        .lookup(&sni)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ssl: unknown SNI"))?;
+    let key = resolver
+        .get(&sni)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ssl: no cert for SNI"))?;
+    let cfg = rustls::ServerConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
+        .with_client_cert_verifier(Arc::new(PinnedClientVerifier::new(
+            anchors, expected, subjects,
+        )))
+        .with_cert_resolver(Arc::new(FixedCert(key)));
+    let tls = start.into_stream(Arc::new(cfg)).await?;
+    Ok((
+        SslStream {
+            io: tls.into(),
+            remote,
+        },
+        sni,
+    ))
+}
+
 /// `session_impl::m_peer_ssl_ctx` accept side — a `ServerConfig`
 /// from PEM material (`set_ssl_certificate` upstream). `dh` params
 /// are OpenSSL DHE-specific; rustls is ECDHE-only, so they are
@@ -628,6 +811,41 @@ impl SniResolver {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(name);
+    }
+
+    /// the `CertifiedKey` registered under `name`, if any.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
+    }
+
+    /// drop every registration (refresh rebuilds the set).
+    pub fn clear(&self) {
+        self.map.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+/// single-key resolver — the per-connection config built by
+/// [`ssl_accept_torrent`] always serves this cert (the SNI was
+/// already matched).
+struct FixedCert(Arc<rustls::sign::CertifiedKey>);
+
+impl std::fmt::Debug for FixedCert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FixedCert").finish()
+    }
+}
+
+impl rustls::server::ResolvesServerCert for FixedCert {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.clone())
     }
 }
 
@@ -720,5 +938,54 @@ mod tests {
             v.verify_server_cert(&leaf, &[], &sni, &[], UnixTime::now())
                 .is_err()
         );
+    }
+
+    use rustls::server::danger::ClientCertVerifier;
+
+    /// A23 — the acceptor pins client-cert verification to the
+    /// SNI-resolved torrent (`set_context` upstream): a client cert
+    /// valid for torrent A must be rejected when the connection was
+    /// claimed by torrent B's SNI.
+    #[test]
+    fn pinned_verifier_rejects_other_torrent_cert() {
+        let (root_a, leaf_a) = ca_and_leaf("torrent-a", true);
+        let (root_b, _leaf_b) = ca_and_leaf("torrent-b", true);
+        let anchors_b = anchors_from_pem(root_b.as_bytes()).expect("anchors b");
+        let pv = PinnedClientVerifier::new(anchors_b, "torrent-b".to_string(), Vec::new());
+        assert!(
+            pv.verify_client_cert(&leaf_a, &[], UnixTime::now())
+                .is_err(),
+            "client cert for torrent-a must not verify under torrent-b"
+        );
+        let anchors_a = anchors_from_pem(root_a.as_bytes()).expect("anchors a");
+        let pv = PinnedClientVerifier::new(anchors_a, "torrent-a".to_string(), Vec::new());
+        assert!(pv.verify_client_cert(&leaf_a, &[], UnixTime::now()).is_ok());
+    }
+
+    /// A23 — `unregister_ssl_torrent`/`clear` drop the trust roots
+    /// so a removed torrent's SNI no longer resolves.
+    #[test]
+    fn ssl_roots_unregister_and_clear() {
+        let (root, _) = ca_and_leaf("t", true);
+        let roots = SslTorrentRoots::default();
+        roots.map.lock().expect("map").insert(
+            "aa".to_string(),
+            SslTorrentRoot {
+                anchors: anchors_from_pem(root.as_bytes()).expect("anchors"),
+                expected: "t".to_string(),
+                subjects: Vec::new(),
+            },
+        );
+        assert!(roots.lookup("aa").is_some());
+        let resolver = SniResolver::new(None);
+        unregister_ssl_torrent(&resolver, &roots, "aa");
+        assert!(roots.lookup("aa").is_none());
+    }
+
+    /// A23 — `validate_https_trackers=false` → verify-none tracker
+    /// config builds (`session_impl::m_ssl_ctx` verify-none leg).
+    #[test]
+    fn tracker_no_verify_config_builds() {
+        let _ = tracker_no_verify_config().expect("no-verify cfg");
     }
 }

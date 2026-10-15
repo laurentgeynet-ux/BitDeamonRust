@@ -123,3 +123,44 @@ fn files_checked_verdict() {
     assert_eq!(t.have.count(), 0);
     assert!(!t.finished && !t.seeding);
 }
+
+/// A23 D1 — `atp.root_certificate` marks the torrent SSL and wins
+/// over the embedded `ssl-cert` for the trust root
+/// (`torrent.cpp:1977-1986`).
+#[test]
+fn add_torrent_root_certificate_override() {
+    let mut info = Vec::new();
+    info.extend(b"d6:lengthi24e4:name4:test12:piece lengthi16384e6:pieces20:");
+    info.extend([0x77; 20]);
+    info.extend(b"8:ssl-cert11:embedded-cae");
+    let node = bdecode_checked(&info).unwrap();
+    let ti = TorrentInfo::from_info_node(&node, &LoadTorrentLimits::default()).unwrap();
+    let ih = ti.info_hash_v1().unwrap();
+
+    // embedded `ssl-cert` alone → SSL torrent
+    let atp = AddTorrentParams {
+        ti: Some(Arc::new(ti.clone())),
+        info_hashes: InfoHash::from_v1(ih),
+        ..Default::default()
+    };
+    let mut s = Session::new();
+    let mut out = Vec::new();
+    s.add_torrent_params(&atp, StorageIndex(0), &mut out);
+    let t = s.torrents.get(&ih).unwrap();
+    assert!(t.is_ssl_torrent());
+    assert_eq!(t.ssl_root_cert(), Some(b"embedded-ca".as_slice()));
+
+    // `root_certificate` preferred (`torrent.cpp:1977-1979`)
+    let atp = AddTorrentParams {
+        ti: Some(Arc::new(ti)),
+        info_hashes: InfoHash::from_v1(ih),
+        root_certificate: b"override-root".to_vec(),
+        ..Default::default()
+    };
+    let mut s = Session::new();
+    let mut out = Vec::new();
+    s.add_torrent_params(&atp, StorageIndex(0), &mut out);
+    let t = s.torrents.get(&ih).unwrap();
+    assert!(t.is_ssl_torrent());
+    assert_eq!(t.ssl_root_cert(), Some(b"override-root".as_slice()));
+}

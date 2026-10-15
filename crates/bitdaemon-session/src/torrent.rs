@@ -791,6 +791,10 @@ pub struct Torrent {
     pub ssl_cert: Option<String>,
     /// `set_ssl_certificate` private key PEM.
     pub ssl_key: Option<String>,
+    /// `add_torrent_params::root_certificate` — SSL-torrent trust
+    /// root override (`torrent.cpp:1977`: preferred over the embedded
+    /// `ssl-cert`, and marks the torrent SSL on its own).
+    pub root_certificate: Vec<u8>,
     /// `m_net_interface` — `use_interface` bind override.
     pub net_interface: Option<String>,
     /// `m_apply_ip_filter` — `apply_ip_filter` flag.
@@ -1159,6 +1163,7 @@ impl Torrent {
             tracker_login: None,
             ssl_cert: None,
             ssl_key: None,
+            root_certificate: Vec::new(),
             net_interface: None,
             // `add_torrent_params::flags` defaults carry
             // `apply_ip_filter` — the raw ctor mirrors that stance;
@@ -1354,6 +1359,13 @@ impl Torrent {
                 t
             }
         };
+        // `m_ssl_torrent`/`init_ssl` — `atp.root_certificate` is the
+        // trust root (preferred over the embedded `ssl-cert`; a
+        // non-empty one makes the torrent SSL even without it).
+        t.root_certificate = atp.root_certificate.clone();
+        // `torrent::init` → `init_ssl` — posts `torrent_need_cert`
+        // (or errors+pauses on an unparseable root).
+        t.init_ssl(out);
         t.web_seeds = atp
             .url_seeds
             .iter()
@@ -1701,6 +1713,10 @@ impl Torrent {
         self.ti = Some(std::sync::Arc::new(info));
         self.metadata_raw = Some(metadata.to_vec());
         self.magnet = false;
+        // `init` → `init_ssl` — metadata now present, an SSL torrent
+        // (embedded `ssl-cert` or `atp.root_certificate`) posts
+        // `torrent_need_cert` / errors on an unparseable root.
+        self.init_ssl(out);
         // upstream `set_metadata`: `protocol_v2` can be set
         // speculatively pre-metadata (a v2-keyed magnet) — clear it
         // swarm-wide when the metainfo proves there is no v2 hash.
@@ -11172,7 +11188,11 @@ impl Torrent {
     /// own keypair.
     #[must_use]
     pub fn is_ssl_torrent(&self) -> bool {
-        self.ti.as_ref().is_some_and(|ti| ti.is_ssl_torrent())
+        // upstream `init()` (`torrent.cpp:1980`): `m_ssl_torrent` set
+        // when the effective root cert — `atp.root_certificate`
+        // preferred, else the embedded `ssl-cert` — is non-empty.
+        // Requires metadata (`init` only runs with valid_metadata).
+        self.ti.is_some() && self.ssl_root_cert().is_some_and(|c| !c.is_empty())
     }
 
     /// `torrent::ssl_ctx` — the PEM keypair this torrent serves on
@@ -11187,9 +11207,44 @@ impl Torrent {
 
     /// `torrent_info::ssl_cert` — the root CA cert embedded in the
     /// metainfo (peers must present certs chaining to it).
+    /// `atp.root_certificate` wins when set (`torrent.cpp:1977-1979`).
     #[must_use]
     pub fn ssl_root_cert(&self) -> Option<&[u8]> {
+        if !self.root_certificate.is_empty() {
+            return Some(&self.root_certificate);
+        }
         self.ti.as_ref().map(|ti| ti.ssl_cert())
+    }
+
+    /// `torrent::init_ssl` (`torrent.cpp:1856-1912`) — run when the
+    /// torrent gains metadata and carries an effective root cert:
+    /// an unparseable root fails the ctx build → `set_error
+    /// (ssl_ctx)` + `pause()` upstream; success posts
+    /// `torrent_need_cert_alert` ("tell the client we need a cert").
+    /// Called from `from_params` (metadata-present add) and
+    /// `set_metadata_verdict` (magnet resolve).
+    pub fn init_ssl(&mut self, out: &mut Vec<TorrentEffect>) {
+        if !self.is_ssl_torrent() {
+            return;
+        }
+        let root = self.ssl_root_cert().map(<[u8]>::to_vec).unwrap_or_default();
+        if bitdaemon_net::ssl_stream::anchors_from_pem(&root).is_err() {
+            self.set_error("ssl_ctx", crate::status::ERROR_FILE_SSL_CTX);
+            out.push(TorrentEffect::Alert(crate::alerts::Alert::TorrentError {
+                ih: self.info_hash,
+                error: self.last_error.clone(),
+                file: self.resolve_filename(crate::status::ERROR_FILE_SSL_CTX),
+            }));
+            self.paused = true;
+            return;
+        }
+        out.push(TorrentEffect::Alert(
+            crate::alerts::Alert::TorrentNeedCert {
+                ih: self.info_hash,
+                error: String::new(),
+                cert_file: String::new(),
+            },
+        ));
     }
 
     /// `predicted_have_piece` — `m_predictive_pieces` (predictive
@@ -12175,9 +12230,20 @@ impl Torrent {
 
     /// `set_ssl_cert_buffer` — PEM buffer form (`set_ssl_cert` takes
     /// paths upstream; we store the resolved cert string either way).
-    pub fn set_ssl_cert_buffer(&mut self, cert: &str, key: &str, _dh: &str) {
+    /// Upstream `use_certificate`/`use_private_key` failures post
+    /// `torrent_error_alert` — `Err(file)` carries the upstream
+    /// `file` tag (`"[certificate]"` / `"[private key]"`) for the
+    /// caller to post (`[dh params]` never errors: ECDHE-only).
+    pub fn set_ssl_cert_buffer(
+        &mut self,
+        cert: &str,
+        key: &str,
+        _dh: &str,
+    ) -> Result<(), &'static str> {
+        bitdaemon_net::ssl_stream::validate_pem_pair(cert.as_bytes(), key.as_bytes())?;
         self.ssl_cert = Some(cert.to_string());
         self.ssl_key = Some(key.to_string());
+        Ok(())
     }
 
     /// `torrent::disconnect_peers(num, ec)` — pick `num` conns by

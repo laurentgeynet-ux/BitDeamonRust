@@ -579,7 +579,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ssl_port) = args.ssl_port {
         let ssl_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ssl_port);
         let ssl_acceptor = TokioTcpAcceptor::bind(ssl_addr).await?;
-        eng.start_ssl_acceptor_at(Arc::new(ssl_acceptor), Some(ssl_addr), 1);
+        // socket_type_t::tcp_ssl = 6 — the attach gate refuses
+        // non-6..=9 conns on SSL torrents (`requires_ssl_connection`).
+        eng.start_ssl_acceptor_at(Arc::new(ssl_acceptor), Some(ssl_addr), 6);
         println!("ssl listen on :{ssl_port}");
     }
     if args.utp {
@@ -592,7 +594,8 @@ async fn main() -> anyhow::Result<()> {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), ssl_port);
             match TokioUdpSocket::bind(addr).await {
                 Ok(dg) => {
-                    eng.start_ssl_utp(Arc::new(dg), addr, 6).await;
+                    // socket_type_t::utp_ssl = 9.
+                    eng.start_ssl_utp(Arc::new(dg), addr, 9).await;
                     println!("ssl uTP listen on :{ssl_port} (udp)");
                 }
                 Err(e) => eprintln!("ssl uTP bind :{ssl_port}: {e}"),
