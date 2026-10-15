@@ -2,7 +2,14 @@
 """Generate per-audit SKILL.md workflows + docs/audits/INDEX.md."""
 import os
 
-PROTOCOL = """## Protocole (fixe — même méthodologie que les audits précédents)
+PROTOCOL = """## Protocole — deux modes
+
+L'invocation précise le mode ; **défaut : `rapport`**. Le découpage existe
+parce que plusieurs audits peuvent tourner en parallèle : la phase
+d'analyse est read-only sur le repo (zéro conflit), la phase de
+correction s'exécute dans un worktree + branche dédiés, mergée via PR.
+
+### Analyse commune (mode A l'exécute, mode B s'appuie sur le rapport)
 
 1. **Cartographier le chemin Rust d'abord** (grep/lecture), sans lire upstream —
    noter la machine d'état, les gates, les compteurs, les alertes, l'ordre des effets.
@@ -10,15 +17,74 @@ PROTOCOL = """## Protocole (fixe — même méthodologie que les audits précéd
    (baseline `e7381c7bc`, lecture seule — ne jamais modifier).
 3. **Diff sémantique** : ordre des opérations, gates, compteurs `counters::`,
    alertes (type + payload + timing), gestion d'erreur, comportement filaire.
-4. **Corriger en Rust idiomatique** — pas de translittération ; commenter les
-   legs subtils avec leur référence upstream.
-5. **Tests de régression** pour chaque déviation trouvée.
-6. **Gates obligatoires** : `cargo fmt --all` · `cargo clippy --workspace --all-targets -- -D warnings` ·
+
+### Mode A — `rapport` (read-only, 100% parallélisable)
+
+4. Écrire le rapport dans `docs/audits/reports/A{aid}_{slug}.md` —
+   **seul fichier écrit**, unique à cet audit, donc plusieurs audits en
+   mode rapport tournent simultanément dans le même checkout. Template :
+
+   ```markdown
+   # Audit A{aid} — rapport d'analyse
+
+   ## Déviations
+   - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
+     (`src/foo.cpp`, fonction) — fix proposé — sévérité
+     (wire-visible / état / cosmétique)
+
+   ## Fichiers du fix
+   Fichiers Rust que les corrections toucheront (planification des vagues).
+
+   ## Non-bugs tranchés
+   Écarts volontaires, avec justification upstream.
+   ```
+
+   Ne modifier **aucun** fichier existant. Pas de build/test cargo —
+   l'analyse ne compile pas (et `target/` verrouillé sérialiserait les
+   audits parallèles).
+
+5. **STOP.** Pas de fix, pas de gate, pas de commit. Le mode `apply`
+   est une invocation séparée qui part de ce rapport.
+
+### Mode B — `apply` (worktree + branche dédiée)
+
+Prérequis : le rapport `docs/audits/reports/A{aid}_{slug}.md` existe.
+Si un seul audit tourne à la fois, le checkout principal suffit ; dès
+que plusieurs `apply` sont parallèles, le worktree est obligatoire
+(sinon `target/` partagé sérialise les builds, `cargo fmt --all` se
+marchent dessus, et `cargo test` tourne sur le code transitoire des
+autres).
+
+4. **Worktree + branche** :
+
+   ```sh
+   git worktree add ../LibtorrentRust-a{aid} -b audit/{aid}-{slug}
+   ```
+
+   Travailler dans `D:/Projet/LibtorrentRust-a{aid}` : `target/` isolé,
+   builds réellement parallèles. `sccache` (`RUSTC_WRAPPER=sccache`)
+   mutualise la compilation des deps entre worktrees.
+
+5. **Corriger en Rust idiomatique** — pas de translittération ; commenter
+   les legs subtils avec leur référence upstream.
+6. **Tests de régression** pour chaque déviation corrigée.
+7. **Gates obligatoires** (dans le worktree) : `cargo fmt --all` ·
+   `cargo clippy --workspace --all-targets -- -D warnings` ·
    `cargo test --workspace` · `cargo doc --workspace --no-deps`.
-7. Mettre à jour `docs/PORTING.md` (row concernée) + `CHANGELOG.md`.
-8. Commit `fix(<crate>): <scope> parity — <mot-clé>` + push `origin/main`.
-9. **Rapport final** : déviations trouvées/corrigées, non-bugs tranchés
-   (avec justification upstream), tests ajoutés, hash du commit.
+8. **Changelog en fragment** : écrire les entrées Keep-a-Changelog dans
+   `docs/audits/changelog/A{aid}.md` sous `### Fixed` (ou autre section) —
+   **ne pas éditer `CHANGELOG.md`** (conflit de merge garanti entre
+   audits parallèles ; agrégation post-merge via
+   `python docs/audits/_aggregate_changelog.py`). `docs/PORTING.md` :
+   n'éditer que les rows du périmètre de l'audit, si leur statut change.
+9. Commit `fix(<crate>): <scope> parity — <mot-clé>` **sur la branche
+   `audit/{aid}-{slug}`** — jamais sur `main`. Push la branche,
+   `gh pr create`. Merges séquentiels (un audit à la fois) ; si conflit
+   sur les fichiers chauds (`torrent.rs`/`peer_conn.rs`/`session.rs`),
+   rebaser sur `main` frais puis re-run les gates avant merge.
+10. **Résultat** : ajouter une section `## Résultat` au rapport
+    (déviations corrigées, tests ajoutés, hash du commit, lien PR).
+    Après merge : `git worktree remove ../LibtorrentRust-a{aid}`.
 
 ## Pièges connus (checklists transverses)
 
@@ -350,6 +416,21 @@ AUDITS = [
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.chdir(ROOT)
 
+# Work dirs for the two-phase workflow (kept in git via README files)
+for sub, desc in [
+    ("reports", "Rapports d'analyse des audits (mode A — un fichier par audit,\n"
+                "écrit en parallèle sans conflit puisque chaque audit n'écrit\n"
+                "que le sien). Alimente le mode apply."),
+    ("changelog", "Fragments de changelog produits par le mode apply (un par\n"
+                  "audit, au lieu d'éditer CHANGELOG.md — élimine les conflits\n"
+                  "de merge). Agrégés dans CHANGELOG.md après merge des PRs\n"
+                  "via `python docs/audits/_aggregate_changelog.py`."),
+]:
+    p = os.path.join("docs", "audits", sub)
+    os.makedirs(p, exist_ok=True)
+    with open(os.path.join(p, "README.md"), "w", encoding="utf-8") as f:
+        f.write(f"# docs/audits/{sub}\n\n{desc}\n")
+
 # INDEX.md — all rows
 idx = [
     "# Registre des audits — couverture complète BitDaemon vs libtorrent",
@@ -367,14 +448,76 @@ idx += [
     "## Utilisation",
     "",
     "```",
-    "/audit-06-peer-wire-codec",
+    "/audit-06-peer-wire-codec            # mode rapport (défaut)",
+    "/audit-06-peer-wire-codec en mode apply",
     "```",
     "",
-    "Le skill embarque : périmètre, fichiers upstream/Rust, checklist, protocole",
-    "(cartographie → diff → fix → gates → docs → commit), pièges connus.",
-    "Rapport final attendu : déviations, corrections, tests, hash du commit poussé.",
+    "Le skill embarque : périmètre, fichiers upstream/Rust, checklist,",
+    "protocole à deux modes, pièges connus.",
     "",
-    "## Ordre conseillé",
+    "## Workflow parallèle — 2 phases",
+    "",
+    "Le protocole historique (analyse + fix + gates + push `main` en une",
+    "passe) n'est pas parallélisable : `target/` verrouillé sérialise les",
+    "builds, `fmt --all` se marchent dessus, `CHANGELOG.md`/`PORTING.md`",
+    "conflitent au merge, et les pushs `main` se rejettent en cascade.",
+    "D'où le découpage :",
+    "",
+    "### Phase 1 — rapports (parallélisme total)",
+    "",
+    "Mode `rapport` : read-only sur le repo, écrit uniquement",
+    "`docs/audits/reports/ANN_<slug>.md`. Tous les audits peuvent tourner",
+    "en même temps, même dans le même checkout — aucun conflit possible.",
+    "",
+    "### Phase 2 — application (worktrees + PRs)",
+    "",
+    "Mode `apply` par audit :",
+    "",
+    "```sh",
+    "git worktree add ../LibtorrentRust-aNN -b audit/NN-<slug>",
+    "# l'agent travaille dans ce dossier (target/ isolé → builds parallèles)",
+    "# gates complets, fragment docs/audits/changelog/ANN.md, puis :",
+    "git push -u origin audit/NN-<slug> && gh pr create",
+    "# après merge :",
+    "git worktree remove ../LibtorrentRust-aNN",
+    "```",
+    "",
+    "Merges **séquentiels** ; en cas de conflit sur les fichiers chauds,",
+    "rebase sur `main` frais + re-run des gates avant merge.",
+    "",
+    "### Vagues d'application conseillées (recouvrement de fichiers)",
+    "",
+    "| Vague | Audits | Raison |",
+    "|---|---|---|",
+    "| 1 — isolés | A13, A15, A17, A18, A19, A26, A28 | modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat) |",
+    "| 2 — session-edge | A20, A23, A24, A27, A29, A11, A12, A16 | fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés |",
+    "| 3 — net-peer | A06 puis A14 | `peer_wire.rs` commun aux deux → séquentiels entre eux |",
+    "| 4 — session-core | A07, A08, A09, A10, A21, A22 | tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels |",
+    "| 5 — final | A25 | transverse (sweep compteurs), seul, en dernier |",
+    "",
+    "A18+A19 partagent `bitdaemon-disk` mais des modules disjoints — OK",
+    "ensemble. Dans la vague 4, préférer des paires (A08+A24-style) et",
+    "merger une PR avant d'en appliquer une autre sur le même fichier.",
+    "",
+    "### Agrégation changelog",
+    "",
+    "```sh",
+    "python docs/audits/_aggregate_changelog.py   # après merge des PRs",
+    "```",
+    "",
+    "Fusionne `docs/audits/changelog/A*.md` dans `CHANGELOG.md` sous",
+    "`## [Unreleased]` (regroupé par section `### Fixed` etc.) puis",
+    "supprime les fragments. Commit : `docs(changelog): aggregate audit entries`.",
+    "",
+    "### Ressources",
+    "",
+    "- Un `target/` par worktree (plusieurs GB chacun). `sccache` mutualise",
+    "  la compilation des deps : `cargo install sccache`, `RUSTC_WRAPPER=sccache`.",
+    "- 2-4 builds workspace concurrents max en local (cargo utilise déjà tous",
+    "  les cœurs). Pour du parallélisme massif : sessions cloud séparées,",
+    "  une par audit — chacune a sa machine, son checkout, sa PR.",
+    "",
+    "## Ordre conseillé (séquentiel, si un seul agent)",
     "",
     "Par blast radius d'interop : A06/A07 (wire+ext) → A11/A13 (réseau) →",
     "A20 (resume) → A21/A24 (état) → A17 (DHT) → A25 (sweep compteurs final).",
@@ -424,7 +567,7 @@ for aid, slug, title, scope, up, rs, chk, traps, status in AUDITS:
         body.append("")
     if traps:
         body += ["## Pièges propres au périmètre", "", traps, ""]
-    body.append(PROTOCOL)
+    body.append(PROTOCOL.format(aid=aid, slug=slug))
     with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(body))
     print(f"wrote {d}/SKILL.md")

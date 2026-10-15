@@ -38,14 +38,76 @@ Chaque audit = un skill `.devin/skills/audit-NN-<slug>/` lançable via `/audit-N
 ## Utilisation
 
 ```
-/audit-06-peer-wire-codec
+/audit-06-peer-wire-codec            # mode rapport (défaut)
+/audit-06-peer-wire-codec en mode apply
 ```
 
-Le skill embarque : périmètre, fichiers upstream/Rust, checklist, protocole
-(cartographie → diff → fix → gates → docs → commit), pièges connus.
-Rapport final attendu : déviations, corrections, tests, hash du commit poussé.
+Le skill embarque : périmètre, fichiers upstream/Rust, checklist,
+protocole à deux modes, pièges connus.
 
-## Ordre conseillé
+## Workflow parallèle — 2 phases
+
+Le protocole historique (analyse + fix + gates + push `main` en une
+passe) n'est pas parallélisable : `target/` verrouillé sérialise les
+builds, `fmt --all` se marchent dessus, `CHANGELOG.md`/`PORTING.md`
+conflitent au merge, et les pushs `main` se rejettent en cascade.
+D'où le découpage :
+
+### Phase 1 — rapports (parallélisme total)
+
+Mode `rapport` : read-only sur le repo, écrit uniquement
+`docs/audits/reports/ANN_<slug>.md`. Tous les audits peuvent tourner
+en même temps, même dans le même checkout — aucun conflit possible.
+
+### Phase 2 — application (worktrees + PRs)
+
+Mode `apply` par audit :
+
+```sh
+git worktree add ../LibtorrentRust-aNN -b audit/NN-<slug>
+# l'agent travaille dans ce dossier (target/ isolé → builds parallèles)
+# gates complets, fragment docs/audits/changelog/ANN.md, puis :
+git push -u origin audit/NN-<slug> && gh pr create
+# après merge :
+git worktree remove ../LibtorrentRust-aNN
+```
+
+Merges **séquentiels** ; en cas de conflit sur les fichiers chauds,
+rebase sur `main` frais + re-run des gates avant merge.
+
+### Vagues d'application conseillées (recouvrement de fichiers)
+
+| Vague | Audits | Raison |
+|---|---|---|
+| 1 — isolés | A13, A15, A17, A18, A19, A26, A28 | modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat) |
+| 2 — session-edge | A20, A23, A24, A27, A29, A11, A12, A16 | fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés |
+| 3 — net-peer | A06 puis A14 | `peer_wire.rs` commun aux deux → séquentiels entre eux |
+| 4 — session-core | A07, A08, A09, A10, A21, A22 | tous sur `torrent.rs`/`peer_conn.rs`/`session.rs` — max 2-3 concurrents, merges séquentiels |
+| 5 — final | A25 | transverse (sweep compteurs), seul, en dernier |
+
+A18+A19 partagent `bitdaemon-disk` mais des modules disjoints — OK
+ensemble. Dans la vague 4, préférer des paires (A08+A24-style) et
+merger une PR avant d'en appliquer une autre sur le même fichier.
+
+### Agrégation changelog
+
+```sh
+python docs/audits/_aggregate_changelog.py   # après merge des PRs
+```
+
+Fusionne `docs/audits/changelog/A*.md` dans `CHANGELOG.md` sous
+`## [Unreleased]` (regroupé par section `### Fixed` etc.) puis
+supprime les fragments. Commit : `docs(changelog): aggregate audit entries`.
+
+### Ressources
+
+- Un `target/` par worktree (plusieurs GB chacun). `sccache` mutualise
+  la compilation des deps : `cargo install sccache`, `RUSTC_WRAPPER=sccache`.
+- 2-4 builds workspace concurrents max en local (cargo utilise déjà tous
+  les cœurs). Pour du parallélisme massif : sessions cloud séparées,
+  une par audit — chacune a sa machine, son checkout, sa PR.
+
+## Ordre conseillé (séquentiel, si un seul agent)
 
 Par blast radius d'interop : A06/A07 (wire+ext) → A11/A13 (réseau) →
 A20 (resume) → A21/A24 (état) → A17 (DHT) → A25 (sweep compteurs final).
