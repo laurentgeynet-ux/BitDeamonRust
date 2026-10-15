@@ -484,3 +484,331 @@ fn magnet_metadata_creates_storage() {
         }
     )));
 }
+
+// ---------- A19 regressions ----------
+
+/// Build a synthetic v2-only or hybrid single-file torrent via
+/// `create_torrent`; returns `(info_dict_bytes, resolved_info_hashes)`.
+/// The served `ut_metadata` payload is the raw `info` dict section —
+/// never a re-encode (bencode is canonical so `data_section` ==
+/// re-serialized here, but the torrent always hashes the verbatim
+/// bytes).
+fn synth_torrent(v2_only: bool) -> (Vec<u8>, bitdaemon_common::info_hash::InfoHash) {
+    use bitdaemon_common::FileIndex;
+    use bitdaemon_core::create_torrent::{CreateFileEntry, CreateFlags, CreateTorrent};
+    use bitdaemon_core::file_storage::FileFlags;
+    let flags = if v2_only {
+        CreateFlags::V2_ONLY
+    } else {
+        CreateFlags::NONE
+    };
+    let mut ct = CreateTorrent::new(
+        vec![CreateFileEntry {
+            filename: b"test".to_vec(),
+            size: 24,
+            flags: FileFlags::from_bits(0),
+            mtime: 0,
+            symlink: Vec::new(),
+        }],
+        0x4000,
+        flags,
+    )
+    .unwrap();
+    if !v2_only {
+        ct.set_hash(PieceIndex(0), Sha1Hash::from_bytes(&[0x77; 20]).unwrap())
+            .unwrap();
+    }
+    ct.set_hash2(
+        FileIndex(0),
+        0,
+        bitdaemon_common::Sha256Hash::from_bytes(&[0x88; 32]).unwrap(),
+    )
+    .unwrap();
+    let buf = ct.generate_buf().unwrap();
+    let info = bitdaemon_bencode::bdecode(&buf)
+        .dict_find(b"info")
+        .data_section()
+        .to_vec();
+    let atp =
+        bitdaemon_core::torrent_info::load_torrent_buffer(&buf, &LoadTorrentLimits::default())
+            .unwrap();
+    (info, *atp.ti.as_ref().unwrap().info_hashes())
+}
+
+/// A19-D1: a v2-only magnet (`btmh`-keyed — the session map key is the
+/// *truncated* v2) resolves metadata by SHA-256. Upstream
+/// `torrent::set_metadata` checks `hasher256` when `has_v2()`; a
+/// SHA-1-only check can never match.
+#[test]
+fn v2_only_magnet_resolves_by_sha256() {
+    use bitdaemon_common::info_hash::{InfoHash, ProtocolVersion as PV};
+    let (info, real) = synth_torrent(true);
+    assert!(real.has_v2() && !real.has_v1());
+    let key = real.get(PV::V2); // truncated v2 — the magnet map key
+    let mut t = Torrent::new(key, 0, 0, Bitfield::new(), StorageIndex(0));
+    t.info_hashes = InfoHash::from_v2(real.v2);
+    t.magnet = true;
+
+    let r = t.on_ut_metadata_data(&info, 0, info.len() as i64, 9, 30 * 1024 * 1024);
+    assert_eq!(r, MetadataResult::Complete);
+    let md = t.metadata_tracker.metadata().to_vec();
+    assert!(t.set_metadata(&md, &LoadTorrentLimits::default()));
+    assert!(t.ti.is_some());
+    assert!(!t.magnet);
+}
+
+/// A19-D1: a `btih`-keyed magnet whose "v1" hash is actually a
+/// truncated v2 (a v2-only torrent announced on a v1 key) resolves via
+/// the upstream truncated-v2 fallback in `set_metadata`
+/// (`torrent.cpp:8282-8292`).
+#[test]
+fn truncated_v2_in_v1_slot_resolves() {
+    use bitdaemon_common::info_hash::{InfoHash, ProtocolVersion as PV};
+    let (info, real) = synth_torrent(true);
+    let key = real.get(PV::V2);
+    let mut t = Torrent::new(key, 0, 0, Bitfield::new(), StorageIndex(0));
+    t.info_hashes = InfoHash::from_v1(key); // declared "v1" = truncated v2
+    t.magnet = true;
+
+    let r = t.on_ut_metadata_data(&info, 0, info.len() as i64, 9, 30 * 1024 * 1024);
+    assert_eq!(r, MetadataResult::Complete);
+    let md = t.metadata_tracker.metadata().to_vec();
+    assert!(t.set_metadata(&md, &LoadTorrentLimits::default()));
+    // upstream `m_info_hash = m_torrent_file->info_hashes()` — the
+    // resolved set is the real v2 hash, not the truncated key.
+    assert!(t.info_hashes.has_v2());
+}
+
+/// A19-D1: a hybrid torrent reached through a v2-keyed magnet verifies
+/// BOTH hashes (v1 truncated-fallback skipped, full SHA-256 required).
+#[test]
+fn v2_keyed_hybrid_magnet_resolves() {
+    use bitdaemon_common::info_hash::{InfoHash, ProtocolVersion as PV};
+    let (info, real) = synth_torrent(false);
+    assert!(real.has_v1() && real.has_v2());
+    let key = real.get(PV::V2);
+    let mut t = Torrent::new(key, 0, 0, Bitfield::new(), StorageIndex(0));
+    t.info_hashes = InfoHash::from_v2(real.v2);
+    t.magnet = true;
+
+    let md_ok = {
+        let r = t.on_ut_metadata_data(&info, 0, info.len() as i64, 9, 30 * 1024 * 1024);
+        assert_eq!(r, MetadataResult::Complete);
+        t.metadata_tracker.metadata().to_vec()
+    };
+    assert!(t.set_metadata(&md_ok, &LoadTorrentLimits::default()));
+    assert_eq!(t.info_hashes, real);
+}
+
+/// A19-D3: post-`init`, every conn re-runs `disconnect_if_redundant`
+/// (`torrent.cpp:8445-8447`) — a conn that was only useful while we
+/// lacked metadata and is now redundant gets dropped.
+#[test]
+fn set_metadata_disconnects_redundant_peers() {
+    use bitdaemon_session::peer_conn::PeerConn;
+    use bitdaemon_session::peer_pipeline::PeerPipeline;
+    use bitdaemon_session::torrent::TorrentEffect;
+    let info = info_bytes(&[0x55; 20]);
+    let ih = {
+        use sha1::Digest as _;
+        let mut h = sha1::Sha1::new();
+        h.update(&info);
+        Sha1Hash::from_bytes(&h.finalize()).unwrap()
+    };
+    let mut t = Torrent::new(ih, 0, 0, Bitfield::new(), StorageIndex(0));
+    t.magnet = true;
+    // we're upload-only; the remote flags upload-only too → once
+    // metadata lands the conn is redundant (`upload_upload_connection`)
+    t.upload_mode = true;
+    let mut c = PeerConn::new(1, PeerPipeline::new(1000, 30, 250), 0);
+    c.remote_upload_only = true;
+    t.add_peer(7, c);
+
+    let r = t.on_ut_metadata_data(&info, 0, info.len() as i64, 7, 30 * 1024 * 1024);
+    assert_eq!(r, MetadataResult::Complete);
+    let md = t.metadata_tracker.metadata().to_vec();
+    let mut out = Vec::new();
+    let v = t.set_metadata_verdict(
+        &md,
+        &LoadTorrentLimits::default(),
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out,
+    );
+    assert!(matches!(v, bitdaemon_session::torrent::MetadataVerdict::Ok));
+    assert!(
+        out.iter()
+            .any(|e| matches!(e, TorrentEffect::DisconnectPeer { peer: 7, .. }))
+    );
+}
+
+/// A19-D4: `prioritize_pieces` on a seed is a no-op upstream
+/// (`torrent.cpp:5967` — before the metadata check) and must not
+/// dirty resume data when nothing changed.
+#[test]
+fn prioritize_pieces_noop_on_seed() {
+    use bitdaemon_common::types::DownloadPriority;
+    let ih = Sha1Hash::from_bytes(&[0x66; 20]).unwrap();
+    let mut t = Torrent::new(ih, 1, 16384, Bitfield::with_size(1), StorageIndex(0));
+    t.init_picker(true);
+    t.seeding = true; // is_seed()
+    let mut out = Vec::new();
+    t.prioritize_pieces(
+        &[DownloadPriority::DONT_DOWNLOAD],
+        &bitdaemon_session::counters::Counters::default(),
+        &mut out,
+    );
+    assert!(!t.need_save_resume);
+    let p = t.picker.as_ref().unwrap();
+    assert_eq!(p.piece_priority(PieceIndex(0)), DownloadPriority::DEFAULT);
+}
+
+/// A19-D5: `num_total_pieces_added` charges on `set_metadata`
+/// (magnet path) — upstream `torrent.cpp:8442`.
+#[test]
+fn set_metadata_charges_pieces_counter() {
+    let info = info_bytes(&[0x55; 20]);
+    let ih = {
+        use sha1::Digest as _;
+        let mut h = sha1::Sha1::new();
+        h.update(&info);
+        Sha1Hash::from_bytes(&h.finalize()).unwrap()
+    };
+    let mut t = Torrent::new(ih, 0, 0, Bitfield::new(), StorageIndex(0));
+    let counters = bitdaemon_session::counters::Counters::default();
+    let mut out = Vec::new();
+    let v = t.set_metadata_verdict(
+        &info,
+        &LoadTorrentLimits::default(),
+        &bitdaemon_session::settings::SessionSettings::default(),
+        &counters,
+        &mut out,
+    );
+    assert!(matches!(v, bitdaemon_session::torrent::MetadataVerdict::Ok));
+    assert_eq!(
+        counters.value(bitdaemon_session::counters::Counter::NumTotalPiecesAdded),
+        1
+    );
+}
+
+/// A19-D6: a v2-only magnet's resume data must carry `info-hash2`,
+/// not the truncated v2 mislabeled as `info-hash` — upstream writes
+/// `ret.info_hashes = m_info_hash` (`torrent.cpp:7562`).
+#[test]
+fn v2_magnet_resume_keeps_v2_hash() {
+    use bitdaemon_common::info_hash::{InfoHash, ProtocolVersion as PV};
+    let full_v2 = bitdaemon_common::Sha256Hash::from_bytes(&[0x42; 32]).unwrap();
+    let key = Sha1Hash::from_bytes(&full_v2.as_bytes()[..20]).unwrap();
+    let mut t = Torrent::new(key, 0, 0, Bitfield::new(), StorageIndex(0));
+    t.info_hashes = InfoHash::from_v2(full_v2);
+    t.magnet = true;
+
+    let mut atp = bitdaemon_core::add_torrent_params::AddTorrentParams::default();
+    t.to_resume_data(&mut atp, &bitdaemon_net::peer_class::PeerClassPool::new());
+    assert!(!atp.info_hashes.has_v1());
+    assert!(atp.info_hashes.has_v2());
+    assert_eq!(atp.info_hashes.v2, full_v2);
+
+    // full round-trip through the wire format — a v2 magnet must
+    // restore as v2, not as a phantom v1 torrent
+    let buf = t.write_resume_data(&bitdaemon_net::peer_class::PeerClassPool::new());
+    let back =
+        bitdaemon_core::resume_data::read_resume_data(&buf, &LoadTorrentLimits::default()).unwrap();
+    assert!(!back.info_hashes.has_v1());
+    assert!(back.info_hashes.has_v2());
+    assert_eq!(back.info_hashes.get(PV::V2), key);
+}
+
+/// A19-D2: two metadata-less magnets resolving to the same swarm are
+/// a `duplicate_torrent` error + pause on BOTH, plus
+/// `torrent_conflict_alert` (upstream `torrent.cpp:8363-8395`) — and
+/// no `metadata_received_alert` / storage creation.
+#[test]
+fn metadata_collision_conflicts_both_torrents() {
+    use bitdaemon_common::info_hash::{InfoHash, ProtocolVersion as PV};
+    use bitdaemon_core::add_torrent_params::AddTorrentParams;
+    use bitdaemon_net::peer_wire::PeerMessage;
+    use bitdaemon_session::peer_conn::PeerConn;
+    use bitdaemon_session::peer_pipeline::PeerPipeline;
+    use bitdaemon_session::session::{PeerPacket, Session};
+    use bitdaemon_session::ut_metadata::{MetadataMsg, metadata_packet};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (info, real) = synth_torrent(false); // hybrid: v1 + v2
+
+    let mut s = Session::new();
+    // torrent A: v1-keyed magnet for the same swarm (metadata-less)
+    let mut out = Vec::new();
+    let atp_a = AddTorrentParams {
+        info_hashes: InfoHash::from_v1(real.v1),
+        ..Default::default()
+    };
+    assert!(
+        s.add_torrent_params(&atp_a, StorageIndex::INVALID, &mut out)
+            .is_some()
+    );
+    // torrent B: v2-keyed magnet of the same hybrid torrent —
+    // different map key, no add-time conflict
+    let key_b = real.get(PV::V2);
+    let atp_b = AddTorrentParams {
+        info_hashes: InfoHash::from_v2(real.v2),
+        ..Default::default()
+    };
+    assert_eq!(
+        s.add_torrent_params(&atp_b, StorageIndex::INVALID, &mut out),
+        Some(key_b)
+    );
+
+    s.set_paused(&key_b, false, &mut out);
+    let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6881);
+    s.peer_connected(
+        &key_b,
+        1,
+        PeerConn::new(1, PeerPipeline::new(1000, 30, 250), 0),
+        remote,
+        &mut out,
+    );
+    {
+        let t = s.torrents.get_mut(&key_b).unwrap();
+        let c = t.peers.get_mut(&1).unwrap();
+        c.ext_ut_metadata = 1;
+        c.metadata_size = Some(info.len() as i64);
+        let mut eff = Vec::new();
+        t.metadata_tick(&mut eff);
+        assert!(t.peers[&1].metadata_sent_requests.contains(&0));
+    }
+    // serve the single metadata piece → set_metadata resolves a
+    // hybrid whose v1 collides with torrent A
+    let packet = metadata_packet(MetadataMsg::Piece, 0, true, &info);
+    s.on_peer_message(
+        &PeerPacket {
+            info_hash: key_b,
+            peer: 1,
+            remote,
+            msg: PeerMessage::Extended {
+                id: 2,
+                data: packet.into(),
+            },
+        },
+        0,
+        &mut out,
+    );
+
+    let a = &s.torrents[&real.v1];
+    let b = &s.torrents[&key_b];
+    assert_eq!(a.last_error, "duplicate torrent");
+    assert_eq!(b.last_error, "duplicate torrent");
+    assert!(a.paused && b.paused);
+
+    let alerts = s.pop_alerts();
+    assert!(
+        alerts
+            .iter()
+            .any(|a| matches!(a, bitdaemon_session::alerts::Alert::TorrentConflict { .. }))
+    );
+    assert!(
+        !alerts
+            .iter()
+            .any(|a| matches!(a, bitdaemon_session::alerts::Alert::MetadataReceived { .. }))
+    );
+}
