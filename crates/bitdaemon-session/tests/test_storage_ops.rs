@@ -130,17 +130,23 @@ fn file_priority_error_runs_full_pause() {
     let t = s.torrents.get(&ih).unwrap();
     assert!(t.paused);
     assert!(!t.announce_trackers && !t.announce_dht && !t.announce_lsd);
-    assert_eq!(t.last_error.as_str(), StorageError::new(
-        std::io::Error::from_raw_os_error(5),
-        FileIndex(0),
-        Operation::FileOpen,
-    ).to_string());
+    assert_eq!(
+        t.last_error.as_str(),
+        StorageError::new(
+            std::io::Error::from_raw_os_error(5),
+            FileIndex(0),
+            Operation::FileOpen,
+        )
+        .to_string()
+    );
     let alerts = s.pop_alerts();
     // `file_error_alert` carries the operation name; `pause()` posts
     // `torrent_paused` (non-graceful leg — no peers to drain).
-    assert!(alerts.iter().any(
-        |a| matches!(a, Alert::FileError { op, .. } if op == "file_open")
-    ));
+    assert!(
+        alerts
+            .iter()
+            .any(|a| matches!(a, Alert::FileError { op, .. } if op == "file_open"))
+    );
     assert!(
         alerts
             .iter()
@@ -157,7 +163,11 @@ fn move_storage_without_metadata_posts_requested_path() {
     let ih = Sha1Hash::from_bytes(&[5; 20]).unwrap();
     let mut s = mk(ih);
     // `mk()`'s torrent has no `files` — the `!valid_metadata()` leg.
-    s.move_storage(&ih, PathBuf::from("rel/spot"), MoveFlags::AlwaysReplaceFiles);
+    s.move_storage(
+        &ih,
+        PathBuf::from("rel/spot"),
+        MoveFlags::AlwaysReplaceFiles,
+    );
     let t = s.torrents.get(&ih).unwrap();
     // complete() absolutizes — the stored path is no longer the raw arg.
     assert_ne!(t.save_path, "rel/spot");
@@ -205,18 +215,13 @@ fn file_priority_getters() {
     // `set_file_priority` may only cover index 0.
     t.file_priorities = vec![DownloadPriority::TOP];
 
-    let h = SessionHandle::wrap(std::sync::Arc::new(std::sync::Mutex::new(
-        Session::new(),
-    )));
+    let h = SessionHandle::wrap(std::sync::Arc::new(std::sync::Mutex::new(Session::new())));
     let th = h.add_torrent(t);
     assert_eq!(
         th.file_priorities(),
         vec![DownloadPriority::TOP, DownloadPriority::DEFAULT]
     );
-    assert_eq!(
-        th.get_file_priority(FileIndex(0)),
-        DownloadPriority::TOP
-    );
+    assert_eq!(th.get_file_priority(FileIndex(0)), DownloadPriority::TOP);
     // pad file always reports dont_download
     assert_eq!(
         th.get_file_priority(FileIndex(1)),

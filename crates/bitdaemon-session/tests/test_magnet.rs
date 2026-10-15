@@ -658,7 +658,7 @@ fn prioritize_pieces_noop_on_seed() {
         &bitdaemon_session::counters::Counters::default(),
         &mut out,
     );
-    assert!(!t.need_save_resume);
+    assert!(!t.need_save_resume.is_set());
     let p = t.picker.as_ref().unwrap();
     assert_eq!(p.piece_priority(PieceIndex(0)), DownloadPriority::DEFAULT);
 }

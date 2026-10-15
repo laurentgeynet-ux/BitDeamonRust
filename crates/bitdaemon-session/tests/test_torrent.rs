@@ -522,7 +522,7 @@ fn recheck_bumps_picker_generation() {
     let mut t = torrent(4);
     t.init_picker(true);
     let g0 = t.picker_generation;
-    assert!(t.arm_full_recheck() > 0);
+    assert!(t.arm_full_recheck(&mut Vec::new()) > 0);
     assert_ne!(t.picker_generation, g0);
 }
 

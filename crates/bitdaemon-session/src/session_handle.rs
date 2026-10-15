@@ -1179,9 +1179,22 @@ impl TorrentHandle {
     }
 
     /// `save_resume_data` — posts `save_resume_data_alert` with
-    /// the bencoded resume blob (`only_if_modified` gate).
+    /// the bencoded resume blob. `only_if_modified` maps to
+    /// upstream's `torrent_handle::only_if_modified` condition
+    /// set; use [`Self::save_resume_data_flags`] for a subset.
     pub fn save_resume_data(&self, only_if_modified: bool) {
-        lock(&self.session).save_resume_data(&self.info_hash, only_if_modified);
+        self.save_resume_data_flags(if only_if_modified {
+            bitdaemon_common::flags::ResumeDataFlags::ONLY_IF_MODIFIED
+        } else {
+            bitdaemon_common::flags::ResumeDataFlags::NONE
+        });
+    }
+
+    /// `torrent_handle::save_resume_data(flags)` — the `if_*` bits
+    /// filter on the matching dirty categories; `FLUSH_DISK_CACHE`
+    /// releases file handles before the dump.
+    pub fn save_resume_data_flags(&self, flags: bitdaemon_common::flags::ResumeDataFlags) {
+        lock(&self.session).save_resume_data(&self.info_hash, flags);
     }
 
     /// `set_upload_limit` / `set_download_limit` — bytes/s, 0 = ∞.
@@ -1393,13 +1406,24 @@ impl TorrentHandle {
             .and_then(|t| t.ti.clone())
     }
 
-    /// `torrent_handle::need_save_resume_data`.
+    /// `torrent_handle::need_save_resume_data` — any dirty
+    /// category (upstream `m_need_save_resume_data != 0`).
     #[must_use]
     pub fn need_save_resume_data(&self) -> bool {
+        self.need_save_resume_data_flags(bitdaemon_common::flags::ResumeDataFlags::ALL)
+    }
+
+    /// `torrent_handle::need_save_resume_data(flags)` — is any of
+    /// the given `if_*` categories dirty.
+    #[must_use]
+    pub fn need_save_resume_data_flags(
+        &self,
+        flags: bitdaemon_common::flags::ResumeDataFlags,
+    ) -> bool {
         lock(&self.session)
             .torrents
             .get(&self.info_hash)
-            .is_some_and(|t| t.need_save_resume)
+            .is_some_and(|t| t.need_save_resume.contains(flags))
     }
 
     /// `torrent_handle::clear_error` — clears `m_error` /
@@ -1677,11 +1701,16 @@ impl TorrentHandle {
         }
     }
 
-    /// `torrent_handle::stop_when_ready`.
+    /// `torrent_handle::stop_when_ready` — the setter's immediate
+    /// trigger (already in a downloading state) routes through
+    /// `TorrentEffect::StopWhenReadyCheck` like upstream.
     pub fn stop_when_ready(&self, on: bool) {
-        if let Some(t) = lock(&self.session).torrents.get_mut(&self.info_hash) {
-            t.stop_when_ready = on;
+        let mut s = lock(&self.session);
+        let mut eff = Vec::new();
+        if let Some(t) = s.torrents.get_mut(&self.info_hash) {
+            t.set_stop_when_ready(on, &mut eff);
         }
+        s.route_into_pending(self.info_hash, eff);
     }
 
     /// `torrent_handle::apply_ip_filter(bool)` — the setter form;
