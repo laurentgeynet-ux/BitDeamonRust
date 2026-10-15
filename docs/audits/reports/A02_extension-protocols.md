@@ -352,3 +352,10 @@ Apply exécuté sur la branche `audit/02-extension-protocols` (worktree
 - `do_connect_boost` après PEX `peers_added` : nécessite
   `session_time`/politique d'encryption côté session — approximé par
   `want_peers = true` + `state_updated` (dial au prochain tick ≤1 s).
+
+### Livraison
+
+- Commit apply : `6dfcdca`
+  `fix(session): extension-protocol parity — BEP-9/10/11 gates, FAST, smart-ban, holepunch`
+- PR : https://github.com/laurentgeynet-ux/BitDeamonRust/pull/2
+  (branche `audit/02-extension-protocols`, worktree `LibtorrentRust-a02`)
