@@ -16,7 +16,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -109,6 +109,23 @@ fn anchors_from_pem(pem: &[u8]) -> io::Result<Vec<rustls::pki_types::TrustAnchor
         ));
     }
     Ok(out)
+}
+
+/// `CryptoProvider` shared by every BitDaemon-built TLS config.
+/// Configs go through `builder_with_provider` with this provider
+/// rather than the ambient `ClientConfig::builder()` /
+/// `ServerConfig::builder()`: the process-level default panics
+/// when several providers are compiled in but none is installed —
+/// exactly what a consumer enabling `ring` next to this crate's
+/// `aws_lc_rs` triggers — and a library must not install a
+/// process-wide provider that would pre-empt the embedding app's
+/// own choice.
+#[must_use]
+pub fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
+    PROVIDER
+        .get_or_init(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .clone()
 }
 
 fn sig_algs() -> rustls::crypto::WebPkiSupportedAlgorithms {
@@ -379,7 +396,9 @@ pub fn peer_ssl_client_config(
 ) -> io::Result<Arc<rustls::ClientConfig>> {
     use rustls::pki_types::pem::PemObject;
     let verifier = TorrentPeerVerifier::new(root_pem, torrent_name)?;
-    let b = rustls::ClientConfig::builder()
+    let b = rustls::ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier));
     let cfg = match (client_cert_pem, client_key_pem) {
@@ -399,23 +418,27 @@ pub fn peer_ssl_client_config(
 
 /// peer-facing client config (`m_peer_ssl_ctx`): verify-none,
 /// TLS 1.2+, no client auth.
-#[must_use]
-pub fn peer_client_config() -> Arc<rustls::ClientConfig> {
-    let cfg = rustls::ClientConfig::builder()
+pub fn peer_client_config() -> io::Result<Arc<rustls::ClientConfig>> {
+    let cfg = rustls::ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(VerifyNone))
         .with_no_client_auth();
-    Arc::new(cfg)
+    Ok(Arc::new(cfg))
 }
 
 /// tracker-facing client config (`m_ssl_ctx`): real PKI — system
 /// roots where available + `set_trust_certificate` PEMs.
-#[must_use]
-pub fn tracker_client_config(roots: Arc<rustls::RootCertStore>) -> Arc<rustls::ClientConfig> {
-    let cfg = rustls::ClientConfig::builder()
+pub fn tracker_client_config(
+    roots: Arc<rustls::RootCertStore>,
+) -> io::Result<Arc<rustls::ClientConfig>> {
+    let cfg = rustls::ClientConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Arc::new(cfg)
+    Ok(Arc::new(cfg))
 }
 
 /// `set_trust_certificate` — load PEM certs/keys into a root store.
@@ -538,7 +561,9 @@ pub fn ssl_server_config(cert_pem: &str, key_pem: &str) -> io::Result<Arc<rustls
     }
     let key = rustls::pki_types::PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-    let cfg = rustls::ServerConfig::builder()
+    let cfg = rustls::ServerConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
@@ -642,9 +667,9 @@ mod tests {
 
     #[test]
     fn configs_build() {
-        let _ = peer_client_config();
+        let _ = peer_client_config().expect("peer cfg");
         let roots = std::sync::Arc::new(rustls::RootCertStore::empty());
-        let _ = tracker_client_config(roots);
+        let _ = tracker_client_config(roots).expect("tracker cfg");
     }
 
     /// `torrent::verify_peer_cert` end-to-end: a CA root + leaf

@@ -4415,11 +4415,7 @@ impl Session {
         // upstream precondition — `index` out of bounds returns
         // silently; a metadata-less torrent's empty layout bounds
         // every index the same way.
-        if index.0 < 0
-            || t.files
-                .as_ref()
-                .is_none_or(|fs| index.0 >= fs.num_files())
-        {
+        if index.0 < 0 || t.files.as_ref().is_none_or(|fs| index.0 >= fs.num_files()) {
             return;
         }
         let Some(disk) = self.disk.clone() else {

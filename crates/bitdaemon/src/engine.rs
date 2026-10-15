@@ -39,9 +39,9 @@ use tracing::{debug, info, trace, warn};
 /// `ssl_context::m_ssl_ctx` — tracker-facing rustls config built once
 /// from the OS root store (upstream loads the system trust DB via
 /// OpenSSL defaults). Lazily initialized so non-https setups never
-/// pay for it.
-fn tracker_tls_config() -> Arc<rustls::ClientConfig> {
-    static CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+/// pay for it. `None` when the crypto provider can't build a config.
+fn tracker_tls_config() -> Option<Arc<rustls::ClientConfig>> {
+    static CFG: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
     CFG.get_or_init(|| {
         let mut roots = rustls::RootCertStore::empty();
         let loaded = rustls_native_certs::load_native_certs();
@@ -51,7 +51,13 @@ fn tracker_tls_config() -> Arc<rustls::ClientConfig> {
         for c in loaded.certs {
             let _ = roots.add(c);
         }
-        bitdaemon_net::ssl_stream::tracker_client_config(Arc::new(roots))
+        match bitdaemon_net::ssl_stream::tracker_client_config(Arc::new(roots)) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!("tracker TLS config unavailable: {e}");
+                None
+            }
+        }
     })
     .clone()
 }
@@ -1039,11 +1045,25 @@ impl Engine {
                         Ok(addr) => match connector.clone().connect(addr).await {
                             Ok(s) => {
                                 let mut s: BoxedPeerStream = if https {
+                                    let cfg = match tracker_tls_config() {
+                                        Some(c) => c,
+                                        None => {
+                                            let _ = tx.send(AnnounceDone {
+                                                ih,
+                                                url,
+                                                result: Err(
+                                                    "tls: crypto provider unavailable".to_string()
+                                                ),
+                                                scrape: false,
+                                            });
+                                            return;
+                                        }
+                                    };
                                     match bitdaemon_net::ssl_stream::ssl_connect(
                                         s,
                                         &c.hostname,
                                         addr,
-                                        tracker_tls_config(),
+                                        cfg,
                                     )
                                     .await
                                     {
@@ -2726,15 +2746,32 @@ impl Engine {
         if let Some(a) = local {
             slock(&self.session).on_listen_succeeded(a.to_string(), kind);
         }
-        let cfg = Arc::new(
-            rustls::ServerConfig::builder()
-                // SSL torrents are mutual-TLS upstream
-                // (`verify_peer | verify_fail_if_no_peer_cert`).
-                .with_client_cert_verifier(Arc::new(
-                    bitdaemon_net::ssl_stream::TorrentClientVerifier::new(self.ssl_roots.clone()),
-                ))
-                .with_cert_resolver(self.ssl_resolver.clone()),
-        );
+        let cfg = match rustls::ServerConfig::builder_with_provider(
+            bitdaemon_net::ssl_stream::crypto_provider(),
+        )
+        .with_safe_default_protocol_versions()
+        {
+            Ok(b) => Arc::new(
+                b
+                    // SSL torrents are mutual-TLS upstream
+                    // (`verify_peer | verify_fail_if_no_peer_cert`).
+                    .with_client_cert_verifier(Arc::new(
+                        bitdaemon_net::ssl_stream::TorrentClientVerifier::new(
+                            self.ssl_roots.clone(),
+                        ),
+                    ))
+                    .with_cert_resolver(self.ssl_resolver.clone()),
+            ),
+            Err(e) => {
+                slock(&self.session).on_listen_failed(
+                    local.map_or_else(String::new, |a| a.to_string()),
+                    "ssl".into(),
+                    e.to_string(),
+                    kind,
+                );
+                return;
+            }
+        };
         let tx = self.connect_tx.clone();
         let fd_tx = self.fd_exhausted_tx.clone();
         let known = self.known_ihs.clone();
