@@ -136,6 +136,13 @@ pub struct TorrentPeer {
     pub maybe_upload_only: bool,
     /// `fast_reconnects:4` — [0, 15].
     pub fast_reconnects: u8,
+    /// `peer_connection::m_fast_reconnect` — parked on the entry
+    /// while the conn is in flight (we have no conn object
+    /// pre-attach). Armed by `peer_connection::fast_reconnect(true)`
+    /// on the MSE-dial leg + the uTP `connect_failed` leg; read by
+    /// `set_connection`/`connection_closed` to keep the rewound
+    /// `last_connected` stamp. Cleared when the conn closes.
+    pub fast_reconnect: bool,
     /// `trust_points:4` — [-7, 8].
     pub trust_points: i8,
     /// `source:6` — `peer_source_flags_t`.
@@ -187,6 +194,7 @@ impl TorrentPeer {
             upload_only: false,
             maybe_upload_only: false,
             fast_reconnects: 0,
+            fast_reconnect: false,
             trust_points: 0,
             source: src,
             // assume no support in order to prefer opening

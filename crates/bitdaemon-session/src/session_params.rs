@@ -262,10 +262,12 @@ impl SettingInt for bitdaemon_net::pe_crypto::EncPolicy {
         }
     }
     fn from_int(v: i64) -> Self {
+        // `sanitize_settings` — an out-of-range enc_policy
+        // deserializes to `pe_disabled` upstream.
         match v {
             0 => Self::Forced,
-            2 => Self::Disabled,
-            _ => Self::Enabled,
+            1 => Self::Enabled,
+            _ => Self::Disabled,
         }
     }
 }

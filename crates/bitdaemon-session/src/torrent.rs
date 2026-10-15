@@ -331,7 +331,8 @@ pub enum WebSeedBackoff {
 
 /// `torrent` — one swarm.
 pub struct Torrent {
-    /// `m_torrent_file->info_hash()`.
+    /// `m_torrent_file->info_hash()` — the session-map key (v1, or
+    /// truncated v2 for v2-only torrents).
     pub info_hash: Sha1Hash,
     /// `m_info_hash` — the torrent's info-hash set (v1 and/or v2);
     /// `info_hash` stays the map key (v1, or truncated v2 for
@@ -863,6 +864,28 @@ pub enum MetadataVerdict {
     ParseError,
 }
 
+/// What the engine settled for an attaching conn — upstream reads
+/// the same off `peer_connection`/the socket (`m_outgoing`,
+/// `m_encrypted`, `peer_info_struct()->protocol_v2`, `is_utp`).
+#[derive(Debug, Clone, Copy)]
+pub struct PeerAttach {
+    /// `m_outgoing` — we dialed (drives the `pe_support`
+    /// write-back gate).
+    pub outgoing: bool,
+    /// `m_encrypted` — the conn went through the MSE handshake
+    /// (`supports_encryption()` — plaintext-select still counts).
+    pub encrypted: bool,
+    /// `protocol_v2` as resolved at handshake parse — the reserved
+    /// bit (incoming), the skey version (MSE) or the v2 echo
+    /// (outgoing). Written onto the swarm entry.
+    pub protocol_v2: bool,
+    /// `is_utp(m_socket)`.
+    pub was_utp: bool,
+    /// `out_enc_policy == pe_enabled` — upstream gates both
+    /// `pe_support` write-backs on it.
+    pub out_enabled: bool,
+}
+
 impl Torrent {
     /// `peer_connection::send_allowed_set` — BEP-6: when the peer
     /// negotiated the FAST extension, advertise a deterministic
@@ -1143,6 +1166,9 @@ impl Torrent {
                         .collect(),
                 );
                 t.ti = Some(ti.clone());
+                // `m_info_hash = m_torrent_file->info_hashes()` —
+                // the metainfo is authoritative for both hashes.
+                t.info_hashes = *ti.info_hashes();
                 if ti.v2() {
                     t.build_merkle_trees(ti);
                 }
@@ -1200,6 +1226,12 @@ impl Torrent {
                     t.info_hashes = atp.info_hashes;
                 }
                 t.magnet = true;
+                // `m_info_hash = atp.info_hashes` — a hybrid magnet
+                // knows both hashes before metadata (drives the v2
+                // MSE index + the protocol_v2 fallback).
+                if atp.info_hashes.has_v1() || atp.info_hashes.has_v2() {
+                    t.info_hashes = atp.info_hashes;
+                }
                 t.default_dont_download = atp
                     .flags
                     .contains(bitdaemon_common::flags::TorrentFlags::DEFAULT_DONT_DOWNLOAD);
@@ -1508,6 +1540,17 @@ impl Torrent {
         self.ti = Some(std::sync::Arc::new(info));
         self.metadata_raw = Some(metadata.to_vec());
         self.magnet = false;
+        // upstream `set_metadata`: `protocol_v2` can be set
+        // speculatively pre-metadata (a v2-keyed magnet) — clear it
+        // swarm-wide when the metainfo proves there is no v2 hash.
+        if !self.info_hashes.has_v2() {
+            for p in self.peer_list.peers_mut() {
+                p.protocol_v2 = false;
+            }
+            for c in self.peers.values_mut() {
+                c.protocol_v2 = false;
+            }
+        }
         // `apply_pad_files` — fully-padded pieces get the `we_have`
         // treatment (upstream `init` → `we_have` per pad piece).
         for piece in self.init_picker(true) {
@@ -2093,7 +2136,12 @@ impl Torrent {
             // `added.f` flows through as `pex_flags` (upstream
             // `add_peer` → `insert_peer` maps `pex_encryption` →
             // `pe_support`, `pex_seed` → `maybe_upload_only`, …).
-            let pf = bitdaemon_common::flags::PexFlags::from_bits(p.flags);
+            let mut pf = bitdaemon_common::flags::PexFlags::from_bits(p.flags);
+            // `torrent::add_peer`: a v2-only swarm flags every
+            // added peer `pex_lt_v2` (no v1 conns exist).
+            if !self.info_hashes.has_v1() {
+                pf |= bitdaemon_common::flags::PexFlags::LT_V2;
+            }
             if self
                 .peer_list
                 .add_peer(
@@ -2699,6 +2747,16 @@ impl Torrent {
         if c.num_pieces >= self.num_pieces {
             flags = flags.with(PeerFlags::SEED);
         }
+        // upstream `get_peer_info`: `m_encrypted` (the conn ran MSE)
+        // reports exactly one of `rc4_encrypted`/`plaintext_encrypted`
+        // by `m_rc4_encrypted`.
+        if c.supports_encryption {
+            flags = flags.with(if c.rc4_encrypted {
+                PeerFlags::RC4_ENCRYPTED
+            } else {
+                PeerFlags::PLAINTEXT_ENCRYPTED
+            });
+        }
         // `p.source` = the torrent_peer's source flags (`{}` when the
         // conn isn't tracked in the peer list).
         let tp = c.remote.or(remote).and_then(|ep| self.peer_index(ep));
@@ -3168,14 +3226,16 @@ impl Torrent {
             }));
             return None;
         }
+        // upstream `torrent::add_peer`: `!info_hashes().has_v1()` →
+        // `pex_lt_v2` on every added peer — a v2-only swarm has no
+        // v1 conns (the flag makes the dial use the v2 SKEY).
+        let mut pex_flags = bitdaemon_common::flags::PexFlags::NONE;
+        if !self.info_hashes.has_v1() {
+            pex_flags |= bitdaemon_common::flags::PexFlags::LT_V2;
+        }
         let added = self
             .peer_list
-            .add_peer(
-                remote,
-                src,
-                bitdaemon_common::flags::PexFlags::NONE,
-                &self.peer_list_state,
-            )
+            .add_peer(remote, src, pex_flags, &self.peer_list_state)
             .map(|(i, _)| i);
         // upstream `add_peer`/`connect_to_peer` → `state_updated()`
         // (list_peers changed).
@@ -3241,43 +3301,18 @@ impl Torrent {
     }
 
     /// `torrent::try_connect_peer` — `connect_one_peer` + the dial
-    /// bookkeeping; the session hands out one dial per call. The
-    /// returned `(endpoint, encrypted)` is what the engine dials;
+    /// bookkeeping; the session hands out one dial per call.
     /// `None` = no usable candidate (`p->ip()` unresolvable — i2p
     /// — counts as a missed attempt, like upstream's failed
-    /// `connect_to_peer`).
-    /// `bt_peer_connection` ctor's encryption pick under
-    /// `pe_enabled` — the `pe_support` self-toggle: a plain dial
-    /// pre-sets it (a failure retries encrypted), an MSE dial
-    /// clears it (success re-arms via `peer_connected`) AND flags
-    /// the conn `fast_reconnect` so a failed MSE leg isn't cooled
-    /// out for the plaintext retry. Returns `(encrypted, fast)`.
-    fn pick_dial_encryption(
-        p: &mut bitdaemon_net::torrent_peer::TorrentPeer,
-        out_policy: bitdaemon_net::pe_crypto::EncPolicy,
-    ) -> (bool, bool) {
-        match out_policy {
-            bitdaemon_net::pe_crypto::EncPolicy::Forced => (true, false),
-            bitdaemon_net::pe_crypto::EncPolicy::Disabled => (false, false),
-            bitdaemon_net::pe_crypto::EncPolicy::Enabled => {
-                if p.pe_support {
-                    p.pe_support = false;
-                    (true, true)
-                } else {
-                    p.pe_support = true;
-                    (false, false)
-                }
-            }
-        }
-    }
-
+    /// `connect_to_peer`). The wire crypto is *not* decided here —
+    /// upstream's `on_connected` toggles `pe_support` once the
+    /// stream exists; the engine calls [`Self::peer_link_up`].
     pub fn try_connect_peer(
         &mut self,
         session_time: i32,
         state: &bitdaemon_net::peer_list::PeerListState,
-        out_policy: bitdaemon_net::pe_crypto::EncPolicy,
         fingerprint: &[u8],
-    ) -> Option<(std::net::SocketAddr, bool, bool, bitdaemon_common::PeerId)> {
+    ) -> Option<(std::net::SocketAddr, bitdaemon_common::PeerId)> {
         // keep `finished` in sync so finished torrents skip
         // seed/upload-only candidates — upstream feeds
         // `torrent_state::is_finished` (`is_finished()`, which is
@@ -3292,7 +3327,7 @@ impl Torrent {
             return None;
         }
         let i = self.peer_list.connect_one_peer(session_time, &st)?;
-        let dial = {
+        let ep = {
             let p = self.peer_list.peers_mut().get_mut(i)?;
             // upstream stamps `last_connected` at `connect_to_peer`
             // entry — a failed instantiate still counts as an
@@ -3306,8 +3341,7 @@ impl Torrent {
                 self.update_want_peers();
                 return None;
             };
-            let (encrypted, fast_reconnect) = Self::pick_dial_encryption(p, out_policy);
-            (ep, encrypted, fast_reconnect)
+            ep
         };
         // `set_connection` at dial start (upstream's peer_connection
         // ctor) — the entry stops being a candidate until
@@ -3320,15 +3354,7 @@ impl Torrent {
         // pid map until the conn attaches or fails.
         let our_pid = bitdaemon_common::peer_id::generate_peer_id(fingerprint);
         self.outgoing_pids.insert(our_pid);
-        self.dial_pids.insert(dial.0, our_pid);
-        // `fast_reconnect(true)` on the MSE-armed dial — rewind
-        // `last_connected` + credit `fast_reconnects` so a failed
-        // leg retries immediately (upstream runs it at the pe1
-        // write inside `start()`).
-        if dial.2 {
-            let st2 = self.peer_list_state.clone();
-            let _ = self.peer_list.fast_reconnect(i, session_time, &st2);
-        }
+        self.dial_pids.insert(ep, our_pid);
         // `++m_num_seeds` at conn creation for a seed-flagged entry
         // (upstream bumps it in `create_peer_connection`, before the
         // dial completes).
@@ -3344,7 +3370,187 @@ impl Torrent {
             self.num_connecting_seeds += 1;
         }
         self.update_want_peers();
-        Some((dial.0, dial.1, dial.2, our_pid))
+        Some((ep, our_pid))
+    }
+
+    /// `bt_peer_connection::on_connected` — runs on a freshly
+    /// *connected* outbound socket, before the handshake: the wire
+    /// crypto is decided there, not at pick. `pe_forced` → MSE
+    /// always; `pe_enabled` → the self-toggling `pe_support` bit
+    /// (an MSE probe clears it and arms `fast_reconnect` so a
+    /// failed probe retries plaintext without cooldown; a plain
+    /// dial sets it optimistically and a completed handshake
+    /// clears it again). SSL transports force `pe_disabled`
+    /// upstream (`is_ssl` streams are already encrypted).
+    ///
+    /// Returns `(wire_ih, protocol_v2, has_v2, encrypted)` — the
+    /// `associated_info_hash` to put on the wire (and into the MSE
+    /// SKEY), the conn's protocol version, the v2 reserved-bit
+    /// advertise, and whether to run MSE.
+    pub fn peer_link_up(
+        &mut self,
+        remote: std::net::SocketAddr,
+        out_policy: bitdaemon_net::pe_crypto::EncPolicy,
+        is_ssl: bool,
+        session_time: i32,
+    ) -> Option<(Sha1Hash, bool, bool, bool)> {
+        use bitdaemon_net::pe_crypto::EncPolicy;
+        let i = self.peer_index(remote)?;
+        let policy = if is_ssl {
+            EncPolicy::Disabled
+        } else {
+            out_policy
+        };
+        let (proto_v2, encrypted) = {
+            let p = &mut self.peer_list.peers_mut()[i];
+            let encrypted = match policy {
+                EncPolicy::Forced => true,
+                EncPolicy::Disabled => false,
+                EncPolicy::Enabled => {
+                    if p.pe_support {
+                        // pessimistic clear — the write-back on a
+                        // completed encrypted handshake re-arms it;
+                        // a failed probe comes back instantly as
+                        // plaintext (fast_reconnect below).
+                        p.pe_support = false;
+                        true
+                    } else {
+                        // optimistic set — cleared again on a
+                        // successful plaintext handshake.
+                        p.pe_support = true;
+                        false
+                    }
+                }
+            };
+            (p.protocol_v2, encrypted)
+        };
+        // `fast_reconnect(true)` — the MSE-probe leg only; rewinds
+        // `last_connected` so `connection_closed` leaving it alone
+        // makes the entry instantly re-dialable.
+        if encrypted && policy == EncPolicy::Enabled {
+            let st = self.peer_list_state.clone();
+            self.peer_list.arm_fast_reconnect(
+                i,
+                session_time,
+                st.min_reconnect_time,
+                st.max_failcount,
+            );
+        }
+        Some((
+            self.wire_ih(proto_v2),
+            proto_v2,
+            self.info_hashes.has_v2(),
+            encrypted,
+        ))
+    }
+
+    /// `init_bt_handshake`'s `pe_support` write-back — the encrypted
+    /// portion of an outgoing `pe_enabled` dial completed, so the
+    /// entry retries encrypted on the next dial. Runs even when the
+    /// conn then fails (the write-back precedes the handshake
+    /// upstream).
+    pub fn rearm_pe_support(&mut self, remote: std::net::SocketAddr) {
+        if let Some(i) = self.peer_index(remote) {
+            self.peer_list.peers_mut()[i].pe_support = true;
+        }
+    }
+
+    /// `associated_info_hash()` — the info-hash this conn puts on
+    /// the wire (and into the MSE SKEY): the truncated v2 when the
+    /// conn's `protocol_v2` is set and the torrent has a v2 hash.
+    #[must_use]
+    pub fn wire_ih(&self, proto_v2: bool) -> Sha1Hash {
+        use bitdaemon_common::info_hash::ProtocolVersion as PV;
+        if proto_v2 && self.info_hashes.has_v2() {
+            return self.info_hashes.get(PV::V2);
+        }
+        if self.info_hashes.has_v1() {
+            return self.info_hashes.get(PV::V1);
+        }
+        // v2-only swarm: `add_swarm_peer` flags every entry
+        // `pex_lt_v2` so `proto_v2` is always set here — this leg
+        // is defensive (upstream would trip its zero-hash assert).
+        self.info_hashes.get(PV::V2)
+    }
+
+    /// `peer_connection::connect_failed` + the `disconnect` peer-list
+    /// legs — a dial died before the conn attached. `fail` carries
+    /// upstream's `(ec, op, severity)` classification; the io/uTP
+    /// kind drives the `supports_utp` clear + posted TCP retry.
+    ///
+    /// Returns `Some(our_pid)` when upstream would post the deferred
+    /// `connect_to_peer` (failed uTP leg on a `supports_utp` peer):
+    /// the entry is already re-marked connecting and a fresh
+    /// per-conn peer-id was registered — the caller re-dials it
+    /// (over TCP now that `supports_utp` is cleared).
+    pub fn peer_dial_failed(
+        &mut self,
+        remote: std::net::SocketAddr,
+        session_time: i32,
+        fail: &bitdaemon_net::bt_peer_conn::DialFail,
+        fingerprint: &[u8],
+    ) -> Option<bitdaemon_common::PeerId> {
+        let i = self.peer_index(remote)?;
+        // pending-dial bookkeeping — the conn never attached, so its
+        // pid leaves `outgoing_pids`/`dial_pids`/`dial_locals` here
+        // (upstream: conn dtor → `remove_peer` erases it).
+        self.dial_locals.remove(&remote);
+        if let Some(pid) = self.dial_pids.remove(&remote) {
+            self.outgoing_pids.remove(&pid);
+        }
+        let st = self.peer_list_state.clone();
+        // upstream's uTP leg: `is_utp && supports_utp && !holepunch`
+        // → clear the flag, `fast_reconnect(true)` (rewind +
+        // `fast_reconnects` credit), `disconnect(normal)` (no
+        // `m_failed` → no failcount), then a posted
+        // `connect_to_peer(pi, ignore_limit)` retries TCP.
+        let retry = fail.utp
+            && fail.severity == bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal
+            && self.peer_list.peers()[i].supports_utp;
+        if retry {
+            self.peer_list.peers_mut()[i].supports_utp = false;
+            self.peer_list.arm_fast_reconnect(
+                i,
+                session_time,
+                st.min_reconnect_time,
+                st.max_failcount,
+            );
+        }
+        // `connection_closed` — `failed()` iff severity > normal; a
+        // fast-reconnecting entry keeps the rewound dial stamp (the
+        // parked flag is consumed here).
+        self.peer_list.connection_closed(
+            i,
+            session_time,
+            false,
+            fail.severity > bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+            &st,
+        );
+        if !retry {
+            // `dec_num_connecting` — the dial is over; `num_seeds`
+            // was bumped at `try_connect_peer` for a seed-flagged
+            // pending dial and unwinds with it (`remove_peer` on a
+            // conn that never completed).
+            self.num_connecting = self.num_connecting.saturating_sub(1);
+            if self.peer_list.peers()[i].seed {
+                self.num_connecting_seeds = self.num_connecting_seeds.saturating_sub(1);
+                self.num_seeds = self.num_seeds.saturating_sub(1);
+            }
+            return None;
+        }
+        // the posted `connect_to_peer(pi, ignore_limit)` — re-mark
+        // the entry connecting; `fast_reconnect` was consumed by
+        // `connection_closed` so `last_connected` restamps normally
+        // for this new dial. `num_connecting` nets to zero.
+        let _ = self.peer_list.set_connected(i, session_time, false, 0);
+        // `create_peer_connection` for the retry — fresh pid in
+        // `m_outgoing_pids`; the wire crypto is picked at the
+        // retry conn's own `peer_link_up` (upstream `on_connected`).
+        let our_pid = bitdaemon_common::peer_id::generate_peer_id(fingerprint);
+        self.outgoing_pids.insert(our_pid);
+        self.dial_pids.insert(remote, our_pid);
+        self.update_want_peers();
+        Some(our_pid)
     }
 
     /// `torrent::do_connect_boost` — the first tracker response
@@ -3358,11 +3564,10 @@ impl Torrent {
         &mut self,
         session_time: i32,
         state: &bitdaemon_net::peer_list::PeerListState,
-        out_policy: bitdaemon_net::pe_crypto::EncPolicy,
         num_connections: i64,
         s: &crate::settings::SessionSettings,
         fingerprint: &[u8],
-    ) -> Vec<(std::net::SocketAddr, bool, bool, bitdaemon_common::PeerId)> {
+    ) -> Vec<(std::net::SocketAddr, bitdaemon_common::PeerId)> {
         if self.connect_boost_counter == 0 {
             return Vec::new();
         }
@@ -3375,96 +3580,12 @@ impl Torrent {
         while self.want_peers(s) && conns > 0 {
             conns -= 1;
             self.connect_boost_counter = self.connect_boost_counter.saturating_sub(1);
-            if let Some(d) = self.try_connect_peer(session_time, state, out_policy, fingerprint) {
+            if let Some(d) = self.try_connect_peer(session_time, state, fingerprint) {
                 dials.push(d);
             }
             self.update_want_peers();
         }
         dials
-    }
-
-    /// `peer_connection::connect_failed` — a dial that never
-    /// completed. Two legs upstream:
-    ///
-    /// * **uTP fallback** (`is_utp` && `supports_utp`): clear
-    ///   `supports_utp`, `fast_reconnect(true)` (rewind
-    ///   `last_connected` + credit `fast_reconnects`), disconnect at
-    ///   **normal** severity (no `failcount`) and immediately re-dial
-    ///   the SAME entry over TCP (`connect_to_peer(pi, ignore_limit)`).
-    ///   The returned `(endpoint, encrypted)` is that retry — the
-    ///   caller dials it right away; `num_connecting` nets to zero
-    ///   (`dec` on the dead conn, `inc` on the new one).
-    /// * **any other failure**: `disconnect(e, connect, failure)` —
-    ///   `failcount++` via `connection_closed`.
-    ///
-    /// `conn_fast` is the failed dial conn's own `m_fast_reconnect`
-    /// (an MSE-retry conn skips the `last_connected` restamp).
-    /// Returns the immediate TCP retry for the uTP leg.
-    pub fn peer_connect_failed(
-        &mut self,
-        remote: std::net::SocketAddr,
-        session_time: i32,
-        was_utp: bool,
-        conn_fast: bool,
-        out_policy: bitdaemon_net::pe_crypto::EncPolicy,
-        fingerprint: &[u8],
-    ) -> Option<(std::net::SocketAddr, bool, bool, bitdaemon_common::PeerId)> {
-        let i = self.peer_index(remote)?;
-        // pending-dial bookkeeping — the conn never attached, so its
-        // pid leaves `outgoing_pids`/`dial_pids`/`dial_locals` here
-        // (upstream: conn dtor → `remove_peer` erases it).
-        self.dial_locals.remove(&remote);
-        if let Some(pid) = self.dial_pids.remove(&remote) {
-            self.outgoing_pids.remove(&pid);
-        }
-        let st = self.peer_list_state.clone();
-        if was_utp && self.peer_list.peers()[i].supports_utp {
-            // `fast_reconnect(true)` rewinds before the close so
-            // `connection_closed` keeps the rewind (`!c.fast_reconnect()`
-            // gates the restamp); `connect_to_peer` restamps to now
-            // anyway for the retry.
-            let _ = self.peer_list.fast_reconnect(i, session_time, &st);
-            self.peer_list.peers_mut()[i].supports_utp = false;
-            // `disconnect(e, connect, normal)` — no failcount.
-            self.peer_list
-                .connection_closed(i, session_time, true, false, &st);
-            // `connect_to_peer(pi, true)` — same entry, TCP this
-            // time (`supports_utp` clear steers `instantiate` away
-            // from uTP); `set_connection` marks + restamps like the
-            // normal dial path. `num_connecting`/`num_connecting_seeds`
-            // net zero — upstream decs then incs.
-            let _ = self.peer_list.set_connected(i, session_time, false, 0);
-            let (encrypted, fast_reconnect) =
-                Self::pick_dial_encryption(&mut self.peer_list.peers_mut()[i], out_policy);
-            // `create_peer_connection` for the retry — fresh pid in
-            // `m_outgoing_pids`, MSE arm rewinds again under the
-            // `fast_reconnects` cap.
-            let our_pid = bitdaemon_common::peer_id::generate_peer_id(fingerprint);
-            self.outgoing_pids.insert(our_pid);
-            self.dial_pids.insert(remote, our_pid);
-            if fast_reconnect {
-                let _ = self.peer_list.fast_reconnect(i, session_time, &st);
-            }
-            self.update_want_peers();
-            return Some((remote, encrypted, fast_reconnect, our_pid));
-        }
-        // `dec_num_connecting` — the dial is over.
-        self.num_connecting = self.num_connecting.saturating_sub(1);
-        if self.peer_list.peers()[i].seed {
-            self.num_connecting_seeds = self.num_connecting_seeds.saturating_sub(1);
-            // `num_seeds` was bumped at `try_connect_peer` for the
-            // pending dial — the teardown decrements it like
-            // upstream's `remove_peer` on a conn that never
-            // completed.
-            self.num_seeds = self.num_seeds.saturating_sub(1);
-        }
-        // `disconnect(e, connect, failure)` — `connection_closed`
-        // bumps `failcount`; the conn's own `m_fast_reconnect` (an
-        // MSE retry) keeps the dial-time stamp so the plaintext
-        // retry isn't cooled out.
-        self.peer_list
-            .connection_closed(i, session_time, conn_fast, true, &st);
-        None
     }
 
     /// `connect_to_peer` for a caller-specified endpoint (the
@@ -3570,11 +3691,10 @@ impl Torrent {
     pub fn peer_connected_attach(
         &mut self,
         index: usize,
-        encrypted: bool,
+        attach: PeerAttach,
         session_time: i32,
         conn_key: u64,
         conn_fast_reconnect: bool,
-        was_utp: bool,
         was_pending: bool,
     ) -> (i64, i64) {
         if was_pending {
@@ -3587,10 +3707,20 @@ impl Torrent {
             self.peer_list
                 .set_connected(index, session_time, conn_fast_reconnect, conn_key);
         if let Some(p) = self.peer_list.peers_mut().get_mut(index) {
-            p.pe_support = encrypted;
+            // upstream write-backs under `is_outgoing() &&
+            // out_enc_policy == pe_enabled`: a completed MSE
+            // handshake re-arms `pe_support`, a completed plaintext
+            // handshake clears it.
+            if attach.outgoing && attach.out_enabled {
+                p.pe_support = attach.encrypted;
+            }
+            // the conn's resolved protocol version lands on the
+            // swarm entry (upstream writes `peer_info_struct()->
+            // protocol_v2` at handshake parse — only ever *set*).
+            p.protocol_v2 |= attach.protocol_v2;
             // a successful uTP dial confirms the transport —
             // upstream `peer_connection` on socket-connect.
-            if was_utp {
+            if attach.was_utp {
                 p.confirmed_supports_utp = true;
                 p.supports_utp = false;
             }
@@ -3617,13 +3747,13 @@ impl Torrent {
     pub fn peer_connected_outgoing(
         &mut self,
         remote: std::net::SocketAddr,
-        encrypted: bool,
+        attach: PeerAttach,
         session_time: i32,
         conn_key: u64,
         conn_fast_reconnect: bool,
-        was_utp: bool,
         our_pid: Option<bitdaemon_common::PeerId>,
     ) -> Option<(usize, i64, i64)> {
+        debug_assert!(attach.outgoing);
         // `Some(pid)` = a marked dial (`try_connect_peer` /
         // `register_manual_dial` registered `dial_pids[remote]`): the
         // mapping must still be OURS — a missing or foreign mapping
@@ -3683,11 +3813,10 @@ impl Torrent {
         let was_pending = bound == 0 && self.peer_list.peers()[i].connection.is_some();
         let (dl, ul) = self.peer_connected_attach(
             i,
-            encrypted,
+            attach,
             session_time,
             conn_key,
             conn_fast_reconnect,
-            was_utp,
             was_pending,
         );
         Some((i, dl, ul))

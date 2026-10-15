@@ -35,13 +35,11 @@ fn tracker_feed_gives_candidates() {
     // `connect_one_peer` pops one candidate per dial — drain the
     // cache like upstream's boost loop.
     let mut cands = Vec::new();
-    while let Some(c) =
-        t.try_connect_peer(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled, &[])
-    {
+    while let Some(c) = t.try_connect_peer(0, &st, &[]) {
         cands.push(c);
     }
     assert_eq!(cands.len(), 4);
-    assert!(cands.iter().any(|c| (c.0, c.1) == (ep(1), false)));
+    assert!(cands.iter().any(|c| c.0 == ep(1)));
 }
 
 #[test]
@@ -73,14 +71,8 @@ fn seed_skips_seed_candidates() {
     let i = t.peer_list.find_peer(ep(1).ip()).unwrap();
     t.peer_list.set_seed(i, true);
     let st = PeerListState::default();
-    assert!(
-        t.try_connect_peer(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled, &[])
-            .is_none()
-    );
+    assert!(t.try_connect_peer(0, &st, &[]).is_none());
     // back to downloading → candidate again
     t.finished = false;
-    assert!(
-        t.try_connect_peer(0, &st, bitdaemon_net::pe_crypto::EncPolicy::Enabled, &[])
-            .is_some()
-    );
+    assert!(t.try_connect_peer(0, &st, &[]).is_some());
 }

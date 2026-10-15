@@ -325,23 +325,21 @@ fn connect_candidates_backoff_on_failure() {
         max_failcount: 3,
         allow_multiple_connections_per_ip: false,
     };
-    let pol = bitdaemon_net::pe_crypto::EncPolicy::Enabled;
-    // the boost already handed the peer out (plaintext — `pe_support`
-    // tentatively armed per upstream's toggle); nothing left to dial.
+    // the boost already handed the peer out; nothing left to dial.
     assert!(
         s.torrents
             .get_mut(&ih)
             .unwrap()
-            .try_connect_peer(0, &st, pol, &[])
+            .try_connect_peer(0, &st, &[])
             .is_none()
     );
     // dial fails → backoff window blocks re-dial at t=1
-    s.peer_connect_failed(&ih, ep, false, false);
+    s.peer_connect_failed(&ih, ep, false);
     assert!(
         s.torrents
             .get_mut(&ih)
             .unwrap()
-            .try_connect_peer(1, &st, pol, &[])
+            .try_connect_peer(1, &st, &[])
             .is_none()
     );
     // after min_reconnect_time*(failcount+1)=120s it's a candidate again
@@ -349,9 +347,8 @@ fn connect_candidates_backoff_on_failure() {
         .torrents
         .get_mut(&ih)
         .unwrap()
-        .try_connect_peer(200, &st, pol, &[]);
-    // the failed plaintext dial left pe_support armed → MSE retry.
-    assert_eq!(c.map(|x| (x.0, x.1)), Some((ep, true)));
+        .try_connect_peer(200, &st, &[]);
+    assert_eq!(c.map(|x| x.0), Some(ep));
 }
 
 #[test]

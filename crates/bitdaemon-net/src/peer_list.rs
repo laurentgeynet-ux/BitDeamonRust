@@ -754,6 +754,37 @@ impl PeerList {
     }
 
     /// `new_connection`'s attach tail + `set_connection` — mark the
+    /// `peer_connection::fast_reconnect(true)` — the flag is
+    /// conn-scoped upstream; since our dial has no conn object yet it
+    /// is *parked* on the swarm entry and consumed by
+    /// [`Self::set_connected`]/[`Self::connection_closed`]. Arming
+    /// restamps `last_connected` to now then rewinds it by
+    /// `min_reconnect_time * max_failcount` so the entry is instantly
+    /// re-dialable; skipped once `fast_reconnects > 1`, counted up
+    /// to 15.
+    pub fn arm_fast_reconnect(
+        &mut self,
+        index: usize,
+        session_time: i32,
+        min_reconnect_time: i32,
+        max_failcount: i32,
+    ) {
+        let p = &mut self.peers[index];
+        if p.fast_reconnects > 1 {
+            return;
+        }
+        p.fast_reconnect = true;
+        p.last_connected = session_time.max(0) as u16;
+        let rewind = min_reconnect_time.saturating_mul(max_failcount).max(0);
+        p.last_connected = p
+            .last_connected
+            .saturating_sub(rewind.clamp(0, i32::from(u16::MAX)) as u16);
+        if p.fast_reconnects < 15 {
+            p.fast_reconnects += 1;
+        }
+    }
+
+    /// `new_connection`'s attach tail + `set_connection` — mark the
     /// entry connected: binds `conn_key` (upstream stores the
     /// `peer_connection*`), clears `maybe_upload_only` (a live conn
     /// tells us the real seed state), stamps `last_connected` unless
@@ -771,10 +802,15 @@ impl PeerList {
     ) -> (i64, i64) {
         let was = self.is_connect_candidate(&self.peers[index]);
         let p = &mut self.peers[index];
+        // `c.fast_reconnect()` upstream — the flag is conn-scoped; it
+        // was parked on the entry when the dial armed it (MSE probe
+        // or uTP fallback), so an armed dial keeps its rewound
+        // `last_connected` through attach.
+        let fr = fast_reconnect || p.fast_reconnect;
         p.connection = Some(std::sync::Arc::new(crate::torrent_peer::NullStats));
         p.conn_key = conn_key;
         p.maybe_upload_only = false;
-        if !fast_reconnect {
+        if !fr {
             p.last_connected = session_time.max(0) as u16;
         }
         // `prev_amount` transfers only when a real conn binds —
@@ -817,7 +853,12 @@ impl PeerList {
             p.connection = None;
             p.conn_key = 0;
             p.optimistically_unchoked = false;
-            if !fast_reconnect {
+            // `!c.fast_reconnect()` — a fast-reconnecting conn keeps
+            // the (rewound) dial-time stamp so the entry is instantly
+            // re-dialable; the parked flag is consumed here.
+            let fr = fast_reconnect || p.fast_reconnect;
+            p.fast_reconnect = false;
+            if !fr {
                 p.last_connected = session_time.max(0) as u16;
             }
             if failed && p.failcount < 31 {
