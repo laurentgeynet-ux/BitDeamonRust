@@ -1,16 +1,82 @@
-# Audit A02 — rapport d'analyse : protocoles d'extension (re-audit round 2)
+# Audit A02 — rapport d'analyse : protocoles d'extension (re-audit round 3)
 
 Périmètre : `ut_metadata` (BEP-9), `ut_pex`/`i2p_pex` (BEP-11), `lt_donthave`,
 `suggest`/`allowed_fast` (BEP-6), `smart_ban`, `upload_only`/`share_mode`
 (BEP-21), `ut_holepunch` (BEP-55). Baseline upstream `e7381c7bc`
-(inchangée depuis le round 1).
+(inchangée depuis les rounds 1–2).
 
-**Contexte** : re-audit report-only demandé par l'utilisateur — le round 1
-(rapport `5be36fd`, apply `6dfcdca`, merge `1cf1381`, PR #2) a été relu
-sur le code **post-merge** (A08–A10, A14–A15 touchant `peer_conn.rs`,
-`torrent.rs`, `session.rs`, `engine.rs`). Objectifs : vérifier la tenue
-des 16 corrections round-1, reprendre la checklist à froid, détecter les
-déviations nouvelles ou ratées. **Aucune correction appliquée.**
+**Contexte round 3** : re-audit report-only à froid — chaque item de
+checklist re-croisé avec la lecture intégrale des jambes upstream
+(`ut_metadata.cpp`, `ut_pex.cpp`, `smart_ban.cpp`,
+`bt_peer_connection.cpp::on_extended`/`on_extended_handshake`/`on_holepunch`,
+`peer_connection.cpp::send_allowed_set`/`incoming_*`/`disconnect_if_redundant`/
+`set_upload_only`/`incoming_have_none`/`incoming_interested`) et des
+oracles de test (`test_fast_extension.cpp`, `test_magnet.cpp`,
+`test_privacy.cpp`, `test_utp.cpp`). Le round 2 (rapport `51ddf18`)
+reste d'actualité sauf contre-indication ci-dessous ; **N5 est un faux
+positif retiré** (cf. `## Corrections round 3`). 6 déviations
+**nouvelles** sont relevées (N13–N18), dont une majeure (N15 :
+`smart_ban` jamais alimenté en production). **Aucune correction
+appliquée.**
+
+## Verdicts checklist (round 3)
+
+- **ut_metadata** — verdict : **conforme** — le cap à deux niveaux
+  est fidèle : `metadata_size` du handshake borné à 4 MiB
+  (`ut_metadata.rs:147` = `ut_metadata.cpp:125`) et `total_size` à la
+  réception borné à `max_metadata_size` = 30 MiB
+  (`ut_metadata.rs:218` = `ut_metadata.cpp:515`). Fenêtre
+  `m_sent_requests` = 2, piece non sollicitée consommée sans compteur,
+  `dont_have` → `request_limit = max(now+60s)` avant le find (même
+  non sollicité), penalité `single piece → now+5min + 20–70 s`,
+  compteur en fin de switch. Tie-break : voir correction N5.
+- **ut_pex** — verdict : **déviation** — N1/N2/N3/N8 (round 2)
+  toujours ouvertes + **N14** (première liste différée jusqu'à 60 s
+  pour une conn fraîche — timer torrent-global vs `m_last_msg`
+  per-conn upstream). Réception conforme sinon (ordre
+  dropped-then-added par famille équivalent, flood-guard 6×60 s,
+  cap/dedup/local-filter dans le bon ordre).
+- **lt_donthave** — verdict : **déviation mineure** — gate
+  `is_disconnecting` upstream manquant avant le disconnect
+  `invalid_dont_have` (**N17**) ; le reste est conforme (taille,
+  plage torrent, plage bitfield → peer_error, redondant ignoré).
+- **suggest/allowed_fast** — verdict : **déviation** — gates de
+  validation et insertion conformes ; **N13** : `send_allowed_set`
+  borne sur **notre** `is_upload_only()` alors qu'upstream borne sur
+  l'`upload_only()` **distant** (`m_upload_only || is_seed() ||
+  m_have_all` — état du pair). Rejets hors-set et purges conformes.
+- **smart_ban** — verdict : **déviation majeure** — la logique est
+  fidèle mais **inerte en production** : `read_digest` vaut `|_|
+  None` aux deux points d'appel (**N15**) → `record_failed_block`
+  jamais invoqué → aucun ban par CRC différentiel.
+- **upload_only / share_mode** — verdict : **conforme** — sauf
+  N13/N16/`is_disconnecting` (cf. détails) : sync peer-list +
+  `disconnect_if_redundant`, clé handshake, share_mode ignoré sur
+  seed (les deux chemins), `share_mode` msg non gaté par
+  `support_share_mode` (upstream `on_extended` — conforme).
+- **holepunch** — verdict : **conforme** — ordre des erreurs,
+  bridging local/non-local, `add_peer(PEX)` + `supports_utp` +
+  `holepunch` flag + force-dial sur entrée existante non connectée
+  (`peer_list::add_peer` retourne les entrées existantes — fidèle à
+  `torrent::add_peer`), `failed` log-only.
+- **extended handshake (BEP-10)** — verdict : **conforme** — `reqq`
+  gate `> 0` + clamp u16 identique (`clamp_assign` upstream), `p` →
+  `update_peer_port` + `received_listen_port`, `complete_ago`,
+  `yourip` → ip_voter (v4-mapped inclus upstream, Rust idem),
+  `upload_only`/`share_mode` keys, compteur en fin de parse.
+  `ipv4`/`ipv6` ignorés à la réception = upstream (envoi seulement).
+
+## Corrections round 3 (révision du round 2)
+
+- **N5 est un faux positif — retiré.** `Iterator::min_by_key`
+  retourne le **premier** élément minimal à égalité (sémantique std
+  documentée), exactement comme `std::min_element` — le tie-break de
+  `metadata_request` (`ut_metadata.rs:179-185`) est **conforme**.
+  Le round 2 l'avait classé « dernier minimum » par erreur.
+- **Lecture complémentaire de W6 (round 1)** : le fix `send_allowed_
+  set` a posé le gate sur notre `is_upload_only()` — mauvais opérande
+  (cf. N13). Le statut « tient » du round 2 est corrigé en
+  « opérande erroné ».
 
 Références upstream : `src/ut_metadata.cpp`, `src/ut_pex.cpp`
 (`tick` 87-149, `send_ut_peer_diff` 431, `send_ut_peer_list` 477,
@@ -247,6 +313,120 @@ régression des merges A08–A10/A14–A15 sur les jambes extension.
   dès `valid_metadata()`. Byte différent, sémantique nulle (le
   récepteur ne lit `total_size` que sur `piece`).
 
+## Déviations nouvelles (round 3)
+
+### Wire-visible
+
+- **N13 — `send_allowed_set` borne sur le mauvais `upload_only`**
+  (`torrent.rs:997-1003`) : Rust retourne quand `self.is_upload_only()`
+  (notre torrent terminé) — upstream `send_allowed_set` retourne quand
+  `upload_only()` du **peer_connection** est vrai, i.e.
+  `m_upload_only || is_seed() || m_have_all` côté **distant**
+  (`peer_connection.cpp:631`, `peer_connection.hpp:400`). Conséquences
+  symétriques : (a) nous upload-only + pair leecher → upstream émet le
+  set, Rust n'émet rien → les requêtes choked du pair tombent en reject
+  au lieu de toucher l'allowed-fast offert ; (b) pair upload-only/seed +
+  nous leecher → upstream saute, Rust envoie un set inutile et remplit
+  `accept_fast`. Introduit par le fix round-1 (opérande inversé ; la
+  vérification round-2 « tient » était erronée). Fix : gater sur
+  `c.remote_upload_only || c.is_seed()` après fetch de la conn (le
+  `num_allowed_pieces <= 0` / `supports_fast` sont déjà corrects).
+- **N14 — première liste PEX différée jusqu'à 60 s pour une conn
+  fraîche** (`torrent.rs:2370-2452`) : `last_pex` est un timer
+  **torrent-global** estampillé à chaque appel éligible — y compris
+  quand `!enable_pex` ou `peers.len() <= 1` (le stamp précède les
+  gates). Upstream garde `m_last_msg` **par conn**, initialisé
+  `min_time()` : la première plugin-tick de la conn (~1 s post-
+  handshake) émet `send_ut_peer_list` (liste complète) dès que
+  `m_message_index != 0 && num_peers() > 1` — et le `num_peers <= 1`
+  early-return tombe **avant** le stamp (`ut_pex.cpp:404-428`).
+  Effet : un pair qui rejoint en cours de cycle attend jusqu'à 60 s
+  sa première liste ; une phase à pair unique ou pex désactivé brûle
+  le stamp pour tout le monde. Le contenu (`pex_first_time` → liste
+  complète, diffs ensuite) est fidèle — c'est la cadence qui diverge.
+  Fix : `pex_last_msg: Option<Instant>` par conn (`None` → envoi
+  plein au prochain tick sous les mêmes gates), ou au minimum
+  déplacer le stamp après les gates.
+
+### État / comportement
+
+- **N15 — `smart_ban` jamais alimenté : protection inerte**
+  (`session.rs:5332`, `torrent.rs:7237`) : `piece_verified_ban` reçoit
+  `read_digest = |_| None` aux deux points d'appel → `on_piece_failed`
+  n'enregistre jamais de CRC par bloc (`block_hashes` toujours vide)
+  et `on_piece_passed` ne re-vérifie rien → `BanDecision::Ban`
+  inatteignable en production. Upstream `smart_ban_plugin::
+  on_piece_failed` lance un `async_read` par bloc et mémorise le SHA-1
+  réel (`smart_ban.cpp`). La logique du module est fidèle et testée,
+  mais le chemin production ne l'atteint jamais — un pair émettant des
+  blocs corrompus n'est puni que par la voie `penalize_peers`/
+  `banned_for_hash_failure` (4 échecs, ou échec unique en
+  `known_bad`), jamais par le ban précis-par-bloc. Fix sans re-lecture
+  disque : le hash job de la pièce lit déjà tous les octets — propager
+  les digests SHA-1 par bloc dans le résultat du job (ou bufferiser la
+  pièce hashée) et les passer à `piece_verified_ban`.
+- **N16 — `has_metadata` : set manquant sur `Interested`, set en trop
+  sur `DontHave`** (`peer_conn.rs:1204-1228, 1363`) : upstream pose
+  `m_has_metadata = true` dans `incoming_interested`
+  (`peer_connection.cpp:1817`, avant `disconnect_if_redundant`) et ne
+  le pose **pas** dans `incoming_dont_have` (2123-2191). Rust fait
+  l'inverse : le bras `M::Interested` ne set rien, le bras
+  `M::DontHave` set. Effet dans les deux sens sur le gate
+  `has_metadata()` de `disconnect_if_redundant` : (a) un pair qui a
+  annoncé `ut_metadata` sans `metadata_size` puis envoie `Interested`
+  reste protégé chez Rust alors qu'upstream le coupe s'il est
+  redondant ; (b) un `lt_donthave` seul rend le pair éligible à la
+  coupure chez Rust, pas chez upstream.
+- **N17 — `lt_donthave`/`DontHave` : gate `is_disconnecting` manquant
+  avant le disconnect `invalid_dont_have`** (`peer_conn.rs:1354-1359,
+  1979-1984`) : upstream `incoming_dont_have` retourne silencieusement
+  sur `is_disconnecting()` **avant** le contrôle de borne bitfield
+  (`peer_connection.cpp:2148`). Rust émet `Disconnect(peer_error)` +
+  `failed |= true` inconditionnellement → une conn en cours de
+  teardown reçoit un `failed` qui pollue le `failcount` à
+  `connection_closed`. (Les bras `SuggestPiece`/`AllowedFast`
+  vérifient bien `c.disconnecting` — asymétrie interne.)
+- **N18 — `disconnect_if_redundant` : pas de garde `disconnecting`,
+  pas de veto `can_disconnect`** (`torrent.rs:6323-6358`) : upstream
+  retourne tôt sur `m_disconnecting` (`peer_connection.cpp:2323`) —
+  Rust peut émettre un `DisconnectPeer` dupliqué sur une conn déjà
+  morte (benign si la session déduplique le teardown). Point
+  structurel : `can_disconnect(ec)` permet aux peer-plugins de
+  veto-er les coupures de ce type ; le trait Rust `PeerPlugin`
+  n'expose aucun hook (`on_extended`, `on_suggest`, `on_allowed_fast`,
+  `on_dont_have`, `on_have_none`, `on_interested`,
+  `on_unknown_message`, `can_disconnect`) — les points
+  d'interception upstream n'existent pas dans le modèle plugin
+  actuel. Sans plugin chargé le comportement filaire est identique ;
+  c'est une limite d'extensibilité, pas un bug.
+
+## Non-bugs tranchés (addenda round 3)
+
+- **`metadata_size` 4 MiB vs `max_metadata_size` 30 MiB** : les deux
+  caps coexistent upstream (`ut_metadata.cpp:125` vs `:515`) et en
+  Rust (`ut_metadata.rs:147` vs `:218`) — pas de divergence.
+- **Ordre `dropped`/`added` à la réception PEX** : upstream traite
+  dropped-v4 → added-v4 → dropped6 → added6 ; Rust applique tous les
+  dropped puis tous les added — résultat identique par famille (le
+  dedup `pex_known` interdit les effets croisés). Non-bug.
+- **`ipv4`/`ipv6` keys du handshake** : upstream ne les lit jamais à
+  la réception (seul `yourip` nourrit `set_external_address`) —
+  champs morts Rust confirmés conformes.
+- **`disconnect_if_redundant` sur handshake ext malformé** : upstream
+  l'invoque inconditionnellement en queue d'`on_extended` id==0
+  (`bt_peer_connection.cpp:1914`) même si le bdecode échoue ; Rust ne
+  l'appelle que sur parse réussi. Fenêtre réelle minuscule (il faut
+  un flag upload_only préalablement posé + un handshake corrompu) —
+  cosmétique.
+- **`need_interest_update`** : pas d'équivalent Rust car l'intérêt
+  est calculé eager dans `update_interest` (queue de
+  `on_peer_message`) avant `disconnect_if_redundant` — l'invariant
+  « intérêt à jour » tient par construction.
+- **`PeerSeed(false)` émis même quand le pair n'était pas seed** :
+  upstream n'appelle `set_seed(pi, false)` que sur `was_seed`
+  (peer_connection.cpp:2186) ; l'effet Rust est idempotent sur la
+  peer-list. Cosmétique.
+
 ## Non-bugs tranchés (addenda round 2)
 
 - **`Interested`/`NotInterested` taille** : le codec exige
@@ -270,9 +450,42 @@ régression des merges A08–A10/A14–A15 sur les jambes extension.
 - **Compteur `num_outgoing_pex`/`num_outgoing_extended`** : périmètre
   A29 (sweep compteurs), pas de régression relevée.
 
+## Test-gap analysis (round 3)
+
+| Scénario upstream (`test/`) | Couverture Rust | Statut |
+|---|---|---|
+| `test_fast_extension::reject_fast` (reject purge `allowed_fast` en choked) | logique présente (`peer_conn.rs` `on_reject`) — pas de test dédié | **gap** |
+| `allowed_fast_survives_metadata` / `suggested_piece_survives_metadata` | `retain` présent (`torrent.rs:1820-1823`) — pas de test requête post-metadata | **gap** |
+| `reject_suggest` (reject purge `suggested_pieces` unchoked) | logique présente — non testée | **gap** |
+| `suggest_order` (front-insert, dernier-suggest prioritaire) | `on_suggest` front-insert — ordre de requête non testé | **gap** |
+| `dont_have` (seed → non-seed, bitfield clear, pieces count) | aucun test `dont_have`/`lt_donthave` trouvé | **gap** |
+| `invalid_suggest` | `suggest_negative_index_dropped` | couvert |
+| `invalid_metadata_request` | `ut_metadata_request_serving_and_counter_timing` | couvert |
+| `invalid_request` (piece OOB) | `invalid_request_rejected_and_alerted` | couvert |
+| `extension_handshake` (ids `m{}` annoncés) | couvert via tests engine/handshake (A01) | couvert |
+| holepunch end-to-end (rendezvous → 2×connect ; connect → swarm entry + uTP flag + force-dial ; banned/connected abort) | units codec/décision (`ut_holepunch.rs`) — intégration `Torrent::on_holepunch` non testée | **gap** |
+| PEX première liste à conn fraîche (~1 s upstream) | `pex_feeds_swarm_and_broadcasts` couvre le broadcast ; le timing première-liste non testé (aurait vu N14) | **gap** |
+| smart_ban chemin production (digests réels) | `smart_ban_differing_crc`/`smart_ban_on_piece_passed` injectent les digests à la main — le chemin `piece_verified_ban` (N15) non couvert | **gap** |
+| `test_magnet.cpp::magnet` (résolution ut_metadata complète) | `magnet_resolves_via_ut_metadata`, `wrong_metadata_rejected` | couvert |
+| `test_utp.cpp`, `test_privacy.cpp` | périmètres A05/A24 | hors scope |
+
 ## Résultat
 
-### Round 2 (ce rapport)
+### Round 3 (cette passe)
+
+Re-audit report-only — **aucune correction appliquée**. Les verdicts
+round-2 tiennent sauf **N5 retiré** (faux positif :
+`min_by_key` = premier minimum = `std::min_element`). **6 déviations
+nouvelles** : N13 (mauvais opérande `upload_only` dans
+`send_allowed_set` — wire), N14 (première liste PEX ≤60 s vs ~1 s —
+wire/tempo), **N15 (`smart_ban` jamais alimenté — protection inerte,
+la plus saillante)**, N16 (`has_metadata` : Interested/DontHave
+inversés), N17 (`is_disconnecting` manquant sur `lt_donthave`), N18
+(`disconnect_if_redundant` : garde `disconnecting` + veto plugin
+`can_disconnect` absents — structurel). 9 scénarios-test orphelins
+identifiés (table ci-dessus), dont deux qui auraient détecté N14/N15.
+
+### Round 2 (historique)
 
 Re-audit report-only — **aucune correction appliquée**. Verdict :
 corrections round-1 intègres post-merge ; **5 déviations nouvelles
