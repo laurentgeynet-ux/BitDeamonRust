@@ -6101,7 +6101,7 @@ impl Torrent {
             data_requests_blocked: self.checking,
             has_picker: self.picker.is_some(),
         };
-        let mut pc_stats = crate::piece_picker::NullPickerStats;
+        let mut pc_stats = counters;
         let (invoked, _endgame, reqs, queued) = {
             let (Some(p), Some(c)) = (self.picker.as_mut(), self.peers.get_mut(&peer_id)) else {
                 return false;
@@ -6234,6 +6234,7 @@ impl Torrent {
         max_blocks: i32,
         s: &crate::settings::SessionSettings,
         session_conns: i64,
+        counters: &crate::counters::Counters,
     ) -> Option<(String, Vec<PeerRequest>)> {
         if self.aborted
             || self.web_seeds.is_empty()
@@ -6396,7 +6397,7 @@ impl Torrent {
             suggested_pieces: &suggested,
         };
         let mut picked = Vec::new();
-        let mut pc_stats = crate::piece_picker::NullPickerStats;
+        let mut pc_stats = counters;
         let picker = self.picker.as_mut()?;
         let (got, _) = crate::request_blocks::request_a_block_out(
             picker,
@@ -9203,7 +9204,7 @@ impl Torrent {
                 c.pipeline.last_request_ms = now_ms;
                 if let Some(p) = self.picker.as_mut() {
                     let (send_buffer, rate) = (c.send_buffer, i64::from(c.rate_down_payload));
-                    let mut pc_stats = crate::piece_picker::NullPickerStats;
+                    let mut pc_stats = counters;
                     let (invoked, _eg, reqs, _queued) = c.drive_requests(
                         p,
                         &tctx,
@@ -9319,7 +9320,7 @@ impl Torrent {
                     ctx.outstanding = &outstanding;
                     ctx.picker_options = opts;
                     let mut picked: Vec<(PieceBlock, bool)> = Vec::new();
-                    let mut pc_stats = crate::piece_picker::NullPickerStats;
+                    let mut pc_stats = counters;
                     let (invoked, eg) = crate::request_blocks::request_a_block_out(
                         p,
                         &tctx,
@@ -11055,7 +11056,7 @@ impl Torrent {
             .as_ref()
             .map(|p| {
                 (
-                    p.num_have().max(p.num_pieces() - p.num_filtered()),
+                    p.num_have().max(p.want().num_pieces),
                     p.get_download_queue_size() as i32,
                 )
             })
@@ -11068,7 +11069,7 @@ impl Torrent {
         {
             return;
         }
-        if num_downloaded <= 0 || dl_queue > num_downloaded / 20 {
+        if dl_queue > num_downloaded / 20 {
             return;
         }
         // collect the rarest pieces among connected peers;
