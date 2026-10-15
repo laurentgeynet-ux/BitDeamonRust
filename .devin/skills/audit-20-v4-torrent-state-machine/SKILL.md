@@ -161,8 +161,14 @@ autres).
     `docs/audits/changelog/A20.md` sous `### Fixed` (ou autre section) —
     **ne pas éditer `CHANGELOG.md`** (conflit de merge garanti entre
     audits parallèles ; agrégation post-merge via
-    `python docs/audits/_aggregate_changelog.py`). `docs/PORTING.md` :
-    n'éditer que les rows du périmètre de l'audit, si leur statut change.
+    `python docs/audits/_aggregate_changelog.py`).
+    **`docs/PORTING.md` — obligatoire** : enrichir les rows du périmètre
+    avec ce que le fix a changé en parité (détails wire, compteurs,
+    sémantique d'erreur — la colonne notes documente l'état réel, pas
+    seulement le statut). Mettre le statut à jour si le fix le change
+    (`ported` → `verified`…). Les edits sont par row → recouvrements
+    quasi nuls entre apply parallèles ; en cas de conflit au merge,
+    rebase + gates comme pour le reste.
 12. Commit `fix(<crate>): <scope> parity — <mot-clé>` **sur la branche
     `audit/20-torrent-state-machine`** — jamais sur `main`. Push la branche,
     `gh pr create`. Merges séquentiels (un audit à la fois) ; si conflit
