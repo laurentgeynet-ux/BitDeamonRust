@@ -194,7 +194,10 @@ fn save_resume_data_alert_and_interval() {
     // `SaveResumeDataFailed(resume_data_not_modified)` — upstream
     // `torrent::save_resume_data` emits the failure alert rather
     // than staying silent.
-    s.save_resume_data(&ih, true);
+    s.save_resume_data(
+        &ih,
+        bitdaemon_common::flags::ResumeDataFlags::ONLY_IF_MODIFIED,
+    );
     assert!(
         s.pop_alerts()
             .iter()
@@ -220,7 +223,10 @@ fn save_resume_data_alert_and_interval() {
     }
     s.on_piece_verified(&ih, PieceIndex(0), true, &mut Vec::new());
     s.pop_alerts();
-    s.save_resume_data(&ih, true);
+    s.save_resume_data(
+        &ih,
+        bitdaemon_common::flags::ResumeDataFlags::ONLY_IF_MODIFIED,
+    );
     let alerts = s.pop_alerts();
     let blob = alerts.iter().find_map(|a| {
         if let Alert::SaveResumeData { data, .. } = a {
@@ -237,7 +243,10 @@ fn save_resume_data_alert_and_interval() {
     );
     assert!(rd.is_ok());
     // flag cleared — a second save posts not-modified again
-    s.save_resume_data(&ih, true);
+    s.save_resume_data(
+        &ih,
+        bitdaemon_common::flags::ResumeDataFlags::ONLY_IF_MODIFIED,
+    );
     assert!(
         s.pop_alerts()
             .iter()

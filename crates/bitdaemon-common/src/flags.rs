@@ -137,7 +137,10 @@ impl TorrentFlags {
     pub const DEPRECATED_OVERRIDE_WEB_SEEDS: Self = Self::bit(12);
     /// `torrent_flags::need_save_resume` (13_bit) — ephemeral, not saved.
     pub const NEED_SAVE_RESUME: Self = Self::bit(13);
-    // bits 14..=18 were ABI-1 only (pinned, override_resume_data,
+    /// `torrent_flags::pinned` (14_bit) — deprecated upstream, still
+    /// accepted from `atp.flags` (never auto-managed out).
+    pub const PINNED: Self = Self::bit(14);
+    // bits 15..=18 were ABI-1 only (override_resume_data,
     // merge_resume_trackers, use_resume_save_path, merge_resume_http_seeds)
     // — upstream removed them; the gap is intentional.
     /// `torrent_flags::disable_dht` (19_bit).
@@ -164,6 +167,41 @@ impl TorrentFlags {
             | Self::PAUSED.0
             | Self::APPLY_IP_FILTER.0
             | Self::NEED_SAVE_RESUME.0,
+    );
+}
+
+bitfield_flag!(
+    /// `resume_data_flags_t` — `torrent_handle::save_resume_data` /
+    /// `need_save_resume_data` condition bits. The torrent keeps a
+    /// dirty bitmask (`m_need_save_resume_data`); each mark records
+    /// *which* category changed, and `save_resume_data(flags)` only
+    /// writes when the request's condition bits intersect the mask.
+    ResumeDataFlags, u32
+);
+
+impl ResumeDataFlags {
+    /// `torrent_handle::flush_disk_cache` (0_bit) — request-side flag:
+    /// release file handles before the save completes. Never stored
+    /// in the dirty mask.
+    pub const FLUSH_DISK_CACHE: Self = Self::bit(0);
+    /// `torrent_handle::if_counters_changed` (3_bit).
+    pub const IF_COUNTERS_CHANGED: Self = Self::bit(3);
+    /// `torrent_handle::if_download_progress` (4_bit).
+    pub const IF_DOWNLOAD_PROGRESS: Self = Self::bit(4);
+    /// `torrent_handle::if_config_changed` (5_bit).
+    pub const IF_CONFIG_CHANGED: Self = Self::bit(5);
+    /// `torrent_handle::if_state_changed` (6_bit).
+    pub const IF_STATE_CHANGED: Self = Self::bit(6);
+    /// `torrent_handle::if_metadata_changed` (7_bit).
+    pub const IF_METADATA_CHANGED: Self = Self::bit(7);
+
+    /// `torrent_handle::only_if_modified` — all `if_*` bits.
+    pub const ONLY_IF_MODIFIED: Self = Self(
+        Self::IF_COUNTERS_CHANGED.0
+            | Self::IF_DOWNLOAD_PROGRESS.0
+            | Self::IF_CONFIG_CHANGED.0
+            | Self::IF_STATE_CHANGED.0
+            | Self::IF_METADATA_CHANGED.0,
     );
 }
 

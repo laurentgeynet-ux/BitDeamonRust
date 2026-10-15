@@ -603,9 +603,6 @@ pub struct Session {
     /// millisecond budget for the paced announce — each tick adds
     /// 1000, each announce costs `dht_announce_interval/N` ms.
     dht_announce_budget_ms: i64,
-    /// `torrent::m_prev_state` — last emitted `state_changed_alert`
-    /// state per torrent (the subscription diff, by state name).
-    torrent_prev_states: std::collections::BTreeMap<Sha1Hash, String>,
     /// `m_boost_connections` — dials handed out by torrent
     /// connect-boosts (tracker responses) since the last connect
     /// pump; deducted from `connection_speed` per
@@ -856,6 +853,13 @@ pub enum DiskCompleted {
         /// torrent.
         ih: Sha1Hash,
     },
+    /// `async_stop_torrent` drained — upstream `on_torrent_paused`:
+    /// the storage is closed/flushed, so the deferred
+    /// `torrent_paused_alert` may now post.
+    Stopped {
+        /// torrent.
+        ih: Sha1Hash,
+    },
     /// `async_clear_piece` fence drained — safe to restore the piece
     /// (upstream's `on_piece_fail_sync` continuation).
     ClearPiece {
@@ -1028,7 +1032,7 @@ impl Default for Session {
             next_portmap_handle: 0,
             pending_out: Vec::new(),
             stats_header_posted: false,
-            torrent_prev_states: std::collections::BTreeMap::new(),
+
             boost_connections: 0,
             prio_torrents: std::collections::VecDeque::new(),
             next_downloading_connect_torrent: 0,
@@ -1956,7 +1960,8 @@ impl Session {
                                     path.to_string_lossy().into_owned(),
                                 );
                                 // `need_save_resume(if_config_changed)`
-                                t.need_save_resume = true;
+                                t.need_save_resume |=
+                                    bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
                                 old
                             })
                             .unwrap_or_default();
@@ -2009,7 +2014,8 @@ impl Session {
                                     .unwrap_or_else(|| t.resolve_filename(index.0));
                                 t.renamed_files
                                     .insert(index.0, name.to_string_lossy().into_owned());
-                                t.need_save_resume = true;
+                                t.need_save_resume |=
+                                    bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
                                 t.state_updated();
                                 old
                             })
@@ -2057,6 +2063,18 @@ impl Session {
                 DiskCompleted::ReleaseFiles { ih } => {
                     // `cache_flushed_alert`
                     self.alerts.post(Alert::CacheFlushed(ih));
+                }
+                DiskCompleted::Stopped { ih } => {
+                    // `on_torrent_paused` — the deferred
+                    // `torrent_paused_alert`. A torrent removed or
+                    // un-flagged between dispatch and completion
+                    // drops it (upstream's shared_ptr guard).
+                    if let Some(t) = self.torrents.get_mut(&ih)
+                        && t.paused_alert_pending
+                    {
+                        t.paused_alert_pending = false;
+                        self.alerts.post(Alert::TorrentPaused { ih });
+                    }
                 }
                 DiskCompleted::DeleteFiles { ih, err } => {
                     // `torrent_deleted{,_failed}_alert`
@@ -2118,7 +2136,7 @@ impl Session {
                         if t.auto_managed {
                             self.auto_manage_scaler = 0;
                         }
-                        if !ok && t.arm_full_recheck() > 0 {
+                        if !ok && t.arm_full_recheck(&mut eff) > 0 {
                             for p in 0..t.num_pieces {
                                 eff.push(TorrentEffect::DiskHash {
                                     piece: bitdaemon_common::types::PieceIndex(p),
@@ -2150,6 +2168,9 @@ impl Session {
                         });
                     }
                     self.route(ih, eff, out);
+                    // `files_checked` tail — `start_announcing`
+                    // (gated: a just-armed re-check early-returns).
+                    self.start_announcing(&ih, out);
                 }
                 DiskCompleted::Hash {
                     ih,
@@ -3016,11 +3037,16 @@ impl Session {
     /// `graceful` mirrors `pause_flags_t::graceful_pause`. The
     /// pause machinery only runs when the *effective* pause
     /// (`m_paused || m_session_paused`) actually flips.
+    /// `mark_save` is the `pause()`/auto-manage distinction:
+    /// upstream `torrent::pause()` marks `need_save_resume(
+    /// if_state_changed)`, but `set_paused` itself does not — the
+    /// queue demotion and session-pause paths call it unmarked.
     fn set_paused_mode(
         &mut self,
         ih: &Sha1Hash,
         paused: bool,
         graceful: bool,
+        mark_save: bool,
         out: &mut Vec<SessionOut>,
     ) {
         enum Act {
@@ -3030,8 +3056,9 @@ impl Session {
         }
         let act = if let Some(t) = self.torrents.get_mut(ih) {
             // upstream `pause()`: `if (!m_paused)` → `set_need_save_resume`
-            if paused && !t.paused {
-                t.need_save_resume = true;
+            // (`set_paused` — the demotion path — does not mark).
+            if mark_save && paused && !t.paused {
+                t.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_STATE_CHANGED;
             }
             // upstream strips graceful_pause when there are no peers
             // to drain — the paused alert posts immediately.
@@ -3065,16 +3092,18 @@ impl Session {
         }
     }
 
-    /// `torrent::pause` — `set_paused(true, 0)`.
+    /// `torrent::pause` — `set_paused(true, 0)`; the API pause
+    /// marks `need_save_resume(if_state_changed)` like upstream
+    /// `torrent::pause()`.
     pub fn set_paused(&mut self, ih: &Sha1Hash, paused: bool, out: &mut Vec<SessionOut>) {
-        self.set_paused_mode(ih, paused, false, out);
+        self.set_paused_mode(ih, paused, false, true, out);
     }
 
     /// `torrent::pause(graceful_pause)` — stop issuing requests but
     /// let in-flight writes finish; idle peers disconnect, busy ones
     /// are choked, and the alert fires when the last write drains.
     pub fn set_paused_graceful(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
-        self.set_paused_mode(ih, true, true, out);
+        self.set_paused_mode(ih, true, true, true, out);
     }
 
     /// `torrent::resume` — clears `m_paused` unconditionally and
@@ -3093,7 +3122,7 @@ impl Session {
             if !t.session_paused {
                 t.graceful_pause = false;
             }
-            t.need_save_resume = true;
+            t.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_STATE_CHANGED;
         }
         self.do_resume(ih, out);
     }
@@ -3229,7 +3258,26 @@ impl Session {
         }
         self.post_tracker_announces(sent);
         if post_alert {
-            self.alerts.post(Alert::TorrentPaused { ih: *ih });
+            // upstream `on_torrent_paused` — with storage the alert
+            // rides the `async_stop_torrent` completion (files
+            // closed, cache flushed); `!m_storage` posts inline.
+            let storage = self.torrents.get(ih).map(|t| t.storage);
+            match (self.disk.clone(), storage) {
+                (Some(disk), Some(storage)) if storage.is_valid() => {
+                    if let Some(t) = self.torrents.get_mut(ih) {
+                        t.paused_alert_pending = true;
+                    }
+                    let tx = self.disk_tx.clone();
+                    let ih = *ih;
+                    disk.async_stop_torrent(
+                        storage,
+                        Box::new(move || {
+                            let _ = tx.send(DiskCompleted::Stopped { ih });
+                        }),
+                    );
+                }
+                _ => self.alerts.post(Alert::TorrentPaused { ih: *ih }),
+            }
         }
     }
 
@@ -3238,8 +3286,6 @@ impl Session {
     /// `start_announcing` (`announcing`, trackers reset, immediate
     /// announce), `update_want_peers`.
     fn do_resume(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
-        let now = Instant::now();
-        let (pid, port) = (self.peer_id, self.listen_port);
         {
             let Some(t) = self.torrents.get_mut(ih) else {
                 return;
@@ -3269,8 +3315,42 @@ impl Session {
             }
         }
         self.alerts.post(Alert::TorrentResumed { ih: *ih });
+        // upstream `do_resume` — `checking_files` returns before
+        // `start_announcing`/`do_connect_boost`; the check posts
+        // its own announce once `files_checked` lands.
+        if self
+            .torrents
+            .get(ih)
+            .is_some_and(|t| t.checking && !t.checking_resume)
+        {
+            return;
+        }
         // `start_announcing` — `m_announcing`, `m_trackers.reset()`
-        // (fresh session → `started` again), then announce now.
+        // (fresh session → `started` again), the per-session stat
+        // counters cleared, then announce now.
+        self.start_announcing(ih, out);
+        // `start_announcing` tail — `do_connect_boost` dials any
+        // pre-known peers (resume data, params) without waiting a
+        // full tick.
+        if self.torrents.contains_key(ih) {
+            self.do_connect_boost(ih, out);
+        }
+    }
+
+    /// `torrent::start_announcing` — gates upstream applies, in
+    /// order: `is_paused()`, the `checking_files` state,
+    /// `!m_files_checked && valid_metadata()` (metadata is on disk
+    /// but unchecked — announce after `files_checked`), and the
+    /// `m_announcing` latch. Announcing arms the tracker slots
+    /// (`m_trackers.reset()` → `started` again), clears the
+    /// per-session stat counters (`m_total_failed_bytes`,
+    /// `m_total_redundant_bytes`, `m_stat.clear()` — fresh session
+    /// from the tracker's point of view) and fires an immediate
+    /// announce, `high_priority` while the connect boost is armed.
+    /// The tail reprioritizes DHT (peer-starved) and LSD.
+    fn start_announcing(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
+        let now = Instant::now();
+        let (pid, port) = (self.peer_id, self.listen_port);
         let mut sent = Vec::new();
         let (to_all_tiers, to_all_trackers) = (
             self.settings.announce_to_all_tiers,
@@ -3281,56 +3361,74 @@ impl Session {
             self.settings.report_true_downloaded,
             self.settings.apply_ip_filter_to_trackers,
         );
-        // `start_announcing` — a peer-starved torrent
-        // (`num_peers < 50`) jumps the DHT announce queue.
         let prioritize = self
             .torrents
             .get(ih)
             .is_some_and(|t| t.peer_list.num_peers() < 50)
             && self.dht.get_node(false).is_some();
-        if let Some(t) = self.torrents.get_mut(ih) {
-            if t.checking && !t.checking_resume {
-                return;
-            }
-            t.announcing = true;
-            t.trackers.reset();
-            let is_seed = t.is_seed();
-            let eff_event = if t.finished && !t.seeding && !t.seed_mode {
-                4
+        let announced = if let Some(t) = self.torrents.get_mut(ih) {
+            if t.is_paused()
+                || (t.checking && !t.checking_resume)
+                || (!t.files_checked && t.ti.is_some())
+                || t.announcing
+            {
+                false
             } else {
-                0
-            };
-            let supports = [t.info_hashes.has_v1(), t.info_hashes.has_v2()];
-            let picks =
-                t.trackers
-                    .due(now, is_seed, to_all_tiers, to_all_trackers, supports, false);
-            for (idx, v) in picks {
-                Self::dispatch_announce(
-                    t,
-                    *ih,
-                    idx,
-                    v,
-                    eff_event,
-                    is_seed,
-                    pid,
-                    port,
-                    apply_filter,
-                    num_want,
-                    report_true,
-                    out,
-                    &mut sent,
-                );
+                t.announcing = true;
+                // `m_trackers.reset()` + the stat reset.
+                t.trackers.reset();
+                t.failed_bytes = 0;
+                t.redundant_bytes = 0;
+                t.payload_uploaded = 0;
+                t.payload_downloaded = 0;
+                t.protocol_uploaded = 0;
+                t.protocol_downloaded = 0;
+                t.ip_overhead_uploaded = 0;
+                t.ip_overhead_downloaded = 0;
+                // `high_priority = m_connect_boost_counter > 0` —
+                // queue-jumps the request at the tracker manager.
+                let high_priority = t.connect_boost_counter > 0;
+                let is_seed = t.is_seed();
+                let eff_event = if t.finished && !t.seeding && !t.seed_mode {
+                    4
+                } else {
+                    0
+                };
+                let supports = [t.info_hashes.has_v1(), t.info_hashes.has_v2()];
+                let picks =
+                    t.trackers
+                        .due(now, is_seed, to_all_tiers, to_all_trackers, supports, false);
+                for (idx, v) in picks {
+                    Self::dispatch_announce(
+                        t,
+                        *ih,
+                        idx,
+                        v,
+                        eff_event,
+                        is_seed,
+                        pid,
+                        port,
+                        apply_filter,
+                        num_want,
+                        report_true,
+                        high_priority,
+                        out,
+                        &mut sent,
+                    );
+                }
+                true
             }
+        } else {
+            false
+        };
+        if !announced {
+            return;
         }
-        // `start_announcing` tail — `do_connect_boost` dials any
-        // pre-known peers (resume data, params) without waiting a
-        // full tick.
-        self.do_connect_boost(ih, out);
         if prioritize {
             self.prioritize_dht(*ih);
         }
-        // `start_announcing` tail — `has_lsd()` → `prioritize_lsd`:
-        // the torrent jumps the LSD broadcast queue.
+        // `has_lsd()` → `prioritize_lsd`: the torrent jumps the LSD
+        // broadcast queue.
         if self.services.lsd && self.torrents.contains_key(ih) {
             self.lsd_queue.push_back(*ih);
         }
@@ -3377,6 +3475,7 @@ impl Session {
                 settings.apply_ip_filter_to_trackers,
                 settings.num_want,
                 settings.report_true_downloaded,
+                false,
                 out,
                 sent,
             );
@@ -3491,10 +3590,10 @@ impl Session {
         // `should_check_files` only consumes the limit here.
         for (_, ih) in checking {
             if checking_limit <= 0 {
-                self.set_paused_mode(&ih, true, false, out);
+                self.set_paused_mode(&ih, true, false, false, out);
                 continue;
             }
-            self.set_paused_mode(&ih, false, false, out);
+            self.set_paused_mode(&ih, false, false, false, out);
             let should_check = self.torrents.get(&ih).is_some_and(|t| {
                 t.checking
                     && !t.checking_resume
@@ -3544,7 +3643,7 @@ impl Session {
                     lsd_limit -= 1;
                     hard_limit -= 1;
                     self.set_announce_limits(ih, dht_limit, tracker_limit, lsd_limit);
-                    self.set_paused_mode(ih, false, false, out);
+                    self.set_paused_mode(ih, false, false, false, out);
                     continue;
                 }
                 if type_limit > 0 && hard_limit > 0 {
@@ -3554,7 +3653,7 @@ impl Session {
                     hard_limit -= 1;
                     type_limit -= 1;
                     self.set_announce_limits(ih, dht_limit, tracker_limit, lsd_limit);
-                    self.set_paused_mode(ih, false, false, out);
+                    self.set_paused_mode(ih, false, false, false, out);
                     if let Some(t) = self.torrents.get_mut(ih) {
                         if t.queued {
                             t.queued = false;
@@ -3572,7 +3671,7 @@ impl Session {
                         t.state_updated();
                     }
                 }
-                self.set_paused_mode(ih, true, true, out);
+                self.set_paused_mode(ih, true, true, false, out);
                 if let Some(t) = self.torrents.get_mut(ih) {
                     t.announce_dht = false;
                     t.announce_trackers = false;
@@ -5091,7 +5190,7 @@ impl Session {
         out: &mut Vec<SessionOut>,
     ) {
         let mut eff = Vec::new();
-        if let Some(t) = self.torrents.get_mut(ih) {
+        let recheck_drained = if let Some(t) = self.torrents.get_mut(ih) {
             // `smart_ban` bookkeeping rides the same path as upstream
             // `on_piece_finished`/`on_piece_failed`: `addr` resolves a
             // downloader's IP from its live connection; `read_digest`
@@ -5122,12 +5221,17 @@ impl Session {
                 },
                 |_| None,
             );
-            if t.recheck_piece_done() {
-                // `torrent_checked_alert` — last check piece landed.
-                self.alerts.post(Alert::TorrentChecked(*ih));
-            }
-        }
+            t.recheck_piece_done(&self.settings, &mut eff)
+        } else {
+            false
+        };
         self.route(*ih, eff, out);
+        if recheck_drained {
+            // `files_checked` tail — `start_announcing` (state
+            // transitions and `torrent_checked` already routed;
+            // upstream calls `start_announcing` last).
+            self.start_announcing(ih, out);
+        }
     }
 
     /// `move_storage` — upstream `torrent_handle::move_storage`
@@ -5159,7 +5263,7 @@ impl Session {
             let newp = bitdaemon_disk::fs::complete(&path);
             let old = t.save_path.clone();
             t.save_path = newp.to_string_lossy().into_owned();
-            t.need_save_resume = true;
+            t.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
             self.alerts.post(Alert::StorageMoved {
                 ih: *ih,
                 path: newp.to_string_lossy().into_owned(),
@@ -5172,7 +5276,7 @@ impl Session {
         let Some(disk) = self.disk.clone() else {
             let old = t.save_path.clone();
             t.save_path = path.to_string_lossy().into_owned();
-            t.need_save_resume = true;
+            t.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
             self.alerts.post(Alert::StorageMoved {
                 ih: *ih,
                 path: path.to_string_lossy().into_owned(),
@@ -5312,7 +5416,7 @@ impl Session {
     pub fn force_recheck(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(ih)
-            && t.arm_full_recheck() > 0
+            && t.arm_full_recheck(&mut eff) > 0
         {
             for p in 0..t.num_pieces {
                 eff.push(TorrentEffect::DiskHash {
@@ -7225,36 +7329,10 @@ impl Session {
         // registrations) is emitted here — `effects` already went
         // out via `route`.
         out.append(&mut self.pending_out);
-        // `state_changed_alert` — per-torrent diff
-        // (`m_prev_state` vs now; upstream
-        // `torrent::state_subscription` notifies on change).
-        let states: Vec<(Sha1Hash, crate::status::TorrentState)> = self
-            .torrents
-            .iter()
-            .map(|(ih, t)| (*ih, t.state()))
-            .collect();
-        for (ih, st) in states {
-            let prev = self.torrent_prev_states.insert(ih, st.name().to_string());
-            match prev {
-                Some(p) if p == st.name() => continue,
-                Some(p) => {
-                    self.alerts.post(Alert::StateChanged {
-                        ih,
-                        prev: p.clone(),
-                        next: st.name().into(),
-                    });
-                    // `torrent::debug_log` — state transitions are
-                    // the upstream torrent_log staple.
-                    self.alerts.post(Alert::TorrentLog {
-                        ih,
-                        msg: format!("state changed to {}", st.name()),
-                    });
-                }
-                // first observation = baseline, no alert (upstream
-                // only posts on transitions).
-                None => {}
-            }
-        }
+        // `state_changed_alert` posts at the transition point now
+        // (`TorrentEffect::StateChangedEdge` — upstream `set_state`
+        // emits inside the call, one alert per transition); the
+        // end-of-tick diff coalesced intermediate steps and is gone.
         wait
     }
 
@@ -7707,6 +7785,7 @@ impl Session {
                         apply_filter,
                         num_want,
                         report_true,
+                        flags.contains(ReannounceFlags::HIGH_PRIORITY),
                         out,
                         &mut sent,
                     );
@@ -8867,6 +8946,61 @@ impl Session {
                     }
                     self.route(ih, te, out);
                 }
+                TorrentEffect::SetStopWhenReady { on } => {
+                    // `torrent::stop_when_ready(b)` — the setter's
+                    // immediate trigger (already in a downloading
+                    // state) pushes `StopWhenReadyCheck`, which the
+                    // handler below evaluates.
+                    let mut te = Vec::new();
+                    if let Some(t) = self.torrents.get_mut(&ih) {
+                        t.set_stop_when_ready(on, &mut te);
+                    }
+                    self.route(ih, te, out);
+                }
+                TorrentEffect::StopWhenReadyCheck => {
+                    // `set_state`'s `trigger_stop` — the armed flag
+                    // saw a non-downloading→downloading edge:
+                    // `auto_managed(false)` (`if_config_changed`
+                    // dirty + state update + auto-manage re-arm),
+                    // `pause()` (the mark lives in `set_paused_mode`),
+                    // then the flag clears.
+                    let fire = self
+                        .torrents
+                        .get(&ih)
+                        .is_some_and(|t| t.stop_when_ready && t.is_downloading_state());
+                    if fire {
+                        if let Some(t) = self.torrents.get_mut(&ih) {
+                            t.stop_when_ready = false;
+                            if t.auto_managed {
+                                t.auto_managed = false;
+                                t.need_save_resume |=
+                                    bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
+                                t.state_updated();
+                                self.auto_manage_scaler = 0;
+                            }
+                        }
+                        self.set_paused(&ih, true, out);
+                    }
+                }
+                TorrentEffect::StateChangedEdge { prev, next } => {
+                    // `state_changed_alert` — one post per
+                    // transition, in transition order.
+                    self.alerts.post(Alert::StateChanged {
+                        ih,
+                        prev: prev.name().to_string(),
+                        next: next.name().to_string(),
+                    });
+                }
+                TorrentEffect::QueueTail => {
+                    // `resume_download` → `set_queue_position(
+                    // last_pos)` — re-stamp `queue_seq` at the tail
+                    // of the download queue.
+                    if let Some(t) = self.torrents.get_mut(&ih) {
+                        t.queue_seq = self.next_queue_seq;
+                        self.next_queue_seq += 1;
+                        t.state_updated();
+                    }
+                }
                 TorrentEffect::GracefulPauseDone => {
                     // `set_paused(true)` on a graceful-paused torrent
                     // — `m_graceful_pause_mode` clears and `do_pause`
@@ -8970,7 +9104,8 @@ impl Session {
                                 t.outstanding_file_priority = false;
                                 if t.file_priorities != prios {
                                     t.file_priorities = prios;
-                                    t.need_save_resume = true;
+                                    t.need_save_resume |=
+                                        bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
                                 }
                                 if !t.deferred_file_priorities.is_empty() {
                                     let deferred = std::mem::take(&mut t.deferred_file_priorities);
@@ -9131,6 +9266,7 @@ impl Session {
                                     self.settings.apply_ip_filter_to_trackers,
                                     self.settings.num_want,
                                     self.settings.report_true_downloaded,
+                                    false,
                                     out,
                                     &mut sent,
                                 );
@@ -9168,6 +9304,27 @@ impl Session {
                             },
                             out,
                         );
+                    }
+                    // upstream `finished()` tail — `async_release_
+                    // files(m_storage)` (the `!m_storage` leg
+                    // skips) and `trigger_auto_manage` for
+                    // auto-managed torrents: a finished torrent
+                    // moved to the seeding class and the queue
+                    // must rebalance now, not next interval.
+                    if let (Some(disk), Some(storage)) =
+                        (self.disk.clone(), self.torrents.get(&ih).map(|t| t.storage))
+                        && storage.is_valid()
+                    {
+                        let tx = self.disk_tx.clone();
+                        disk.async_release_files(
+                            storage,
+                            Box::new(move || {
+                                let _ = tx.send(DiskCompleted::ReleaseFiles { ih });
+                            }),
+                        );
+                    }
+                    if self.torrents.get(&ih).is_some_and(|t| t.auto_managed) {
+                        self.auto_manage_scaler = 0;
                     }
                     out.push(SessionOut::Torrent(TorrentEffect::BecameSeed));
                 }
@@ -9231,6 +9388,7 @@ impl Session {
                     apply_filter,
                     num_want,
                     report_true,
+                    false,
                     out,
                     &mut sent,
                 );
@@ -9261,6 +9419,7 @@ impl Session {
         apply_ip_filter_to_trackers: bool,
         num_want: i32,
         report_true_downloaded: bool,
+        high_priority: bool,
         out: &mut Vec<SessionOut>,
         sent: &mut Vec<(Sha1Hash, String, i32)>,
     ) {
@@ -9318,20 +9477,24 @@ impl Session {
             tracker_id
         };
         let info_hash = t.info_hashes.get(v).to_bytes();
+        let mut params = t.announce_params(
+            pid,
+            port,
+            ev,
+            apply_ip_filter_to_trackers,
+            num_want,
+            report_true_downloaded,
+            info_hash,
+        );
+        // `tracker_request::high_priority` — queue-jump at the
+        // tracker manager (`m_queued.push_front`).
+        params.high_priority = high_priority;
         out.push(SessionOut::TrackerAnnounce {
             ih,
             url,
             tracker_id,
             v,
-            params: t.announce_params(
-                pid,
-                port,
-                ev,
-                apply_ip_filter_to_trackers,
-                num_want,
-                report_true_downloaded,
-                info_hash,
-            ),
+            params,
         });
         t.outstanding_announces += 1;
         sent.push((ih, t.trackers.trackers[idx].url.clone(), ev));
@@ -9852,6 +10015,7 @@ impl Session {
                             apply_filter,
                             num_want,
                             report_true,
+                            false,
                             out,
                             &mut sent,
                         );
@@ -9891,27 +10055,45 @@ impl Session {
 
     /// `save_resume_data` — upstream `torrent::save_resume_data`
     /// → `save_resume_data_alert` carrying the bencoded resume
-    /// blob. `only_if_modified` honors `need_save_resume`
-    /// (upstream `flags & only_if_modified`).
-    pub fn save_resume_data(&mut self, ih: &Sha1Hash, only_if_modified: bool) {
+    /// blob. `flags` carries the `resume_data_flags_t` conditions:
+    /// when any `if_*` bit is requested but none of those
+    /// categories changed since the last dump, upstream posts
+    /// `save_resume_data_failed_alert(resume_data_not_modified)`.
+    pub fn save_resume_data(
+        &mut self,
+        ih: &Sha1Hash,
+        flags: bitdaemon_common::flags::ResumeDataFlags,
+    ) {
+        use bitdaemon_common::flags::ResumeDataFlags as RF;
         let Some(t) = self.torrents.get_mut(ih) else {
             return;
         };
-        // upstream `torrent::save_resume_data`: when the
-        // `if_*_changed` conditions were given but nothing changed
-        // since the last save, it posts
-        // `save_resume_data_failed_alert(errors::resume_data_not_modified)`
-        // — not silence.
-        if only_if_modified && !t.need_save_resume {
+        let conditions = flags & RF::ONLY_IF_MODIFIED;
+        if conditions.is_set() && !t.need_save_resume.contains(conditions) {
             self.alerts.post(Alert::SaveResumeDataFailed {
                 ih: *ih,
                 error: "resume data not modified".into(),
             });
             return;
         }
+        t.need_save_resume = RF::NONE;
+        t.state_updated();
+        if flags.contains(RF::FLUSH_DISK_CACHE)
+            && t.storage.is_valid()
+            && let Some(disk) = self.disk.clone()
+        {
+            let storage = t.storage;
+            let tx = self.disk_tx.clone();
+            let ih = *ih;
+            disk.async_release_files(
+                storage,
+                Box::new(move || {
+                    let _ = tx.send(DiskCompleted::ReleaseFiles { ih });
+                }),
+            );
+        }
         let mut atp = bitdaemon_core::AddTorrentParams::default();
         t.to_resume_data(&mut atp, &self.peer_class_pool);
-        t.need_save_resume = false;
         t.last_saved_resume = Some(Instant::now());
         let data = bitdaemon_core::resume_data::write_resume_data_buf(&atp);
         self.alerts.post(Alert::SaveResumeData { ih: *ih, data });
@@ -9925,14 +10107,14 @@ impl Session {
             .torrents
             .values()
             .filter(|t| {
-                t.need_save_resume
+                t.need_save_resume.is_set()
                     && t.last_saved_resume
                         .is_none_or(|t0| now.duration_since(t0) >= interval)
             })
             .map(|t| t.info_hash)
             .collect();
         for ih in due {
-            self.save_resume_data(&ih, false);
+            self.save_resume_data(&ih, bitdaemon_common::flags::ResumeDataFlags::NONE);
         }
     }
 

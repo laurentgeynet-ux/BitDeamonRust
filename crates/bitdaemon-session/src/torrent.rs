@@ -126,6 +126,26 @@ pub enum TorrentEffect {
     /// clears the graceful bit and posts `torrent_paused_alert`.
     /// Session-side the handler completes `do_pause`.
     GracefulPauseDone,
+    /// `torrent::stop_when_ready(b)` — the setter lives session-side
+    /// because its immediate trigger (`is_downloading_state` →
+    /// `auto_managed(false); pause()`) needs `do_pause`.
+    SetStopWhenReady { on: bool },
+    /// `set_state`'s `trigger_stop` — a non-downloading→downloading
+    /// transition just ran and `m_stop_when_ready` may be armed.
+    /// The session evaluates the flag and runs the stop sequence.
+    StopWhenReadyCheck,
+    /// `resume_download`'s `set_queue_position(last_pos)` — the
+    /// session owns `next_queue_seq`, so the torrent asks it to
+    /// re-stamp this torrent at the download-queue tail.
+    QueueTail,
+    /// `set_state`'s `state_changed_alert` — emitted at the point of
+    /// transition (upstream posts inside `set_state`, not deferred).
+    StateChangedEdge {
+        /// `m_state` before the transition.
+        prev: crate::status::TorrentState,
+        /// the state just entered.
+        next: crate::status::TorrentState,
+    },
 }
 
 /// The `PipelineTorrent` view `send_block_requests` needs — the
@@ -658,10 +678,13 @@ pub struct Torrent {
     /// attaches; `ignore_unchoke_slots()` and the connection-limit
     /// factor scan it alongside the conn's set.
     pub peer_classes: bitdaemon_net::peer_class::PeerClassSet,
-    /// `m_need_save_resume_data` — set by state changes
-    /// (verified piece, priorities, metadata, check verdict);
-    /// cleared when a `save_resume_data` dump is produced.
-    pub need_save_resume: bool,
+    /// `m_need_save_resume_data` — dirty bitmask set by state
+    /// changes (verified piece, priorities, metadata, check
+    /// verdict); each site records the `resume_data_flags_t`
+    /// category that changed (`if_counters_changed`…
+    /// `if_metadata_changed`) so `save_resume_data(flags)` can
+    /// filter. Empty when a dump has just been produced.
+    pub need_save_resume: bitdaemon_common::flags::ResumeDataFlags,
     /// last resume dump instant (`auto_save_resume` cadence).
     pub last_saved_resume: Option<Instant>,
     /// `m_sequence_number` — auto-managed queue order (assigned
@@ -731,9 +754,22 @@ pub struct Torrent {
     /// `m_pinned` — `set_pinned`: pinned torrents are never
     /// auto-managed out of the active set.
     pub pinned: bool,
-    /// `m_stop_when_ready` — `stop_when_ready`: pause the torrent as
-    /// soon as the download completes.
+    /// `m_stop_when_ready` — `stop_when_ready`: force-stop
+    /// (`auto_managed(false)` + `pause()`) when the torrent
+    /// transitions *into* a downloading state — i.e. as soon as the
+    /// checking pass lands (upstream `torrent_flags.hpp:130-146`).
     pub stop_when_ready: bool,
+    /// `torrent_paused_alert` deferred: upstream posts it from
+    /// `on_torrent_paused` (end of `async_stop_torrent`) or the
+    /// drained check/peers — never from `do_pause` itself when
+    /// storage exists. Cleared when the alert goes out.
+    pub paused_alert_pending: bool,
+    /// last `state()` value a `state_changed_alert` was emitted for
+    /// (upstream `set_state` posts prev/next at each transition).
+    /// `pub` like the other derived-state flags: tests and harness
+    /// callers that mutate `checking`/`finished`/`seeding` directly
+    /// re-baseline it with `Some(t.state())`.
+    pub state_prev: Option<crate::status::TorrentState>,
     /// `m_ratio` — `set_ratio` upload/download ratio target (0 = none).
     pub ratio: f32,
     /// `m_tracker_login` — `set_tracker_login` user/pass.
@@ -1081,7 +1117,7 @@ impl Torrent {
             error_file: crate::status::ERROR_FILE_NONE,
             peer_class: 0,
             peer_classes: bitdaemon_net::peer_class::PeerClassSet::default(),
-            need_save_resume: false,
+            need_save_resume: bitdaemon_common::flags::ResumeDataFlags::NONE,
             last_saved_resume: None,
             queue_seq: 0,
             time_critical: std::collections::BTreeMap::new(),
@@ -1105,6 +1141,8 @@ impl Torrent {
             max_uploads: -1,
             pinned: false,
             stop_when_ready: false,
+            paused_alert_pending: false,
+            state_prev: None,
             ratio: 0.0,
             tracker_login: None,
             ssl_cert: None,
@@ -1162,6 +1200,16 @@ impl Torrent {
             predictive: Bitfield::default(),
             progress_ppm: 0,
         }
+        .with_state_baseline()
+    }
+
+    /// `m_state` baseline — the first `emit_state_change` sees the
+    /// constructed state as `prev`, so construction itself never
+    /// posts a `state_changed_alert` (upstream `m_state` simply
+    /// starts at its initial value).
+    fn with_state_baseline(mut self) -> Self {
+        self.state_prev = Some(self.state());
+        self
     }
 
     /// `torrent` ctor path — build a torrent from `AddTorrentParams`:
@@ -1357,6 +1405,15 @@ impl Torrent {
         t.auto_managed = atp
             .flags
             .contains(bitdaemon_common::flags::TorrentFlags::AUTO_MANAGED);
+        // `m_stop_when_ready(p.flags & stop_when_ready)` — armed
+        // from `atp.flags`; the edge is evaluated once the checking
+        // state lands (the setter only fires immediately when
+        // already in a downloading state). `pinned` is ABI-1-only
+        // upstream (`default_flags` under `TORRENT_ABI_VERSION==1`),
+        // so it stays a handle-set extension here.
+        t.stop_when_ready = atp
+            .flags
+            .contains(bitdaemon_common::flags::TorrentFlags::STOP_WHEN_READY);
         // `m_apply_ip_filter(p.flags & apply_ip_filter)` — the flag
         // rides `default_flags`, so a fresh `AddTorrentParams` opts
         // the torrent INTO the session filter.
@@ -1515,6 +1572,9 @@ impl Torrent {
             false,
             pool,
         );
+        // `m_state` baseline — the first `emit_state_change` sees
+        // this as `prev`, so construction itself never alerts.
+        t.state_prev = Some(t.state());
         Some(t)
     }
 
@@ -1687,7 +1747,7 @@ impl Torrent {
             self.seed_verified.resize(self.num_pieces.max(0) as usize);
             self.seed_verifying.resize(self.num_pieces.max(0) as usize);
         }
-        self.need_save_resume = true;
+        self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_METADATA_CHANGED;
         // upstream `torrent::init` sets `m_connections_initialized`
         // before replaying `pc->init()` per conn — magnet interest is
         // evaluated as soon as metadata lands, not deferred to
@@ -2759,7 +2819,7 @@ impl Torrent {
             }
             picker.set_piece_priority(PieceIndex(i as i32), *prio);
         }
-        self.need_save_resume = true;
+        self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_DOWNLOAD_PROGRESS;
         for (piece, blocks) in &atp.unfinished_pieces {
             let idx = PieceIndex(*piece);
             if *piece < 0 || *piece >= self.num_pieces || self.have.get_bit(*piece as usize) {
@@ -3020,13 +3080,12 @@ impl Torrent {
         out: &mut Vec<TorrentEffect>,
     ) {
         self.checking = false;
-        self.need_save_resume = true;
-        // `files_checked` posts `torrent_checked_alert` on both
-        // verdicts (also reached via `no_verify_files`/`seed_mode`
-        // shortcuts upstream).
-        out.push(TorrentEffect::Alert(crate::alerts::Alert::TorrentChecked(
-            self.info_hash,
-        )));
+        self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_DOWNLOAD_PROGRESS;
+        // upstream `files_checked` posts `torrent_checked_alert`
+        // once the state transitions below have run (`set_state`
+        // first, alert last) — it is pushed near the end, not here.
+        // On the rejected leg the armed re-check posts it when the
+        // piece drain completes (one alert per check upstream).
         // `m_files_checked`/`m_connections_initialized` — gates the
         // late-add `on_files_checked` replay in `add_extension`.
         // `notify_initialized` — magnets get conn init replayed here
@@ -3070,6 +3129,8 @@ impl Torrent {
             self.seeding = false;
             // the fastresume-verify window closed — a following
             // `arm_full_recheck` is `checking_files`, not resume data.
+            // The `checking_resume_data`→`checking_files`
+            // `state_changed` emits inside `arm_full_recheck`.
             self.checking_resume = false;
             return;
         }
@@ -3104,11 +3165,17 @@ impl Torrent {
         if want_done {
             self.finished = true;
             self.finished_at.get_or_insert_with(Instant::now);
+            // upstream `finished()` → `set_state(finished)` posts the
+            // state_changed before `torrent_finished_alert`.
+            self.emit_state_change(out);
             out.push(TorrentEffect::BecameSeed);
         }
         if all {
             self.seeding = true;
             self.seeding_since.get_or_insert_with(Instant::now);
+            // `completed()` → `set_state(seeding)` — second
+            // transition upstream, second alert.
+            self.emit_state_change(out);
             // `maybe_done_flushing` — a confirmed seed drops the
             // hash-picker state upstream (`suggest_read_cache` keeps
             // it to answer piece-hash requests).
@@ -3132,6 +3199,18 @@ impl Torrent {
         if became_finished {
             self.send_upload_only(out);
         }
+        // remaining leg — `files_checked` lands in `downloading`
+        // when nothing finished (emit covers that transition; the
+        // finished/seeding legs already emitted).
+        self.emit_state_change(out);
+        // `files_checked` tail — `torrent_checked_alert` posts last,
+        // after every `set_state` transition.
+        out.push(TorrentEffect::Alert(crate::alerts::Alert::TorrentChecked(
+            self.info_hash,
+        )));
+        // `set_state`'s `trigger_stop` — leaving the checking states
+        // is the stop_when_ready edge upstream.
+        self.stop_when_ready_edge(false, out);
     }
 
     /// `add_tracker_url` — upstream `add_tracker_url`; `source`
@@ -6762,7 +6841,8 @@ impl Torrent {
             WebSeedBackoff::Remove => {
                 self.web_seeds.retain(|u| u != url);
                 self.web_seed_state.remove(url);
-                self.need_save_resume = true;
+                self.need_save_resume |=
+                    bitdaemon_common::flags::ResumeDataFlags::IF_METADATA_CHANGED;
             }
             WebSeedBackoff::Retry | WebSeedBackoff::NameLookup | WebSeedBackoff::Header(_) => {
                 self.retry_web_seed(url, backoff, s);
@@ -7013,7 +7093,8 @@ impl Torrent {
                     if let Some(p) = self.picker.as_mut() {
                         p.piece_flushed(piece);
                     }
-                    self.need_save_resume = true;
+                    self.need_save_resume |=
+                        bitdaemon_common::flags::ResumeDataFlags::IF_DOWNLOAD_PROGRESS;
                 }
                 self.we_have(piece, false, s, counters, out, &mut read_digest);
             }
@@ -7040,7 +7121,7 @@ impl Torrent {
         if passed {
             // `piece_passed` — `set_need_save_resume` (download
             // progress) + `num_piece_passed` before anything else.
-            self.need_save_resume = true;
+            self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_DOWNLOAD_PROGRESS;
             counters.add(crate::counters::Counter::NumPiecePassed, 1);
             // `suggest_read_cache` — a just-verified piece is likely
             // the rarest we hold; upstream inserts it into the
@@ -7374,7 +7455,7 @@ impl Torrent {
         if !loading_resume {
             // `set_need_save_resume(if_download_progress)` +
             // `state_updated` — download progress changed.
-            self.need_save_resume = true;
+            self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_DOWNLOAD_PROGRESS;
             self.state_updated();
         }
         // `piece_finished_alert` — after the announce + interest
@@ -7397,46 +7478,54 @@ impl Torrent {
         }
         // upstream `torrent::finished()` fires on `is_finished()` —
         // all *wanted* pieces, not necessarily all pieces (a file
-        // priority of 0 makes its pieces unwanted).
-        let all = self.have.count() as i32 == self.num_pieces;
-        let want_done = all || self.picker.as_ref().is_some_and(|p| p.is_finished());
-        if !self.finished && want_done {
-            self.finished = true;
-            self.finished_at.get_or_insert_with(Instant::now);
-            self.state_updated();
-            out.push(TorrentEffect::BecameSeed);
-            // upstream `finished()` drops upload-only peers — nothing
-            // more to exchange either way.
-            let uo: Vec<u64> = self
-                .peers
-                .iter()
-                .filter(|(_, c)| c.remote_upload_only)
-                .map(|(id, _)| *id)
-                .collect();
-            for id in uo {
-                out.push(TorrentEffect::DisconnectPeer {
-                    peer: id,
-                    reason: "torrent finished",
-                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                });
+        // priority of 0 makes its pieces unwanted). During a check
+        // pass the verdict belongs to the drain (`recheck_piece_done`
+        // → `files_checked`), not to the per-piece verify.
+        if !self.checking {
+            let all = self.have.count() as i32 == self.num_pieces;
+            let want_done = all || self.picker.as_ref().is_some_and(|p| p.is_finished());
+            let became_finished = !self.finished && want_done;
+            if became_finished {
+                self.finished = true;
+                self.finished_at.get_or_insert_with(Instant::now);
+                self.state_updated();
+                self.emit_state_change(out);
+                out.push(TorrentEffect::BecameSeed);
             }
-            // `stop_when_ready` — pause as soon as the download
-            // completes (upstream pauses the torrent in
-            // `files_checked`/piece-finish path).
-            if self.stop_when_ready && !self.is_paused() {
-                self.paused = true;
+            if all {
+                self.seeding = true;
+                self.seeding_since.get_or_insert_with(Instant::now);
+                self.emit_state_change(out);
+                // `maybe_done_flushing` — once seeding, upstream drops
+                // `m_hash_picker`/`m_file_progress` (we keep the piece
+                // picker for bookkeeping; its request/throttle state is
+                // what's actually reset). Under `suggest_read_cache` the
+                // picker must survive to keep answering hash requests.
+                if s.suggest_mode != crate::settings::SuggestMode::SuggestReadCache {
+                    self.hash_picker_state =
+                        bitdaemon_disk::hash_picker::HashPickerState::default();
+                }
             }
-        }
-        if all {
-            self.seeding = true;
-            self.seeding_since.get_or_insert_with(Instant::now);
-            // `maybe_done_flushing` — once seeding, upstream drops
-            // `m_hash_picker`/`m_file_progress` (we keep the piece
-            // picker for bookkeeping; its request/throttle state is
-            // what's actually reset). Under `suggest_read_cache` the
-            // picker must survive to keep answering hash requests.
-            if s.suggest_mode != crate::settings::SuggestMode::SuggestReadCache {
-                self.hash_picker_state = bitdaemon_disk::hash_picker::HashPickerState::default();
+            if became_finished {
+                // upstream `finished()` drops upload-only peers —
+                // nothing more to exchange either way. Gated on
+                // `close_redundant_connections` (torrent.cpp:9016)
+                // and runs *after* `completed()` upstream.
+                if self.close_redundant_connections {
+                    let uo: Vec<u64> = self
+                        .peers
+                        .iter()
+                        .filter(|(_, c)| c.remote_upload_only)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for id in uo {
+                        out.push(TorrentEffect::DisconnectPeer {
+                            peer: id,
+                            reason: "torrent finished",
+                            sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                        });
+                    }
+                }
             }
         }
         // `m_last_download = now` — the verify edge, not block
@@ -7758,7 +7847,7 @@ impl Torrent {
         if self.super_seeding {
             f |= F::SUPER_SEEDING;
         }
-        if self.need_save_resume {
+        if self.need_save_resume.is_set() {
             f |= F::NEED_SAVE_RESUME;
         }
         if self.seed_mode {
@@ -7834,7 +7923,22 @@ impl Torrent {
             self.set_super_seeding(flags.contains(F::SUPER_SEEDING));
         }
         if mask.contains(F::NEED_SAVE_RESUME) {
-            self.need_save_resume = flags.contains(F::NEED_SAVE_RESUME);
+            // the flag bit reads `m_need_save_resume_data != 0` —
+            // setting it through the mask marks every category,
+            // clearing it wipes the mask.
+            self.need_save_resume = if flags.contains(F::NEED_SAVE_RESUME) {
+                bitdaemon_common::flags::ResumeDataFlags::ONLY_IF_MODIFIED
+            } else {
+                bitdaemon_common::flags::ResumeDataFlags::NONE
+            };
+        }
+        if mask.contains(F::STOP_WHEN_READY) {
+            // `set_flags` routes stop_when_ready through its setter
+            // (immediate trigger when already in a downloading
+            // state) — the effect lands via the session.
+            out.push(TorrentEffect::SetStopWhenReady {
+                on: flags.contains(F::STOP_WHEN_READY),
+            });
         }
         if mask.contains(F::UPDATE_SUBSCRIBE) {
             // upstream `set_flags` flips `m_state_subscription`
@@ -7852,7 +7956,8 @@ impl Torrent {
                 let v = !flags.contains(bit);
                 if *field != v {
                     *field = v;
-                    self.need_save_resume = true;
+                    self.need_save_resume |=
+                        bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
                     changed = true;
                 }
             }
@@ -7890,7 +7995,12 @@ impl Torrent {
             self.verified_bytes = 0;
             self.init_files_completed();
             self.checking = false;
-            if self.arm_full_recheck() > 0 {
+            // upstream `leave_seed_mode(check_files)` — `set_state(
+            // downloading)` (seeding→downloading alert edge), then
+            // `force_recheck` → `set_state(checking_files)` inside
+            // `arm_full_recheck`.
+            self.emit_state_change(out);
+            if self.arm_full_recheck(out) > 0 {
                 for p in 0..self.num_pieces {
                     out.push(TorrentEffect::DiskHash {
                         piece: PieceIndex(p),
@@ -7901,7 +8011,7 @@ impl Torrent {
         self.num_verified = 0;
         self.seed_verified = Bitfield::default();
         self.seed_verifying = Bitfield::default();
-        self.need_save_resume = true;
+        self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_STATE_CHANGED;
     }
 
     /// `peer_connection::on_seed_mode_hashed`'s torrent-side verdict
@@ -7997,7 +8107,7 @@ impl Torrent {
         debug_assert!(!self.seed_verified.get_bit(piece.0 as usize));
         self.num_verified += 1;
         self.seed_verified.set_bit(piece.0 as usize);
-        self.need_save_resume = true;
+        self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_DOWNLOAD_PROGRESS;
     }
 
     /// `replace_trackers` (upstream `torrent::replace_trackers`) —
@@ -8007,7 +8117,7 @@ impl Torrent {
         for (url, tier) in trackers {
             self.add_tracker(url.clone(), *tier, crate::tracker_list::SOURCE_CLIENT);
         }
-        self.need_save_resume = true;
+        self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_METADATA_CHANGED;
     }
 
     /// `torrent::write_resume_data` — serialize this torrent's state
@@ -8075,7 +8185,7 @@ impl Torrent {
     pub fn add_url_seed(&mut self, url: String) {
         if !self.web_seeds.contains(&url) {
             self.web_seeds.push(url);
-            self.need_save_resume = true;
+            self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_METADATA_CHANGED;
         }
     }
 
@@ -8113,7 +8223,7 @@ impl Torrent {
             } else {
                 self.web_seed_state.remove(url);
             }
-            self.need_save_resume = true;
+            self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_METADATA_CHANGED;
         }
     }
 
@@ -8161,7 +8271,7 @@ impl Torrent {
         // upstream only dirties resume data when a priority actually
         // changed (`filter_updated` → `set_need_save_resume`).
         if filter_updated {
-            self.need_save_resume = true;
+            self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
         }
         // `remove_time_critical_pieces` — a piece filtered to
         // `dont_download` loses its deadline (canceled alerts post).
@@ -8196,16 +8306,33 @@ impl Torrent {
             // `m_completed_time` stamps.
             self.finished = true;
             self.finished_at.get_or_insert_with(Instant::now);
+            self.emit_state_change(out);
+            // upstream `finished()` → `completed()` on a full seed —
+            // `set_state(seeding)` + the completed announce (the
+            // `BecameSeed` handler fires it).
+            if self.is_seed() {
+                self.seeding = true;
+                self.seeding_since.get_or_insert_with(Instant::now);
+                self.emit_state_change(out);
+            }
             out.push(TorrentEffect::BecameSeed);
             self.send_upload_only(out);
             self.state_updated();
         } else if was_finished && !finished {
-            // upstream `resume_download()` — back on the download
-            // queue, `m_completed_time` cleared, upload-only
-            // rebroadcast (now false), tick re-evaluated.
+            // upstream `resume_download()` — a `seed_mode` promise
+            // that no longer holds re-verifies, the state goes back
+            // to `downloading`, the torrent re-joins the download
+            // queue *at the tail* (`set_queue_position(last_pos)`),
+            // `m_completed_time` clears and upload-only is
+            // rebroadcast (now false).
+            if self.seed_mode {
+                self.leave_seed_mode(true, out);
+            }
             self.finished = false;
             self.seeding = self.is_seed();
             self.finished_at = None;
+            self.emit_state_change(out);
+            out.push(TorrentEffect::QueueTail);
             self.send_upload_only(out);
             self.state_updated();
         }
@@ -8277,7 +8404,7 @@ impl Torrent {
         if state_update {
             self.state_updated();
             // `set_need_save_resume(if_config_changed)`.
-            self.need_save_resume = true;
+            self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
         }
         tpc.channel[channel].throttle(limit);
     }
@@ -8371,7 +8498,7 @@ impl Torrent {
         self.max_uploads = limit;
         if state_update {
             // `set_need_save_resume(if_config_changed)`.
-            self.need_save_resume = true;
+            self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
         }
     }
 
@@ -8398,7 +8525,7 @@ impl Torrent {
             self.disconnect_peers(excess, "too_many_connections", out);
         }
         if state_update {
-            self.need_save_resume = true;
+            self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
         }
     }
 
@@ -8417,7 +8544,7 @@ impl Torrent {
         }
         self.share_mode = on;
         // upstream `set_need_save_resume(if_config_changed)`.
-        self.need_save_resume = true;
+        self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
         self.state_updated();
         if on {
             // upstream sizes the vector from `file_priority`'s
@@ -8442,7 +8569,7 @@ impl Torrent {
             return;
         }
         self.super_seeding = on;
-        self.need_save_resume = true;
+        self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_STATE_CHANGED;
         self.state_updated();
         if on {
             return;
@@ -8480,7 +8607,7 @@ impl Torrent {
     /// `checking_pieces`; the session then queues a `DiskHash`
     /// per piece (`torrent::force_recheck` → per-piece hash jobs).
     /// Returns how many pieces were queued (0 = nothing to check).
-    pub fn arm_full_recheck(&mut self) -> i32 {
+    pub fn arm_full_recheck(&mut self, out: &mut Vec<TorrentEffect>) -> i32 {
         if self.picker.is_none() || self.checking || self.num_pieces <= 0 {
             return 0;
         }
@@ -8498,24 +8625,72 @@ impl Torrent {
         self.checking = true;
         self.checking_resume = false;
         self.checking_pieces = self.num_pieces;
+        // `force_recheck` → `set_state(checking_files)` — the alert
+        // edge (`checking_resume_data`→`checking_files` on a
+        // rejected fastresume, `downloading`→`checking_files` on a
+        // user recheck).
+        self.emit_state_change(out);
         self.num_pieces
     }
 
     /// one recheck hash came back — `checking` clears when the
     /// armed count drains (upstream `torrent::on_piece_hashed`
-    /// ends the checking state at the last piece).
+    /// ends the checking state at the last piece, then
+    /// `files_checked` runs the `finished()`/`completed()` ladder,
+    /// posts `torrent_checked_alert` and triggers
+    /// `stop_when_ready`'s non-downloading→downloading edge).
     /// returns `true` on the last checked piece (checking ended).
-    pub fn recheck_piece_done(&mut self) -> bool {
-        if self.checking_pieces > 0 {
-            self.checking_pieces -= 1;
-            if self.checking_pieces == 0 {
-                self.checking = false;
-                // recheck completion → `state_updated()` upstream.
-                self.state_updated();
-                return true;
-            }
+    pub fn recheck_piece_done(
+        &mut self,
+        s: &crate::settings::SessionSettings,
+        out: &mut Vec<TorrentEffect>,
+    ) -> bool {
+        if self.checking_pieces == 0 {
+            return false;
         }
-        false
+        self.checking_pieces -= 1;
+        if self.checking_pieces > 0 {
+            return false;
+        }
+        self.checking = false;
+        // recheck completion → `state_updated()` upstream.
+        self.state_updated();
+        // upstream `files_checked` — `is_finished()` → `finished()`
+        // (`set_state(finished)` + `torrent_finished` via the
+        // `BecameSeed` effect), `is_seed()` → `completed()`
+        // (`set_state(seeding)` + the completed-announce latch).
+        let all = self.num_pieces > 0 && self.have.count() as i32 == self.num_pieces;
+        let want_done = all || self.picker.as_ref().is_some_and(|p| p.is_finished());
+        if want_done && !self.finished {
+            self.finished = true;
+            self.finished_at.get_or_insert_with(Instant::now);
+            self.emit_state_change(out);
+            out.push(TorrentEffect::BecameSeed);
+        }
+        if all {
+            self.seeding = true;
+            self.seeding_since.get_or_insert_with(Instant::now);
+            if s.suggest_mode != crate::settings::SuggestMode::SuggestReadCache {
+                self.hash_picker_state = bitdaemon_disk::hash_picker::HashPickerState::default();
+            }
+            self.emit_state_change(out);
+        }
+        if self.is_seed() {
+            self.complete_sent = true;
+            self.trackers.set_complete_sent();
+        }
+        // remaining leg — the drain lands in `downloading` when
+        // pieces are still missing.
+        self.emit_state_change(out);
+        // `files_checked` posts `torrent_checked_alert` last, after
+        // every `set_state` transition.
+        out.push(TorrentEffect::Alert(crate::alerts::Alert::TorrentChecked(
+            self.info_hash,
+        )));
+        // `set_state`'s `trigger_stop` — leaving `checking_files`
+        // is the `stop_when_ready` edge upstream.
+        self.stop_when_ready_edge(false, out);
+        true
     }
 
     /// `prioritize_files` (upstream `torrent::prioritize_files`) —
@@ -8581,7 +8756,8 @@ impl Torrent {
             // job, no picker touch.
             if self.file_priorities != fixed {
                 self.file_priorities = fixed;
-                self.need_save_resume = true;
+                self.need_save_resume |=
+                    bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
             }
         }
         let _ = (s, counters);
@@ -8605,7 +8781,7 @@ impl Torrent {
             self.update_piece_priorities(&prios, s, counters, out);
             self.file_priorities = prios;
             // `need_save_resume(if_config_changed)`.
-            self.need_save_resume = true;
+            self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
             if self.share_mode {
                 self.recalc_share_mode(s, counters, out);
             }
@@ -9729,6 +9905,58 @@ impl Torrent {
         }
     }
 
+    /// upstream `is_downloading_state` — any state that connects
+    /// peers (`downloading_metadata`/`downloading`/`finished`/
+    /// `seeding`); the two checking states are not (torrent.cpp:121).
+    /// This is what `stop_when_ready`'s trigger tests.
+    #[must_use]
+    pub fn is_downloading_state(&self) -> bool {
+        matches!(
+            self.state(),
+            crate::status::TorrentState::DownloadingMetadata
+                | crate::status::TorrentState::Downloading
+                | crate::status::TorrentState::Finished
+                | crate::status::TorrentState::Seeding
+        )
+    }
+
+    /// `set_state`'s `state_changed_alert` — emit a
+    /// `StateChangedEdge` carrying the previously emitted state
+    /// (the session fills `next` from the current `state()`). The
+    /// first call records the baseline without an alert — upstream
+    /// `m_state` starts at its initial value, no alert is posted
+    /// until the first real transition.
+    pub fn emit_state_change(&mut self, out: &mut Vec<TorrentEffect>) {
+        let cur = self.state();
+        if let Some(prev) = self.state_prev.replace(cur)
+            && prev != cur
+        {
+            out.push(TorrentEffect::StateChangedEdge { prev, next: cur });
+        }
+    }
+
+    /// `torrent::stop_when_ready(b)` — set the flag; when `b` and
+    /// the torrent is already in a downloading state, the trigger
+    /// fires immediately (upstream avoids the race where the
+    /// downloading state was reached before the flag landed).
+    /// The session runs `auto_managed(false)` + `pause()`.
+    pub fn set_stop_when_ready(&mut self, b: bool, out: &mut Vec<TorrentEffect>) {
+        self.stop_when_ready = b;
+        if b && self.is_downloading_state() {
+            out.push(TorrentEffect::StopWhenReadyCheck);
+        }
+    }
+
+    /// `set_state`'s `trigger_stop` — push `StopWhenReadyCheck`
+    /// when a non-downloading→downloading transition just ran and
+    /// `m_stop_when_ready` is armed. `was_dl` is the caller's
+    /// `is_downloading_state()` sample from before the mutation.
+    pub fn stop_when_ready_edge(&self, was_dl: bool, out: &mut Vec<TorrentEffect>) {
+        if self.stop_when_ready && !was_dl && self.is_downloading_state() {
+            out.push(TorrentEffect::StopWhenReadyCheck);
+        }
+    }
+
     /// `torrent_status()` — the snapshot upstream's `status()`
     /// fills; `queue_pos` comes from the session (ordering lives
     /// there).
@@ -9913,7 +10141,7 @@ impl Torrent {
             announcing_to_trackers: self.outstanding_announces > 0,
             announcing_to_dht: self.dht_announcing,
             announcing_to_lsd: self.lsd_announcing,
-            need_save_resume: self.need_save_resume,
+            need_save_resume: self.need_save_resume.is_set(),
             ip_filter_applies: self.apply_ip_filter,
             flags: self.flags(),
             sequential_download: self.sequential,
@@ -10140,7 +10368,7 @@ impl Torrent {
         // marks the resume dirty each tick the stat counters moved
         // (`total_uploaded`/`total_downloaded` are resume fields).
         if down + up > 0 {
-            self.need_save_resume = true;
+            self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_COUNTERS_CHANGED;
         }
         if let Some(prev_t) = self.stat_sample {
             let dt = (now - prev_t).as_secs_f64();
@@ -10684,7 +10912,7 @@ impl Torrent {
         }
         self.upload_mode = b;
         // upstream `set_need_save_resume(if_state_changed)`.
-        self.need_save_resume = true;
+        self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_STATE_CHANGED;
         self.state_updated();
         self.send_upload_only(out);
         if b {
@@ -10890,8 +11118,8 @@ impl Torrent {
 
     /// `set_need_save_resume` — flag for the periodic flush
     /// (`m_need_save_resume_data`).
-    pub fn set_need_save_resume(&mut self) {
-        self.need_save_resume = true;
+    pub fn set_need_save_resume(&mut self, flags: bitdaemon_common::flags::ResumeDataFlags) {
+        self.need_save_resume |= flags;
     }
 
     /// `set_progress_ppm` — `m_progress_ppm` progress parts-per-
@@ -11011,7 +11239,7 @@ impl Torrent {
             self.incomplete = incomplete;
             self.downloaded = downloaded;
             self.update_auto_sequential(s);
-            self.need_save_resume = true;
+            self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_COUNTERS_CHANGED;
         }
     }
 
@@ -11044,7 +11272,7 @@ impl Torrent {
         if !self.session_paused {
             self.graceful_pause = false;
         }
-        self.need_save_resume = true;
+        self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_STATE_CHANGED;
     }
 
     /// `recalc_share_mode` — share-mode re-prioritization: pieces we
@@ -11941,7 +12169,7 @@ impl Torrent {
             if yes { -1 } else { 1 },
         );
         self.apply_ip_filter = yes;
-        self.need_save_resume = true;
+        self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
         self.state_updated();
         // `ip_filter_updated` — turning the flag ON applies the
         // current filter to live conns and swarm entries right now
@@ -12023,7 +12251,8 @@ impl Torrent {
         } else {
             if self.file_priorities != v {
                 self.file_priorities = v;
-                self.need_save_resume = true;
+                self.need_save_resume |=
+                    bitdaemon_common::flags::ResumeDataFlags::IF_CONFIG_CHANGED;
             }
         }
         let _ = (s, counters);
@@ -12033,13 +12262,15 @@ impl Torrent {
     /// state_t)` drives the checking→downloading→finished ladder;
     /// ours is derived (`checking`/`finished`/`seeding` flags), so
     /// this only covers the explicit transitions callers make.
-    pub fn set_state(&mut self, s: crate::status::TorrentState) {
+    pub fn set_state(&mut self, s: crate::status::TorrentState, out: &mut Vec<TorrentEffect>) {
         use crate::status::TorrentState as S;
         // upstream `set_state`: no-op on no-change; otherwise the
-        // transition marks `state_updated()`.
+        // transition marks `state_updated()`, posts the
+        // `state_changed` edge and evaluates `trigger_stop`.
         if self.state() == s {
             return;
         }
+        let was_dl = self.is_downloading_state();
         match s {
             // `checking_resume_data` — and ABI-1's
             // `queued_for_checking`, which upstream reports through
@@ -12072,6 +12303,8 @@ impl Torrent {
             }
         }
         self.state_updated();
+        self.emit_state_change(out);
+        self.stop_when_ready_edge(was_dl, out);
     }
 
     /// `post_status` — snapshot routed to the alert queue by the

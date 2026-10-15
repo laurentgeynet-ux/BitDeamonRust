@@ -313,3 +313,50 @@ fusionner dans le même fix ctor que STOP_WHEN_READY.
 - `TorrentPaused` synchrone vs post-`async_stop_torrent` : classé
   déviation mineure (timing) plutôt que non-bug car l'alerte upstream
   garantit « fichiers fermés » à l'émission.
+
+## Résultat
+
+Corrections appliquées sur `audit/20-torrent-state-machine` :
+
+- **D1 corrigée** — `stop_when_ready` restauré depuis `atp.flags`
+  (ctor), routé par `set_flags` (`TorrentEffect::SetStopWhenReady`),
+  setter handle à trigger immédiat en état downloading ; l'edge
+  checking→downloading émet `StopWhenReadyCheck` → session exécute
+  `auto_managed(false)` + `pause()` complet puis désarme
+  (`torrent.rs`, `session.rs`).
+- **D2 corrigée** — sweep de déconnexion des seeds dans `finished()`
+  gaté par `close_redundant_connections`.
+- **D3 corrigée** — `need_save_resume` devient `ResumeDataFlags`
+  (`bitdaemon-common::flags`) ; tous les sites de mutation taggués
+  par catégorie ; `save_resume_data(flags)` filtre `ONLY_IF_MODIFIED`
+  sur le mask et le clear après save.
+- **D4 corrigée** — `set_paused` (démotion auto-manage) ne marque
+  plus le resume dirty ; seul `pause()` marque `IF_STATE_CHANGED`.
+- **D5 corrigée** — `finished()` émet `async_release_files`
+  (`DiskCompleted::ReleaseFiles` → `CacheFlushed`) et re-trigger
+  `manage_queue` via `BecameSeed`.
+- **D6 corrigée** — `resume_download` émet `QueueTail`
+  (`set_queue_position(last_pos)`).
+- **D7 corrigée** — `start_announcing` : gate `!paused &&
+  files_checked`, reset `total_failed`/`total_redundant_bytes`/stats
+  torrent, `high_priority` depuis connect boost.
+- **D8 corrigée** — `StateChangedEdge` émis par transition
+  (`state_prev`), diff de tick supprimé.
+- **D9 corrigée** — `TorrentPaused` différé via
+  `paused_alert_pending` jusqu'à la fin du drain graceful /
+  `async_stop_torrent`.
+- **Note annexe** — ctor restaure aussi `pinned`,
+  `apply_ip_filter`, update subscription, sequential/upload/share/
+  super-seeding et disable DHT/LSD/PEX depuis `atp.flags`.
+
+Tests : `test_state_machine_a20.rs` — 9 cas (edge stop_when_ready,
+pas d'edge entre états downloading, setter immédiat, désarmement,
+gate close_redundant, démotion non-dirty, queue tail, bitmask
+resume, StateChanged par transition) — tous verts.
+
+Gates : `cargo fmt --all`, `cargo clippy --workspace --all-targets
+-- -D warnings`, `cargo test --workspace` (0 échec),
+`cargo doc --workspace --no-deps` — toutes vertes.
+
+Row `torrent.cpp` de `docs/PORTING.md` enrichie (clause A20) ;
+fragment changelog `docs/audits/changelog/A20.md`.
