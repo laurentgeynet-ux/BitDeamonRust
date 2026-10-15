@@ -1,6 +1,6 @@
 ---
 name: audit-08-v4-download-request-path
-description: "[V4] Audit sémantique vs libtorrent — Chemin download (request→write) & rejects" (re-vérification — déjà passé)
+description: "[V4] Audit sémantique vs libtorrent — Chemin download (request→write) & rejects"
 allowed-tools:
   - read
   - grep
@@ -10,10 +10,6 @@ allowed-tools:
 ---
 
 # Audit A08 — Chemin download (request→write) & rejects
-
-> **Déjà passé** (done — commit `cbee65c`). Le relancer = re-vérifier que les
-> correctifs tiennent toujours (non-régression) et que la checklist
-> reste verte après les changements intermédiaires.
 
 **Périmètre** : request_a_block → add_request → send_block_requests → Piece → on_reject → timeouts/snub/endgame.
 

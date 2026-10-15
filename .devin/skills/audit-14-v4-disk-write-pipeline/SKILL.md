@@ -1,6 +1,6 @@
 ---
 name: audit-14-v4-disk-write-pipeline
-description: "[V4] Audit sémantique vs libtorrent — Pipeline disque — bloc entrant → écriture" (re-vérification — déjà passé)
+description: "[V4] Audit sémantique vs libtorrent — Pipeline disque — bloc entrant → écriture"
 allowed-tools:
   - read
   - grep
@@ -10,10 +10,6 @@ allowed-tools:
 ---
 
 # Audit A14 — Pipeline disque — bloc entrant → écriture
-
-> **Déjà passé** (done — audit initial + commit `5541959`). Le relancer = re-vérifier que les
-> correctifs tiennent toujours (non-régression) et que la checklist
-> reste verte après les changements intermédiaires.
 
 **Périmètre** : incoming block → async_write → cache → flush → completion.
 

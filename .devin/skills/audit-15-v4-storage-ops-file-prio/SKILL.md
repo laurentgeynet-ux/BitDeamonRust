@@ -1,6 +1,6 @@
 ---
 name: audit-15-v4-storage-ops-file-prio
-description: "[V4] Audit sémantique vs libtorrent — Ops storage & priorités fichiers" (re-vérification — déjà passé)
+description: "[V4] Audit sémantique vs libtorrent — Ops storage & priorités fichiers"
 allowed-tools:
   - read
   - grep
@@ -10,10 +10,6 @@ allowed-tools:
 ---
 
 # Audit A15 — Ops storage & priorités fichiers
-
-> **Déjà passé** (done — commit `24fffc8`). Le relancer = re-vérifier que les
-> correctifs tiennent toujours (non-régression) et que la checklist
-> reste verte après les changements intermédiaires.
 
 **Périmètre** : move_storage / delete_files / rename_file / prioritize_files / file_priority + complétions.
 

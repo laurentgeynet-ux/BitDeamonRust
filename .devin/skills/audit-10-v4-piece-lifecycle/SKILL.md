@@ -1,6 +1,6 @@
 ---
 name: audit-10-v4-piece-lifecycle
-description: "[V4] Audit sémantique vs libtorrent — Cycle de vie des pièces" (re-vérification — déjà passé)
+description: "[V4] Audit sémantique vs libtorrent — Cycle de vie des pièces"
 allowed-tools:
   - read
   - grep
@@ -10,10 +10,6 @@ allowed-tools:
 ---
 
 # Audit A10 — Cycle de vie des pièces
-
-> **Déjà passé** (done — commit `e957a83`). Le relancer = re-vérifier que les
-> correctifs tiennent toujours (non-régression) et que la checklist
-> reste verte après les changements intermédiaires.
 
 **Périmètre** : incoming_piece → flush → hash → piece_verified → Have → hash_failed → restore.
 

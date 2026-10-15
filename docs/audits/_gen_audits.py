@@ -641,7 +641,9 @@ idx += [
 with open("docs/audits/INDEX.md", "w", encoding="utf-8") as f:
     f.write("\n".join(idx))
 
-# Per-audit skills — ALL audits get a workflow (done ones = re-verify mode)
+# Per-audit skills — identical whether done or not: a re-run is a FULL
+# fresh audit, never a reduced regression check (the done flag only
+# feeds INDEX.md status + wave-table filtering, invisible to the agent).
 # Skills are generated — wipe stale audit-* dirs so renames (e.g. wave
 # tags added to the name) never leave orphans. Never hand-edit them.
 skills_root = os.path.join(".devin", "skills")
@@ -650,7 +652,7 @@ for old in os.listdir(skills_root):
     if old.startswith("audit-") and os.path.isdir(p):
         shutil.rmtree(p)
 
-for aid, slug, title, scope, up, rs, chk, traps, status in AUDITS:
+for aid, slug, title, scope, up, rs, chk, traps, _status in AUDITS:
     w = WAVE_OF[aid]
     wspec = WAVES[w]
     sname = f"audit-{aid}-v{w}-{slug}"
@@ -659,7 +661,7 @@ for aid, slug, title, scope, up, rs, chk, traps, status in AUDITS:
     body = [
         "---",
         f"name: {sname}",
-        f'description: "[V{w}] Audit sémantique vs libtorrent — {title}"' + (" (re-vérification — déjà passé)" if status else ""),
+        f'description: "[V{w}] Audit sémantique vs libtorrent — {title}"',
         "allowed-tools:",
         "  - read",
         "  - grep",
@@ -671,13 +673,6 @@ for aid, slug, title, scope, up, rs, chk, traps, status in AUDITS:
         f"# Audit A{aid} — {title}",
         "",
     ]
-    if status:
-        body += [
-            f"> **Déjà passé** ({status}). Le relancer = re-vérifier que les",
-            "> correctifs tiennent toujours (non-régression) et que la checklist",
-            "> reste verte après les changements intermédiaires.",
-            "",
-        ]
     body += [
         f"**Périmètre** : {scope}.",
         "",

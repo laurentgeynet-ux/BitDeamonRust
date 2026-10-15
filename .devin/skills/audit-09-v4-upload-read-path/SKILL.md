@@ -1,6 +1,6 @@
 ---
 name: audit-09-v4-upload-read-path
-description: "[V4] Audit sémantique vs libtorrent — Chemin upload/read (Request → fill_send_buffer → async_read)" (re-vérification — déjà passé)
+description: "[V4] Audit sémantique vs libtorrent — Chemin upload/read (Request → fill_send_buffer → async_read)"
 allowed-tools:
   - read
   - grep
@@ -10,10 +10,6 @@ allowed-tools:
 ---
 
 # Audit A09 — Chemin upload/read (Request → fill_send_buffer → async_read)
-
-> **Déjà passé** (done — commit `b518598` (DontHave wire fix)). Le relancer = re-vérifier que les
-> correctifs tiennent toujours (non-régression) et que la checklist
-> reste verte après les changements intermédiaires.
 
 **Périmètre** : Request entrant → validation → upload queue → read disque → Piece ; choke drain, rejects, compteurs.
 

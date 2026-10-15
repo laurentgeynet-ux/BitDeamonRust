@@ -157,9 +157,10 @@ committer.
 ## FAQ
 
 **Un audit marqué "done" (A08–A10, A14–A15) se relance ?**
-Oui — en mode `rapport` c'est une re-vérification de non-régression :
-le skill note que l'audit est déjà passé et sert à confirmer que les
-fix tiennent après les changements intermédiaires.
+Oui — et le skill ne sait PAS qu'il est déjà passé : un re-run est un
+audit complet à blanc, jamais une vérif allégée. Le statut `done` ne
+sert qu'à ton suivi (colonne Statut de l'INDEX) et au filtrage de la
+table des vagues — il ne biaise pas l'analyse de l'agent.
 
 **Le rapport dit « fix toucherait torrent.rs » mais l'audit est en
 vague 1 — contradiction ?**
