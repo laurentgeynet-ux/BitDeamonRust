@@ -55,13 +55,20 @@ D'où le découpage :
 
 ### Phase 1 — rapports (parallélisme total)
 
-Mode `rapport` : read-only sur le repo, écrit uniquement
-`docs/audits/reports/ANN_<slug>.md`. Tous les audits peuvent tourner
-en même temps, même dans le même checkout — aucun conflit possible.
+Mode `rapport` : read-only sur le code, écrit uniquement
+`docs/audits/reports/ANN_<slug>.md` puis le commit sur `main` en
+pathspec-limited (`git commit -- <path>` — n'embarque que ce fichier
+même si l'index partagé contient le rapport d'un voisin). Tous les
+audits peuvent tourner en même temps dans le même checkout.
+
+**Gate obligatoire avant la phase 2** : chaque rapport est relu et
+validé par un humain ; les déviations contestées basculent dans
+`## Non-bugs tranchés`. Un `apply` sur rapport brut applique des
+faux positifs possibles en branche.
 
 ### Phase 2 — application (worktrees + PRs)
 
-Mode `apply` par audit :
+Mode `apply` par audit — prérequis : rapport commité + validé :
 
 ```sh
 git worktree add ../LibtorrentRust-aNN -b audit/NN-<slug>
@@ -102,7 +109,9 @@ supprime les fragments. Commit : `docs(changelog): aggregate audit entries`.
 ### Ressources
 
 - Un `target/` par worktree (plusieurs GB chacun). `sccache` mutualise
-  la compilation des deps : `cargo install sccache`, `RUSTC_WRAPPER=sccache`.
+  la compilation des deps : `cargo install sccache` puis
+  `RUSTC_WRAPPER=sccache` (bash) ou `$env:RUSTC_WRAPPER="sccache"`
+  (PowerShell).
 - 2-4 builds workspace concurrents max en local (cargo utilise déjà tous
   les cœurs). Pour du parallélisme massif : sessions cloud séparées,
   une par audit — chacune a sa machine, son checkout, sa PR.
