@@ -2806,10 +2806,7 @@ impl Engine {
         }
         let (dht, enc_level) = {
             let ses = slock(&self.session);
-            (
-                ses.settings.enable_dht,
-                ses.pe_settings.allowed_enc_level,
-            )
+            (ses.settings.enable_dht, ses.pe_settings.allowed_enc_level)
         };
         // upstream `peer_connection` always advertises the FAST
         // extension (BEP-6); DHT bit follows `enable_dht`.

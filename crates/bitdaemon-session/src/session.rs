@@ -3757,8 +3757,8 @@ impl Session {
             };
             // the `pe_support` write-backs are `is_outgoing() &&
             // out_enc_policy == pe_enabled`-gated upstream.
-            let out_enabled = self.settings.out_enc_policy
-                == bitdaemon_net::pe_crypto::EncPolicy::Enabled;
+            let out_enabled =
+                self.settings.out_enc_policy == bitdaemon_net::pe_crypto::EncPolicy::Enabled;
             match t.peer_connected_outgoing(
                 remote,
                 crate::torrent::PeerAttach {
@@ -4917,12 +4917,7 @@ impl Session {
     /// (`connect()` refused/errored). Thin wrapper over
     /// [`Self::peer_dial_failed`]; returns `true` when the deferred
     /// TCP retry is owed (failed uTP leg).
-    pub fn peer_connect_failed(
-        &mut self,
-        ih: &Sha1Hash,
-        remote: SocketAddr,
-        was_utp: bool,
-    ) {
+    pub fn peer_connect_failed(&mut self, ih: &Sha1Hash, remote: SocketAddr, was_utp: bool) {
         let fail = bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
             std::io::ErrorKind::Other,
             was_utp,

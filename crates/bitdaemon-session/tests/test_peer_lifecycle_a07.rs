@@ -248,12 +248,8 @@ fn outgoing_dials_get_distinct_peer_ids() {
     let ih = s.add_torrent(t);
     let st = PeerListState::default();
     let t = s.torrents.get_mut(&ih).unwrap();
-    let (e1, pid1) = t
-        .try_connect_peer(0, &st, &[])
-        .unwrap();
-    let (e2, pid2) = t
-        .try_connect_peer(0, &st, &[])
-        .unwrap();
+    let (e1, pid1) = t.try_connect_peer(0, &st, &[]).unwrap();
+    let (e2, pid2) = t.try_connect_peer(0, &st, &[]).unwrap();
     assert_ne!(pid1, pid2);
     assert_ne!(e1, e2);
     // both registered for the self-connection probe.

@@ -159,17 +159,30 @@ fn pe_support_writeback_on_attach() {
     assert!(!s.peer_link_up(&ih, ep_out, false).unwrap().3);
     // MSE probe leg: clear at link-up, re-armed on completed attach.
     assert!(s.peer_link_up(&ih, ep_out, false).unwrap().3);
-    s.torrents
-        .get_mut(&ih)
-        .unwrap()
-        .peer_connected_outgoing(ep_out, attach(true, true), 0, 7, false, Some(pid_out));
+    s.torrents.get_mut(&ih).unwrap().peer_connected_outgoing(
+        ep_out,
+        attach(true, true),
+        0,
+        7,
+        false,
+        Some(pid_out),
+    );
     assert!(pe_support(&s, &ih, ep_out));
 
-    // a completed plaintext conn drives it back to false.
+    // the MSE conn goes away; a completed plaintext conn drives
+    // `pe_support` back to false.
     s.torrents
         .get_mut(&ih)
         .unwrap()
-        .peer_connected_outgoing(ep_out, attach(true, false), 1, 8, false, None);
+        .peer_disconnected_addr(ep_out, 1, false, false, 7);
+    s.torrents.get_mut(&ih).unwrap().peer_connected_outgoing(
+        ep_out,
+        attach(true, false),
+        1,
+        8,
+        false,
+        None,
+    );
     assert!(!pe_support(&s, &ih, ep_out));
 
     // an incoming attach never runs the `pe_support` write-back —
@@ -224,7 +237,12 @@ fn pe_support_rearmed_when_mse_completed() {
         mse_done: false,
         ..fail
     };
-    let e2 = s.torrents.get_mut(&ih).unwrap().try_connect_peer(0, &st, &[]).map(|x| x.0);
+    let e2 = s
+        .torrents
+        .get_mut(&ih)
+        .unwrap()
+        .try_connect_peer(0, &st, &[])
+        .map(|x| x.0);
     if let Some(e2) = e2 {
         if s.peer_link_up(&ih, e2, false).unwrap().3 {
             s.peer_dial_failed(&ih, e2, &fail2);
