@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use bitdaemon_bencode::{BdecodeNode, Dictionary, Entry, NodeType, bdecode_checked};
+use bitdaemon_bencode::{BdecodeNode, Dictionary, Entry, NodeType};
 use bitdaemon_net::socket_io::endpoint_to_bytes;
 use sha1::{Digest as _, Sha1};
 
@@ -157,6 +157,13 @@ pub struct DhtNode {
     blocker: crate::dos_blocker::DosBlocker,
     /// `m_last_self_refresh` — last `node::tick` self-id lookup.
     last_self_refresh: Option<std::time::Instant>,
+    /// `m_last_tracker_tick` — `node::connection_timeout` runs
+    /// `storage.tick()` at most once per 2 minutes.
+    last_storage_tick: Option<std::time::Instant>,
+    /// number of `storage.tick()` runs — the 2-minute
+    /// `m_last_tracker_tick` gate in [`DhtNode::tick`].
+    #[doc(hidden)]
+    pub storage_ticks: u64,
     /// our listen address (`m_sock.get_local_endpoint().address()`
     /// upstream) — persisted in `dht_state.nids` and used to
     /// re-derive the BEP-42 node id on external-IP change.
@@ -193,6 +200,11 @@ impl DhtNode {
             ip_votes: Vec::new(),
             blocker: crate::dos_blocker::DosBlocker::new(),
             last_self_refresh: None,
+            // upstream seeds `m_last_tracker_tick` two minutes in
+            // the past so the first `connection_timeout` runs
+            // `storage.tick()` immediately.
+            last_storage_tick: None,
+            storage_ticks: 0,
             bind_addr: bind_ip,
             probe_targets: HashMap::new(),
         }
@@ -410,7 +422,13 @@ impl DhtNode {
             ep: from,
             bytes: buf.to_vec(),
         });
-        let root = bdecode_checked(buf).ok()?;
+        // upstream `dht_tracker::incoming_packet` bdecodes KRPC
+        // with `depth_limit = 10, token_limit = 500` — tighter
+        // than the crate defaults.
+        let root = bitdaemon_bencode::bdecode_limits(buf, 10, 500);
+        if root.error().is_some() {
+            return None;
+        }
         // upstream `dht::node::on_bdecode` — a top-level `ip` key
         // is the peer's view of our external address; vote on it.
         let ip = root.dict_find_string_value(b"ip", b"");
@@ -524,9 +542,11 @@ impl DhtNode {
                     .map(|l| (l.on_reply(&r, obs_ep), l.kind))
                 {
                     Some((Some(data), _)) => self.lookup_reply(li, oi, data),
-                    other => {
-                        tracing::trace!(li, oi, kind = ?other.map(|t| t.1), "dht reply produced no data")
-                    }
+                    // `observer::timeout()` — a reply that failed the
+                    // kind's validation (e.g. `sample_infohashes`)
+                    // counts as an observer failure upstream.
+                    Some((None, _)) => self.lookup_failed(li, oi, 0),
+                    None => tracing::trace!(li, oi, "dht reply for dead lookup"),
                 }
             }
             Incoming::Error { tag } => {
@@ -579,8 +599,14 @@ impl DhtNode {
     /// feed `ReplyData` into the traversal + surface events.
     fn lookup_reply(&mut self, li: usize, oi: usize, data: ReplyData) {
         let hooks = self.hooks();
-        // traverse into discovered nodes
-        let nodes = data.nodes.clone();
+        // traverse into discovered nodes — except kinds whose
+        // upstream observer skips `traversal_observer::reply`
+        // (`sample_infohashes`, `ReplyData::traverse`).
+        let nodes = if data.traverse {
+            data.nodes.clone()
+        } else {
+            Vec::new()
+        };
         let resp_id = data.id;
         self.events.push(DhtEvent::Data {
             lookup: li,
@@ -1649,30 +1675,46 @@ impl DhtNode {
         self.blocker
             .set_rate_limit(self.settings.block_ratelimit.max(0) as u32);
         self.blocker.set_block_timeout(self.settings.block_timeout);
+        // upstream `rpc_manager::tick` first erases `flag_done`
+        // observers — a cancelled entry never fires a timeout.
+        let lookups = &self.lookups;
+        self.rpc.drop_tags(|tag| {
+            if tag == PING_TAG || tag & (PUT_BIT | DIRECT_BIT) != 0 {
+                return false;
+            }
+            let (li, oi) = unpack_tag(tag);
+            lookups.get(li).and_then(Option::as_ref).is_none_or(|l| {
+                l.algo
+                    .results()
+                    .get(oi)
+                    .is_none_or(|o| o.flags & crate::traversal::obs_flags::DONE != 0)
+            })
+        });
         let mut expirations = Vec::new();
         let wait = self.rpc.tick(|tag, ep, ex| expirations.push((tag, ep, ex)));
         for (tag, ep, ex) in expirations {
             self.expire_tag(tag, ep, ex);
         }
-        self.storage.tick();
-
-        // `node::tick` — every `refresh_timeout` (5 s upstream; our
-        // session calls us every tick): self-refresh the routing
-        // table's own-id region when shallow (`depth() < 4`), else
-        // refresh the least-recently-queried node. While the table
-        // is still empty the bootstrap is retried at that cadence —
-        // a single lost datagram must not stall discovery for the
-        // whole self-refresh interval.
         let now = std::time::Instant::now();
-        let empty = self.table.size().0 == 0;
+        // `m_last_tracker_tick` — `connection_timeout` runs
+        // `storage.tick()` at most once per two minutes.
+        if self
+            .last_storage_tick
+            .is_none_or(|t| now.duration_since(t) >= STORAGE_TICK)
+        {
+            self.last_storage_tick = Some(now);
+            self.storage_ticks += 1;
+            self.storage.tick();
+        }
+
+        // `node::tick` — self-refresh the routing table's own-id
+        // region every 10 min while it stays shallow
+        // (`depth() < 4`), else refresh the least-recently-queried
+        // node.
         let stale = self
             .last_self_refresh
             .is_none_or(|t| now.duration_since(t) >= SELF_REFRESH_INTERVAL);
-        let retry = empty
-            && self
-                .last_self_refresh
-                .is_none_or(|t| now.duration_since(t) >= BOOTSTRAP_RETRY);
-        if (stale && self.table.depth() < 4) || retry {
+        if stale && self.table.depth() < 4 {
             self.last_self_refresh = Some(now);
             self.bootstrap();
         } else if let Some((nid, ep)) = self.table.next_refresh() {
@@ -1792,9 +1834,9 @@ pub type MutableFields<'a> = (&'a [u8; 32], i64, &'a [u8; 64], &'a [u8]);
 /// region every 10 min while the table stays shallow
 /// (`node::tick`).
 const SELF_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
-/// Empty-table bootstrap retry cadence — upstream's
-/// `refresh_timeout` re-fires `node::tick` every 5 s.
-const BOOTSTRAP_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+/// `connection_timeout` floor for `storage.tick()` —
+/// `now - minutes(2) < m_last_tracker_tick` upstream.
+const STORAGE_TICK: std::time::Duration = std::time::Duration::from_secs(120);
 /// Tag space for `add_node` pings — decodes to `usize::MAX` which
 /// never indexes a live lookup.
 const PING_TAG: u64 = u64::MAX;

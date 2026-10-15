@@ -137,6 +137,14 @@ impl DhtTracker {
 
     /// feed a datagram; returns any immediate reply to send.
     pub fn incoming(&mut self, from: SocketAddr, buf: &[u8]) -> Option<(Vec<u8>, SocketAddr)> {
+        // `dht_tracker::incoming_packet` — anything that doesn't
+        // look like a bencoded dict isn't DHT at all: it is dropped
+        // before counters, ip_filter and the dos-blocker, so other
+        // UDP protocols sharing the port (LSD's `BT-SEARCH`,
+        // tracker replies) never consume rate-limit budget.
+        if buf.len() <= 20 || buf.first() != Some(&b'd') || buf.last() != Some(&b'e') {
+            return None;
+        }
         // `dht_ignore_dark_internet` — drop packets from the class-A
         // ranges that can't be public internet (v4 only).
         if self.settings.ignore_dark_internet

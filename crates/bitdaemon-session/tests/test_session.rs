@@ -1257,10 +1257,11 @@ fn dht_ip_key_votes_external_ip() {
         bitdaemon_dht::dht_settings::DhtSettings::default(),
     );
     // a DHT packet carrying top-level "ip" → vote (upstream
-    // dht.cpp does it on every incoming message)
+    // dht.cpp does it on every incoming message); >20 bytes or
+    // `dht_tracker::incoming_packet`'s framing check drops it.
     let mut pkt = b"d2:ip4:".to_vec();
     pkt.extend([203, 0, 113, 7]); // 203.0.113.7 (TEST-NET-3, global)
-    pkt.extend_from_slice(b"1:y1:ee");
+    pkt.extend_from_slice(b"1:t4:aaaa1:y1:ee");
     let from: std::net::SocketAddr = "8.8.8.8:6881".parse().unwrap();
     let mut out = Vec::new();
     s.on_udp(from, &pkt, &mut out);

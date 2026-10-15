@@ -141,6 +141,50 @@ fn sample_infohashes_reply() {
     assert_eq!(out.interval, Some(25));
     assert_eq!(out.num, Some(1000));
     assert_eq!(out.samples, vec![id(0x44), id(0x55)]);
+    // upstream's observer skips `traversal_observer::reply` —
+    // collected nodes go to the callback, never to the search.
+    assert!(!out.traverse);
+}
+
+#[test]
+fn sample_infohashes_malformed_is_timeout() {
+    // `sample_infohashes_observer::reply` upstream: missing or
+    // out-of-range `interval`/`num`/`samples` is `timeout()`, not
+    // a partial success.
+    // (interval, num, samples-len) — `None` = field omitted.
+    let cases: [(Option<i64>, Option<i64>, Option<usize>); 5] = [
+        (None, Some(1), Some(20)),        // missing interval
+        (Some(21601), Some(1), Some(20)), // interval out of range
+        (Some(25), Some(-1), Some(20)),   // negative num
+        (Some(25), Some(1), Some(21)),    // samples not multiple of 20
+        (Some(25), Some(1), None),        // samples missing entirely
+    ];
+    for (i, (iv, n, sl)) in cases.iter().enumerate() {
+        let mut l = Lookup::new(
+            LookupKind::SampleInfohashes,
+            id(0xaa),
+            false,
+            &hooks(),
+            vec![],
+        );
+        let buf = reply_entry(|r| {
+            r.insert("id".into(), Entry::String(id(0x33).as_bytes().to_vec()));
+            if let Some(v) = iv {
+                r.insert("interval".into(), Entry::Int(*v));
+            }
+            if let Some(v) = n {
+                r.insert("num".into(), Entry::Int(*v));
+            }
+            if let Some(len) = sl {
+                r.insert("samples".into(), Entry::String(vec![0; *len]));
+            }
+        });
+        let root = bdecode_checked(&buf).unwrap();
+        assert!(
+            l.on_reply(&root.dict_find_dict(b"r"), ep_any()).is_none(),
+            "case {i} must time out"
+        );
+    }
 }
 
 #[test]

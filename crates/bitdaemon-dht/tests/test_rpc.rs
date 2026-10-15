@@ -129,3 +129,23 @@ fn tick_fires_short_then_final() {
     rpc.abort();
     assert_eq!(rpc.outstanding(), 0);
 }
+
+#[test]
+fn drop_tags_removes_done_observers() {
+    // upstream `rpc_manager::tick` erases `flag_done` observers
+    // (aborted / already-answered entries) without a timeout.
+    let mut rpc = RpcManager::new();
+    let ep: SocketAddr = "8.8.8.8:6881".parse().unwrap();
+    rpc.invoke(query(), ep, 7, our_id(), false, false, |_, _| true);
+    rpc.invoke(query(), ep, 8, our_id(), false, false, |_, _| true);
+    assert_eq!(rpc.outstanding(), 2);
+
+    assert_eq!(rpc.drop_tags(|t| t == 7), 1);
+    assert_eq!(rpc.outstanding(), 1);
+    // the surviving transaction still matches replies
+    assert_eq!(rpc.drop_tags(|_| false), 0);
+    assert_eq!(rpc.outstanding(), 1);
+    // dropping everything empties the table
+    assert_eq!(rpc.drop_tags(|_| true), 1);
+    assert_eq!(rpc.outstanding(), 0);
+}

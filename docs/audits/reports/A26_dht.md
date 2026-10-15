@@ -278,10 +278,44 @@ jugées.
 
 ## Résultat
 
-Mode **rapport** : aucune modification de code. Déviations
-confirmées : D1 framing pre-check absent, D2 limites bdecode
-(10/500), D3 `ip_filter` non appliqué au DHT, D4 validation +
-non-traversée `sample_infohashes`, D5 `storage.tick` non borné à
-2 min, D6 retry bootstrap 5 s (à documenter ou aligner), D7
-transactions d'observers annulés gardées jusqu'à timeout. À
-corriger dans la phase apply (`audit/26-dht`).
+Mode **apply** exécuté sur `audit/26-dht` — les 7 déviations sont
+corrigées :
+
+- **D1** — pré-filtre de framing (`len <= 20` || `front != 'd'`
+  || `back != 'e'`) restauré dans `DhtTracker::incoming`, avant
+  le filtre dark-internet, le blocker et le bdecode
+  (`dht_tracker.rs`). Test : 20 datagrammes `BT-SEARCH` ne
+  consomment plus le budget `dos_blocker` (le ping suivant
+  répond) ; `de` et le bruit non-dict droppés.
+- **D2** — `node::incoming` bdecode avec `depth_limit = 10`,
+  `token_limit = 500` (`dht_node.rs`). Test : une requête >500
+  tokens est ignorée, un ping nu répond.
+- **D3** — `Session::on_udp` applique `ip_filter` aux datagrammes
+  DHT (`session.rs`) ; la source filtrée n'atteint ni le blocker
+  ni le parse, LSD voit toujours le datagramme comme upstream
+  (`return false` = « pas du DHT »).
+- **D4** — `Lookup::on_reply` valide la réponse
+  `sample_infohashes` (`interval 0..=21600`, `num 0..=i32::MAX`,
+  `samples % 20`) et renvoie `None` → `lookup_failed` sur
+  malformé ; `ReplyData::traverse = false` empêche la traversée
+  des `nodes` collectés (upstream ne fait pas
+  `traversal_observer::reply`). Le même gate borne l'alerte
+  `DhtSampleInfohashes` du chemin direct (`session.rs`).
+- **D5** — `storage.tick()` borné à 2 min via
+  `last_storage_tick` (`m_last_tracker_tick`), compteur
+  `storage_ticks` exposé `#[doc(hidden)]` pour le test.
+- **D6** — retry bootstrap à 5 s supprimé ; `bootstrap()` ne se
+  déclenche que sur le self-refresh 10 min `depth() < 4`
+  (aligné upstream).
+- **D7** — `RpcManager::drop_tags` : les transactions des
+  observers `flag_done` (annulés/déjà servis) sont effacées au
+  tick sans timeout, comme le premier passage de
+  `rpc_manager::tick` upstream.
+
+Tests ajoutés : `test_dht_tracker.rs` (4), `test_lookups.rs`
+(1 nouveau + assert `traverse`), `test_rpc.rs`
+(`drop_tags_removes_done_observers`), `test_session.rs` ajusté
+(paquet `ip`-vote paddé > 20 o — upstream le dropperait aussi).
+Gates : `fmt` · `clippy --workspace --all-targets -D warnings` ·
+`cargo test --workspace` (38 suites ok) · `cargo doc -D warnings`
+— tous verts.

@@ -7235,7 +7235,13 @@ impl Session {
     /// UDP datagram → dht tracker (any family) — and LSD announces
     /// (BT-SEARCH isn't a bencoded dict, so the dht drops it first).
     pub fn on_udp(&mut self, from: SocketAddr, buf: &[u8], out: &mut Vec<SessionOut>) {
-        if let Some((pkt, to)) = self.dht.incoming(from, buf) {
+        // `m_ip_filter.access` — filtered sources are dropped
+        // before the dos-blocker (upstream
+        // `dht_tracker::incoming_packet` returns false, so other
+        // decoders — LSD below — still see the datagram).
+        if self.ip_filter.access(from.ip()) != bitdaemon_net::ip_filter::BLOCKED
+            && let Some((pkt, to)) = self.dht.incoming(from, buf)
+        {
             tracing::trace!(%from, len = buf.len(), "dht incoming handled");
             out.push(SessionOut::UdpPacket(pkt, to));
         }
@@ -8830,20 +8836,29 @@ impl Session {
                 if failed {
                     return;
                 }
-                // parse `r.{id,interval,num,samples,nodes}` — same
-                // fields `sample_infohashes` traversals extract.
+                // parse `r.{id,interval,num,samples,nodes}` —
+                // upstream's `sample_infohashes_observer::reply`
+                // range-checks every field and treats anything
+                // malformed as `timeout()`: the callback never
+                // fires and no alert is posted.
                 let Ok(node) = bitdaemon_bencode::bdecode_checked(&response) else {
                     return;
                 };
-                let interval = node.dict_find_int_value(b"interval", 0).max(0) as u32;
-                let num = node.dict_find_int_value(b"num", 0);
-                let mut samples = Vec::new();
+                let interval_raw = node.dict_find_int_value(b"interval", -1);
+                let num = node.dict_find_int_value(b"num", -1);
                 let s = node.dict_find_string(b"samples");
-                if s.is_valid() {
-                    for chunk in s.string_value().chunks_exact(20) {
-                        if let Some(h) = Sha1Hash::from_bytes(chunk) {
-                            samples.push(h);
-                        }
+                if !(0..=21600).contains(&interval_raw)
+                    || !(0..=i64::from(i32::MAX)).contains(&num)
+                    || !s.is_valid()
+                    || s.string_value().len() % 20 != 0
+                {
+                    return;
+                }
+                let interval = interval_raw as u32;
+                let mut samples = Vec::new();
+                for chunk in s.string_value().chunks_exact(20) {
+                    if let Some(h) = Sha1Hash::from_bytes(chunk) {
+                        samples.push(h);
                     }
                 }
                 // `r.nodes` — compact 26 B entries (id ‖ ip ‖ port,
