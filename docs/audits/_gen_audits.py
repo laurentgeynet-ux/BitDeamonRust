@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Generate per-audit SKILL.md workflows + docs/audits/INDEX.md."""
 import os
+import re
 import shutil
 
 PROTOCOL = """## Protocole — deux modes
@@ -48,9 +49,18 @@ correction s'exécute dans un worktree + branche dédiés, mergée via PR.
 {checklist_verdicts}
 
    ## Déviations
+   Chaque déviation porte un **sketch de fix concret** — hunk de diff
+   ou edit-spec exacte (quel symbole, quel code à la place, réf.
+   upstream à la ligne près). Un « fix proposé » vague (« ajouter une
+   vérif ») est incomplet : l'apply doit pouvoir l'exécuter sans
+   re-designer. Le sketch n'est PAS un patch garanti : il date de
+   l'analyse, le contexte peut avoir bougé — l'apply l'applique en
+   sémantique et boucle les gates. Format :
    - `fichier.rs:ligne` — comportement Rust actuel / attendu upstream
-     (`src/foo.cpp`, fonction) — fix proposé — sévérité
-     (wire-visible / état / cosmétique)
+     (`src/foo.cpp`, fonction) — sévérité (wire-visible / état /
+     cosmétique)
+     - **sketch** : `avant → après` minimal (diff ou edit-spec) +
+       réf. upstream `src/foo.cpp:ligne` + test de régression suggéré
 
    ## Fichiers du fix
    Fichiers Rust que les corrections toucheront (planification des vagues).
@@ -113,8 +123,14 @@ autres).
     `docs/audits/changelog/A{aid}.md` sous `### Fixed` (ou autre section) —
     **ne pas éditer `CHANGELOG.md`** (conflit de merge garanti entre
     audits parallèles ; agrégation post-merge via
-    `python docs/audits/_aggregate_changelog.py`). `docs/PORTING.md` :
-    n'éditer que les rows du périmètre de l'audit, si leur statut change.
+    `python docs/audits/_aggregate_changelog.py`).
+    **`docs/PORTING.md` — obligatoire** : enrichir les rows du périmètre
+    avec ce que le fix a changé en parité (détails wire, compteurs,
+    sémantique d'erreur — la colonne notes documente l'état réel, pas
+    seulement le statut). Mettre le statut à jour si le fix le change
+    (`ported` → `verified`…). Les edits sont par row → recouvrements
+    quasi nuls entre apply parallèles ; en cas de conflit au merge,
+    rebase + gates comme pour le reste.
 12. Commit `fix(<crate>): <scope> parity — <mot-clé>` **sur la branche
     `audit/{aid}-{slug}`** — jamais sur `main`. Push la branche,
     `gh pr create`. Merges séquentiels (un audit à la fois) ; si conflit
@@ -204,7 +220,7 @@ AUDITS = [
       "Messages hors-ordre : have/bitfield avant handshake, piece avant bitfield, reject sans request",
       "Dépassements : oversized piece (packet_too_large), truncated frames, length incohérente → disconnect vs drop silencieux",
       "Compteurs `num_incoming_*` par type de message (funnel dispatch)",
-      "Port/dht_port message, extension id 0 handshake vs ids étendus"], "", "done — commit `9072a9e`"),
+      "Port/dht_port message, extension id 0 handshake vs ids étendus"], "", None),
     ("07", "extension-protocols", "Protocoles d'extension (ut_metadata, ut_pex, lt_*, suggest, smartban, holepunch)",
      "Extensions BEP-10 : métadata, pex, dont_have/have_none, suggest+allowed_fast, smart_ban, upload_only, holepunch.",
      "`src/ut_metadata.cpp`, `src/ut_pex.cpp`, `src/smart_ban.cpp`, `src/bt_peer_connection.cpp` (extended legs), `src/peer_connection.cpp` (incoming_suggest/allowed_fast/dont_have)",
@@ -526,6 +542,23 @@ for sub, desc in [
     with open(os.path.join(p, "README.md"), "w", encoding="utf-8") as f:
         f.write(f"# docs/audits/{sub}\n\n{desc}\n")
 
+# Derived status: a report containing a `## Résultat` section means the
+# audit ran the full loop (rapport -> apply -> merged). Static AUDITS
+# status stays as fallback for audits done before the report system.
+def derived_status(aid, slug):
+    p = os.path.join("docs", "audits", "reports", f"A{aid}_{slug}.md")
+    if not os.path.exists(p):
+        return None
+    txt = open(p, encoding="utf-8").read()
+    m = re.search(r"^##\s+Résultat\b(.*?)(?=^##\s|\Z)", txt, re.S | re.M)
+    if not m:
+        return None
+    h = re.search(r"commit[^`]*`([0-9a-f]{7,40})`", m.group(1), re.I)
+    return f"done — commit `{h.group(1)}`" if h else "done — rapport"
+
+
+status_of = {a[0]: (derived_status(a[0], a[1]) or a[8]) for a in AUDITS}
+
 # INDEX.md — all rows
 idx = [
     "# Registre des audits — couverture complète BitDaemon vs libtorrent",
@@ -537,9 +570,12 @@ idx = [
     "| # | Audit | Périmètre | Statut |",
     "|---|---|---|---|",
 ]
-for aid, slug, title, scope, _up, _rs, _chk, _traps, status in AUDITS:
-    idx.append(f"| A{aid} | {title} | {scope} | {status or 'à faire'} |")
+for aid, slug, title, scope, _up, _rs, _chk, _traps, _status in AUDITS:
+    idx.append(f"| A{aid} | {title} | {scope} | {status_of[aid] or 'à faire'} |")
 idx += [
+    "",
+    "*Statut* : `done` est dérivé de la section `## Résultat` du rapport",
+    "d'audit — régénérer après merge : `python docs/audits/_gen_audits.py`.",
     "",
     "## Utilisation",
     "",
@@ -596,7 +632,6 @@ idx += [
     "| Vague | Audits | Raison |",
     "|---|---|---|",
 ]
-status_of = {a[0]: a[8] for a in AUDITS}
 for w in sorted(WAVES):
     spec = WAVES[w]
     todo = [f"A{i}" for i in spec["ids"] if not status_of.get(i)]
