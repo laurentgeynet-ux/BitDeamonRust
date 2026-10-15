@@ -360,6 +360,14 @@ pub struct Torrent {
     pub picker: Option<PiecePicker>,
     /// `m_connections` — peers keyed by caller-chosen id.
     pub peers: BTreeMap<u64, PeerConn>,
+    /// picker downloader key → swarm address. Upstream stores a
+    /// `torrent_peer*` in `block_info.peer`, which survives the
+    /// connection; our key is conn-derived (`peer_key()`), so this
+    /// side table (filled at `add_peer`) lets `penalize_peers` /
+    /// `reward_downloader` still reach the swarm entry after the
+    /// conn died (`p->connection == nullptr` upstream does not
+    /// disarm the penalty).
+    downloader_addrs: std::collections::BTreeMap<u64, std::net::SocketAddr>,
     /// `m_trackers` — tier-ordered announce entries.
     pub trackers: crate::tracker_list::TrackerList,
     /// `m_merkle_trees` — per-file v2 merkle trees (empty for v1).
@@ -932,6 +940,7 @@ impl Torrent {
             connections_initialized: num_pieces > 0,
             picker: None,
             peers: BTreeMap::new(),
+            downloader_addrs: std::collections::BTreeMap::new(),
             trackers: crate::tracker_list::TrackerList::default(),
             merkle_trees: Vec::new(),
             hash_picker_state: bitdaemon_disk::hash_picker::HashPickerState::default(),
@@ -3849,6 +3858,13 @@ impl Torrent {
                     conn.plugins.push(pp);
                 }
             }
+            // mint the key→addr link now so a downloader still
+            // resolves to its swarm entry if the conn is gone by
+            // the time `piece_failed`/`piece_passed` runs blame
+            // or rewards (`torrent_peer*` outlives conns upstream).
+            if let Some(key) = conn.peer_key() {
+                self.downloader_addrs.insert(key, remote);
+            }
         }
         self.peers.insert(id, conn);
     }
@@ -4060,24 +4076,39 @@ impl Torrent {
             .find_map(|(id, c)| (c.peer_key() == Some(key)).then_some(*id))
     }
 
+    /// Resolve a picker's downloader key to `(conn id, swarm
+    /// address)`: the live conn first (refreshing `downloader_addrs`
+    /// — its `peer_id` may have arrived after `add_peer`), else the
+    /// remembered key→addr link. Upstream's `block_info.peer` is a
+    /// `torrent_peer*`, reachable without a live connection — the
+    /// map is how we reproduce that for dead conns.
+    fn resolve_downloader(&mut self, key: u64) -> (Option<u64>, Option<std::net::SocketAddr>) {
+        if let Some(id) = self.conn_by_key(key) {
+            let remote = self.peers.get(&id).and_then(|c| c.remote);
+            if let Some(remote) = remote {
+                self.downloader_addrs.insert(key, remote);
+            }
+            return (Some(id), remote);
+        }
+        (None, self.downloader_addrs.get(&key).copied())
+    }
+
     /// `piece_finished`'s trust loop — every peer that contributed
     /// blocks to a *passing* piece clears parole and gains a trust
     /// point (cap 8). Upstream's `received_valid_data` only fires
     /// peer-plugin hooks here; ours live on the torrent plugin list
     /// already (`on_piece_pass`).
     fn reward_downloader(&mut self, key: u64) {
-        let Some(id) = self.conn_by_key(key) else {
-            // downloader disconnected — upstream still updates the
-            // `torrent_peer` (it outlives conns); our picker key is
-            // conn-derived so the map is lost. Documented gap.
-            return;
-        };
-        if let Some(c) = self.peers.get_mut(&id) {
+        // upstream updates the `torrent_peer` even when its
+        // connection is already gone (`p->connection == nullptr`
+        // only skips the `received_valid_data` hook).
+        let (id, remote) = self.resolve_downloader(key);
+        if let Some(id) = id
+            && let Some(c) = self.peers.get_mut(&id)
+        {
             c.on_parole = false;
         }
-        if let Some(remote) = self.peers.get(&id).and_then(|c| c.remote)
-            && let Some(i) = self.peer_index(remote)
-        {
+        if let Some(i) = remote.and_then(|r| self.peer_index(r)) {
             let p = &mut self.peer_list.peers_mut()[i];
             p.on_parole = false;
             p.trust_points = (p.trust_points + 1).min(8);
@@ -4131,18 +4162,23 @@ impl Torrent {
             if key == Self::WEB_SEED_PEER {
                 continue;
             }
+            // `allow_disconnect` — upstream starts at true and only
+            // a live conn's `received_invalid_data` can veto it (web
+            // seeds handled above); a dead conn never vetoes.
             let allow_disconnect = true;
-            let Some(id) = self.conn_by_key(key) else {
+            let (id, remote) = self.resolve_downloader(key);
+            let Some(remote) = remote else {
+                // key never seen at `add_peer` and conn gone —
+                // untraceable, like a `nullptr` downloader entry.
                 continue;
             };
-            let Some(remote) = self.peers.get(&id).and_then(|c| c.remote) else {
-                continue;
-            };
-            if let Some(c) = self.peers.get_mut(&id)
+            if let Some(id) = id
+                && let Some(c) = self.peers.get_mut(&id)
                 && s.use_parole_mode
             {
                 c.on_parole = true;
             }
+            let pid = id.and_then(|id| self.peers.get(&id).and_then(|c| c.peer_id));
             let Some(i) = self.peer_index(remote) else {
                 continue;
             };
@@ -4166,17 +4202,22 @@ impl Torrent {
                 out.push(TorrentEffect::Alert(crate::alerts::Alert::PeerBan {
                     ih: self.info_hash,
                     ip: remote,
+                    pid,
                 }));
                 // `peer->disconnect(errors::too_many_corrupt_pieces)`
                 // — a peer-error disconnect, counted as a failure
-                // (the swarm entry's `failcount` grows).
-                out.push(TorrentEffect::DisconnectPeer {
-                    peer: id,
-                    reason: "too many corrupt pieces",
-                    // torrent.cpp:5200 — default (normal) severity;
-                    // the ban itself is separate.
-                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                });
+                // (the swarm entry's `failcount` grows). Upstream
+                // gates this on `p->connection` (`torrent.cpp:5189`)
+                // — a dead conn has nothing to drop.
+                if let Some(id) = id {
+                    out.push(TorrentEffect::DisconnectPeer {
+                        peer: id,
+                        reason: "too many corrupt pieces",
+                        // torrent.cpp:5200 — default (normal)
+                        // severity; the ban itself is separate.
+                        sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
+                    });
+                }
             }
         }
     }

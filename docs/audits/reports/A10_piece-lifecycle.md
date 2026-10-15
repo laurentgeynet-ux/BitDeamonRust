@@ -178,3 +178,28 @@ hash_failed → restore. Références upstream : `src/torrent.cpp`
   `need_picker()` recrée ; chez nous tous les jobs stale sont déjà
   dropés par `picker_gen` (inconsistent/force_recheck bumpent en
   même temps qu'ils dropent le picker) — inatteignable en pratique.
+
+## Résultat
+
+Apply effectué sur `audit/10-piece-lifecycle` (merge `--no-ff` vers
+`main` à la fin de l'apply — hash du commit de branche dans `git
+log audit/10-piece-lifecycle`).
+
+- **Déviation 1 (état) corrigée** : `penalize_peers` /
+  `reward_downloader` résolvent désormais une clé downloader via la
+  conn vivante *ou* `downloader_addrs` (key→addr mémorisé à
+  `add_peer`, rafraîchi à chaque résolution — `torrent.rs`). Un
+  culprit déconnecté reçoit parole + trust −2/min−7 + hashfails sur
+  son entrée swarm, ban si `known_bad`/`trust <= -7` avec
+  `BannedForHashFailure` + `PeerBan` + `update_want_peers`, sans
+  `DisconnectPeer` (gate `if (p->connection)` upstream). Le leg pass
+  rend le +1/parole-off symétrique.
+- **Déviation 2 (cosmétique) corrigée** : `Alert::PeerBan` porte
+  `pid: Option<PeerId>` — rempli depuis la conn vivante (torrent et
+  `ban_peer` manuel), `None` sinon.
+- **Tests** : `hash_fail_penalizes_dead_conn_culprit`,
+  `piece_pass_rewards_dead_conn_downloader`
+  (`tests/test_torrent.rs`) ; `test_alert_types` mis à jour pour le
+  nouveau champ.
+- **Gates** : `fmt`, `clippy -D warnings`, `cargo test --workspace`,
+  `cargo doc --no-deps` — tous verts dans le worktree.
