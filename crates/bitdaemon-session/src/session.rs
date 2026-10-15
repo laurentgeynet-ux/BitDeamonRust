@@ -430,8 +430,10 @@ pub struct Session {
     pub write_gates: Option<Arc<PeerWriteGates<(Sha1Hash, u64)>>>,
     /// `m_alert_manager`.
     pub alerts: AlertManager,
-    /// `m_stats_counters`.
-    pub counters: Counters,
+    /// `m_stats_counters` — `Arc` so transport sinks
+    /// (`utp_counter_sink`) can post increments off-thread like
+    /// upstream's manager→counters calls.
+    pub counters: Arc<Counters>,
     /// `m_peer_id` — generated with the default fingerprint
     /// (`generate_peer_id`); used in announces and handshakes.
     pub peer_id: bitdaemon_common::PeerId,
@@ -928,7 +930,7 @@ impl Default for Session {
             disk: None,
             write_gates: None,
             alerts: AlertManager::default(),
-            counters: Counters::default(),
+            counters: Arc::new(Counters::default()),
 
             peer_id: bitdaemon_common::peer_id::generate_peer_id(b"-OB0001-"),
             listen_port: 6881,

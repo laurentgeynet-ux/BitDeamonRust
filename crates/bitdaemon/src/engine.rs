@@ -416,7 +416,12 @@ impl Engine {
         let Some(dg) = self.datagram.clone() else {
             return;
         };
-        let cfg = bitdaemon_net::utp_socket::UtpConfig::default();
+        let cfg = bitdaemon_net::utp_socket::UtpConfig {
+            counter_sink: Some(bitdaemon_session::counters::utp_counter_sink(
+                &slock(&self.session).counters.clone(),
+            )),
+            ..Default::default()
+        };
         let manager = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
         if slock(&self.session).settings.enable_outgoing_utp {
             self.utp_connector = Some(Arc::new(bitdaemon_net::utp_stream::UtpConnector {
@@ -446,7 +451,12 @@ impl Engine {
         local: SocketAddr,
         kind: u8,
     ) {
-        let cfg = bitdaemon_net::utp_socket::UtpConfig::default();
+        let cfg = bitdaemon_net::utp_socket::UtpConfig {
+            counter_sink: Some(bitdaemon_session::counters::utp_counter_sink(
+                &slock(&self.session).counters.clone(),
+            )),
+            ..Default::default()
+        };
         let manager = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
         let acc =
             bitdaemon_net::utp_stream::UtpAcceptor::new(manager.clone(), dg.clone(), cfg).await;

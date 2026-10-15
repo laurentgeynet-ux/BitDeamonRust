@@ -35,6 +35,31 @@ pub type AcceptFut = Pin<
     Box<dyn Future<Output = crate::Result<(BoxedPeerStream, Option<SocketAddr>)>> + Send + Sync>,
 >;
 
+/// `udp_send_flags_t` — per-datagram send flags upstream passes to
+/// `udp_socket::send` (`send_flags_t`, a bitmask).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DatagramSendFlags(u8);
+
+impl DatagramSendFlags {
+    /// No flags.
+    pub const NONE: Self = Self(0);
+    /// `udp_socket::dont_fragment` — request the DF bit on the IP
+    /// header (uTP MTU probes only; upstream `1 << 3`).
+    pub const DONT_FRAGMENT: Self = Self(1 << 3);
+
+    /// Bitwise-or combination.
+    #[must_use]
+    pub fn or(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether `flag` is set.
+    #[must_use]
+    pub fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 != 0
+    }
+}
+
 /// Object-safe datagram transport — the subset of `tokio::net::UdpSocket`
 /// used by the DHT, UDP tracker clients, uTP socket manager and LSD.
 ///
@@ -50,6 +75,22 @@ pub type AcceptFut = Pin<
 pub trait DatagramSocket: Send + Sync + Debug + 'static {
     /// Send a datagram to `target`.
     fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> BoxFut<'a, usize>;
+
+    /// `udp_socket::send(ep, buf, ..., flags)` — send honoring
+    /// [`DatagramSendFlags`]. The default ignores `flags` and defers
+    /// to [`DatagramSocket::send_to`]: transports where the flag has
+    /// no OS meaning (tunnels, simulation sockets) inherit upstream's
+    /// "can't honor it" behavior (`TORRENT_HAS_DONT_FRAGMENT` is
+    /// itself conditional upstream).
+    fn send_to_flags<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+        flags: DatagramSendFlags,
+    ) -> BoxFut<'a, usize> {
+        let _ = flags;
+        self.send_to(buf, target)
+    }
 
     /// Receive one datagram into `buf`, returning its length and sender.
     fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> BoxFut<'a, (usize, SocketAddr)>;

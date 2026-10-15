@@ -239,3 +239,38 @@ Côté Rust : `crates/bitdaemon-net/src/utp.rs`, `utp_socket.rs`, `utp_stream.rs
   `utp_socket.rs:427-436` = `utp_stream.cpp:641-655` — conforme.
 - `send_fin` branche erreur sans `test_socket_state` (`utp_socket.rs:503-508`)
   : inatteignable (pas d'erreur de transport possible), couvert par D9.
+
+## Résultat (apply — branche `audit/05-utp-transport`)
+
+Les 13 déviations sont corrigées ; gates workspace verts
+(`fmt`, `clippy -D warnings`, `test --workspace`, `doc --no-deps`).
+
+| Dév. | Correction |
+|---|---|
+| D1 | `close()` exige `nagle_packet.is_none()` **et** `outbuf.at(m_seq_nr).is_none()` ; `send_fin` garde `debug_assert!` sur le paquet naglé — plus de FIN-avec-payload possible |
+| D2 | `WriterMsg::Close` : `poll_shutdown` envoie `sock.close()` (FIN émis, le pump tourne jusqu'à FinSent/Deleting avant `unregister`) ; `Drop` de `UtpStream` ferme au lieu de laisser `wr_tx` mourir en EOF silencieux |
+| D3 | `UtpSocket::set_close_reason(u16)` + `WriterMsg::CloseReason` → l'extension close-reason part sur le FIN ; erreurs mappées `UtpError → close_reason` côté stream |
+| D4 | Le pump draine `inbound_rx` par `try_recv` jusqu'à vide puis émet **un** `send_deferred_ack` par batch (≤ 1 ST_STATE par rafale, comme `socket_drained` upstream) |
+| D5 | `DatagramSendFlags::DONT_FRAGMENT` + `DatagramSocket::send_to_flags` (défaut → `send_to`) ; `TokioUdpSocket` pose IP_MTU_DISCOVER/IP_PMTUDISC_PROBE via `rustix` autour du send (Linux safe, v4 only — parité `TORRENT_HAS_DONT_FRAGMENT`) ; le pump propage `OutDatagram.dont_fragment` |
+| D6 | `accept_syn` parse le header, exige `ty == Syn` (version vérifiée au parse), n'enregistre le socket que si `incoming_packet` retourne vrai ; `route()` droppe `< 20 B` et `version != 1` avant le demux |
+| D7 | `sock.read()` n'est appelé que si `rd_tx.capacity() > 0` — le lecteur stoppé ne fige plus le pump (les données restent dans `receive_buffer`, upstream `m_receive_buffer`) |
+| D8 | `UtpSocketDemux` : ids `rand::random::<u16>()` (plus séquentiels), clé `(endpoint, conn_id)` stricte — l'essai ±1 est retiré, le drop échoit au `m_recv_id` check comme upstream `match` |
+| D9 | `abort()` chaîne `test_socket_state()` → `ErrorWait` puis `Deleting` si handlers annulés (ordre upstream) |
+| D10 | `UtpStat`/`UtpCounterSink` injecté via `UtpConfig` ; incréments aux sites upstream (packets_in/out, payload_in/out, invalid/redundant_in, resend/fast_retransmit, timeout/loss, samples above/below) + gauges d'état (`num_utp_*`) aux transitions/`Drop` ; `Counters::add_idx` + `utp_counter_sink` câblés session→engine |
+| D11 | `sock.read()` Err propage `m_error` dans `last_error` → `AsyncRead` voit `ConnectionReset`/`ConnectionAborted`/timeout au lieu d'un EOF propre |
+| D12 | `route` clone le sender sous lock puis `try_send` hors lock — canal plein → datagramme droppé (lossy), plus de head-of-line |
+| D13 | `UtpManager::remove_datagram_socket(dg)` : abort de tous les sockets dont l'entrée demux retient ce `Arc` (upstream `remove_udp_socket`) |
+
+## Tests de régression ajoutés
+
+`test_utp_socket.rs` : `close_waits_for_pending_nagle` (D1),
+`abort_progresses_to_deleting` (D9), `close_reason_rides_the_fin` (D3),
+`demux_ids_and_endpoint_keying` (D8),
+`counter_sink_observes_wire_activity` (D10).
+
+`test_utp_stream.rs` : `shutdown_emits_fin` (D2),
+`deferred_ack_batches_per_receive_round` (D4),
+`mtu_probe_carries_dont_fragment` (D5), `accept_syn_rejects_garbage` (D6),
+`stalled_reader_keeps_acking` (D7), `reset_maps_to_connection_reset` (D11),
+`route_drops_on_full_listener_queue` (D12),
+`remove_datagram_socket_aborts_streams` (D13).

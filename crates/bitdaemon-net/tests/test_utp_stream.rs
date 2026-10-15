@@ -356,3 +356,514 @@ async fn bulk_transfer_throughput() {
     );
     responder.abort();
 }
+
+fn wire_pair() -> (Wire, Wire) {
+    let (tx_a, rx_a) = mpsc::channel(64);
+    let (tx_b, rx_b) = mpsc::channel(64);
+    (
+        Wire {
+            me: a(),
+            out: tx_a,
+            rx: Mutex::new(rx_b),
+        },
+        Wire {
+            me: b(),
+            out: tx_b,
+            rx: Mutex::new(rx_a),
+        },
+    )
+}
+
+/// scripted peer on `wb`: accepts the SYN, then keeps acking every
+/// datagram it receives for the life of the test. Every datagram in
+/// both directions is mirrored into the tap channel as
+/// `(from_client, bytes)` so tests can read the real connection ids
+/// and sequence numbers without racing `recv_from`.
+fn spawn_peer(
+    wb: Arc<Wire>,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedReceiver<(bool, Vec<u8>)>,
+) {
+    let (tap_tx, tap_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let Ok((n, from)) = wb.recv_from(&mut buf).await else {
+            return;
+        };
+        let _ = tap_tx.send((true, buf[..n].to_vec()));
+        let id = u16::from_be_bytes([buf[2], buf[3]]);
+        let mut sock = UtpSocket::new(id.wrapping_add(1), id, UtpConfig::default());
+        assert!(sock.incoming_packet(&buf[..n], from, std::time::Instant::now()));
+        sock.send_deferred_ack();
+        for d in sock.drain_outbox() {
+            let _ = tap_tx.send((false, d.bytes.clone()));
+            let _ = wb.send_to(&d.bytes, d.to).await;
+        }
+        while let Ok((n, from)) = wb.recv_from(&mut buf).await {
+            let _ = tap_tx.send((true, buf[..n].to_vec()));
+            sock.incoming_packet(&buf[..n], from, std::time::Instant::now());
+            sock.send_deferred_ack();
+            for d in sock.drain_outbox() {
+                let _ = tap_tx.send((false, d.bytes.clone()));
+                let _ = wb.send_to(&d.bytes, d.to).await;
+            }
+        }
+    });
+    (handle, tap_rx)
+}
+
+async fn connect_stream(
+    mgr: &Arc<UtpManager>,
+    wa: &Arc<Wire>,
+) -> bitdaemon_net::utp_stream::UtpStream {
+    let mut s = mgr
+        .connect(wa.clone(), b(), UtpConfig::default())
+        .await
+        .unwrap();
+    s.wait_connected().await.unwrap();
+    s
+}
+
+/// collect the packet types arriving on `wb` for up to `dur`
+/// (short-circuiting on `stop` when `want` is seen).
+async fn collect_types(wb: &Arc<Wire>, dur: std::time::Duration, want: u8) -> Vec<u8> {
+    let mut types = Vec::new();
+    let deadline = std::time::Instant::now() + dur;
+    loop {
+        let mut buf = vec![0u8; 2048];
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, wb.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) if n >= 20 => {
+                let ty = buf[0] >> 4;
+                types.push(ty);
+                if ty == want {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    types
+}
+
+/// same as `collect_types` but reads the `spawn_peer` tap channel,
+/// keeping only packets flowing in `from_client` direction.
+async fn collect_tap(
+    tap: &mut tokio::sync::mpsc::UnboundedReceiver<(bool, Vec<u8>)>,
+    from_client: bool,
+    dur: std::time::Duration,
+    want: u8,
+) -> Vec<u8> {
+    let mut types = Vec::new();
+    let deadline = std::time::Instant::now() + dur;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, tap.recv()).await {
+            Ok(Some((fc, p))) if fc == from_client && p.len() >= 20 => {
+                let ty = p[0] >> 4;
+                types.push(ty);
+                if ty == want {
+                    break;
+                }
+            }
+            Ok(Some(_)) => {}
+            _ => break,
+        }
+    }
+    types
+}
+
+/// next tapped packet in `from_client` direction (or `None` on
+/// timeout).
+async fn tap_pkt(
+    tap: &mut tokio::sync::mpsc::UnboundedReceiver<(bool, Vec<u8>)>,
+    from_client: bool,
+    dur: std::time::Duration,
+) -> Option<Vec<u8>> {
+    let deadline = std::time::Instant::now() + dur;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        match tokio::time::timeout(left, tap.recv()).await {
+            Ok(Some((fc, p))) if fc == from_client => return Some(p),
+            Ok(Some(_)) => {}
+            _ => return None,
+        }
+    }
+}
+
+// D2 — `poll_shutdown` must emit a FIN on the wire (upstream
+// `utp_stream::close` → `send_fin`). Pre-fix it was a no-op and the
+// FIN path was dead code.
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_emits_fin() {
+    use tokio::io::AsyncWriteExt;
+
+    let (wa, wb) = wire_pair();
+    let (wa, wb) = (Arc::new(wa), Arc::new(wb));
+    let mgr = Arc::new(UtpManager::new());
+    let _pump = mgr.pump_in(wa.clone());
+    let (_peer, mut tap) = spawn_peer(wb);
+    let mut stream = connect_stream(&mgr, &wa).await;
+
+    stream.write_all(b"x").await.unwrap();
+    stream.shutdown().await.unwrap();
+
+    // ST_FIN = 1
+    let types = collect_tap(&mut tap, true, std::time::Duration::from_secs(2), 1).await;
+    assert!(
+        types.contains(&1),
+        "no ST_FIN reached the wire after shutdown(): {types:?}"
+    );
+}
+
+// D6 — `accept_syn` must reject anything that isn't a valid v1 SYN
+// (previously garbage fed `incoming_packet` and a phantom socket
+// lingered ~connect_timeout).
+#[tokio::test(flavor = "current_thread")]
+async fn accept_syn_rejects_garbage() {
+    let (wa, _wb) = wire_pair();
+    let wa = Arc::new(wa);
+    let mgr = Arc::new(UtpManager::new());
+
+    // version != 1 → rejected by the version gate
+    let mut bad = vec![0u8; 20];
+    bad[0] = (4 << 4) | 2;
+    assert!(
+        mgr.accept_syn(wa.clone(), b(), &bad, UtpConfig::default())
+            .await
+            .is_err()
+    );
+    // v1 but ST_DATA, not SYN → rejected
+    bad[0] = 1;
+    assert!(
+        mgr.accept_syn(wa.clone(), b(), &bad, UtpConfig::default())
+            .await
+            .is_err()
+    );
+
+    // a well-formed SYN is still accepted (the gate isn't overstrict)
+    let mut syn = vec![0u8; 20];
+    syn[0] = (4 << 4) | 1;
+    syn[2..4].copy_from_slice(&7u16.to_be_bytes());
+    assert!(
+        mgr.accept_syn(wa.clone(), b(), &syn, UtpConfig::default())
+            .await
+            .is_ok()
+    );
+}
+
+// D13 + D11 — `remove_datagram_socket` aborts every socket bound to
+// the transport (upstream `remove_udp_socket`); the abort surfaces
+// as `ConnectionAborted`, not a bare EOF.
+#[tokio::test(flavor = "current_thread")]
+async fn remove_datagram_socket_aborts_streams() {
+    use tokio::io::AsyncReadExt;
+
+    let (wa, wb) = wire_pair();
+    let (wa, wb) = (Arc::new(wa), Arc::new(wb));
+    let mgr = Arc::new(UtpManager::new());
+    let _pump = mgr.pump_in(wa.clone());
+    let (_peer, _tap) = spawn_peer(wb);
+    let mut stream = connect_stream(&mgr, &wa).await;
+
+    let dg: Arc<dyn DatagramSocket> = wa;
+    mgr.remove_datagram_socket(&dg).await;
+
+    let mut buf = [0u8; 8];
+    let err = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("read did not complete")
+        .expect_err("expected an error, got EOF/bytes");
+    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionAborted);
+}
+
+// D11 — a peer ST_RESET surfaces as `ConnectionReset`, not EOF.
+#[tokio::test(flavor = "current_thread")]
+async fn reset_maps_to_connection_reset() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (wa, wb) = wire_pair();
+    let (wa, wb) = (Arc::new(wa), Arc::new(wb));
+    let mgr = Arc::new(UtpManager::new());
+    let _pump = mgr.pump_in(wa.clone());
+    let (_peer, mut tap) = spawn_peer(wb.clone());
+    let mut stream = connect_stream(&mgr, &wa).await;
+
+    // learn the client's recv_id and seq from the wire: a SYN
+    // carries recv_id directly, DATA carries send_id = recv_id + 1.
+    // The peer's STATE seq gives a seq_nr inside the client's
+    // reorder window, and ack_nr must not ack past what the client
+    // sent (both are sanity-checked in incoming_packet).
+    stream.write_all(b"probe").await.unwrap();
+    let pkt = tap_pkt(&mut tap, true, std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(pkt.len() >= 20);
+    let conn_id = u16::from_be_bytes([pkt[2], pkt[3]]);
+    let recv_id = if pkt[0] >> 4 == 4 {
+        conn_id
+    } else {
+        conn_id.wrapping_sub(1)
+    };
+    let client_seq = u16::from_be_bytes([pkt[16], pkt[17]]);
+    let state = tap_pkt(&mut tap, false, std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(state.len() >= 20);
+    let peer_seq = u16::from_be_bytes([state[16], state[17]]);
+
+    let mut rst = vec![0u8; 20];
+    rst[0] = (3 << 4) | 1; // ST_RESET v1
+    rst[2..4].copy_from_slice(&recv_id.to_be_bytes());
+    rst[16..18].copy_from_slice(&peer_seq.to_be_bytes());
+    rst[18..20].copy_from_slice(&client_seq.to_be_bytes());
+    wb.send_to(&rst, a()).await.unwrap();
+
+    let mut b = [0u8; 8];
+    let err = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut b))
+        .await
+        .expect("read did not complete")
+        .expect_err("expected an error");
+    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+}
+
+// D7 — a stalled reader must not wedge the pump: once the 64-slot
+// read channel is saturated the pump keeps feeding ACKs back
+// (upstream: reads are pull-based, the receive path never blocks).
+#[tokio::test(flavor = "current_thread")]
+async fn stalled_reader_keeps_acking() {
+    use tokio::io::AsyncWriteExt;
+
+    let (wa, wb) = wire_pair();
+    let (wa, wb) = (Arc::new(wa), Arc::new(wb));
+    let mgr = Arc::new(UtpManager::new());
+    let _pump = mgr.pump_in(wa.clone());
+    let (_peer, mut tap) = spawn_peer(wb.clone());
+    // never polled for read — the read channel will saturate
+    let mut stream = connect_stream(&mgr, &wa).await;
+
+    // learn the client's ids and the seq windows from the wire —
+    // crafted packets with zeroed seq/ack fields fail the
+    // redundant/reorder sanity checks in incoming_packet
+    stream.write_all(b"x").await.unwrap();
+    let pkt = tap_pkt(&mut tap, true, std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(pkt.len() >= 20);
+    let conn_id = u16::from_be_bytes([pkt[2], pkt[3]]);
+    let recv_id = if pkt[0] >> 4 == 4 {
+        conn_id
+    } else {
+        conn_id.wrapping_sub(1)
+    };
+    let client_seq = u16::from_be_bytes([pkt[16], pkt[17]]);
+    let state = tap_pkt(&mut tap, false, std::time::Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(state.len() >= 20);
+    let peer_seq = u16::from_be_bytes([state[16], state[17]]);
+
+    let data = |seq: u16| {
+        let mut d = vec![0u8; 21];
+        d[0] = 1; // ST_DATA v1
+        d[2..4].copy_from_slice(&recv_id.to_be_bytes());
+        d[16..18].copy_from_slice(&seq.to_be_bytes());
+        d[18..20].copy_from_slice(&client_seq.to_be_bytes());
+        d[20] = 0xAB;
+        d
+    };
+
+    // phase 1: flood past the 64-slot read channel and let the pump
+    // saturate it (pre-fix the pump parks in `rd_tx.send` here and
+    // never processes inbound again)
+    // seq numbers in the responder's space, inside the client's
+    // reorder window
+    for i in 1..=70u16 {
+        wb.send_to(&data(peer_seq.wrapping_add(i)), a())
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // drain whatever the client emitted so far — not the discriminator
+    while tap.try_recv().is_ok() {}
+
+    // phase 2: more data — a live pump keeps acking; a wedged one
+    // stays silent forever (ST_STATE = 2)
+    for i in 71..=80u16 {
+        wb.send_to(&data(peer_seq.wrapping_add(i)), a())
+            .await
+            .unwrap();
+    }
+    let types = collect_tap(&mut tap, true, std::time::Duration::from_secs(2), 2).await;
+    assert!(
+        types.contains(&2),
+        "pump wedged — no STATE acks after the read channel filled: {types:?}"
+    );
+}
+
+// D4 — datagrams already queued when the pump wakes are processed
+// as one receive round → a single deferred ACK per batch (upstream
+// `m_deferred_ack_list`), not one ACK per datagram.
+#[tokio::test(flavor = "current_thread")]
+async fn deferred_ack_batches_per_receive_round() {
+    let (wa, wb) = wire_pair();
+    let (wa, wb) = (Arc::new(wa), Arc::new(wb));
+    let mgr = Arc::new(UtpManager::new());
+    // no pump_in — route() by hand so both datagrams are already
+    // queued when the socket pump wakes (single-threaded runtime
+    // guarantees the ordering)
+
+    let mut syn = vec![0u8; 20];
+    syn[0] = (4 << 4) | 1; // ST_SYN v1
+    syn[2..4].copy_from_slice(&42u16.to_be_bytes());
+    let _s = mgr
+        .accept_syn(wa.clone(), b(), &syn, UtpConfig::default())
+        .await
+        .unwrap();
+    // drain the SYN's STATE ack — capture it: its seq_nr anchors
+    // the responder's send-seq space so our DATA can ack exactly
+    // the last consumed seq (state_seq − 1)
+    let mut raw = vec![0u8; 2048];
+    let (_n, _) = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        wb.recv_from(&mut raw),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(raw[0] >> 4, 2, "expected a STATE ack for the SYN");
+    let state_seq = u16::from_be_bytes([raw[16], raw[17]]);
+    let ack_nr = state_seq.wrapping_sub(1);
+
+    // two DATA packets addressed to the responder's recv_id =
+    // SYN conn_id + 1 (accept_syn registers under that key)
+    for seq in [1u16, 2] {
+        let mut d = vec![0u8; 21];
+        d[0] = 1;
+        d[2..4].copy_from_slice(&43u16.to_be_bytes());
+        d[16..18].copy_from_slice(&seq.to_be_bytes());
+        d[18..20].copy_from_slice(&ack_nr.to_be_bytes());
+        d[20] = 0xCD;
+        mgr.route(b(), &d).await;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let types = collect_types(&wb, std::time::Duration::from_millis(300), 99).await;
+    let states = types.iter().filter(|&&t| t == 2).count();
+    assert_eq!(
+        states, 1,
+        "expected one batched deferred ACK, got {types:?}"
+    );
+}
+
+// D12 — `route` must never wait on a full per-socket queue: excess
+// datagrams drop like upstream packet loss, the shared receive pump
+// keeps running.
+#[tokio::test(flavor = "current_thread")]
+async fn route_drops_on_full_listener_queue() {
+    let (wa, _wb) = wire_pair();
+    let _wa = Arc::new(wa);
+    let mgr = Arc::new(UtpManager::new());
+    let mut listener_rx = mgr.set_listener().await;
+
+    // nobody accepts — the 64-slot listener queue fills up; every
+    // route() call must still return promptly
+    let mut syn = vec![0u8; 20];
+    syn[0] = (4 << 4) | 1;
+    for i in 0..70u16 {
+        syn[2..4].copy_from_slice(&(1000u16 + i).to_be_bytes());
+        tokio::time::timeout(std::time::Duration::from_millis(100), mgr.route(b(), &syn))
+            .await
+            .expect("route() blocked on a full queue");
+    }
+    let mut got = 0;
+    while listener_rx.try_recv().is_ok() {
+        got += 1;
+    }
+    assert_eq!(got, 64, "overflowing datagrams must drop, not block");
+}
+
+// D5 — `dont_fragment` must reach `DatagramSocket::send_to_flags`
+// on MTU probes. cwnd grows past 3×floor after the first acked
+// payload, so the next ≥floor packet leaves as a DF-flagged probe.
+#[tokio::test(flavor = "current_thread")]
+async fn mtu_probe_carries_dont_fragment() {
+    use bitdaemon_net::transport::DatagramSendFlags;
+    use tokio::io::AsyncWriteExt;
+
+    #[derive(Debug)]
+    struct FlagWire {
+        inner: Wire,
+        flags: std::sync::Mutex<Vec<DatagramSendFlags>>,
+    }
+    impl DatagramSocket for FlagWire {
+        fn send_to<'a>(
+            &'a self,
+            buf: &'a [u8],
+            to: SocketAddr,
+        ) -> bitdaemon_net::transport::BoxFut<'a, usize> {
+            self.inner.send_to(buf, to)
+        }
+        fn send_to_flags<'a>(
+            &'a self,
+            buf: &'a [u8],
+            to: SocketAddr,
+            flags: DatagramSendFlags,
+        ) -> bitdaemon_net::transport::BoxFut<'a, usize> {
+            self.flags
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(flags);
+            self.inner.send_to(buf, to)
+        }
+        fn recv_from<'a>(
+            &'a self,
+            buf: &'a mut [u8],
+        ) -> bitdaemon_net::transport::BoxFut<'a, (usize, SocketAddr)> {
+            self.inner.recv_from(buf)
+        }
+        fn local_addr(&self) -> SocketAddr {
+            self.inner.local_addr()
+        }
+    }
+
+    let (wa, wb) = wire_pair();
+    let fwa = Arc::new(FlagWire {
+        inner: wa,
+        flags: std::sync::Mutex::new(Vec::new()),
+    });
+    let wb = Arc::new(wb);
+    let mgr = Arc::new(UtpManager::new());
+    let _pump = mgr.pump_in(fwa.clone());
+    let (_peer, _tap) = spawn_peer(wb);
+    let mut stream = mgr
+        .connect(fwa.clone(), b(), UtpConfig::default())
+        .await
+        .unwrap();
+    stream.wait_connected().await.unwrap();
+
+    // a first payload whose acks grow cwnd past 3×mtu_floor, then a
+    // second one — its ≥floor packet leaves as an MTU probe and must
+    // carry DONT_FRAGMENT through send_to_flags
+    stream.write_all(&vec![0x55u8; 1400]).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    stream.write_all(&vec![0x55u8; 2000]).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let seen: Vec<DatagramSendFlags> = fwa.flags.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert!(
+        seen.iter()
+            .any(|f| f.contains(DatagramSendFlags::DONT_FRAGMENT)),
+        "no DF-flagged datagram on the transport: {seen:?}"
+    );
+}
