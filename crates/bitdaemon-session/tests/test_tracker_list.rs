@@ -7,6 +7,7 @@
 
 use std::time::{Duration, Instant};
 
+use bitdaemon_common::info_hash::ProtocolVersion;
 use bitdaemon_session::alerts::{Alert, AlertCategory, AlertManager};
 use bitdaemon_session::tracker_list::{AnnounceEntry, RETRY_MAX, TrackerList};
 
@@ -50,8 +51,10 @@ fn tier_ordering_and_failover() {
     l.trackers[0].fail_limit = 1;
     l.trackers[0].failed(250, Duration::ZERO, Instant::now());
     let now = Instant::now() + Duration::from_secs(3600);
-    let due = l.due(now, false, false, false);
-    assert_eq!(due, vec![1]); // only tier-2 remains
+    // v1-only torrent (supports = [v1, !v2]); picks are
+    // (tracker index, info-hash version) pairs.
+    let due = l.due(now, false, false, false, [true, false], false);
+    assert_eq!(due, vec![(1, ProtocolVersion::V1)]); // only tier-2 remains
 }
 
 #[test]

@@ -19,6 +19,21 @@ use crate::transport::BoxedPeerStream;
 /// `default_max_bottled_buffer_size`-scale cap for response buffers.
 pub const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 
+/// Tracker wire-traffic accounting — upstream folds these into
+/// `net.sent_tracker_bytes`/`net.recv_tracker_bytes`
+/// (`tracker_connection::sent_bytes`/`received_bytes`). The engine
+/// hands the totals to the session's counters when an exchange
+/// completes. `Option<&mut WireStats>` params let non-tracker
+/// callers (web seeds, UPnP) skip accounting.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WireStats {
+    /// bytes sent (upstream: request url + ~100 header estimate,
+    /// or datagram size + 28 for UDP/IP overhead).
+    pub sent: i64,
+    /// bytes received (raw response buffer; datagram size + 28 UDP).
+    pub recv: i64,
+}
+
 /// Errors from the HTTP pump.
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
@@ -31,6 +46,10 @@ pub enum HttpError {
     /// response exceeded `max_response`.
     #[error("response too large")]
     TooLarge,
+    /// `errors::timed_out` — the per-read deadline elapsed
+    /// (`tracker_receive_timeout` upstream).
+    #[error("timed out")]
+    TimedOut,
     /// non-2xx status (`http_connection` treats the code as the
     /// error; `errors::http_error`).
     #[error("http status {0}")]
@@ -147,16 +166,25 @@ impl HttpResponse {
 
 /// read until `parser.finished()` or EOF — mirrors
 /// `http_connection::on_read` looping `parser.incoming` on the
-/// whole receive buffer.
+/// whole receive buffer. `read_timeout` bounds *each* `read`
+/// (upstream `http_connection` rearms `tracker_receive_timeout`
+/// on every incoming chunk); `None` waits indefinitely.
 pub async fn recv_response(
     s: &mut BoxedPeerStream,
     max_response: usize,
+    read_timeout: Option<std::time::Duration>,
 ) -> Result<HttpResponse, HttpError> {
     let mut parser = HttpParser::new(0);
     let mut buf = Vec::with_capacity(8192);
     let mut tmp = [0u8; 8192];
     loop {
-        let n = s.read(&mut tmp).await?;
+        let n = match read_timeout {
+            Some(t) => match tokio::time::timeout(t, s.read(&mut tmp)).await {
+                Ok(r) => r?,
+                Err(_) => return Err(HttpError::TimedOut),
+            },
+            None => s.read(&mut tmp).await?,
+        };
         if n == 0 {
             break;
         }
@@ -187,11 +215,17 @@ pub async fn recv_response(
 /// [`HttpError::CrossOriginRedirect`] carrying the resolved URL. Up to
 /// 5 hops (`m_redirects`). Non-redirect statuses return the response
 /// — callers apply `is_ok_status` like upstream.
+/// `read_timeout` is the per-read deadline (`tracker_receive_timeout`
+/// for tracker callers); `stats` accumulates wire bytes when given
+/// (each redirect hop counts, like upstream's per-connection
+/// `sent_bytes`/`received_bytes`).
 pub async fn http_get(
     s: &mut BoxedPeerStream,
     url: &str,
     headers: &[(String, String)],
     max_response: usize,
+    read_timeout: Option<std::time::Duration>,
+    mut stats: Option<&mut WireStats>,
 ) -> Result<HttpResponse, HttpError> {
     let mut url = url.to_string();
     for _ in 0..=5 {
@@ -203,9 +237,20 @@ pub async fn http_get(
         };
         let host = crate::string_util::format_host_header(c.hostname, c.port, default_port);
         send_request(s, "GET", &c.path, &host, headers, &[]).await?;
-        let resp = recv_response(s, max_response).await?;
+        // `sent_bytes(url.size() + 100)` — upstream's estimate of
+        // request-line + headers overhead per request.
+        if let Some(st) = stats.as_deref_mut() {
+            st.sent += url.len() as i64 + 100;
+        }
+        let resp = recv_response(s, max_response, read_timeout).await?;
         if !crate::http_parser::is_redirect(resp.status()) {
             return Ok(resp);
+        }
+        if let Some(st) = stats.as_deref_mut() {
+            // `received_bytes(data.size() + parser.body_start())` —
+            // upstream counts the whole receive buffer (headers
+            // + payload); `raw` is exactly that.
+            st.recv += resp.raw.len() as i64;
         }
         let loc = resp
             .header("location")

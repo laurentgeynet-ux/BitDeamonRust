@@ -312,8 +312,22 @@ fn force_announce_emits_effects() {
         min_interval: 0,
         ..TrackerResponse::default()
     };
-    s.on_announce_response(&ih, "http://a/announce", Ok(reply.clone()), &mut out);
-    s.on_announce_response(&ih, "http://b/announce", Ok(reply), &mut out);
+    s.on_announce_response(
+        &ih,
+        "http://a/announce",
+        bitdaemon_common::info_hash::ProtocolVersion::V1,
+        Ok(reply.clone()),
+        None,
+        &mut out,
+    );
+    s.on_announce_response(
+        &ih,
+        "http://b/announce",
+        bitdaemon_common::info_hash::ProtocolVersion::V1,
+        Ok(reply),
+        None,
+        &mut out,
+    );
     s.settings.announce_to_all_tiers = true;
     out.clear();
     s.force_announce(

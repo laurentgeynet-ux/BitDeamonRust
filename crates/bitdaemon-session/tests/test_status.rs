@@ -56,7 +56,12 @@ fn status_snapshot() {
         external_ip: None,
         ..Default::default()
     };
-    s.on_scrape_response(&ih, "http://tr/announce", Ok(resp));
+    s.on_scrape_response(
+        &ih,
+        "http://tr/announce",
+        bitdaemon_common::info_hash::ProtocolVersion::V1,
+        Ok(resp),
+    );
 
     let st = s.torrents.get(&ih).unwrap().status(
         &s.settings,

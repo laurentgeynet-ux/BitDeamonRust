@@ -119,6 +119,72 @@ pub enum AlertPriority {
     Meta = 3,
 }
 
+/// `operation_t` — the phase a `tracker_error_alert` blames.
+/// Upstream `operation_t` is a closed enum rendered by
+/// `operation_name()`; this mirrors the subset tracker paths emit
+/// (`AnnounceError::operation()` labels) so the alert payload stays
+/// compact like the C++ enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackerOp {
+    /// `operation_t::unknown`.
+    Unknown,
+    /// `operation_t::timed_out` — deadline hit mid-exchange.
+    TimedOut,
+    /// `operation_t::sock_read` — transport read failed.
+    SockRead,
+    /// `operation_t::connect` — dial failed.
+    Connect,
+    /// `operation_t::hostname_lookup` — resolver failed.
+    HostnameLookup,
+    /// `operation_t::parse_address` — endpoint/URL parse failed.
+    ParseAddress,
+    /// `operation_t::bittorrent` — protocol-level failure
+    /// (tracker `failure reason`, HTTP status, SSRF gate).
+    Bittorrent,
+    /// `operation_t::udp_tracker` — BEP-15 exchange failure.
+    UdpTracker,
+}
+
+impl TrackerOp {
+    /// `operation_name()` — upstream's string rendering.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::TimedOut => "timed_out",
+            Self::SockRead => "sock_read",
+            Self::Connect => "connect",
+            Self::HostnameLookup => "hostname_lookup",
+            Self::ParseAddress => "parse_address",
+            Self::Bittorrent => "bittorrent",
+            Self::UdpTracker => "udp_tracker",
+        }
+    }
+
+    /// Maps the `operation()` label `AnnounceError` emits onto the
+    /// enum (unknown labels degrade to `operation_t::unknown`, the
+    /// upstream catch-all).
+    #[must_use]
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "timed_out" => Self::TimedOut,
+            "sock_read" => Self::SockRead,
+            "connect" => Self::Connect,
+            "hostname_lookup" => Self::HostnameLookup,
+            "parse_address" => Self::ParseAddress,
+            "bittorrent" => Self::Bittorrent,
+            "udp_tracker" => Self::UdpTracker,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl std::fmt::Display for TrackerOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// `alert` — the full upstream alert set as one enum. Each variant
 /// documents its `*_alert` type and carries upstream's `(alert_type,
 /// priority, static_category)` via the tables below. Variants whose
@@ -198,8 +264,18 @@ pub enum Alert {
         ih: Sha1Hash,
         /// tracker url.
         url: String,
-        /// failure message.
+        /// failure message (`error_message()` upstream).
         error: String,
+        /// `times_in_row` — consecutive failures on this entry
+        /// (`a.fails` upstream).
+        times_in_row: i32,
+        /// `status_code` — HTTP status of the tracker reply,
+        /// `-1` when the tracker never answered (upstream's
+        /// `tracker_error_alert::status_code`).
+        status_code: i32,
+        /// `op` — the `operation_t` phase that failed
+        /// (`hostname_lookup`/`connect`/`sock_read`/`bittorrent`…).
+        op: TrackerOp,
     },
     /// `tracker_warning_alert` (12).
     TrackerWarning {
@@ -209,8 +285,6 @@ pub enum Alert {
         url: String,
         /// warning message.
         msg: String,
-        /// `times_in_row`.
-        times_in_row: i32,
     },
     /// `scrape_reply_alert` (13).
     ScrapeReply {
@@ -1174,15 +1248,16 @@ impl Alert {
             Self::StateChanged { ih, prev, next } => {
                 format!("{ih} state changed: {prev} -> {next}")
             }
-            Self::TrackerError { ih, url, error } => {
-                format!("{ih} tracker {url} error: {error}")
-            }
-            Self::TrackerWarning {
+            Self::TrackerError {
                 ih,
                 url,
-                msg,
+                error,
                 times_in_row,
-            } => format!("{ih} tracker {url} warning: {msg} ({times_in_row}x)"),
+                ..
+            } => format!("{ih} tracker {url} error ({times_in_row}x): {error}"),
+            Self::TrackerWarning { ih, url, msg } => {
+                format!("{ih} tracker {url} warning: {msg}")
+            }
             Self::ScrapeReply {
                 ih,
                 url,

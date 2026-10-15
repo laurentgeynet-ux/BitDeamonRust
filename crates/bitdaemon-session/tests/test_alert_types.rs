@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use bitdaemon_common::Sha1Hash;
 use bitdaemon_common::types::PieceIndex;
 use bitdaemon_session::alerts::{
-    Alert, AlertCategory, AlertPriority, DhtMutableItemAlert, DhtNodeStats, DhtPutAlert,
+    Alert, AlertCategory, AlertPriority, DhtMutableItemAlert, DhtNodeStats, DhtPutAlert, TrackerOp,
 };
 
 const E: AlertCategory = AlertCategory::ERROR;
@@ -134,6 +134,9 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
                 ih: ih(),
                 url: "u".into(),
                 error: "e".into(),
+                times_in_row: 1,
+                status_code: -1,
+                op: TrackerOp::TimedOut,
             },
             11,
             H,
@@ -144,7 +147,6 @@ fn table() -> Vec<(Alert, u32, AlertPriority, AlertCategory)> {
                 ih: ih(),
                 url: "u".into(),
                 msg: "m".into(),
-                times_in_row: 1,
             },
             12,
             N,

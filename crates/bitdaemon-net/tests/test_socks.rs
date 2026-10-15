@@ -486,7 +486,7 @@ fn response_dict_peers() {
 fn response_failure() {
     let body = b"d14:failure reason23:not authorized to announcee";
     let err = parse_response(body, false, None, false).unwrap_err();
-    assert!(matches!(err, HttpTrackerError::Failure(_)));
+    assert!(matches!(err, HttpTrackerError::Failure { .. }));
 }
 
 #[test]

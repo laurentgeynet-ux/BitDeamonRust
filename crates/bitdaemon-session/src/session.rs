@@ -116,6 +116,10 @@ pub enum SessionOut {
         url: String,
         /// `trackerid` from the previous response, if any.
         tracker_id: String,
+        /// `r.info_hash`'s version — which `announce_infohash`
+        /// slot the reply/failure lands on (upstream runs one
+        /// announce per (endpoint, info-hash version)).
+        v: bitdaemon_common::info_hash::ProtocolVersion,
         /// announce parameters (event, counters, key).
         params: bitdaemon_net::tracker_client::AnnounceParams,
     },
@@ -144,6 +148,12 @@ pub enum SessionOut {
         /// tracker URL (announce form — the driver derives the
         /// scrape URL / udp action).
         url: String,
+        /// the info-hash version this scrape covers — upstream
+        /// sends one `scrape_request` per supported version.
+        v: bitdaemon_common::info_hash::ProtocolVersion,
+        /// `sreq.scrape_ih` — the info-hash (truncated to 20
+        /// bytes) the scrape query carries.
+        info_hash: [u8; 20],
     },
     /// fetch one batch of blocks from a url seed — the async
     /// driver dials the host via the injected connector and
@@ -2899,12 +2909,12 @@ impl Session {
     pub fn remove_torrent(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) -> Option<Torrent> {
         let mut sent = Vec::new();
         if let Some(t) = self.torrents.get_mut(ih) {
+            t.trackers.stop_announcing(Instant::now());
             Self::announce_stopped_collect(
                 t,
                 self.peer_id,
                 self.listen_port,
-                self.key,
-                self.settings.apply_ip_filter_to_trackers,
+                &self.settings,
                 out,
                 &mut sent,
             );
@@ -3108,8 +3118,7 @@ impl Session {
                 t,
                 self.peer_id,
                 self.listen_port,
-                self.key,
-                self.settings.apply_ip_filter_to_trackers,
+                &self.settings,
                 out,
                 &mut sent,
             );
@@ -3154,7 +3163,7 @@ impl Session {
     /// announce), `update_want_peers`.
     fn do_resume(&mut self, ih: &Sha1Hash, out: &mut Vec<SessionOut>) {
         let now = Instant::now();
-        let (pid, port, key) = (self.peer_id, self.listen_port, self.key);
+        let (pid, port) = (self.peer_id, self.listen_port);
         {
             let Some(t) = self.torrents.get_mut(ih) else {
                 return;
@@ -3191,6 +3200,11 @@ impl Session {
             self.settings.announce_to_all_tiers,
             self.settings.announce_to_all_trackers,
         );
+        let (num_want, report_true, apply_filter) = (
+            self.settings.num_want,
+            self.settings.report_true_downloaded,
+            self.settings.apply_ip_filter_to_trackers,
+        );
         // `start_announcing` — a peer-starved torrent
         // (`num_peers < 50`) jumps the DHT announce queue.
         let prioritize = self
@@ -3210,17 +3224,23 @@ impl Session {
             } else {
                 0
             };
-            for idx in t.trackers.due(now, is_seed, to_all_tiers, to_all_trackers) {
+            let supports = [t.info_hashes.has_v1(), t.info_hashes.has_v2()];
+            let picks =
+                t.trackers
+                    .due(now, is_seed, to_all_tiers, to_all_trackers, supports, false);
+            for (idx, v) in picks {
                 Self::dispatch_announce(
                     t,
                     *ih,
                     idx,
+                    v,
                     eff_event,
                     is_seed,
                     pid,
                     port,
-                    key,
-                    self.settings.apply_ip_filter_to_trackers,
+                    apply_filter,
+                    num_want,
+                    report_true,
                     out,
                     &mut sent,
                 );
@@ -3242,41 +3262,48 @@ impl Session {
     }
 
     /// `torrent::do_pause`/`~torrent` — `stopped` for trackers that
-    /// already announced `started`. `sent` collects `(ih,url)` for
-    /// the caller's `tracker_announce_alert` posts.
+    /// already announced `started`. Upstream routes this through
+    /// `announce_with_tracker(event_t::stopped)` — the regular
+    /// tier/announce-state selection with
+    /// `!a.start_sent && event == stopped → skip`, so stopped only
+    /// reaches the slots that actually announced (per info-hash
+    /// version). `sent` collects `(ih,url)` for the caller's
+    /// `tracker_announce_alert` posts.
     fn announce_stopped_collect(
         t: &mut Torrent,
         peer_id: bitdaemon_common::PeerId,
         port: u16,
-        key: i32,
-        apply_ip_filter_to_trackers: bool,
+        settings: &crate::settings::SessionSettings,
         out: &mut Vec<SessionOut>,
         sent: &mut Vec<(Sha1Hash, String, i32)>,
     ) {
-        let mut due = Vec::new();
-        for e in &mut t.trackers.trackers {
-            let started = e
-                .endpoints
-                .iter()
-                .any(|ep| ep.v1.start_sent || ep.v2.start_sent);
-            if started {
-                for ep in &mut e.endpoints {
-                    ep.v1.updating = true;
-                    ep.v1.sent_event = 3;
-                    ep.v2.updating = true;
-                }
-                due.push((e.url.clone(), e.tracker_id.clone()));
-            }
-        }
-        for (url, tracker_id) in due {
-            out.push(SessionOut::TrackerAnnounce {
-                ih: t.info_hash,
-                url: url.clone(),
-                tracker_id,
-                params: t.announce_params(peer_id, port, 3, key, apply_ip_filter_to_trackers),
-            });
-            t.outstanding_announces += 1;
-            sent.push((t.info_hash, url, 3));
+        let now = Instant::now();
+        let supports = [t.info_hashes.has_v1(), t.info_hashes.has_v2()];
+        let is_seed = t.is_seed();
+        let picks = t.trackers.due(
+            now,
+            is_seed,
+            settings.announce_to_all_tiers,
+            settings.announce_to_all_trackers,
+            supports,
+            true,
+        );
+        for (idx, v) in picks {
+            Self::dispatch_announce(
+                t,
+                t.info_hash,
+                idx,
+                v,
+                3,
+                is_seed,
+                peer_id,
+                port,
+                settings.apply_ip_filter_to_trackers,
+                settings.num_want,
+                settings.report_true_downloaded,
+                out,
+                sent,
+            );
         }
     }
 
@@ -6833,7 +6860,12 @@ impl Session {
         let now = Instant::now();
         let at = now + Duration::from_secs(seconds.max(0) as u64);
         let ignore_min = flags.contains(ReannounceFlags::IGNORE_MIN_INTERVAL);
-        let (pid, port, key) = (self.peer_id, self.listen_port, self.key);
+        let (pid, port) = (self.peer_id, self.listen_port);
+        let (num_want, report_true, apply_filter) = (
+            self.settings.num_want,
+            self.settings.report_true_downloaded,
+            self.settings.apply_ip_filter_to_trackers,
+        );
         let Some(t) = self.torrents.get_mut(ih) else {
             return;
         };
@@ -6845,36 +6877,50 @@ impl Session {
                 // `force_tracker_request(idx)` — forcing a specific
                 // tracker must reach *it*, bypassing tier failover
                 // (upstream `announce_tracker_now`): trigger the
-                // entry, then dispatch it if its new deadline is
-                // already due (`min_announce` still clamps unless
+                // entry, then dispatch each supported info-hash
+                // version whose new deadline is already due
+                // (`min_announce` still clamps unless
                 // `ignore_min_interval`).
                 let is_seed = t.is_seed();
                 t.trackers.trigger(Some(i), at, ignore_min);
-                let due = t.trackers.trackers.get(i).is_some_and(|e| {
-                    // `announce_with_tracker` skips undispatchable
-                    // schemes even when forced (`e0716cf24`).
-                    crate::tracker_list::tracker_protocol_supported(&e.url)
-                        && e.endpoints
-                            .iter()
-                            .any(|ep| ep.can_announce(now, is_seed, e.fail_limit))
-                });
-                if !due {
-                    return;
-                }
+                let supports = [t.info_hashes.has_v1(), t.info_hashes.has_v2()];
                 let mut sent = Vec::new();
-                Self::dispatch_announce(
-                    t,
-                    *ih,
-                    i,
-                    0,
-                    is_seed,
-                    pid,
-                    port,
-                    key,
-                    self.settings.apply_ip_filter_to_trackers,
-                    out,
-                    &mut sent,
-                );
+                for v in bitdaemon_common::info_hash::ALL_VERSIONS {
+                    if !supports[v as usize] {
+                        continue;
+                    }
+                    let due = t.trackers.trackers.get(i).is_some_and(|e| {
+                        // `announce_with_tracker` skips undispatchable
+                        // schemes even when forced (`e0716cf24`).
+                        crate::tracker_list::tracker_protocol_supported(&e.url)
+                            && e.endpoints.iter().any(|ep| {
+                                let a = if v == bitdaemon_common::info_hash::ProtocolVersion::V1 {
+                                    &ep.v1
+                                } else {
+                                    &ep.v2
+                                };
+                                ep.enabled && a.can_announce(now, is_seed, e.fail_limit)
+                            })
+                    });
+                    if !due {
+                        continue;
+                    }
+                    Self::dispatch_announce(
+                        t,
+                        *ih,
+                        i,
+                        v,
+                        0,
+                        is_seed,
+                        pid,
+                        port,
+                        apply_filter,
+                        num_want,
+                        report_true,
+                        out,
+                        &mut sent,
+                    );
+                }
                 self.post_tracker_announces(sent);
             }
             None => {
@@ -8088,34 +8134,43 @@ impl Session {
                         .is_some_and(|t| t.have.count() as i32 == t.num_pieces);
                     let mut sent = Vec::new();
                     if is_full_seed && let Some(t) = self.torrents.get_mut(&ih) {
-                        for e in &t.trackers.trackers {
-                            // `tracker_list::completed` arms only
-                            // slots without `complete_sent` — a
-                            // load-time seed latched it in
-                            // `files_checked` and re-announces none.
-                            let started = e
-                                .endpoints
-                                .iter()
-                                .any(|ep| ep.v1.start_sent || ep.v2.start_sent);
-                            let done = e
-                                .endpoints
-                                .iter()
-                                .all(|ep| ep.v1.complete_sent && ep.v2.complete_sent);
-                            if started && !done {
-                                out.push(SessionOut::TrackerAnnounce {
+                        // `torrent::completed` — `!m_announcing`
+                        // returns early upstream; otherwise
+                        // `tracker_list::completed` arms every
+                        // non-complete slot and the burst goes
+                        // through the regular announce selection —
+                        // slots latch `updating`/`sent_event` so the
+                        // ack marks `complete_sent` (and
+                        // `m_complete_sent`) and the event is never
+                        // re-sent.
+                        if t.announcing {
+                            let now = Instant::now();
+                            t.trackers.completed(now);
+                            let supports = [t.info_hashes.has_v1(), t.info_hashes.has_v2()];
+                            let picks = t.trackers.due(
+                                now,
+                                true,
+                                self.settings.announce_to_all_tiers,
+                                self.settings.announce_to_all_trackers,
+                                supports,
+                                false,
+                            );
+                            for (idx, v) in picks {
+                                Self::dispatch_announce(
+                                    t,
                                     ih,
-                                    url: e.url.clone(),
-                                    tracker_id: e.tracker_id.clone(),
-                                    params: t.announce_params(
-                                        self.peer_id,
-                                        self.listen_port,
-                                        1, // completed
-                                        self.key,
-                                        self.settings.apply_ip_filter_to_trackers,
-                                    ),
-                                });
-                                t.outstanding_announces += 1;
-                                sent.push((ih, e.url.clone(), 1));
+                                    idx,
+                                    v,
+                                    0,
+                                    true,
+                                    self.peer_id,
+                                    self.listen_port,
+                                    self.settings.apply_ip_filter_to_trackers,
+                                    self.settings.num_want,
+                                    self.settings.report_true_downloaded,
+                                    out,
+                                    &mut sent,
+                                );
                             }
                         }
                     }
@@ -8168,10 +8223,15 @@ impl Session {
         event: i32,
         out: &mut Vec<SessionOut>,
     ) {
-        let (pid, port, key) = (self.peer_id, self.listen_port, self.key);
+        let (pid, port) = (self.peer_id, self.listen_port);
         let (to_all_tiers, to_all_trackers) = (
             self.settings.announce_to_all_tiers,
             self.settings.announce_to_all_trackers,
+        );
+        let (num_want, report_true, apply_filter) = (
+            self.settings.num_want,
+            self.settings.report_true_downloaded,
+            self.settings.apply_ip_filter_to_trackers,
         );
         let mut sent = Vec::new();
         for (ih, t) in &mut self.torrents {
@@ -8186,17 +8246,28 @@ impl Session {
             } else {
                 event
             };
-            for idx in t.trackers.due(now, is_seed, to_all_tiers, to_all_trackers) {
+            let supports = [t.info_hashes.has_v1(), t.info_hashes.has_v2()];
+            let picks = t.trackers.due(
+                now,
+                is_seed,
+                to_all_tiers,
+                to_all_trackers,
+                supports,
+                eff_event == 3,
+            );
+            for (idx, v) in picks {
                 Self::dispatch_announce(
                     t,
                     *ih,
                     idx,
+                    v,
                     eff_event,
                     is_seed,
                     pid,
                     port,
-                    key,
-                    self.settings.apply_ip_filter_to_trackers,
+                    apply_filter,
+                    num_want,
+                    report_true,
                     out,
                     &mut sent,
                 );
@@ -8205,66 +8276,99 @@ impl Session {
         self.post_tracker_announces(sent);
     }
 
-    /// `send_tracker_request` — dispatch one tracker entry:
-    /// auto-picks `started`/`completed`/`none` when `event` is 0
-    /// (upstream `tracker_request` event selection), marks the
-    /// info-hash slots in-flight and moves `triggered_manually`
-    /// onto the request. Skips `stopped` announces to trackers
-    /// that never got `started`.
+    /// `send_tracker_request` — dispatch one (entry, info-hash
+    /// version) announce: auto-picks `started`/`completed`/`none`
+    /// when `event` is 0 (upstream `tracker_request` event
+    /// selection on the announced slot), marks the `v` slot
+    /// in-flight on every enabled endpoint and moves
+    /// `triggered_manually` onto the request. Skips `stopped`
+    /// announces to slots that never got `started`. The
+    /// `trackerid` falls back to the torrent-level `m_trackerid`
+    /// (add-torrent param) when the entry has none.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_announce(
         t: &mut Torrent,
         ih: Sha1Hash,
         idx: usize,
+        v: bitdaemon_common::info_hash::ProtocolVersion,
         eff_event: i32,
         is_seed: bool,
         pid: bitdaemon_common::PeerId,
         port: u16,
-        key: i32,
         apply_ip_filter_to_trackers: bool,
+        num_want: i32,
+        report_true_downloaded: bool,
         out: &mut Vec<SessionOut>,
         sent: &mut Vec<(Sha1Hash, String, i32)>,
     ) {
+        use bitdaemon_common::info_hash::ProtocolVersion as PV;
         let m_complete_sent = t.complete_sent;
         let (ev, url, tracker_id, skip) = {
             let e = &mut t.trackers.trackers[idx];
-            let slot = &mut e.endpoints[0].v1;
-            let ev = if eff_event != 0 {
-                eff_event
-            } else if !slot.start_sent {
-                2
-            } else if is_seed && !m_complete_sent && !slot.complete_sent {
-                1
-            } else {
-                0
-            };
-            if ev == 3 && !slot.start_sent {
-                (ev, e.url.clone(), e.tracker_id.clone(), true)
-            } else {
-                slot.updating = true;
-                slot.sent_event = ev;
-                // upstream moves `a.triggered_manually` onto the
-                // request at build time — the reply/error alerts
-                // then post unconditionally.
-                slot.sent_manual = slot.triggered_manually;
-                slot.triggered_manually = false;
-                // our announce covers the whole entry — hold both
-                // slots in-flight so a hybrid torrent doesn't
-                // re-fire on the v2 slot next tick.
-                for ep in &mut e.endpoints {
-                    ep.v2.updating = true;
+            let mut ev = eff_event;
+            let skip = {
+                let slot = if v == PV::V1 {
+                    &e.endpoints[0].v1
+                } else {
+                    &e.endpoints[0].v2
+                };
+                if ev == 0 {
+                    // upstream `send_tracker_request` — `started`
+                    // on first contact, `completed` once after
+                    // seeding, `none` otherwise.
+                    ev = if !slot.start_sent {
+                        2
+                    } else if is_seed && !m_complete_sent && !slot.complete_sent {
+                        1
+                    } else {
+                        0
+                    };
                 }
-                (ev, e.url.clone(), e.tracker_id.clone(), false)
+                // `event == stopped` only reaches slots that
+                // announced `started` (upstream `send_tracker_request`
+                // drops it when `!a.start_sent`).
+                ev == 3 && !slot.start_sent
+            };
+            if !skip {
+                for ep in e.endpoints.iter_mut().filter(|ep| ep.enabled) {
+                    let a = if v == PV::V1 { &mut ep.v1 } else { &mut ep.v2 };
+                    a.updating = true;
+                    a.sent_event = ev;
+                    // upstream moves `a.triggered_manually` onto the
+                    // request at build time — the reply/error alerts
+                    // then post unconditionally.
+                    a.sent_manual = a.triggered_manually;
+                    a.triggered_manually = false;
+                }
             }
+            (ev, e.url.clone(), e.tracker_id.clone(), skip)
         };
         if skip {
             return;
         }
+        // `req.trackerid = ae->trackerid` — falling back to the
+        // client-supplied `m_trackerid` when the tracker never
+        // assigned one.
+        let tracker_id = if tracker_id.is_empty() {
+            String::from_utf8_lossy(&t.trackerid).into_owned()
+        } else {
+            tracker_id
+        };
+        let info_hash = t.info_hashes.get(v).to_bytes();
         out.push(SessionOut::TrackerAnnounce {
             ih,
             url,
             tracker_id,
-            params: t.announce_params(pid, port, ev, key, apply_ip_filter_to_trackers),
+            v,
+            params: t.announce_params(
+                pid,
+                port,
+                ev,
+                apply_ip_filter_to_trackers,
+                num_want,
+                report_true_downloaded,
+                info_hash,
+            ),
         });
         t.outstanding_announces += 1;
         sent.push((ih, t.trackers.trackers[idx].url.clone(), ev));
@@ -8290,19 +8394,33 @@ impl Session {
             if !crate::tracker_list::tracker_protocol_supported(&e.url) {
                 return;
             }
-            // `scrape_tracker` is client-initiated — the request
-            // carries `triggered_manually` so its reply/failed
-            // alert posts unconditionally.
-            if let Some(ep) = e.endpoints.first_mut() {
-                ep.v1.sent_manual = true;
-            }
             // `m_last_scrape` stamps at request time upstream —
             // `status.last_scrape` reports the elapsed.
             e.scrape_time = Some(Instant::now());
-            out.push(SessionOut::TrackerScrape {
-                ih: *ih,
-                url: e.url.clone(),
-            });
+            let url = e.url.clone();
+            // upstream `scrape_tracker` — one `scrape_request` per
+            // supported info-hash version (`sreq.scrape_ih`); each
+            // is client-initiated (`user_triggered`) so its
+            // reply/failed alert posts unconditionally — the flag
+            // lives on the matching version slot.
+            for v in bitdaemon_common::info_hash::ALL_VERSIONS {
+                if !t.info_hashes.has(v) {
+                    continue;
+                }
+                if let Some(ep) = e.endpoints.first_mut() {
+                    if v == bitdaemon_common::info_hash::ProtocolVersion::V1 {
+                        ep.v1.sent_manual = true;
+                    } else {
+                        ep.v2.sent_manual = true;
+                    }
+                }
+                out.push(SessionOut::TrackerScrape {
+                    ih: *ih,
+                    url: url.clone(),
+                    v,
+                    info_hash: t.info_hashes.get(v).to_bytes(),
+                });
+            }
         }
     }
 
@@ -8319,12 +8437,20 @@ impl Session {
     }
 
     /// `on_scrape_response` — update seed/leech counts from a
-    /// scrape (`resp.complete`/`incomplete`), post `scrape_reply`.
+    /// scrape (`resp.complete`/`incomplete`), post `scrape_reply`;
+    /// failure → `scrape_failed` (410 additionally latches
+    /// `dont_try_again`, like upstream's scrape branch of
+    /// `tracker_request_error`). `v` is the info-hash version the
+    /// scrape covered — its `sent_manual` flag is the one consumed.
     pub fn on_scrape_response(
         &mut self,
         ih: &Sha1Hash,
         url: &str,
-        resp: Result<bitdaemon_net::http_tracker::TrackerResponse, String>,
+        v: bitdaemon_common::info_hash::ProtocolVersion,
+        resp: Result<
+            bitdaemon_net::http_tracker::TrackerResponse,
+            bitdaemon_net::tracker_client::AnnounceError,
+        >,
     ) {
         let Some(t) = self.torrents.get_mut(ih) else {
             return;
@@ -8334,7 +8460,7 @@ impl Session {
         let manual = t
             .trackers
             .find(url)
-            .is_some_and(|i| t.trackers.trackers[i].endpoints[0].v1.sent_manual);
+            .is_some_and(|i| announce_slot(t, i, v).sent_manual);
         let post = |s: &mut Self, a: Alert| {
             if manual {
                 s.alerts.post_unconditional(a);
@@ -8347,7 +8473,7 @@ impl Session {
                 if let Some(i) = t.trackers.find(url) {
                     let e = &mut t.trackers.trackers[i];
                     e.verified = true;
-                    // `aep->info_hashes[].scrape_*` — written on every
+                    // `aep->scrape_*` — written on every
                     // reply that carries the counts.
                     if r.downloaded >= 0 {
                         e.scrape_downloaded = r.downloaded;
@@ -8376,12 +8502,19 @@ impl Session {
                 );
             }
             Err(e) => {
+                // `never talk to this tracker again` — HTTP 410,
+                // same rule as the announce branch upstream.
+                if e.http_status() == Some(410)
+                    && let Some(i) = t.trackers.find(url)
+                {
+                    t.trackers.dont_try_again(i);
+                }
                 post(
                     self,
                     Alert::ScrapeFailed {
                         ih: *ih,
                         url: url.to_string(),
-                        reason: e,
+                        reason: e.to_string(),
                     },
                 );
             }
@@ -8390,7 +8523,12 @@ impl Session {
         if let Some(t2) = self.torrents.get_mut(ih)
             && let Some(i) = t2.trackers.find(url)
         {
-            t2.trackers.trackers[i].endpoints[0].v1.sent_manual = false;
+            let ep = &mut t2.trackers.trackers[i].endpoints[0];
+            if v == bitdaemon_common::info_hash::ProtocolVersion::V1 {
+                ep.v1.sent_manual = false;
+            } else {
+                ep.v2.sent_manual = false;
+            }
         }
     }
 
@@ -8501,15 +8639,28 @@ impl Session {
 
     /// `on_announce_response` — a tracker exchange completed:
     /// success → peers into `peer_list` (source TRACKER),
-    /// `trackerid` saved, `complete`→`num_seeds`; failure →
-    /// `announce_entry::failed` (quadratic backoff).
+    /// `trackerid` saved, scrape counts updated, the announced
+    /// info-hash slot marked `sent`; failure → `announce_infohash::
+    /// failed` (quadratic backoff + tracker `retry_interval`
+    /// hints), `410 → dont_try_again`, all-endpoints-failed →
+    /// `deprioritize_tracker`, then the next tracker is tried like
+    /// upstream's `announce_with_tracker` tail. `v` is the info-hash
+    /// version the exchange announced; `source_ip` is the resolved
+    /// tracker endpoint (`tracker_ip` upstream) — the `ip_voter`
+    /// reporter key for `external ip`.
     pub fn on_announce_response(
         &mut self,
         ih: &Sha1Hash,
         url: &str,
-        resp: Result<bitdaemon_net::http_tracker::TrackerResponse, String>,
+        v: bitdaemon_common::info_hash::ProtocolVersion,
+        resp: Result<
+            bitdaemon_net::http_tracker::TrackerResponse,
+            bitdaemon_net::tracker_client::AnnounceError,
+        >,
+        source_ip: Option<std::net::IpAddr>,
         out: &mut Vec<SessionOut>,
     ) {
+        use bitdaemon_common::info_hash::ProtocolVersion as PV;
         let Some(t) = self.torrents.get_mut(ih) else {
             return;
         };
@@ -8520,7 +8671,7 @@ impl Session {
         let manual = t
             .trackers
             .find(url)
-            .is_some_and(|i| t.trackers.trackers[i].endpoints[0].v1.sent_manual);
+            .is_some_and(|i| announce_slot(t, i, v).sent_manual);
         let mut ext_ip = None;
         // `do_connect_boost` fires once the response is fully
         // folded in (upstream calls it inside `tracker_response`
@@ -8558,12 +8709,12 @@ impl Session {
                 let mut trackerid = None;
                 let mut completed_acked = false;
                 if let Some(i) = t.trackers.find(url) {
+                    let ev = announce_slot(t, i, v).sent_event;
                     let e = &mut t.trackers.trackers[i];
                     e.verified = true;
-                    // `aep->info_hashes[].scrape_*` — announce replies
-                    // carry the swarm counts too (upstream writes
-                    // them on the same endpoint slot, then
-                    // `update_scrape_state`).
+                    // `aep->scrape_*` — announce replies carry the
+                    // swarm counts too (entry-level fields upstream,
+                    // max-ed in `update_scrape_state`).
                     if r.downloaded >= 0 {
                         e.scrape_downloaded = r.downloaded;
                     }
@@ -8573,15 +8724,15 @@ impl Session {
                     if r.complete >= 0 {
                         e.scrape_complete = r.complete;
                     }
-                    // `announce_endpoint::sent` — re-arms
+                    // `announce_infohash::sent` — re-arms
                     // `next_announce` at the tracker interval and
-                    // records `started`/`completed` delivery. An
-                    // acked `completed` marks `m_complete_sent` —
-                    // no other tracker gets the event again.
-                    let ev = e.endpoints[0].v1.sent_event;
+                    // records `started`/`completed` delivery on the
+                    // announced hash slot only. An acked `completed`
+                    // marks `m_complete_sent` — no other tracker
+                    // gets the event again.
                     let iv = std::time::Duration::from_secs(r.interval.max(0) as u64);
                     let min_iv = std::time::Duration::from_secs(r.min_interval.max(0) as u64);
-                    e.sent(iv, min_iv, now);
+                    e.sent_version(v, iv, min_iv, now);
                     // `record_working` — the last tracker to answer
                     // is `status::current_tracker` and the scrape
                     // fallback target.
@@ -8613,15 +8764,12 @@ impl Session {
                     });
                 }
                 // `tracker_warning_alert` — `warning message` in
-                // the response (non-fatal). Upstream's
-                // `times_in_row` is a per-entry warning counter;
-                // we report the first occurrence.
+                // the response (non-fatal).
                 if let Some(w) = r.warning_message {
                     self.alerts.post(Alert::TrackerWarning {
                         ih: *ih,
                         url: url.to_string(),
                         msg: w,
-                        times_in_row: 1,
                     });
                 }
                 let reply = Alert::TrackerReply {
@@ -8636,29 +8784,116 @@ impl Session {
                 }
             }
             Err(e) => {
-                // `announce_infohash::failed(tracker_backoff,
-                // retry_interval)` — upstream's retry_interval is the
-                // failed request's interval, which is 0 on transport
-                // errors (`fail()` defaults); pure quadratic backoff
-                // applies.
+                // `tracker_request_error` — `a.failed(tracker_backoff,
+                // retry_interval)` where retry_interval is the
+                // failure response's `interval` (or `min interval`);
+                // 0 on transport errors → pure quadratic backoff.
                 let backoff = self.settings.tracker_backoff;
+                let retry = e.retry_interval();
+                let status = e.http_status();
+                let op = crate::alerts::TrackerOp::from_name(e.operation());
+                let msg = match &e {
+                    bitdaemon_net::tracker_client::AnnounceError::Failure { message, .. } => {
+                        message.clone()
+                    }
+                    other => other.to_string(),
+                };
+                // `r.event` rides the cascade — a failed `stopped`
+                // still triggers `announce_with_tracker`.
+                let mut failed_event = 0;
+                let mut fails = 0;
+                let supports = [t.info_hashes.has_v1(), t.info_hashes.has_v2()];
                 if let Some(i) = t.trackers.find(url) {
-                    t.trackers.trackers[i].failed(backoff, std::time::Duration::ZERO, now);
-                    // l'erreur va sur l'endpoint (`announce_entry::
-                    // last_error`), pas dans `torrent_status::error`
-                    // — celui-ci est reserve aux erreurs fatales
-                    // (disque) qui pausent le torrent.
-                    t.trackers.trackers[i].set_message(&e);
+                    failed_event = announce_slot(t, i, v).sent_event;
+                    {
+                        let e = &mut t.trackers.trackers[i];
+                        e.failed_version(v, backoff, retry, now);
+                        fails = if v == bitdaemon_common::info_hash::ProtocolVersion::V1 {
+                            e.endpoints[0].v1.fails
+                        } else {
+                            e.endpoints[0].v2.fails
+                        };
+                        // `a.last_error`/`a.message` live on the
+                        // endpoint — `torrent_status::error` is for
+                        // fatal (disk) errors only.
+                        e.set_message(&msg);
+                    }
+                    // `never talk to this tracker again` — HTTP 410.
+                    if status == Some(410) {
+                        t.trackers.dont_try_again(i);
+                    }
+                    // `if all endpoints fail → deprioritize_tracker`
+                    // — only when *every* supported (endpoint, hash)
+                    // slot is non-working.
+                    let any_working = t.trackers.trackers[i].endpoints.iter().any(|ep| {
+                        ep.enabled
+                            && ((supports[0] && ep.v1.is_working())
+                                || (supports[1] && ep.v2.is_working()))
+                    });
+                    if !any_working {
+                        t.trackers.deprioritize(i);
+                    }
                 }
                 let err = Alert::TrackerError {
                     ih: *ih,
                     url: url.to_string(),
-                    error: e,
+                    error: msg,
+                    times_in_row: i32::from(fails),
+                    status_code: status.unwrap_or(-1),
+                    op,
                 };
                 if manual {
                     self.alerts.post_unconditional(err);
                 } else {
                     self.alerts.post(err);
+                }
+                // `announce to the next working tracker` — upstream
+                // tails `tracker_request_error` with
+                // `announce_with_tracker(r.event)` unless
+                // paused/checking/aborting (stopped events always
+                // cascade). Each failure drives failover, so a dead
+                // tier-0 tracker hands off to tier-1 without waiting
+                // for its own backoff to expire.
+                if (!t.is_paused() && !t.checking) || failed_event == 3 {
+                    let is_seed = t.is_seed();
+                    let (to_all_tiers, to_all_trackers) = (
+                        self.settings.announce_to_all_tiers,
+                        self.settings.announce_to_all_trackers,
+                    );
+                    let (num_want, report_true, apply_filter) = (
+                        self.settings.num_want,
+                        self.settings.report_true_downloaded,
+                        self.settings.apply_ip_filter_to_trackers,
+                    );
+                    let pid = self.peer_id;
+                    let port = self.listen_port;
+                    let mut sent = Vec::new();
+                    let picks = t.trackers.due(
+                        now,
+                        is_seed,
+                        to_all_tiers,
+                        to_all_trackers,
+                        supports,
+                        failed_event == 3,
+                    );
+                    for (idx, v2) in picks {
+                        Self::dispatch_announce(
+                            t,
+                            *ih,
+                            idx,
+                            v2,
+                            failed_event,
+                            is_seed,
+                            pid,
+                            port,
+                            apply_filter,
+                            num_want,
+                            report_true,
+                            out,
+                            &mut sent,
+                        );
+                    }
+                    self.post_tracker_announces(sent);
                 }
             }
         }
@@ -8666,15 +8901,21 @@ impl Session {
         if let Some(t2) = self.torrents.get_mut(ih)
             && let Some(i) = t2.trackers.find(url)
         {
-            t2.trackers.trackers[i].endpoints[0].v1.sent_manual = false;
+            let ep = &mut t2.trackers.trackers[i].endpoints[0];
+            if v == PV::V1 {
+                ep.v1.sent_manual = false;
+            } else {
+                ep.v2.sent_manual = false;
+            }
         }
         // `tracker response "external ip"` → ip_voter
-        // (`source_tracker` — upstream `on_announce`).
-        if let Some(ip) = ext_ip {
+        // (`source_tracker` — upstream keys the vote by
+        // `tracker_ip`, the resolved tracker endpoint).
+        if let (Some(ip), Some(src)) = (ext_ip, source_ip) {
             self.vote_external(
                 ip,
                 bitdaemon_net::ip_voter::IpSourceFlags::SOURCE_TRACKER,
-                &ip,
+                &src,
             );
         }
         // `do_connect_boost` — the first tracker response hands out
@@ -8967,6 +9208,21 @@ impl Session {
     /// `Bitfield` re-export used by tests/callers.
     #[doc(hidden)]
     pub fn _bitfield_marker(_: &Bitfield) {}
+}
+
+/// `aep->info_hashes[ih]` — the announce slot of tracker entry `i`
+/// for info-hash version `v` (single synthetic endpoint).
+fn announce_slot(
+    t: &Torrent,
+    i: usize,
+    v: bitdaemon_common::info_hash::ProtocolVersion,
+) -> &crate::tracker_list::AnnounceInfohash {
+    let ep = &t.trackers.trackers[i].endpoints[0];
+    if v == bitdaemon_common::info_hash::ProtocolVersion::V1 {
+        &ep.v1
+    } else {
+        &ep.v2
+    }
 }
 
 /// Upstream `scrape_tracker` entry selection: a valid `idx` wins;

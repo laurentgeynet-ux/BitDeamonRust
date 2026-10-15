@@ -23,9 +23,9 @@ use std::time::Instant;
 use bitdaemon_common::types::PeerRequest;
 use bitdaemon_common::{PeerId, Sha1Hash};
 use bitdaemon_net::bt_peer_conn::{run_handshake, write_messages};
-use bitdaemon_net::peer_wire::PeerMessage;
+use bitdaemon_net::peer_wire::{MessageId, PeerMessage};
 use bitdaemon_net::resolver::{BoxedResolver, ResolveFlags, resolve_host};
-use bitdaemon_net::tracker_client::{AnnounceError, announce_http, announce_udp};
+use bitdaemon_net::tracker_client::{AnnounceError, announce_udp};
 use bitdaemon_net::transport::{BoxedPeerStream, DatagramSocket, PeerConnector};
 use bitdaemon_session::alerts::Alert;
 use bitdaemon_session::peer_conn::PeerConn;
@@ -66,9 +66,30 @@ fn tracker_tls_config() -> Option<Arc<rustls::ClientConfig>> {
 struct AnnounceDone {
     ih: Sha1Hash,
     url: String,
-    result: Result<bitdaemon_net::http_tracker::TrackerResponse, String>,
+    /// `r.info_hash`'s version — which `announce_infohash` slot the
+    /// response bookkeeping lands on.
+    v: bitdaemon_common::info_hash::ProtocolVersion,
+    result: Result<bitdaemon_net::http_tracker::TrackerResponse, AnnounceError>,
     /// `scrape_request` — routes to `on_scrape_response`.
     scrape: bool,
+    /// the exchange ran as an HTTP(S) announce — accounted in
+    /// `http_announces_in_flight` (upstream `m_http_conns`), so its
+    /// completion frees the head of `http_announce_queue`.
+    http: bool,
+    /// `tracker_ip` — the resolved tracker endpoint the exchange
+    /// went to; `ip_voter` keys `external ip` votes by reporter.
+    source_ip: Option<std::net::IpAddr>,
+}
+
+/// `tracker_request` job — the session's `TrackerAnnounce` effect,
+/// held in `http_announce_queue` when HTTP announces hit
+/// `max_concurrent_http_announces` (upstream `m_queued`).
+struct AnnounceJob {
+    ih: Sha1Hash,
+    url: String,
+    tracker_id: String,
+    v: bitdaemon_common::info_hash::ProtocolVersion,
+    params: bitdaemon_net::tracker_client::AnnounceParams,
 }
 
 /// An inbound peer message, tagged with its stream's peer id.
@@ -213,6 +234,12 @@ pub struct Engine {
     /// announce completions.
     announce_rx: mpsc::UnboundedReceiver<AnnounceDone>,
     announce_tx: mpsc::UnboundedSender<AnnounceDone>,
+    /// `m_http_conns` — in-flight HTTP(S) announce exchanges
+    /// (upstream's `max_concurrent_http_announces` gate).
+    http_announces_in_flight: usize,
+    /// `m_queued` — HTTP announce jobs waiting for a slot
+    /// (`high_priority` inserts at the front).
+    http_announce_queue: std::collections::VecDeque<AnnounceJob>,
     /// disconnect events from dead streams.
     gone_rx:
         mpsc::UnboundedReceiver<(Sha1Hash, u64, Option<bitdaemon_net::bt_peer_conn::PeerGone>)>,
@@ -356,6 +383,8 @@ impl Engine {
             inbound_tx,
             announce_rx,
             announce_tx,
+            http_announces_in_flight: 0,
+            http_announce_queue: std::collections::VecDeque::new(),
             gone_rx,
             gone_tx,
             sent_rx,
@@ -668,9 +697,29 @@ impl Engine {
         }
         while let Ok(a) = self.announce_rx.try_recv() {
             if a.scrape {
-                slock(&self.session).on_scrape_response(&a.ih, &a.url, a.result);
+                slock(&self.session).on_scrape_response(&a.ih, &a.url, a.v, a.result);
             } else {
-                slock(&self.session).on_announce_response(&a.ih, &a.url, a.result, &mut out);
+                slock(&self.session).on_announce_response(
+                    &a.ih,
+                    &a.url,
+                    a.v,
+                    a.result,
+                    a.source_ip,
+                    &mut out,
+                );
+            }
+            if a.http {
+                // `remove_request` — an http_conn slot frees, the
+                // head of `m_queued` starts.
+                self.http_announces_in_flight = self.http_announces_in_flight.saturating_sub(1);
+                if let Some(j) = self.http_announce_queue.pop_front() {
+                    self.http_announces_in_flight += 1;
+                    self.spawn_announce(j);
+                    slock(&self.session).counters.set(
+                        bitdaemon_session::counters::Counter::NumQueuedTrackerAnnounces,
+                        i64::try_from(self.http_announce_queue.len()).unwrap_or(i64::MAX),
+                    );
+                }
             }
         }
         while let Ok((from, buf)) = self.udp_rx.try_recv() {
@@ -868,9 +917,16 @@ impl Engine {
                     ih,
                     url,
                     tracker_id,
+                    v,
                     params,
                 } => {
-                    self.spawn_announce(ih, url, tracker_id, params);
+                    self.queue_announce(AnnounceJob {
+                        ih,
+                        url,
+                        tracker_id,
+                        v,
+                        params,
+                    });
                 }
                 SessionOut::WebSeedFetch {
                     ih,
@@ -921,8 +977,13 @@ impl Engine {
                         }
                     }));
                 }
-                SessionOut::TrackerScrape { ih, url } => {
-                    self.spawn_scrape(ih, url);
+                SessionOut::TrackerScrape {
+                    ih,
+                    url,
+                    v,
+                    info_hash,
+                } => {
+                    self.spawn_scrape(ih, url, v, info_hash);
                 }
                 SessionOut::Torrent(e) => {
                     if let bitdaemon_session::torrent::TorrentEffect::DisconnectPeer {
@@ -968,54 +1029,173 @@ impl Engine {
         }
     }
 
-    /// spawn the announce exchange for one tracker entry.
-    fn spawn_announce(
-        &mut self,
-        ih: Sha1Hash,
-        url: String,
-        tracker_id: String,
-        params: bitdaemon_net::tracker_client::AnnounceParams,
+    /// `tracker_manager::queue_request` — HTTP(S) announces run
+    /// under the `max_concurrent_http_announces` cap; overflow jobs
+    /// wait in `http_announce_queue` (`high_priority` → front, like
+    /// upstream). UDP/WS announces always start immediately.
+    fn queue_announce(&mut self, job: AnnounceJob) {
+        let http = bitdaemon_net::parse_url::parse_url_components(&job.url)
+            .is_ok_and(|c| c.protocol == "http" || c.protocol == "https");
+        if http {
+            let max = slock(&self.session)
+                .settings
+                .max_concurrent_http_announces
+                .max(0) as usize;
+            if self.http_announces_in_flight >= max {
+                if job.params.high_priority {
+                    self.http_announce_queue.push_front(job);
+                } else {
+                    self.http_announce_queue.push_back(job);
+                }
+                slock(&self.session).counters.set(
+                    bitdaemon_session::counters::Counter::NumQueuedTrackerAnnounces,
+                    i64::try_from(self.http_announce_queue.len()).unwrap_or(i64::MAX),
+                );
+                return;
+            }
+            self.http_announces_in_flight += 1;
+        }
+        self.spawn_announce(job);
+    }
+
+    /// `tracker_settings` snapshot for one exchange — upstream's
+    /// `tracker_connection` reads `announce_ip`, `anonymous_mode`,
+    /// `min_announce_interval`, crypto/report flags and the
+    /// completion/receive deadlines from `session_settings`; a
+    /// `stopped` announce gets `stop_tracker_timeout` instead.
+    /// Returns (opts, timeouts, completion, user_agent).
+    #[allow(clippy::type_complexity)]
+    fn tracker_settings(
+        session: &Arc<std::sync::Mutex<Session>>,
+        private_torrent: bool,
+        stopped: bool,
+    ) -> (
+        bitdaemon_net::http_tracker::AnnounceOptions,
+        bitdaemon_net::tracker_client::TrackerTimeouts,
+        std::time::Duration,
+        String,
     ) {
+        let s = slock(session);
+        let set = &s.settings;
+        (
+            bitdaemon_net::http_tracker::AnnounceOptions {
+                supportcrypto: set.announce_crypto_support
+                    && !matches!(
+                        set.in_enc_policy,
+                        bitdaemon_net::pe_crypto::EncPolicy::Disabled
+                    ),
+                report_redundant: set.report_redundant_bytes,
+                anonymous_mode: set.anonymous_mode,
+                announce_ip: (!set.announce_ip.is_empty())
+                    .then(|| String::from_utf8_lossy(&set.announce_ip).into_owned()),
+                ssrf_mitigation: set.ssrf_mitigation,
+                min_announce_interval: set.min_announce_interval.as_secs().min(i32::MAX as u64)
+                    as i32,
+            },
+            bitdaemon_net::tracker_client::TrackerTimeouts {
+                receive: set.tracker_receive_timeout,
+                conn_id_ttl: set.udp_tracker_token_expiry,
+            },
+            if stopped {
+                set.stop_tracker_timeout
+            } else {
+                set.tracker_completion_timeout
+            },
+            // upstream sends a generic UA under anonymous_mode
+            // (fingerprinting mitigation) — private torrents keep
+            // the real one since private trackers may require it.
+            if set.anonymous_mode && !private_torrent {
+                "curl/7.81.0".to_string()
+            } else {
+                String::from_utf8_lossy(&set.user_agent).into_owned()
+            },
+        )
+    }
+
+    /// spawn the announce exchange for one tracker entry — the
+    /// async task runs the BEP-15/HTTP exchange and reports back
+    /// via `AnnounceDone`.
+    fn spawn_announce(&mut self, job: AnnounceJob) {
+        let AnnounceJob {
+            ih,
+            url,
+            tracker_id,
+            v,
+            mut params,
+        } = job;
         let tx = self.announce_tx.clone();
         let connector = self.connector.clone();
         let datagram = self.datagram.clone();
         let demux = self.udp_tracker_demux.clone();
         let resolver = self.resolver.clone();
         let session = Arc::clone(&self.session);
+        let (opts, timeouts, completion, user_agent) =
+            Self::tracker_settings(&session, params.private_torrent, params.event == 3);
         self.tasks_forget();
         let handle = tokio::spawn(async move {
-            let mut params = params;
             params.url = url.clone();
-            params.tracker_id = tracker_id.clone().into_bytes();
-            let opts = bitdaemon_net::http_tracker::AnnounceOptions::default();
-            let result = match bitdaemon_net::parse_url::parse_url_components(&url) {
+            params.tracker_id = tracker_id.into_bytes();
+            let mut stats = bitdaemon_net::http_conn::WireStats::default();
+            let mut source_ip = None;
+            let parsed = bitdaemon_net::parse_url::parse_url_components(&url);
+            let http = parsed
+                .as_ref()
+                .is_ok_and(|c| c.protocol == "http" || c.protocol == "https");
+            let mut result = match parsed {
                 Ok(c) if c.protocol == "udp" => {
                     let Some(dg) = datagram else {
                         let _ = tx.send(AnnounceDone {
                             ih,
                             url,
-                            result: Err("no datagram transport injected".into()),
+                            v,
+                            result: Err(AnnounceError::Op {
+                                op: "hostname_lookup",
+                                message: "no datagram transport injected".into(),
+                            }),
                             scrape: false,
+                            http,
+                            source_ip,
                         });
                         return;
                     };
                     let port = u16::try_from(c.port).unwrap_or(80);
                     let v4 = DatagramSocket::local_addr(dg.as_ref()).is_ipv4();
-                    match resolve_for_socket(&resolver, &c.hostname, port, v4)
+                    match udp_tracker_endpoints(&resolver, &c.hostname, port, v4, &params.filter)
                         .await
-                        .and_then(|a| filter_tracker_addr(&params.filter, a))
                     {
-                        Ok(addr) => announce_udp(
-                            dg.as_ref(),
-                            &demux,
-                            addr,
-                            &params,
-                            &opts,
-                            std::time::Duration::from_secs(15),
-                        )
-                        .await
-                        .map_err(|e: AnnounceError| e.to_string()),
                         Err(e) => Err(e),
+                        Ok(eps) => {
+                            // upstream `udp_tracker_connection::fail`
+                            // — a failed target is dropped and the
+                            // next resolved endpoint gets a fresh
+                            // attempt with a re-armed deadline.
+                            let mut result = Err(AnnounceError::TimedOut);
+                            for addr in eps {
+                                match tokio::time::timeout(
+                                    completion,
+                                    announce_udp(
+                                        dg.as_ref(),
+                                        &demux,
+                                        addr,
+                                        &params,
+                                        &opts,
+                                        timeouts,
+                                        &mut stats,
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(r)) => {
+                                        source_ip = Some(addr.ip());
+                                        result = Ok(r);
+                                        break;
+                                    }
+                                    Ok(Err(e)) => result = Err(e),
+                                    Err(_) => result = Err(AnnounceError::TimedOut),
+                                }
+                            }
+                            result
+                        }
                     }
                 }
                 Ok(c) if c.protocol == "ws" || c.protocol == "wss" => {
@@ -1029,6 +1209,7 @@ impl Engine {
                     {
                         Ok(addr) => match connector.clone().connect(addr).await {
                             Ok(mut s) => {
+                                source_ip = Some(addr.ip());
                                 let host = if c.port < 0 {
                                     c.hostname.clone()
                                 } else {
@@ -1049,7 +1230,10 @@ impl Engine {
                                     &mut s, &host, &c.path, &key, &payload,
                                 )
                                 .await
-                                .map_err(|e| e.to_string())
+                                .map_err(|e| AnnounceError::Op {
+                                    op: "sock_read",
+                                    message: e.to_string(),
+                                })
                                 .and_then(|r| {
                                     // upstream `on_read`: a `failure
                                     // reason` reports the announce as
@@ -1058,7 +1242,11 @@ impl Engine {
                                     // info_hash are filtered inside
                                     // `announce_ws` (`73f4832de`).
                                     if let Some(reason) = r.failure_reason {
-                                        return Err(reason);
+                                        return Err(AnnounceError::Failure {
+                                            message: reason,
+                                            interval: 0,
+                                            min_interval: 0,
+                                        });
                                     }
                                     Ok(bitdaemon_net::http_tracker::TrackerResponse {
                                         // upstream clamps the reply's
@@ -1073,79 +1261,90 @@ impl Engine {
                                     })
                                 })
                             }
-                            Err(e) => Err(format!("connect: {e}")),
+                            Err(e) => Err(AnnounceError::Op {
+                                op: "connect",
+                                message: e.to_string(),
+                            }),
                         },
-                        Err(e) => Err(e),
+                        Err(e) => Err(AnnounceError::Op {
+                            op: "hostname_lookup",
+                            message: e,
+                        }),
                     }
                 }
-                Ok(c) => {
-                    // http/https — dial a stream; https wraps it in
-                    // rustls with the OS root store (upstream's
-                    // `m_ssl_ctx` built from the system trust DB).
-                    let https = c.protocol == "https";
-                    let default_port = if https { 443 } else { 80 };
-                    let port = u16::try_from(c.port).unwrap_or(default_port);
-                    match resolve(&resolver, &c.hostname, port)
-                        .await
-                        .and_then(|a| filter_tracker_addr(&params.filter, a))
-                    {
-                        Ok(addr) => match connector.clone().connect(addr).await {
-                            Ok(s) => {
-                                let mut s: BoxedPeerStream = if https {
-                                    let cfg = match tracker_tls_config() {
-                                        Some(c) => c,
-                                        None => {
-                                            let _ = tx.send(AnnounceDone {
-                                                ih,
-                                                url,
-                                                result: Err(
-                                                    "tls: crypto provider unavailable".to_string()
-                                                ),
-                                                scrape: false,
-                                            });
-                                            return;
-                                        }
-                                    };
-                                    match bitdaemon_net::ssl_stream::ssl_connect(
-                                        s,
-                                        &c.hostname,
-                                        addr,
-                                        cfg,
-                                    )
-                                    .await
-                                    {
-                                        Ok(t) => Box::new(t),
-                                        Err(e) => {
-                                            let _ = tx.send(AnnounceDone {
-                                                ih,
-                                                url,
-                                                result: Err(format!("tls: {e}")),
-                                                scrape: false,
-                                            });
-                                            return;
-                                        }
-                                    }
-                                } else {
-                                    s
-                                };
-                                announce_http(&mut s, &params, &opts, &[], 1024 * 1024)
-                                    .await
-                                    .map_err(|e| e.to_string())
-                            }
-                            Err(e) => Err(format!("connect: {e}")),
-                        },
+                Ok(c) if c.protocol == "http" || c.protocol == "https" => {
+                    let mut headers = vec![("User-Agent".to_string(), user_agent.clone())];
+                    // `tracker_req().auth` → `Authorization: Basic`
+                    // (upstream `http_connection::start`; the header
+                    // is dropped on cross-origin redirects).
+                    if !c.auth.is_empty() {
+                        headers.push((
+                            "Authorization".to_string(),
+                            format!(
+                                "Basic {}",
+                                bitdaemon_net::http_stream::base64_encode(c.auth.as_bytes())
+                            ),
+                        ));
+                    }
+                    match bitdaemon_net::tracker_client::announce_url(&params, &opts) {
                         Err(e) => Err(e),
+                        Ok(get_url) => {
+                            let (r, src) = tracker_http_exchange(
+                                &connector,
+                                &resolver,
+                                get_url,
+                                &headers,
+                                &params.filter,
+                                opts.ssrf_mitigation,
+                                completion,
+                                Some(timeouts.receive),
+                                1024 * 1024,
+                                TrackerHttpOp::Announce {
+                                    i2p: params.i2p,
+                                    min_announce_interval: opts.min_announce_interval,
+                                },
+                                &mut stats,
+                            )
+                            .await;
+                            source_ip = src;
+                            r
+                        }
                     }
                 }
-                Err(e) => Err(format!("bad tracker url {url}: {e}")),
+                Ok(c) => Err(AnnounceError::Op {
+                    op: "parse_address",
+                    message: format!("unsupported tracker protocol {}", c.protocol),
+                }),
+                Err(e) => Err(AnnounceError::Op {
+                    op: "parse_address",
+                    message: format!("bad tracker url {url}: {e}"),
+                }),
             };
+            // fold wire bytes into the session counters —
+            // `tracker_manager::sent_bytes`/`received_bytes`.
+            {
+                let s = slock(&session);
+                use bitdaemon_session::counters::Counter as C;
+                s.counters.add(C::SentTrackerBytes, stats.sent);
+                s.counters.add(C::RecvTrackerBytes, stats.recv);
+            }
             // dict-style `peers` may carry hostnames — upstream
-            // `on_peer_name_lookup` resolves them and feeds
-            // `add_peer` (the ip_filter gate runs downstream in
-            // `add_swarm_peer`, same as upstream).
-            let mut result = result;
+            // `on_peer_name_lookup` resolves them UNLESS peer
+            // connections+hostnames are proxied (a local lookup
+            // would leak outside the proxy, and hostname peers
+            // can't dial through a proxy anyway — they're dropped
+            // upstream); IP literals always resolve for free.
             if let Ok(r) = &mut result {
+                let resolve_hostnames = {
+                    let s = slock(&session);
+                    !s.settings.proxy_hostnames
+                        || !s.settings.proxy_peer_connections
+                        || s.settings.proxy_type == bitdaemon_net::proxy::ProxyType::None
+                };
                 for hp in r.hostname_peers.clone() {
+                    if !resolve_hostnames && !bitdaemon_net::ip_helpers::is_ip_address(&hp.ip) {
+                        continue;
+                    }
                     if let Ok(a) = resolve(&resolver, &hp.ip, hp.port).await {
                         r.peers.push(a);
                     }
@@ -1154,8 +1353,11 @@ impl Engine {
             let _ = tx.send(AnnounceDone {
                 ih,
                 url,
+                v,
                 result,
                 scrape: false,
+                http,
+                source_ip,
             });
         });
         self.tasks.push(handle);
@@ -1163,91 +1365,159 @@ impl Engine {
 
     /// `scrape_request` — one scrape exchange (http scrape-url or
     /// udp action 2), result routed to `on_scrape_response`.
-    fn spawn_scrape(&mut self, ih: Sha1Hash, url: String) {
+    fn spawn_scrape(
+        &mut self,
+        ih: Sha1Hash,
+        url: String,
+        v: bitdaemon_common::info_hash::ProtocolVersion,
+        info_hash: [u8; 20],
+    ) {
         let tx = self.announce_tx.clone();
         let connector = self.connector.clone();
         let datagram = self.datagram.clone();
         let demux = self.udp_tracker_demux.clone();
         let resolver = self.resolver.clone();
+        let session = Arc::clone(&self.session);
+        let (opts, timeouts, completion, user_agent) =
+            Self::tracker_settings(&session, false, false);
         self.tasks_forget();
         let handle = tokio::spawn(async move {
-            let result = match bitdaemon_net::parse_url::parse_url_components(&url) {
+            let mut stats = bitdaemon_net::http_conn::WireStats::default();
+            let mut source_ip = None;
+            let parsed = bitdaemon_net::parse_url::parse_url_components(&url);
+            let result = match parsed {
                 Ok(c) if c.protocol == "udp" => {
                     let Some(dg) = datagram else {
                         let _ = tx.send(AnnounceDone {
                             ih,
                             url,
-                            result: Err("no datagram transport injected".into()),
+                            v,
+                            result: Err(AnnounceError::Op {
+                                op: "hostname_lookup",
+                                message: "no datagram transport injected".into(),
+                            }),
                             scrape: true,
+                            http: false,
+                            source_ip,
                         });
                         return;
                     };
                     let port = u16::try_from(c.port).unwrap_or(80);
                     let v4 = DatagramSocket::local_addr(dg.as_ref()).is_ipv4();
-                    match resolve_for_socket(&resolver, &c.hostname, port, v4).await {
-                        Ok(addr) => bitdaemon_net::tracker_client::scrape_udp(
-                            dg.as_ref(),
-                            &demux,
-                            addr,
-                            ih.as_bytes(),
-                            std::time::Duration::from_secs(15),
-                        )
-                        .await
-                        .map(|r| bitdaemon_net::http_tracker::TrackerResponse {
-                            complete: i64::from(r.complete),
-                            incomplete: i64::from(r.incomplete),
-                            downloaded: i64::from(r.downloaded),
-                            ..Default::default()
-                        })
-                        .map_err(|e: AnnounceError| e.to_string()),
+                    // scrape carries no torrent `ip_filter` — upstream
+                    // still applies the session filter via `req.filter`
+                    // … which `scrape_tracker` leaves unset, so the
+                    // endpoints go in unfiltered like upstream.
+                    match udp_tracker_endpoints(&resolver, &c.hostname, port, v4, &None).await {
                         Err(e) => Err(e),
+                        Ok(eps) => {
+                            let mut result = Err(AnnounceError::TimedOut);
+                            for addr in eps {
+                                match tokio::time::timeout(
+                                    completion,
+                                    bitdaemon_net::tracker_client::scrape_udp(
+                                        dg.as_ref(),
+                                        &demux,
+                                        addr,
+                                        &info_hash,
+                                        timeouts,
+                                        &mut stats,
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(r)) => {
+                                        source_ip = Some(addr.ip());
+                                        result = Ok(bitdaemon_net::http_tracker::TrackerResponse {
+                                            complete: i64::from(r.complete),
+                                            incomplete: i64::from(r.incomplete),
+                                            downloaded: i64::from(r.downloaded),
+                                            ..Default::default()
+                                        });
+                                        break;
+                                    }
+                                    Ok(Err(e)) => result = Err(e),
+                                    Err(_) => result = Err(AnnounceError::TimedOut),
+                                }
+                            }
+                            result
+                        }
                     }
                 }
-                Ok(_) => {
-                    // http — derive scrape url (`scrape_not_available`
+                Ok(c) if c.protocol == "http" || c.protocol == "https" => {
+                    // derive scrape url (`scrape_not_available`
                     // upstream → hard fail)
                     let Some(scrape) = bitdaemon_net::http_tracker::scrape_url(&url) else {
                         let _ = tx.send(AnnounceDone {
                             ih,
                             url,
-                            result: Err("scrape not available".into()),
+                            v,
+                            result: Err(AnnounceError::Op {
+                                op: "bittorrent",
+                                message: "scrape not available".into(),
+                            }),
                             scrape: true,
+                            http: false,
+                            source_ip,
                         });
                         return;
                     };
-                    let Ok(c) = bitdaemon_net::parse_url::parse_url_components(&scrape) else {
-                        let _ = tx.send(AnnounceDone {
-                            ih,
-                            url,
-                            result: Err("bad scrape url".into()),
-                            scrape: true,
-                        });
-                        return;
-                    };
-                    let port = u16::try_from(c.port).unwrap_or(80);
-                    match resolve(&resolver, &c.hostname, port).await {
-                        Ok(addr) => match connector.clone().connect(addr).await {
-                            Ok(mut s) => bitdaemon_net::tracker_client::scrape_http(
-                                &mut s,
-                                &scrape,
-                                ih.as_bytes(),
-                                &[],
-                                1024 * 1024,
-                            )
-                            .await
-                            .map_err(|e| e.to_string()),
-                            Err(e) => Err(format!("connect: {e}")),
-                        },
-                        Err(e) => Err(e),
+                    let mut headers = vec![("User-Agent".to_string(), user_agent.clone())];
+                    if let Ok(sc) = bitdaemon_net::parse_url::parse_url_components(&scrape)
+                        && !sc.auth.is_empty()
+                    {
+                        headers.push((
+                            "Authorization".to_string(),
+                            format!(
+                                "Basic {}",
+                                bitdaemon_net::http_stream::base64_encode(sc.auth.as_bytes())
+                            ),
+                        ));
                     }
+                    let get_url =
+                        bitdaemon_net::tracker_client::scrape_url_full(&scrape, &info_hash);
+                    let (r, src) = tracker_http_exchange(
+                        &connector,
+                        &resolver,
+                        get_url,
+                        &headers,
+                        &None,
+                        opts.ssrf_mitigation,
+                        completion,
+                        Some(timeouts.receive),
+                        1024 * 1024,
+                        TrackerHttpOp::Scrape {
+                            info_hash: &info_hash,
+                        },
+                        &mut stats,
+                    )
+                    .await;
+                    source_ip = src;
+                    r
                 }
-                Err(e) => Err(format!("bad tracker url {url}: {e}")),
+                Ok(c) => Err(AnnounceError::Op {
+                    op: "parse_address",
+                    message: format!("unsupported scrape protocol {}", c.protocol),
+                }),
+                Err(e) => Err(AnnounceError::Op {
+                    op: "parse_address",
+                    message: format!("bad tracker url {url}: {e}"),
+                }),
             };
+            {
+                let s = slock(&session);
+                use bitdaemon_session::counters::Counter as C;
+                s.counters.add(C::SentTrackerBytes, stats.sent);
+                s.counters.add(C::RecvTrackerBytes, stats.recv);
+            }
             let _ = tx.send(AnnounceDone {
                 ih,
                 url,
+                v,
                 result,
                 scrape: true,
+                http: false,
+                source_ip,
             });
         });
         self.tasks.push(handle);
@@ -2062,7 +2332,7 @@ impl Engine {
             let r = async {
                 bitdaemon_net::http_conn::send_request(&mut s, "GET", &path, &host, &[], &[])
                     .await?;
-                bitdaemon_net::http_conn::recv_response(&mut s, 256 * 1024).await
+                bitdaemon_net::http_conn::recv_response(&mut s, 256 * 1024, None).await
             }
             .await;
             let Ok(resp) = r else { return };
@@ -2264,7 +2534,7 @@ impl Engine {
             let r = async {
                 use tokio::io::AsyncWriteExt;
                 s.write_all(request.as_bytes()).await?;
-                bitdaemon_net::http_conn::recv_response(&mut s, 64 * 1024).await
+                bitdaemon_net::http_conn::recv_response(&mut s, 64 * 1024, None).await
             }
             .await;
             match r {
@@ -3813,6 +4083,21 @@ impl Engine {
                                 // `peer_info::{used_,}receive_buffer_size`.
                                 bw.recv_pos.store(buf.len() as i64, Relaxed);
                                 bw.recv_capacity.store(buf.capacity() as i64, Relaxed);
+                                // `downloading_piece_progress` —
+                                // staged bytes of an in-flight
+                                // `piece` message: `buf` only holds
+                                // an undecoded tail, so the head is
+                                // always the partial message. The 9
+                                // is upstream's header discount
+                                // (id+index+offset) on top of the
+                                // 4-byte length prefix.
+                                let piece_staged =
+                                    if buf.len() > 9 + 4 && buf[4] == MessageId::Piece as u8 {
+                                        (buf.len() - 4 - 9) as i64
+                                    } else {
+                                        0
+                                    };
+                                bw.piece_recv_staged.store(piece_staged, Relaxed);
                             },
                             Err(e) => {
                                 debug!(peer = peer, remote = ?remote, err = %e, "peer read error, dropping");
@@ -4223,16 +4508,29 @@ async fn resolve(
     hostname: &str,
     port: u16,
 ) -> Result<SocketAddr, String> {
+    resolve_all(r, hostname, port)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no address for {hostname}"))
+}
+
+/// `resolve` keeping the whole endpoint list — upstream's tracker
+/// connections iterate `endpoints()` and retry each one on failure
+/// (`udp_tracker_connection::fail` drops the dead target and moves
+/// to the next).
+async fn resolve_all(
+    r: &Option<BoxedResolver>,
+    hostname: &str,
+    port: u16,
+) -> Result<Vec<SocketAddr>, String> {
     if let Ok(addr) = format!("{hostname}:{port}").parse::<SocketAddr>() {
-        return Ok(addr);
+        return Ok(vec![addr]);
     }
     match r {
         Some(r) => resolve_host(r.as_ref(), hostname, port, ResolveFlags::default())
             .await
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .next()
-            .ok_or_else(|| format!("no address for {hostname}")),
+            .map_err(|e| e.to_string()),
         None => Err(format!("no resolver injected for {hostname}")),
     }
 }
@@ -4264,6 +4562,281 @@ async fn resolve_for_socket(
             .find(|a| a.is_ipv4())
             .ok_or_else(|| format!("no v4 address for {hostname}")),
         None => Err(format!("no resolver injected for {hostname}")),
+    }
+}
+
+/// `udp_tracker_connection::name_lookup` — resolve all endpoints,
+/// drop the ones the datagram socket cannot reach (address family),
+/// then the `ip_filter` leg: all-filtered → `banned_by_ip_filter`.
+/// (No SSRF leg for UDP upstream.)
+async fn udp_tracker_endpoints(
+    r: &Option<BoxedResolver>,
+    hostname: &str,
+    port: u16,
+    v4_socket: bool,
+    filter: &Option<std::sync::Arc<bitdaemon_net::ip_filter::IpFilter>>,
+) -> Result<Vec<SocketAddr>, AnnounceError> {
+    let mut eps = resolve_all(r, hostname, port)
+        .await
+        .map_err(|e| AnnounceError::Op {
+            op: "hostname_lookup",
+            message: e,
+        })?;
+    // `can_route` — a v4 datagram socket can't reach v6 endpoints.
+    if v4_socket {
+        eps.retain(|a| a.is_ipv4());
+    }
+    if eps.is_empty() {
+        return Err(AnnounceError::Op {
+            op: "hostname_lookup",
+            message: format!("no reachable address for {hostname}"),
+        });
+    }
+    if let Some(f) = filter {
+        eps.retain(|a| f.access(a.ip()) != bitdaemon_net::ip_filter::BLOCKED);
+        if eps.is_empty() {
+            return Err(AnnounceError::Op {
+                op: "hostname_lookup",
+                message: "banned_by_ip_filter".into(),
+            });
+        }
+    }
+    Ok(eps)
+}
+
+/// `http_tracker_connection`'s endpoint legs — resolve all, then:
+/// 1. `ssrf_mitigation`: if any endpoint is loopback and the request
+///    path doesn't start with `/announce`, loopback endpoints are
+///    dropped; empty → `errors::ssrf_mitigation`.
+/// 2. `tracker_req().filter`: `ip_filter::blocked` endpoints dropped;
+///    empty → `errors::banned_by_ip_filter`.
+async fn http_tracker_endpoints(
+    r: &Option<BoxedResolver>,
+    hostname: &str,
+    port: u16,
+    path: &str,
+    filter: &Option<std::sync::Arc<bitdaemon_net::ip_filter::IpFilter>>,
+    ssrf_mitigation: bool,
+) -> Result<Vec<SocketAddr>, AnnounceError> {
+    let mut eps = resolve_all(r, hostname, port)
+        .await
+        .map_err(|e| AnnounceError::Op {
+            op: "hostname_lookup",
+            message: e,
+        })?;
+    if ssrf_mitigation && eps.iter().any(|e| e.ip().is_loopback()) {
+        // `parse_url_components`-level check upstream: an announce
+        // to localhost must look like a standard `/announce` path.
+        if !path.starts_with("/announce") {
+            eps.retain(|e| !e.ip().is_loopback());
+            if eps.is_empty() {
+                return Err(AnnounceError::Ssrf);
+            }
+        }
+    }
+    if eps.is_empty() {
+        return Err(AnnounceError::Op {
+            op: "hostname_lookup",
+            message: format!("no address for {hostname}"),
+        });
+    }
+    if let Some(f) = filter {
+        eps.retain(|e| f.access(e.ip()) != bitdaemon_net::ip_filter::BLOCKED);
+        if eps.is_empty() {
+            return Err(AnnounceError::Op {
+                op: "bittorrent",
+                message: "banned_by_ip_filter".into(),
+            });
+        }
+    }
+    Ok(eps)
+}
+
+/// dial one tracker endpoint through the injected connector; `https`
+/// wraps the stream in rustls (upstream `m_ssl_ctx` from the OS root
+/// store). Errors map to `operation_t::connect`-ish failures.
+async fn tracker_dial(
+    connector: &Arc<dyn PeerConnector>,
+    addr: SocketAddr,
+    https: bool,
+    hostname: &str,
+) -> Result<BoxedPeerStream, AnnounceError> {
+    let s = connector
+        .clone()
+        .connect(addr)
+        .await
+        .map_err(|e| AnnounceError::Op {
+            op: "connect",
+            message: e.to_string(),
+        })?;
+    if !https {
+        return Ok(s);
+    }
+    let cfg = tracker_tls_config().ok_or_else(|| AnnounceError::Op {
+        op: "connect",
+        message: "tls: crypto provider unavailable".into(),
+    })?;
+    bitdaemon_net::ssl_stream::ssl_connect(s, hostname, addr, cfg)
+        .await
+        .map(|t| Box::new(t) as BoxedPeerStream)
+        .map_err(|e| AnnounceError::Op {
+            op: "connect",
+            message: format!("tls: {e}"),
+        })
+}
+
+/// which exchange runs over the dialed stream in
+/// [`tracker_http_exchange`] — announce (interval floor applied)
+/// or scrape.
+enum TrackerHttpOp<'a> {
+    /// `announce_http_get` params.
+    Announce {
+        /// `i2p` — decode `peers` as destinations.
+        i2p: bool,
+        /// `min_announce_interval` floor on the reply interval.
+        min_announce_interval: i32,
+    },
+    /// `scrape_http_get` params.
+    Scrape {
+        /// `info_hash` carried by the scrape query.
+        info_hash: &'a [u8; 20],
+    },
+}
+
+/// `http_connection`'s connect+redirect loop lifted to the engine:
+/// `get_url` is the fully-formed request URL; each attempt resolves
+/// the origin (SSRF + `ip_filter` legs upstream runs in
+/// `on_filter`), dials each resolved endpoint in turn, and runs the
+/// exchange under the *completion* deadline. A `CrossOriginRedirect`
+/// re-enters the loop with the resolved `Location` (upstream
+/// re-GETs it verbatim, `Authorization` dropped cross-origin) — 5
+/// cross-origin hops max, `m_redirects`-style. Returns the exchange
+/// result plus the endpoint that answered (`tracker_ip`).
+#[allow(clippy::too_many_arguments)]
+async fn tracker_http_exchange(
+    connector: &Arc<dyn PeerConnector>,
+    resolver: &Option<BoxedResolver>,
+    mut get_url: String,
+    headers: &[(String, String)],
+    filter: &Option<std::sync::Arc<bitdaemon_net::ip_filter::IpFilter>>,
+    ssrf_mitigation: bool,
+    completion: std::time::Duration,
+    read_timeout: Option<std::time::Duration>,
+    max_response: usize,
+    op: TrackerHttpOp<'_>,
+    stats: &mut bitdaemon_net::http_conn::WireStats,
+) -> (
+    Result<bitdaemon_net::http_tracker::TrackerResponse, AnnounceError>,
+    Option<std::net::IpAddr>,
+) {
+    let mut headers = headers.to_vec();
+    let mut redirects = 5u32;
+    loop {
+        let c = match bitdaemon_net::parse_url::parse_url_components(&get_url) {
+            Ok(c) if c.protocol == "http" || c.protocol == "https" => c,
+            _ => {
+                return (
+                    Err(AnnounceError::Op {
+                        op: "parse_address",
+                        message: format!("bad tracker url {get_url}"),
+                    }),
+                    None,
+                );
+            }
+        };
+        let https = c.protocol == "https";
+        let port = u16::try_from(c.port).unwrap_or(if https { 443 } else { 80 });
+        let eps = match http_tracker_endpoints(
+            resolver,
+            &c.hostname,
+            port,
+            &c.path,
+            filter,
+            ssrf_mitigation,
+        )
+        .await
+        {
+            Ok(eps) => eps,
+            Err(e) => return (Err(e), None),
+        };
+        // upstream `http_connection` walks `endpoints()` on connect
+        // failure; the last error wins.
+        let mut attempt = Err(AnnounceError::Op {
+            op: "connect",
+            message: "no endpoints".into(),
+        });
+        let mut redirect = None;
+        for addr in eps {
+            let mut s = match tracker_dial(connector, addr, https, &c.hostname).await {
+                Ok(s) => s,
+                Err(e) => {
+                    attempt = Err(e);
+                    continue;
+                }
+            };
+            let r = tokio::time::timeout(completion, async {
+                match op {
+                    TrackerHttpOp::Announce {
+                        i2p,
+                        min_announce_interval,
+                    } => {
+                        bitdaemon_net::tracker_client::announce_http_get(
+                            &mut s,
+                            &get_url,
+                            i2p,
+                            min_announce_interval,
+                            &headers,
+                            max_response,
+                            read_timeout,
+                            Some(&mut *stats),
+                        )
+                        .await
+                    }
+                    TrackerHttpOp::Scrape { info_hash } => {
+                        bitdaemon_net::tracker_client::scrape_http_get(
+                            &mut s,
+                            &get_url,
+                            info_hash,
+                            &headers,
+                            max_response,
+                            read_timeout,
+                            Some(&mut *stats),
+                        )
+                        .await
+                    }
+                }
+            })
+            .await;
+            match r {
+                Ok(Ok(resp)) => return (Ok(resp), Some(addr.ip())),
+                Ok(Err(AnnounceError::Http(
+                    bitdaemon_net::http_conn::HttpError::CrossOriginRedirect(next),
+                ))) => {
+                    redirect = Some(next);
+                    break;
+                }
+                Ok(Err(e)) => attempt = Err(e),
+                Err(_) => attempt = Err(AnnounceError::TimedOut),
+            }
+        }
+        let Some(next) = redirect else {
+            return (attempt, None);
+        };
+        if redirects == 0 {
+            return (
+                Err(AnnounceError::Http(
+                    bitdaemon_net::http_conn::HttpError::TooManyRedirects,
+                )),
+                None,
+            );
+        }
+        redirects -= 1;
+        // `http_connection::on_redirect` — auth credentials never
+        // cross to a different origin.
+        if !bitdaemon_net::parse_url::same_origin(&get_url, &next) {
+            headers.retain(|(k, _)| !k.eq_ignore_ascii_case("authorization"));
+        }
+        get_url = next;
     }
 }
 
