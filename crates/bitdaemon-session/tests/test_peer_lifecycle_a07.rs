@@ -248,8 +248,8 @@ fn outgoing_dials_get_distinct_peer_ids() {
     let ih = s.add_torrent(t);
     let st = PeerListState::default();
     let t = s.torrents.get_mut(&ih).unwrap();
-    let (e1, pid1) = t.try_connect_peer(0, &st, &[]).unwrap();
-    let (e2, pid2) = t.try_connect_peer(0, &st, &[]).unwrap();
+    let (e1, pid1) = t.try_connect_peer(0, &st, &[]).0.into_dial().unwrap();
+    let (e2, pid2) = t.try_connect_peer(0, &st, &[]).0.into_dial().unwrap();
     assert_ne!(pid1, pid2);
     assert_ne!(e1, e2);
     // both registered for the self-connection probe.
@@ -293,6 +293,8 @@ fn utp_failure_retries_tcp_without_failcount() {
         .get_mut(&ih)
         .unwrap()
         .try_connect_peer(0, &st, &[])
+        .0
+        .into_dial()
         .unwrap();
     s.peer_connect_failed(&ih, ep1, true);
     let t = &s.torrents[&ih];
@@ -392,8 +394,8 @@ fn full_torrent_evicts_oldest_pending_dial() {
     {
         let t = s.torrents.get_mut(&ih).unwrap();
         // dial A stamped at t=0, dial B at t=5 — A is the oldest.
-        (ea, _pa) = t.try_connect_peer(0, &st, &[]).unwrap();
-        (eb, _pb) = t.try_connect_peer(5, &st, &[]).unwrap();
+        (ea, _pa) = t.try_connect_peer(0, &st, &[]).0.into_dial().unwrap();
+        (eb, _pb) = t.try_connect_peer(5, &st, &[]).0.into_dial().unwrap();
         assert_ne!(ea, eb);
         assert_eq!(t.num_connecting, 2);
     }
@@ -432,7 +434,7 @@ fn num_connections_counts_live_not_peer_list() {
     let mut out = Vec::new();
     s.peer_connected(&ih, 1, incoming_conn(), ep(9, 40000), &mut out);
     let t = s.torrents.get_mut(&ih).unwrap();
-    t.try_connect_peer(0, &st, &[]).unwrap();
+    t.try_connect_peer(0, &st, &[]).0.into_dial().unwrap();
     t.peers.get_mut(&1).unwrap().disconnecting = true;
     // upstream `num_peers()` = m_connections − m_peers_to_disconnect:
     // 0 live attached + 1 in-flight dial = 1 — while the peer-list

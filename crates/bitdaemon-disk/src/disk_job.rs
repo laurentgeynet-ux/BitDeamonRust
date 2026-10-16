@@ -360,6 +360,35 @@ pub struct DiskJob {
     pub error: StorageError,
     /// `action` variant.
     pub action: JobKind,
+    /// `disk_job_pool` ownership — `mk_job` allocates with the pool's
+    /// counters and the `read`/`write` tag (`is_same_v<JobType>`
+    /// split upstream; flush/hash only count in `jobs_in_use`).
+    /// `Drop` is `free_job` — the tag survives `call_callback`'s
+    /// `action` replacement, so the dec stays in the right bucket.
+    /// `None` for hand-constructed jobs (tests).
+    #[doc(hidden)]
+    pub pool_counters: Option<(std::sync::Arc<crate::disk_pool::JobPoolCounters>, u8)>,
+}
+
+impl Drop for DiskJob {
+    /// `free_job` — `get_type()`-keyed dec of the pool counters
+    /// (verbatim: `read` → `read_jobs`, `write` → `write_jobs`,
+    /// everything else only `jobs_in_use`).
+    fn drop(&mut self) {
+        if let Some((c, kind)) = self.pool_counters.take() {
+            use std::sync::atomic::Ordering::Relaxed;
+            c.jobs_in_use.fetch_sub(1, Relaxed);
+            match kind {
+                1 => {
+                    c.read_jobs.fetch_sub(1, Relaxed);
+                }
+                2 => {
+                    c.write_jobs.fetch_sub(1, Relaxed);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl DiskJob {

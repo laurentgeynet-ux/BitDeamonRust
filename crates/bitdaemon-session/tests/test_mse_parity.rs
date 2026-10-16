@@ -101,6 +101,8 @@ fn pe_support_toggles_at_link_up() {
                 .get_mut(&ih)
                 .unwrap()
                 .try_connect_peer(0, &st, &[])
+                .0
+                .into_dial()
                 .unwrap()
                 .0
         })
@@ -152,6 +154,8 @@ fn pe_support_writeback_on_attach() {
         .get_mut(&ih)
         .unwrap()
         .try_connect_peer(0, &st, &[])
+        .0
+        .into_dial()
         .unwrap();
 
     // fresh entries start `pe_support = false` — the first link-up
@@ -213,6 +217,8 @@ fn pe_support_rearmed_when_mse_completed() {
         .get_mut(&ih)
         .unwrap()
         .try_connect_peer(0, &st, &[])
+        .0
+        .into_dial()
         .unwrap()
         .0;
     let _ = s.peer_link_up(&ih, e, false); // plaintext — sets pe_support
@@ -224,6 +230,7 @@ fn pe_support_rearmed_when_mse_completed() {
         op: FailOp::Bittorrent,
         reason: "invalid_info_hash",
         io_kind: None,
+        os_err: None,
         encrypted: true,
         rc4: true,
         mse_done: true,
@@ -242,6 +249,8 @@ fn pe_support_rearmed_when_mse_completed() {
         .get_mut(&ih)
         .unwrap()
         .try_connect_peer(0, &st, &[])
+        .0
+        .into_dial()
         .map(|x| x.0);
     if let Some(e2) = e2 {
         if s.peer_link_up(&ih, e2, false).unwrap().1 {
@@ -265,6 +274,8 @@ fn dial_failure_counters_and_alert() {
         .get_mut(&ih)
         .unwrap()
         .try_connect_peer(0, &st, &[])
+        .0
+        .into_dial()
         .unwrap()
         .0;
     let _ = s.peer_link_up(&ih, e, false);
@@ -273,6 +284,7 @@ fn dial_failure_counters_and_alert() {
         op: FailOp::Encryption,
         reason: "invalid_encryption_constant",
         io_kind: None,
+        os_err: None,
         encrypted: true,
         rc4: true,
         mse_done: false,
@@ -313,6 +325,7 @@ fn inbound_failure_counts_incoming() {
         op: FailOp::Encryption,
         reason: "invalid_pad_size",
         io_kind: None,
+        os_err: None,
         encrypted: true,
         rc4: false,
         mse_done: false,
@@ -405,7 +418,7 @@ fn fast_reconnect_skips_cooldown_on_probe_failure() {
     let ih = s.add_torrent(torrent_v1(1, 1));
     let st = s.peer_list_state();
     let t = s.torrents.get_mut(&ih).unwrap();
-    let (e, _pid) = t.try_connect_peer(0, &st, &[]).unwrap();
+    let (e, _pid) = t.try_connect_peer(0, &st, &[]).0.into_dial().unwrap();
     let _ = s.peer_link_up(&ih, e, false); // plaintext — sets pe_support
     assert!(s.peer_link_up(&ih, e, false).unwrap().1); // MSE probe leg
     // a connect-level refusal on the probe → fast reconnect: the
@@ -413,10 +426,13 @@ fn fast_reconnect_skips_cooldown_on_probe_failure() {
     s.peer_dial_failed(
         &ih,
         e,
-        &DialFail::connect_failed(std::io::ErrorKind::ConnectionRefused, false),
+        &DialFail::connect_failed(std::io::ErrorKind::ConnectionRefused, None, false),
     );
     let t = s.torrents.get_mut(&ih).unwrap();
-    assert_eq!(t.try_connect_peer(0, &st, &[]).map(|x| x.0), Some(e));
+    assert_eq!(
+        t.try_connect_peer(0, &st, &[]).0.into_dial().map(|x| x.0),
+        Some(e)
+    );
 }
 
 #[test]

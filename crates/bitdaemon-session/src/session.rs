@@ -100,8 +100,14 @@ pub enum SessionOut {
         /// the wire message.
         msg: PeerMessage,
     },
-    /// UDP datagram from the DHT (injected transport).
+    /// UDP datagram (injected transport) — LSD announces and other
+    /// non-DHT traffic.
     UdpPacket(Vec<u8>, SocketAddr),
+    /// DHT-originated datagram — the engine stamps
+    /// `dht_bytes_out`/`dht_messages_out`/`sent_ip_overhead_bytes`
+    /// on send success, `dht_messages_out_dropped` on failure
+    /// (upstream `dht_tracker::send_packet` edge).
+    DhtPacket(Vec<u8>, SocketAddr),
     /// torrent-level effect routed upward (disk/alerts).
     Torrent(TorrentEffect),
     /// `alert` — surfaced to the API.
@@ -1135,6 +1141,10 @@ impl Session {
     #[must_use]
     pub fn new() -> Self {
         let mut s = Self::default();
+        // `m_dht` shares the session counters upstream — the sink
+        // survives `bind` re-creations (the tracker re-injects it).
+        s.dht
+            .set_counter_sink(Some(crate::counters::dht_counter_sink(&s.counters)));
         // `session_impl` ctor — the `local` class (id 2) is unchoke-
         // exempt and gets a 150% connection-limit factor.
         let local = s.peer_class_pool.new_peer_class("local");
@@ -1294,9 +1304,12 @@ impl Session {
 
     /// `session_impl::inc_boost_connections` — one boost dial took
     /// a connect slot outside the per-tick budget; deducted next
-    /// pump pass.
+    /// pump pass. Upstream also counts each one in
+    /// `boost_connection_attempts`.
     pub fn inc_boost_connections(&mut self) {
         self.boost_connections += 1;
+        self.counters
+            .inc(crate::counters::Counter::BoostConnectionAttempts);
     }
 
     /// `session_impl::try_connect_more_peers` — hand out up to
@@ -1444,21 +1457,32 @@ impl Session {
                 }
                 continue;
             }
-            match t.try_connect_peer(session_time, &st, &fp) {
-                Some((ep, pid)) => {
+            // `inc_stats_counter(connection_attempt_loops, st.loop_counter)`
+            // — the peer-list scan iterations this hand-out ran.
+            let (outcome, loops) = t.try_connect_peer(session_time, &st, &fp);
+            self.counters.add(
+                crate::counters::Counter::ConnectionAttemptLoops,
+                i64::from(loops),
+            );
+            match outcome {
+                crate::torrent::ConnectOutcome::Dial(ep, pid) => {
                     self.counters
                         .inc(crate::counters::Counter::ConnectionAttempts);
                     dials.push((ih, ep, pid));
                     max_connections -= 1;
                     steps_since_last_connect = 0;
                 }
-                None => {
+                crate::torrent::ConnectOutcome::ListEmpty
+                | crate::torrent::ConnectOutcome::Refused => {
                     // `no_peer_connection_attempts` when the cache
                     // was empty, `missed_connection_attempts` when
-                    // `connect_to_peer` failed — both collapse into
-                    // the want-list drop + `update_want_peers`.
-                    self.counters
-                        .inc(crate::counters::Counter::NoPeerConnectionAttempts);
+                    // `connect_to_peer` refused the entry.
+                    self.counters.inc(match outcome {
+                        crate::torrent::ConnectOutcome::Refused => {
+                            crate::counters::Counter::MissedConnectionAttempts
+                        }
+                        _ => crate::counters::Counter::NoPeerConnectionAttempts,
+                    });
                     t.update_want_peers();
                     if !t.want_peers(&self.settings) {
                         want_download.retain(|k| *k != ih);
@@ -1489,12 +1513,18 @@ impl Session {
         if t.connect_boost_counter == 0 {
             return;
         }
-        let dials = t.do_connect_boost(
+        let (dials, loops) = t.do_connect_boost(
             self.session_time,
             &st,
             nconn,
             &self.settings,
             &self.settings.peer_fingerprint,
+        );
+        // upstream incs `connection_attempt_loops` inside the boost
+        // while loop — same accounting as the per-tick pump.
+        self.counters.add(
+            crate::counters::Counter::ConnectionAttemptLoops,
+            i64::from(loops),
         );
         for _ in &dials {
             self.inc_boost_connections();
@@ -1628,6 +1658,8 @@ impl Session {
         // handlers push `DiskCompleted` into `disk_rx`, so run them
         // first or nothing below ever fires (writes/hashes wedged).
         if let Some(d) = &self.disk {
+            // `call_job_handlers` — upstream counts each handler run.
+            self.counters.inc(crate::counters::Counter::OnDiskCounter);
             let n = d.call_job_handlers();
             if n > 0 {
                 tracing::debug!(n, "disk completions drained");
@@ -4699,7 +4731,7 @@ impl Session {
         if t.share_mode {
             t.recalc_share_mode(&self.settings, &self.counters, &mut eff);
         }
-        t.add_peer(peer, conn);
+        t.add_peer(peer, conn, &self.counters);
         {
             // upstream does NOT `send_allowed_set` at attach —
             // it fires once on the first inbound `Interested`
@@ -4801,10 +4833,18 @@ impl Session {
                 self.counters
                     .inc_idx(crate::counters::incoming_counter_idx(id));
             }
-            let (remote, outgoing, is_utp, conn_failed, conn_fast, supports_enc, rc4_enc) = t
-                .peers
-                .get(&peer)
-                .map_or((None, false, false, false, false, false, false), |c| {
+            let (
+                remote,
+                outgoing,
+                is_utp,
+                conn_failed,
+                conn_fast,
+                supports_enc,
+                rc4_enc,
+                was_connecting,
+            ) = t.peers.get(&peer).map_or(
+                (None, false, false, false, false, false, false, false),
+                |c| {
                     (
                         c.remote,
                         c.outgoing,
@@ -4813,8 +4853,10 @@ impl Session {
                         c.fast_reconnect,
                         c.supports_encryption,
                         c.rc4_encrypted,
+                        c.connecting,
                     )
-                });
+                },
+            );
             if let Some(r) = remote {
                 // `peer` IS the conn's `conn_key` — the bound-entry
                 // lookup survives `update_peer_port` rewrites.
@@ -4838,20 +4880,7 @@ impl Session {
                     .inc(crate::counters::Counter::DisconnectedPeers);
                 let kind_ctr = match &gone {
                     Some(PeerGone::Transport(PeerConnError::Io(e))) => {
-                        use crate::counters::Counter as C;
-                        use std::io::ErrorKind as K;
-                        match e.kind() {
-                            K::ConnectionReset => Some(C::ConnresetPeers),
-                            K::UnexpectedEof => Some(C::EofPeers),
-                            K::ConnectionRefused => Some(C::ConnrefusedPeers),
-                            K::ConnectionAborted => Some(C::ConnabortedPeers),
-                            K::NotConnected => Some(C::NotconnectedPeers),
-                            K::PermissionDenied => Some(C::PermPeers),
-                            K::BrokenPipe => Some(C::BrokenPipePeers),
-                            K::AddrInUse => Some(C::AddrinusePeers),
-                            K::TimedOut => Some(C::TransportTimeoutPeers),
-                            _ => None,
-                        }
+                        crate::counters::transport_error_counter(e.kind(), e.raw_os_error())
                     }
                     Some(PeerGone::Disconnected { reason, .. }) => {
                         crate::counters::disconnect_reason_counter(reason)
@@ -4860,6 +4889,13 @@ impl Session {
                 };
                 if let Some(c) = kind_ctr {
                     self.counters.inc(c);
+                }
+                // `connect_failed(errors::timed_out)` — the tick's
+                // connecting-conn leg bumps `connect_timeouts`
+                // unconditionally before `disconnect` runs the
+                // transport legs.
+                if was_connecting && reason.as_deref() == Some("timed_out") {
+                    self.counters.inc(crate::counters::Counter::ConnectTimeouts);
                 }
                 if sev > DisconnectSeverity::Normal {
                     // `error > normal` → transport + direction legs.
@@ -5133,22 +5169,10 @@ impl Session {
         }
         // `disconnected_peers` — every `ec != 0` close.
         self.counters.inc(C::DisconnectedPeers);
-        // per-`ec` transport legs.
+        // per-`ec` transport legs — `kind` + raw errno (the raw
+        // code splits EPERM/EACCES and sees ENOBUFS/ECANCELED).
         if let Some(k) = fail.io_kind {
-            use std::io::ErrorKind as K;
-            let c = match k {
-                K::ConnectionReset => Some(C::ConnresetPeers),
-                K::UnexpectedEof => Some(C::EofPeers),
-                K::ConnectionRefused => Some(C::ConnrefusedPeers),
-                K::ConnectionAborted => Some(C::ConnabortedPeers),
-                K::NotConnected => Some(C::NotconnectedPeers),
-                K::PermissionDenied => Some(C::PermPeers),
-                K::BrokenPipe => Some(C::BrokenPipePeers),
-                K::AddrInUse => Some(C::AddrinusePeers),
-                K::TimedOut => Some(C::TransportTimeoutPeers),
-                _ => None,
-            };
-            if let Some(c) = c {
+            if let Some(c) = crate::counters::transport_error_counter(k, fail.os_err) {
                 self.counters.inc(c);
             }
         }
@@ -5200,6 +5224,7 @@ impl Session {
     pub fn peer_connect_failed(&mut self, ih: &Sha1Hash, remote: SocketAddr, was_utp: bool) {
         let fail = bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
             std::io::ErrorKind::Other,
+            None,
             was_utp,
         );
         self.peer_dial_failed(ih, remote, &fail);
@@ -7414,15 +7439,19 @@ impl Session {
     /// UDP datagram → dht tracker (any family) — and LSD announces
     /// (BT-SEARCH isn't a bencoded dict, so the dht drops it first).
     pub fn on_udp(&mut self, from: SocketAddr, buf: &[u8], out: &mut Vec<SessionOut>) {
-        // `m_ip_filter.access` — filtered sources are dropped
-        // before the dos-blocker (upstream
-        // `dht_tracker::incoming_packet` returns false, so other
-        // decoders — LSD below — still see the datagram).
-        if self.ip_filter.access(from.ip()) != bitdaemon_net::ip_filter::BLOCKED
-            && let Some((pkt, to)) = self.dht.incoming(from, buf)
-        {
+        // `on_udp_packet` — counted unconditionally at handler entry.
+        self.counters.inc(crate::counters::Counter::OnUdpCounter);
+        // `dht_tracker::incoming_packet` — the `d…e` sniff, the
+        // `dht_*_in` counters and the dark-internet/dos-blocker
+        // drops all run inside `DhtTracker::incoming`; the session
+        // only supplies the `apply_filter_to_dht` + `ip_filter`
+        // verdict (upstream reads the filter mid-ladder, after the
+        // dark-internet check).
+        let filtered = self.settings.apply_filter_to_dht
+            && self.ip_filter.access(from.ip()) == bitdaemon_net::ip_filter::BLOCKED;
+        if let Some((pkt, to)) = self.dht.incoming(from, buf, filtered) {
             tracing::trace!(%from, len = buf.len(), "dht incoming handled");
-            out.push(SessionOut::UdpPacket(pkt, to));
+            out.push(SessionOut::DhtPacket(pkt, to));
         }
         // `ip_voter::cast_vote` — the `ip` key a node echoed back is
         // its view of our external address (upstream `dht.cpp`).
@@ -7453,6 +7482,11 @@ impl Session {
                 let Some(ih) = Sha1Hash::from_bytes(&ih_raw) else {
                     continue;
                 };
+                // `on_lsd_peer` — counted at handler entry upstream
+                // (before the private/i2p filter), once per
+                // announced info-hash.
+                self.counters
+                    .inc(crate::counters::Counter::OnLsdPeerCounter);
                 let mut boost = false;
                 if let Some(t) = self.torrents.get_mut(&ih) {
                     // private torrents and i2p torrents (without
@@ -7576,6 +7610,10 @@ impl Session {
     /// pacing slot upstream (the round-robin cursor advances past
     /// them).
     fn lsd_announce_one(&mut self, ih: Sha1Hash, now: Instant, out: &mut Vec<SessionOut>) {
+        // `on_lsd_announce` — upstream counts one per announce
+        // timer fire (one torrent per fire); ours maps to one per
+        // announce slot processed.
+        self.counters.inc(crate::counters::Counter::OnLsdCounter);
         let Some(t) = self.torrents.get_mut(&ih) else {
             return;
         };
@@ -7628,6 +7666,9 @@ impl Session {
 
     /// `tick` — drive every torrent's peers + dht timeouts.
     pub fn tick(&mut self, out: &mut Vec<SessionOut>) -> std::time::Duration {
+        // `session_impl::on_tick` — counted unconditionally, before
+        // the abort check upstream.
+        self.counters.inc(crate::counters::Counter::OnTickCounter);
         self.session_time += 1;
         // upstream `session_time()` is a u16-seconds epoch — near
         // the 65536 s wrap (18.2 h) `m_created` steps forward 4 h
@@ -7691,7 +7732,7 @@ impl Session {
                     msg: pkt.clone(),
                 });
             }
-            out.push(SessionOut::UdpPacket(pkt, to));
+            out.push(SessionOut::DhtPacket(pkt, to));
         }
         let now = Instant::now();
         // `m_stat.second_tick` for every torrent — upstream ticks
@@ -9566,7 +9607,7 @@ impl Session {
             if let Some(p) = peer {
                 out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
                     peer: p,
-                    reason: "out of memory",
+                    reason: "no_memory",
                     // `errors::no_memory` — default (normal) severity
                     // upstream; a local alloc failure, not a peer fault.
                     sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
@@ -9628,7 +9669,18 @@ impl Session {
         out: &mut Vec<SessionOut>,
     ) {
         let mut eff = Vec::new();
-        // `on_send_data` — `counters::sent_bytes` tracks socket-level
+        // `on_send_data` — `on_write_counter` then `sent_buffer`'s
+        // `socket_send_size*` bucket, `log2p1(bytes >> 3)` verbatim.
+        self.counters.inc(crate::counters::Counter::OnWriteCounter);
+        {
+            let idx = bitdaemon_common::ffs::log2p1((bytes >> 3) as u32).min(17);
+            self.counters.add_idx(
+                crate::counters::Counter::SocketSendSize3 as usize
+                    + usize::try_from(idx).unwrap_or(0),
+                1,
+            );
+        }
+        // `counters::sent_bytes` tracks socket-level
         // writes (payload + protocol, excluding IP overhead).
         self.counters
             .add(crate::counters::Counter::SentBytes, bytes as i64);
@@ -11216,18 +11268,22 @@ impl Session {
     /// a `SessionStats` snapshot plus the `session_status` summary.
     #[must_use]
     pub fn session_stats(&self) -> crate::counters::SessionStats {
-        let downloading = self
-            .torrents
-            .values()
-            .filter(|t| !t.is_seed() && !t.is_paused())
-            .count() as i64;
-        let seeding = self.torrents.values().filter(|t| t.is_seed()).count() as i64;
-        self.counters.set(
-            crate::counters::Counter::NumDownloadingTorrents,
-            downloading,
-        );
-        self.counters
-            .set(crate::counters::Counter::NumSeedingTorrents, seeding);
+        // `update_gauge` recompute — upstream maintains the eight
+        // `num_*_torrents` buckets incrementally; the snapshot
+        // produces identical values from `current_stats_state`.
+        {
+            use crate::counters::Counter as C;
+            let mut buckets = [0i64; 8];
+            for t in self.torrents.values() {
+                if let Some(c) = t.current_stats_state() {
+                    buckets[c as usize - C::NumCheckingTorrents as usize] += 1;
+                }
+            }
+            for (i, n) in buckets.iter().enumerate() {
+                self.counters
+                    .set_idx(C::NumCheckingTorrents as usize + i, *n);
+            }
+        }
         self.counters.set(
             crate::counters::Counter::NumPeersConnected,
             self.num_peers() as i64,
@@ -11250,6 +11306,20 @@ impl Session {
             crate::counters::Counter::LimiterDownBytes,
             self.download_rate.queued_bytes(),
         );
+        // `dht_tracker::update_stats_counters` — storage + routing
+        // gauges summed over both families.
+        {
+            use crate::counters::Counter as C;
+            let g = self.dht.stats_counters();
+            self.counters.set(C::DhtNodes, g.nodes);
+            self.counters.set(C::DhtNodeCache, g.node_cache);
+            self.counters
+                .set(C::DhtAllocatedObservers, g.allocated_observers);
+            self.counters.set(C::DhtTorrents, g.torrents);
+            self.counters.set(C::DhtPeers, g.peers);
+            self.counters.set(C::DhtImmutableData, g.immutable_data);
+            self.counters.set(C::DhtMutableData, g.mutable_data);
+        }
         // `update_stats_counters` — the backend's live disk gauges
         // land in the stats bank on each snapshot (upstream calls
         // `m_disk_thread.update_stats_counters(m_stats_counters)`
@@ -11298,6 +11368,34 @@ impl Session {
                 .set(crate::counters::Counter::NumWriteOps, q.num_write_ops);
             self.counters
                 .set(crate::counters::Counter::NumReadOps, q.num_read_ops);
+            self.counters
+                .set(crate::counters::Counter::NumReadBack, q.num_read_back);
+            self.counters
+                .set(crate::counters::Counter::DiskReadTime, q.disk_read_time);
+            self.counters
+                .set(crate::counters::Counter::DiskWriteTime, q.disk_write_time);
+            self.counters
+                .set(crate::counters::Counter::DiskHashTime, q.disk_hash_time);
+            self.counters
+                .set(crate::counters::Counter::DiskJobTime, q.disk_job_time);
+            self.counters
+                .set(crate::counters::Counter::NumReadJobs, q.num_read_jobs);
+            self.counters
+                .set(crate::counters::Counter::NumWriteJobs, q.num_write_jobs);
+            self.counters
+                .set(crate::counters::Counter::NumJobs, q.num_jobs);
+            self.counters.set(
+                crate::counters::Counter::NumRunningDiskJobs,
+                q.num_running_disk_jobs,
+            );
+            self.counters.set(
+                crate::counters::Counter::NumWritingThreads,
+                q.num_writing_threads,
+            );
+            self.counters.set(
+                crate::counters::Counter::NumRunningThreads,
+                q.threads as i64,
+            );
             // `num_fenced_read + get_type()` — verbatim upstream
             // arithmetic: the name table predates `hash2` (type 3),
             // so every kind ≥ hash2 reports under the next-shifted

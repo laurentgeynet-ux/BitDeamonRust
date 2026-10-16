@@ -214,6 +214,10 @@ pub struct DialFail {
     pub reason: &'static str,
     /// io kind for transport failures (`connrefused_peers` & co.).
     pub io_kind: Option<std::io::ErrorKind>,
+    /// raw errno/WSA code — `ErrorKind` can't split EPERM/EACCES
+    /// (`perm_peers` vs `no_access_peers` upstream) or see
+    /// ENOBUFS/ECANCELED at all (`buffer_peers`/`aborted_peers`).
+    pub os_err: Option<i32>,
     /// `supports_encryption()` at failure (MSE entered).
     pub encrypted: bool,
     /// `rc4_encrypted()` at failure.
@@ -231,7 +235,7 @@ impl DialFail {
     /// dial. uTP failures get `normal` severity + the deferred TCP
     /// retry upstream posts; TCP refusals are `failure`.
     #[must_use]
-    pub fn connect_failed(kind: std::io::ErrorKind, utp: bool) -> Self {
+    pub fn connect_failed(kind: std::io::ErrorKind, os_err: Option<i32>, utp: bool) -> Self {
         Self {
             severity: if utp {
                 DisconnectSeverity::Normal
@@ -241,6 +245,7 @@ impl DialFail {
             op: FailOp::Connect,
             reason: "connect failed",
             io_kind: Some(kind),
+            os_err,
             encrypted: false,
             rc4: false,
             mse_done: false,
@@ -308,6 +313,10 @@ impl PeerConnError {
             reason,
             io_kind: match self {
                 Self::Io(e) | Self::Mse(MseError::Io(e)) => Some(e.kind()),
+                _ => None,
+            },
+            os_err: match self {
+                Self::Io(e) | Self::Mse(MseError::Io(e)) => e.raw_os_error(),
                 _ => None,
             },
             encrypted: st.encrypted,

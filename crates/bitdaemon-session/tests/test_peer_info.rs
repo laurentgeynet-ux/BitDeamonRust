@@ -26,7 +26,7 @@ fn snapshot_flags_and_queues() {
     c.peer_choked = false;
     c.bitfield_received = true;
     c.num_pieces = 4;
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
     let s = SessionSettings::default();
     let pi = t.peer_info(1, None, &s).expect("peer 1");
     assert!(pi.flags.has(PeerFlags::INTERESTING));

@@ -70,6 +70,14 @@ pub struct PeerQuota {
     /// `build_tracker_request` folds it into `downloaded`/`redundant`
     /// on seed torrents.
     pub piece_recv_staged: std::sync::atomic::AtomicI64,
+    /// `on_read_counter` — completed socket reads, bumped by the
+    /// socket task (upstream incs inside `on_receive_data` under
+    /// the session lock; we accumulate per-conn and drain into the
+    /// session counters at second_tick/`remove_peer`).
+    pub socket_reads: std::sync::atomic::AtomicI64,
+    /// `socket_recv_size3..20` — per-read bucket counts, index
+    /// `min(log2p1(bytes >> 3), 17)` like `received_buffer`.
+    pub recv_size_hist: [std::sync::atomic::AtomicI64; 18],
 }
 
 impl PeerQuota {
@@ -94,7 +102,53 @@ impl PeerQuota {
             recv_pos: std::sync::atomic::AtomicI64::new(0),
             recv_capacity: std::sync::atomic::AtomicI64::new(0),
             piece_recv_staged: std::sync::atomic::AtomicI64::new(0),
+            socket_reads: std::sync::atomic::AtomicI64::new(0),
+            recv_size_hist: [
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+                std::sync::atomic::AtomicI64::new(0),
+            ],
         })
+    }
+
+    /// `session_impl::received_buffer` + the `on_read_counter` leg
+    /// of `on_receive_data` — one completed socket read.
+    pub fn record_read(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.socket_reads.fetch_add(1, Relaxed);
+        let idx = bitdaemon_common::ffs::log2p1((bytes >> 3) as u32).min(17);
+        self.recv_size_hist[usize::try_from(idx).unwrap_or(0)].fetch_add(1, Relaxed);
+    }
+
+    /// Move the conn's accumulated read accounting into the session
+    /// counters — `second_tick` and `remove_peer` call this.
+    pub fn drain_read_counters(&self, counters: &crate::counters::Counters) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let reads = self.socket_reads.swap(0, Relaxed);
+        if reads != 0 {
+            counters.add(crate::counters::Counter::OnReadCounter, reads);
+        }
+        for (i, b) in self.recv_size_hist.iter().enumerate() {
+            let n = b.swap(0, Relaxed);
+            if n != 0 {
+                counters.add_idx(crate::counters::Counter::SocketRecvSize3 as usize + i, n);
+            }
+        }
     }
 
     /// Park until `assign_bandwidth` dispatches quota on `channel`

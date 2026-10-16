@@ -215,6 +215,26 @@ pub struct PreadDiskIo {
     /// `settings_pack::disk_disable_copy_on_write` — pushed to
     /// storages; `open_mode::no_cow` on truncate-opens (mmap only).
     disk_disable_cow: AtomicBool,
+    /// `counters::num_read_back` — blocks pulled off disk for hashing.
+    num_read_back: std::sync::atomic::AtomicI64,
+    /// `counters::disk_{read,write,hash,job}_time` — cumulative µs
+    /// in the corresponding I/O legs (success only, like upstream's
+    /// `!error.ec` guard).
+    disk_read_time: std::sync::atomic::AtomicI64,
+    disk_write_time: std::sync::atomic::AtomicI64,
+    disk_hash_time: std::sync::atomic::AtomicI64,
+    disk_job_time: std::sync::atomic::AtomicI64,
+    /// `counters::num_running_disk_jobs` — inside `perform_job`.
+    num_running_disk_jobs: std::sync::atomic::AtomicI64,
+    /// `counters::num_writing_threads` — inside the flush writev.
+    num_writing_threads: std::sync::atomic::AtomicI64,
+    /// `counters::num_running_threads` — live pool workers (all
+    /// pools share one counter like upstream `m_num_running_threads`
+    /// incremented in the common `disk_thread_fun`).
+    num_running_threads: std::sync::atomic::AtomicI64,
+    /// `disk_job_pool` — outstanding job objects; `mk_job` allocates
+    /// and `DiskJob::drop` frees.
+    job_pool_counters: std::sync::Arc<crate::disk_pool::JobPoolCounters>,
 }
 
 impl PreadDiskIo {
@@ -300,6 +320,15 @@ impl PreadDiskIo {
             mmap_file_size_cutoff: AtomicI64::new(40),
             disk_write_mode: AtomicI64::new(1),
             disk_disable_cow: AtomicBool::new(false),
+            num_read_back: std::sync::atomic::AtomicI64::new(0),
+            disk_read_time: std::sync::atomic::AtomicI64::new(0),
+            disk_write_time: std::sync::atomic::AtomicI64::new(0),
+            disk_hash_time: std::sync::atomic::AtomicI64::new(0),
+            disk_job_time: std::sync::atomic::AtomicI64::new(0),
+            num_running_disk_jobs: std::sync::atomic::AtomicI64::new(0),
+            num_writing_threads: std::sync::atomic::AtomicI64::new(0),
+            num_running_threads: std::sync::atomic::AtomicI64::new(0),
+            job_pool_counters: std::sync::Arc::new(crate::disk_pool::JobPoolCounters::default()),
         });
         // upstream `pread_disk_io` ctor:
         // `m_cache.set_max_size(max_queued_disk_bytes / 0x4000)` with
@@ -1209,6 +1238,10 @@ impl PreadDiskIo {
 
     /// worker loop (`thread_fun`) — wait, pop, perform, complete.
     fn worker_loop(&self, pool: &Arc<DiskIoThreadPool>) {
+        // `num_running_threads` — inc on entry, dec on exit; all three
+        // pools share the one counter like upstream's
+        // `m_num_running_threads` in `disk_thread_fun`.
+        self.num_running_threads.fetch_add(1, Ordering::Relaxed);
         // `thread_id == pool.first_thread_id()` — one generic-pool
         // worker owns the maintenance pass. Claimed on the first
         // popped job, released on exit so a respawned worker picks it
@@ -1239,6 +1272,7 @@ impl PreadDiskIo {
                     if owns_maintenance {
                         self.maintenance_claimed.store(false, Ordering::Release);
                     }
+                    self.num_running_threads.fetch_sub(1, Ordering::Relaxed);
                     return;
                 }
             }
@@ -1249,7 +1283,12 @@ impl PreadDiskIo {
         let entry = self.storage(j.storage);
         let is_flush = matches!(j.action, JobKind::Flush(_));
         let t0 = std::time::Instant::now();
-        if self.perform_job(&mut j, entry.as_deref()) {
+        // `num_running_disk_jobs` — inc before `perform_job`, dec via
+        // upstream's `scope_end` when it returns (reposts included).
+        self.num_running_disk_jobs.fetch_add(1, Ordering::Relaxed);
+        let repost = self.perform_job(&mut j, entry.as_deref());
+        self.num_running_disk_jobs.fetch_sub(1, Ordering::Relaxed);
+        if repost {
             // repost: the job observed in-flight writes on its piece —
             // it re-enters at the post-fence consult point, where the
             // piece gate parks it behind the flush (upstream parks
@@ -1541,8 +1580,28 @@ impl PreadDiskIo {
         let st: &dyn DiskStorage = &**st_guard;
         let cache = &e.cache;
         j.error = match &mut j.action {
-            JobKind::Read(r) => read_job(st, r, j.storage, cache),
-            JobKind::PartialRead(r) => partial_read_job(st, r, j.storage, cache),
+            // `async_read`'s timing leg — µs into `disk_read_time` +
+            // `disk_job_time`, success-only (`!error.ec` upstream).
+            JobKind::Read(r) => {
+                let t = std::time::Instant::now();
+                let e = read_job(st, r, j.storage, cache);
+                if e.is_ok() {
+                    let us = i64::try_from(t.elapsed().as_micros()).unwrap_or(i64::MAX);
+                    self.disk_read_time.fetch_add(us, Ordering::Relaxed);
+                    self.disk_job_time.fetch_add(us, Ordering::Relaxed);
+                }
+                e
+            }
+            JobKind::PartialRead(r) => {
+                let t = std::time::Instant::now();
+                let e = partial_read_job(st, r, j.storage, cache);
+                if e.is_ok() {
+                    let us = i64::try_from(t.elapsed().as_micros()).unwrap_or(i64::MAX);
+                    self.disk_read_time.fetch_add(us, Ordering::Relaxed);
+                    self.disk_job_time.fetch_add(us, Ordering::Relaxed);
+                }
+                e
+            }
             // upstream `do_job(write)` is `TORRENT_ASSERT_FAIL` — a
             // write never reaches the pool: `gate_or_enqueue` folds
             // it into the cache at the post-fence consult point.
@@ -1580,6 +1639,9 @@ impl PreadDiskIo {
                     (v || w.volatile, p || w.force_flush)
                 });
                 let tw = std::time::Instant::now();
+                // `num_writing_threads` — a worker inside the flush
+                // writev (upstream wraps `flush_cache_blocks`' write).
+                self.num_writing_threads.fetch_add(1, Ordering::Relaxed);
                 // one physical write in flight per storage — see
                 // `StorageEntry::write_serializer`.
                 let r = {
@@ -1593,8 +1655,15 @@ impl PreadDiskIo {
                         flush,
                     )
                 };
-                self.write_us
-                    .fetch_add(tw.elapsed().as_micros() as u64, Ordering::Relaxed);
+                self.num_writing_threads.fetch_sub(1, Ordering::Relaxed);
+                let wus = i64::try_from(tw.elapsed().as_micros()).unwrap_or(i64::MAX);
+                self.write_us.fetch_add(wus as u64, Ordering::Relaxed);
+                // upstream `do_write`/`flush_cache_blocks`:
+                // `disk_write_time` + `disk_job_time` on success only.
+                if r.is_ok() {
+                    self.disk_write_time.fetch_add(wus, Ordering::Relaxed);
+                    self.disk_job_time.fetch_add(wus, Ordering::Relaxed);
+                }
                 self.flush_bytes
                     .fetch_add(flat_len as u64, Ordering::Relaxed);
                 match r {
@@ -1657,8 +1726,42 @@ impl PreadDiskIo {
                     Err(e) => e,
                 }
             }
-            JobKind::Hash(h) => hash_job(st, h, j.storage, cache),
-            JobKind::Hash2(h) => hash2_job(st, h, j.storage, cache),
+            // `async_hash`/`do_job(hash)` — `num_read_back` +
+            // `num_blocks_read` + `num_read_ops` per block actually
+            // pulled off disk (cache hits don't count), and
+            // `disk_hash_time`/`disk_job_time` on success.
+            JobKind::Hash(h) => {
+                let t = std::time::Instant::now();
+                let (e, blocks_read) = hash_job(st, h, j.storage, cache);
+                if blocks_read > 0 {
+                    self.num_read_back.fetch_add(blocks_read, Ordering::Relaxed);
+                    self.num_blocks_read
+                        .fetch_add(blocks_read, Ordering::Relaxed);
+                    self.num_read_ops.fetch_add(blocks_read, Ordering::Relaxed);
+                }
+                if e.is_ok() {
+                    let us = i64::try_from(t.elapsed().as_micros()).unwrap_or(i64::MAX);
+                    self.disk_hash_time.fetch_add(us, Ordering::Relaxed);
+                    self.disk_job_time.fetch_add(us, Ordering::Relaxed);
+                }
+                e
+            }
+            JobKind::Hash2(h) => {
+                let t = std::time::Instant::now();
+                let (e, blocks_read) = hash2_job(st, h, j.storage, cache);
+                if blocks_read > 0 {
+                    self.num_read_back.fetch_add(blocks_read, Ordering::Relaxed);
+                    self.num_blocks_read
+                        .fetch_add(blocks_read, Ordering::Relaxed);
+                    self.num_read_ops.fetch_add(blocks_read, Ordering::Relaxed);
+                }
+                if e.is_ok() {
+                    let us = i64::try_from(t.elapsed().as_micros()).unwrap_or(i64::MAX);
+                    self.disk_hash_time.fetch_add(us, Ordering::Relaxed);
+                    self.disk_job_time.fetch_add(us, Ordering::Relaxed);
+                }
+                e
+            }
             JobKind::MoveStorage(m) => {
                 // upstream `do_job(move_storage)`: ret = status_t, the
                 // job's `path` out-param gets the *resulting* save
@@ -2031,12 +2134,15 @@ fn partial_read_job(
 // job's only destination is the cache insert at the post-fence
 // consult point (`add_write_to_cache`).
 
+/// Returns the error plus the number of blocks physically read off
+/// disk (cache-served blocks don't count — `num_read_back` upstream
+/// only incs on the storage-read leg).
 fn hash_job(
     st: &dyn DiskStorage,
     h: &mut HashJob,
     storage: StorageIndex,
     cache: &Mutex<crate::disk_cache::DiskCache>,
-) -> StorageError {
+) -> (StorageError, i64) {
     // SHA-1 over the whole piece when `v1_hash` is set (upstream
     // `do_job(hash)`: v2-only hashing skips the SHA-1 pass entirely);
     // also fills per-block SHA-256 for the caller-provided
@@ -2109,7 +2215,7 @@ fn hash_job(
         if let Some(ph) = piece_hash {
             h.piece_hash = ph;
         }
-        return StorageError::default();
+        return (StorageError::default(), 0);
     }
     {
         let g = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -2127,6 +2233,7 @@ fn hash_job(
     }
     let mut buf = vec![0u8; piece_len];
     let mut r: Result<(), StorageError> = Ok(());
+    let mut blocks_read: i64 = 0;
     let mut i = 0usize;
     while i < nblocks {
         let want = v1_pending || needed.get(i).copied().unwrap_or(false);
@@ -2163,6 +2270,12 @@ fn hash_job(
                     h.flush,
                 )
                 .map(|_| ());
+            // upstream incs `num_read_back`/`num_blocks_read`/
+            // `num_read_ops` per block pulled from storage — a run
+            // covers `i - start` physical blocks.
+            if r.is_ok() {
+                blocks_read += i64::try_from(i - start).unwrap_or(i64::MAX);
+            }
         }
     }
     let mut sha1 = Sha1::new();
@@ -2211,7 +2324,7 @@ fn hash_job(
         h.block_hashes[block_idx] =
             Sha256Hash::from_bytes(&block.finalize_reset()).unwrap_or_default();
     }
-    match r {
+    let e = match r {
         Ok(_) => {
             if h.v1_hash {
                 // `piece_hash` was already fed incrementally at
@@ -2252,15 +2365,19 @@ fn hash_job(
             StorageError::default()
         }
         Err(e) => e,
-    }
+    };
+    (e, blocks_read)
 }
 
+/// `(error, blocks_read)` — `blocks_read` is 1 only when the block
+/// actually came off disk (`hash_with_hints`), matching upstream's
+/// per-block `num_read_back` leg.
 fn hash2_job(
     st: &dyn DiskStorage,
     h: &mut Hash2Job,
     storage: StorageIndex,
     cache: &Mutex<crate::disk_cache::DiskCache>,
-) -> StorageError {
+) -> (StorageError, i64) {
     let mut sha = Sha256::new();
     let blk =
         usize::try_from(i64::from(h.offset) / crate::disk_cache::DEFAULT_BLOCK_SIZE).unwrap_or(0);
@@ -2279,21 +2396,21 @@ fn hash2_job(
         // `piece_hasher` result stored at flush — reuse, no re-read.
         if let Some(hash) = g.block_hash(loc, blk) {
             h.piece_hash2 = hash;
-            return StorageError::default();
+            return (StorageError::default(), 0);
         }
         // block still parked in the write cache → hash it from RAM.
         if let Some(c) = g.get(loc, blk) {
             let take = usize::try_from(len).unwrap_or(0).min(c.len());
             sha.update(&c[..take]);
             h.piece_hash2 = Sha256Hash::from_bytes(&sha.finalize()).unwrap_or_default();
-            return StorageError::default();
+            return (StorageError::default(), 0);
         }
     }
     // `take_precomputed_v2_block` — a piece hash already computed
     // this block's SHA-256; no disk read needed.
     if let Some(hash) = st.take_precomputed_v2_block(h.piece, i32::try_from(blk).unwrap_or(0)) {
         h.piece_hash2 = hash;
-        return StorageError::default();
+        return (StorageError::default(), 0);
     }
     let r = st.hash_with_hints(
         &mut |d| sha.update(d),
@@ -2307,9 +2424,9 @@ fn hash2_job(
     match r {
         Ok(_) => {
             h.piece_hash2 = Sha256Hash::from_bytes(&sha.finalize()).unwrap_or_default();
-            StorageError::default()
+            (StorageError::default(), 1)
         }
-        Err(e) => e,
+        Err(e) => (e, 0),
     }
 }
 
@@ -2326,12 +2443,37 @@ use std::path::PathBuf;
 /// field — declared on `PreadDiskIo` struct below via include-style.
 impl PreadDiskIo {
     fn mk_job(&self, action: JobKind) -> Box<DiskJob> {
+        // `disk_job_pool::allocate` — `jobs_in_use` for every kind,
+        // plus the `job::read`/`job::write` split upstream does with
+        // `is_same_v<JobType>` (flush/hash land only in the total).
+        let tag = match &action {
+            JobKind::Read(_) => 1u8,
+            JobKind::Write(_) => 2,
+            _ => 0,
+        };
+        self.job_pool_counters
+            .jobs_in_use
+            .fetch_add(1, Ordering::Relaxed);
+        match tag {
+            1 => {
+                self.job_pool_counters
+                    .read_jobs
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            2 => {
+                self.job_pool_counters
+                    .write_jobs
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
         Box::new(DiskJob {
             storage: StorageIndex(u32::MAX),
             flags: 0,
             ret: 0,
             error: StorageError::default(),
             action,
+            pool_counters: Some((std::sync::Arc::clone(&self.job_pool_counters), tag)),
         })
     }
 
@@ -2880,7 +3022,12 @@ impl DiskIo for PreadDiskIo {
             threads: self.pool.num_threads()
                 + self.hash_pool.num_threads()
                 + self.flush_pool.num_threads(),
-            queued_disk_jobs: self.pool.queue_size(),
+            // upstream `m_generic_threads.queue_size() +
+            // m_hash_threads.queue_size()` — our flush pool is a
+            // third queue upstream doesn't split out.
+            queued_disk_jobs: self.pool.queue_size()
+                + self.hash_pool.queue_size()
+                + self.flush_pool.queue_size(),
             blocked_disk_jobs: self
                 .fence_counters
                 .blocked_disk_jobs
@@ -2893,6 +3040,16 @@ impl DiskIo for PreadDiskIo {
             num_blocks_hashed: self.num_blocks_hashed.load(Ordering::Relaxed),
             num_write_ops: self.num_write_ops.load(Ordering::Relaxed),
             num_read_ops: self.num_read_ops.load(Ordering::Relaxed),
+            num_read_back: self.num_read_back.load(Ordering::Relaxed),
+            disk_read_time: self.disk_read_time.load(Ordering::Relaxed),
+            disk_write_time: self.disk_write_time.load(Ordering::Relaxed),
+            disk_hash_time: self.disk_hash_time.load(Ordering::Relaxed),
+            disk_job_time: self.disk_job_time.load(Ordering::Relaxed),
+            num_read_jobs: self.job_pool_counters.read_jobs.load(Ordering::Relaxed),
+            num_write_jobs: self.job_pool_counters.write_jobs.load(Ordering::Relaxed),
+            num_jobs: self.job_pool_counters.jobs_in_use.load(Ordering::Relaxed),
+            num_running_disk_jobs: self.num_running_disk_jobs.load(Ordering::Relaxed),
+            num_writing_threads: self.num_writing_threads.load(Ordering::Relaxed),
             ..Default::default()
         };
         let (hits, misses, stalls, races, num_files) = self.file_pool.stats_counters();
@@ -2908,8 +3065,11 @@ impl DiskIo for PreadDiskIo {
         }
         // per-kind counts maintained on push/pop — walking the queue
         // here held the worker lock for O(queue) every stats tick and
-        // stalled all disk threads mid-burst.
+        // stalled all disk threads mid-burst. Hash jobs route to the
+        // dedicated pool upstream-style (`job_pool()`), so their
+        // queue lands on `queued_hashes`.
         (s.queued_writes, s.queued_hashes, s.queued_other) = self.pool.kind_counts();
+        s.queued_hashes += self.hash_pool.queue_size();
         // `Flush` jobs sitting in the dedicated pool's queue are
         // still "other" from the display's point of view.
         s.queued_other += self.flush_pool.queue_size();

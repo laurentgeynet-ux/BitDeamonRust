@@ -402,3 +402,247 @@ fn optimistic_unchoke_slots_alert() {
         "fires on unlimited too (verbatim upstream)"
     );
 }
+
+// =====================================================================
+// A29 — counter-sweep regressions
+// =====================================================================
+
+use bitdaemon_net::bt_peer_conn::{DialFail, FailOp};
+use bitdaemon_session::counters::{
+    disconnect_reason_counter, find_metric_idx, transport_error_counter,
+};
+
+/// `disconnect()`'s reason legs — every emitter must send a canonical
+/// upstream `errors::*` name or the counter (and the uTP
+/// `close_reason` map downstream) never sees it.
+#[test]
+fn disconnect_reason_counter_maps_errors_names() {
+    for (reason, want) in [
+        ("self_connection", Counter::UninterestingPeers),
+        ("upload_upload_connection", Counter::UninterestingPeers),
+        ("torrent_paused", Counter::UninterestingPeers),
+        ("torrent_aborted", Counter::UninterestingPeers),
+        ("uninteresting_upload_peer", Counter::UninterestingPeers),
+        ("too_many_connections", Counter::TooManyPeers),
+        ("no_memory", Counter::NoMemoryPeers),
+        ("timed_out", Counter::TransportTimeoutPeers),
+        ("timed_out_inactivity", Counter::TimeoutPeers),
+        ("timed_out_no_request", Counter::TimeoutPeers),
+        ("timed_out_no_interest", Counter::TimeoutPeers),
+        ("timed_out_no_handshake", Counter::ConnectTimeouts),
+    ] {
+        assert_eq!(disconnect_reason_counter(reason), Some(want), "{reason}");
+    }
+    // not an upstream `errors::*` leg
+    assert_eq!(disconnect_reason_counter("session_closing"), None);
+    assert_eq!(disconnect_reason_counter("connect failed"), None);
+}
+
+/// `error::*` transport legs — the raw errno splits what `ErrorKind`
+/// cannot (EPERM vs EACCES both read `PermissionDenied`; ENOBUFS and
+/// ECANCELED land in `Uncategorized`).
+#[test]
+fn transport_error_counter_uses_raw_errno() {
+    use std::io::ErrorKind as K;
+    // EPERM — upstream `no_permission` → perm_peers.
+    assert_eq!(
+        transport_error_counter(K::PermissionDenied, Some(1)),
+        Some(Counter::PermPeers)
+    );
+    // EACCES — `access_denied` → no_access_peers.
+    assert_eq!(
+        transport_error_counter(K::PermissionDenied, Some(13)),
+        Some(Counter::NoAccessPeers)
+    );
+    // without a raw code the socket denial maps to access_denied.
+    assert_eq!(
+        transport_error_counter(K::PermissionDenied, None),
+        Some(Counter::NoAccessPeers)
+    );
+    // ENOBUFS (linux) → buffer_peers — `ErrorKind` sees nothing.
+    assert_eq!(
+        transport_error_counter(K::Other, Some(105)),
+        Some(Counter::BufferPeers)
+    );
+    // WSAENOBUFS — same counter on Windows.
+    assert_eq!(
+        transport_error_counter(K::Other, Some(10055)),
+        Some(Counter::BufferPeers)
+    );
+    // ECANCELED → aborted_peers.
+    assert_eq!(
+        transport_error_counter(K::Other, Some(125)),
+        Some(Counter::AbortedPeers)
+    );
+    // EINVAL via raw → invalid_arg_peers.
+    assert_eq!(
+        transport_error_counter(K::Other, Some(22)),
+        Some(Counter::InvalidArgPeers)
+    );
+    // EHOSTUNREACH → unreachable_peers.
+    assert_eq!(
+        transport_error_counter(K::Other, Some(113)),
+        Some(Counter::UnreachablePeers)
+    );
+    // plain `ErrorKind` legs when no raw code is available.
+    assert_eq!(
+        transport_error_counter(K::TimedOut, None),
+        Some(Counter::TransportTimeoutPeers)
+    );
+    assert_eq!(
+        transport_error_counter(K::ConnectionRefused, None),
+        Some(Counter::ConnrefusedPeers)
+    );
+    assert_eq!(
+        transport_error_counter(K::BrokenPipe, None),
+        Some(Counter::BrokenPipePeers)
+    );
+    // unknown raw codes fall through to the kind table, then None.
+    assert_eq!(transport_error_counter(K::Other, Some(999_999)), None);
+    assert_eq!(transport_error_counter(K::Other, None), None);
+}
+
+/// `peer_connection::connect_failed` — a refused dial incs
+/// `connect_timeouts` (unconditional upstream) + `disconnected_peers`
+/// + the transport leg.
+#[test]
+fn connect_failed_incs_connect_timeouts() {
+    let mut s = Session::new();
+    let fail = DialFail::connect_failed(std::io::ErrorKind::ConnectionRefused, Some(111), false);
+    s.peer_dial_failed(&ih(9), addr(7000), &fail);
+    assert_eq!(s.counters.value(Counter::ConnectTimeouts), 1);
+    assert_eq!(s.counters.value(Counter::DisconnectedPeers), 1);
+    assert_eq!(s.counters.value(Counter::ConnrefusedPeers), 1);
+    // severity failure (TCP) → error_tcp_peers + error_outgoing_peers.
+    assert_eq!(s.counters.value(Counter::ErrorTcpPeers), 1);
+    assert_eq!(s.counters.value(Counter::ErrorOutgoingPeers), 1);
+    // not PeerError → no error_peers.
+    assert_eq!(s.counters.value(Counter::ErrorPeers), 0);
+}
+
+/// the handshake-deadline leg: `timed_out_no_handshake` reads
+/// `connect_timeouts` upstream (`disconnect(errors::timed_out_no_handshake)`),
+/// while a mid-stream `timed_out` reads `transport_timeout_peers`.
+#[test]
+fn handshake_timeout_lands_on_connect_timeouts() {
+    let mut s = Session::new();
+    let mut fail = DialFail::connect_failed(std::io::ErrorKind::TimedOut, None, false);
+    fail.op = FailOp::Bittorrent;
+    fail.reason = "timed_out_no_handshake";
+    s.peer_dial_failed(&ih(9), addr(7001), &fail);
+    assert_eq!(s.counters.value(Counter::ConnectTimeouts), 1);
+    // io leg: TimedOut → transport_timeout_peers too (upstream runs
+    // both the `error::timed_out` leg and the `errors::*` leg).
+    assert_eq!(s.counters.value(Counter::TransportTimeoutPeers), 1);
+}
+
+/// `num_tcp_peers + sock_type` — attach incs, remove decs. The
+/// rtc-shift quirk (upstream `socket_type_idx` has no rtc slot)
+/// is reproduced verbatim: `sock_type` indexes raw.
+#[test]
+fn socket_type_gauge_follows_attach_remove() {
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+    let mut out = Vec::new();
+
+    // sock_type 0 = plain TCP (upstream `socket_type_t::tcp`).
+    add_conn(&mut s, &ih, 1, &mut out);
+    assert_eq!(s.counters.value(Counter::NumTcpPeers), 1);
+    assert_eq!(s.counters.value(Counter::NumSslPeers), 0);
+
+    // a uTP conn (sock_type 3) lands on `num_utp_peers` — different
+    // IP: `find_peer` dedups by address when
+    // `allow_multiple_connections_per_ip` is off (upstream).
+    let mut c2 = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
+    c2.sock_type = 3;
+    let remote2 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 2)), 6882);
+    s.peer_connected(&ih, 2, c2, remote2, &mut out);
+    assert_eq!(s.counters.value(Counter::NumUtpPeers), 1);
+
+    s.torrents.get_mut(&ih).unwrap().remove_peer(
+        1,
+        &s.counters,
+        &s.peer_class_pool,
+        &mut Vec::new(),
+    );
+    assert_eq!(s.counters.value(Counter::NumTcpPeers), 0);
+    assert_eq!(s.counters.value(Counter::NumUtpPeers), 1);
+}
+
+/// `on_tick`/`on_udp`/`on_write` event counters + the send-size
+/// histogram bucket (`log2p1(bytes >> 3)` clamped at 17).
+#[test]
+fn event_counters_and_send_histogram() {
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    let ih = s.add_torrent(t);
+    let mut out = Vec::new();
+    add_conn(&mut s, &ih, 1, &mut out);
+
+    let base_tick = s.counters.value(Counter::OnTickCounter);
+    s.tick(&mut out);
+    assert_eq!(s.counters.value(Counter::OnTickCounter), base_tick + 1);
+
+    // a datagram that isn't DHT/LSD still counts `on_udp` —
+    // upstream incs at `on_udp_packet` entry.
+    s.on_udp(addr(6000), b"not-dht", &mut out);
+    assert_eq!(s.counters.value(Counter::OnUdpCounter), 1);
+
+    // 16 KiB write → bucket log2p1(16384 >> 3) = log2p1(2048) = 12.
+    let bucket =
+        usize::try_from(bitdaemon_common::ffs::log2p1((0x4000usize >> 3) as u32).min(17)).unwrap();
+    s.on_peer_sent(&ih, 1, 0x4000, 0x4000, &mut out);
+    assert_eq!(s.counters.value(Counter::OnWriteCounter), 1);
+    assert_eq!(
+        s.counters
+            .value_idx(Counter::SocketSendSize3 as usize + bucket),
+        1
+    );
+}
+
+/// `update_gauge` buckets — a downloading torrent lands on
+/// `num_downloading_torrents` at snapshot; pausing a non-auto-managed
+/// torrent lands on `num_stopped_torrents`.
+#[test]
+fn torrent_state_gauges_at_snapshot() {
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.auto_managed = true;
+    let ih = s.add_torrent(t);
+
+    let _ = s.session_stats();
+    assert_eq!(s.counters.value(Counter::NumDownloadingTorrents), 1);
+    assert_eq!(s.counters.value(Counter::NumStoppedTorrents), 0);
+
+    // paused + not auto-managed → num_stopped_torrents upstream.
+    {
+        let t = s.torrents.get_mut(&ih).unwrap();
+        t.paused = true;
+        t.auto_managed = false;
+    }
+    let _ = s.session_stats();
+    assert_eq!(s.counters.value(Counter::NumStoppedTorrents), 1);
+    assert_eq!(s.counters.value(Counter::NumDownloadingTorrents), 0);
+}
+
+/// `find_metric_idx` resolves `"category.name"` to the value_index
+/// into the stats snapshot — the same index `stats_metrics` reports.
+#[test]
+fn find_metric_idx_resolves_value_index() {
+    assert_eq!(
+        find_metric_idx("peer.error_peers"),
+        Some(Counter::ErrorPeers as usize)
+    );
+    assert_eq!(
+        find_metric_idx("ses.num_downloading_torrents"),
+        Some(Counter::NumDownloadingTorrents as usize)
+    );
+    assert_eq!(find_metric_idx("no.such_metric"), None);
+    // a bare counter name without its category doesn't resolve —
+    // upstream's find is over `category.name` strings.
+    assert_eq!(find_metric_idx("error_peers"), None);
+}

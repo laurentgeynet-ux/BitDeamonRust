@@ -76,6 +76,7 @@ fn write_job(piece: i32, fill: u8, io: &PreadDiskIo, done: Arc<AtomicUsize>) -> 
         *b = fill;
     }
     Box::new(DiskJob {
+        pool_counters: None,
         storage: StorageIndex(u32::MAX),
         flags: 0,
         ret: 0,
@@ -184,6 +185,7 @@ impl bitdaemon_disk::storage::DiskStorage for GatedStorage {
 
 fn read_job(piece: i32, got: Arc<Mutex<Vec<u8>>>, done: Arc<AtomicUsize>) -> Box<DiskJob> {
     Box::new(DiskJob {
+        pool_counters: None,
         storage: StorageIndex(u32::MAX),
         flags: 0,
         ret: 0,
@@ -394,6 +396,7 @@ fn hash_job_computes_piece_sha1() {
     io.add_job(
         StorageIndex(0),
         Box::new(DiskJob {
+            pool_counters: None,
             storage: StorageIndex(u32::MAX),
             flags: 0,
             ret: 0,
@@ -451,6 +454,7 @@ fn hash_parked_behind_inflight_write_is_released() {
     io.add_job(
         StorageIndex(0),
         Box::new(DiskJob {
+            pool_counters: None,
             storage: StorageIndex(u32::MAX),
             flags: 0,
             ret: 0,
@@ -2476,4 +2480,104 @@ fn parked_write_over_watermark_schedules_flush() {
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();
     std::fs::remove_dir_all(&d2).unwrap();
+}
+
+/// A29 — `queue_stats` fields wired: pool `num_jobs` incs at `mk_job`
+/// (`disk_job_pool::allocate`) while a job is in flight and decs at
+/// `free_job` (job `Drop`); `num_read_back`/`num_blocks_read`/
+/// `num_read_ops` count only blocks hashing pulled off disk — a piece
+/// already digested by the insert-time incremental hasher answers
+/// `job_completed` without a re-read, so the read is forced with
+/// files written out-of-band; `disk_*_time` accumulate on success.
+#[test]
+fn queue_stats_pool_counters_and_read_back() {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::{DiskIo, flags};
+
+    let d = dir("qstats");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    let (io, _drained) = make_io(1);
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    io.insert_storage(
+        StorageIndex(0),
+        Box::new(GatedStorage {
+            inner: storage(&make_fs(), &d),
+            gate: Arc::clone(&gate),
+        }),
+    );
+
+    // force-flushed write: the write job completes at cache insert;
+    // the Flush job then blocks in `storage.write` — `jobs_in_use`
+    // stays non-zero for its whole lifetime.
+    let wdone = Arc::new(AtomicUsize::new(0));
+    let mut buf = io.buffer_pool().allocate_buffer("w");
+    for b in buf.data_mut().unwrap() {
+        *b = 0x5A;
+    }
+    let d2 = Arc::clone(&wdone);
+    io.async_write(
+        StorageIndex(0),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start: 0,
+            length: 1024,
+        },
+        buf,
+        None,
+        Box::new(move |e| {
+            assert!(!e.is_err());
+            d2.fetch_add(1, Ordering::Relaxed);
+        }),
+        flags::FLUSH_PIECE,
+    );
+    // the write job stays parked as the block's `writer` until the
+    // flush retires it — upstream completes a cached write when the
+    // data is durable, not at insert. While the Flush job blocks in
+    // `storage.write`, both pool gauges must be non-zero.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while io.queue_stats().num_jobs < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let s = io.queue_stats();
+    assert_eq!(s.num_jobs, 2, "write parked on its block + Flush in flight");
+    assert_eq!(s.num_write_jobs, 1, "write still allocated");
+    assert_eq!(s.num_read_jobs, 0);
+    gate.wait(); // release the worker
+    wait_done(&io, &wdone, 1);
+    let s = io.queue_stats();
+    assert_eq!(s.num_jobs, 0, "`free_job` balances the gauge");
+    assert_eq!(s.num_write_jobs, 0);
+    assert_eq!(s.num_blocks_written, 1);
+    assert_eq!(s.num_write_ops, 1);
+    assert_eq!(s.num_read_back, 0, "no hash ran yet");
+
+    // second storage with the data files written out-of-band — no
+    // cache entry, no stored piece hash → the v1 hash job pulls the
+    // block off disk.
+    io.insert_storage(StorageIndex(1), Box::new(storage(&make_fs(), &d)));
+    let hdone = Arc::new(AtomicUsize::new(0));
+    let d3 = Arc::clone(&hdone);
+    io.async_hash(
+        StorageIndex(1),
+        PieceIndex(0),
+        Vec::new(),
+        flags::V1_HASH,
+        Box::new(move |_, _, _, _, e| {
+            assert!(!e.is_err());
+            d3.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    wait_done(&io, &hdone, 1);
+    let s = io.queue_stats();
+    // piece 0 is 1024 B → one block pulled off disk.
+    assert_eq!(s.num_read_back, 1);
+    assert_eq!(s.num_blocks_read, 1);
+    assert_eq!(s.num_read_ops, 1);
+    // success-only timing legs: `disk_job_time` sums every kind.
+    assert!(s.disk_job_time >= s.disk_write_time);
+    assert!(s.disk_job_time >= s.disk_hash_time);
+    assert_eq!(s.num_jobs, 0, "pool counters balance after free_job");
+
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
 }

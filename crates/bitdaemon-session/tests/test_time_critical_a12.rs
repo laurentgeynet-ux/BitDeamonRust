@@ -93,7 +93,7 @@ fn cancel_non_critical_is_deferred() {
         c.pipeline.download_queue.push(PendingBlock::new(b));
         c.pipeline.outstanding_bytes += 0x4000;
     }
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
 
     let counters = Counters::default();
     let mut eff = Vec::new();
@@ -144,8 +144,12 @@ fn stalled_critical_piece_repicks_busy_blocks() {
         c1.pipeline.download_queue.push(PendingBlock::new(b));
         c1.pipeline.outstanding_bytes += 0x4000;
     }
-    t.add_peer(1, c1);
-    t.add_peer(2, conn(4));
+    t.add_peer(1, c1, &bitdaemon_session::counters::Counters::default());
+    t.add_peer(
+        2,
+        conn(4),
+        &bitdaemon_session::counters::Counters::default(),
+    );
 
     let mut eff = Vec::new();
     t.set_piece_deadline(PieceIndex(1), 5000, false, &counters, &mut eff);
@@ -179,7 +183,7 @@ fn choked_peer_is_not_a_critical_candidate() {
     t.init_picker(false);
     let mut c = conn(4);
     c.peer_choked = true;
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
     let counters = Counters::default();
     let mut eff = Vec::new();
     t.set_piece_deadline(PieceIndex(1), 5000, false, &counters, &mut eff);
@@ -280,7 +284,7 @@ fn cancel_skips_untracked_blocks() {
     // in-flight block on piece 3 never marked in the picker.
     c.pipeline.download_queue.push(PendingBlock::new(blk(3, 0)));
     c.pipeline.outstanding_bytes = 0x4000;
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
 
     let counters = Counters::default();
     let mut eff = Vec::new();

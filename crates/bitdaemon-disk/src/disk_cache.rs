@@ -1249,6 +1249,7 @@ mod tests {
     /// a write job parked on a block — `write_state = disk_job*`.
     fn parked_write() -> Box<DiskJob> {
         Box::new(DiskJob {
+            pool_counters: None,
             storage: StorageIndex(u32::MAX),
             flags: 0,
             ret: 0,
@@ -1395,6 +1396,7 @@ mod tests {
         let loc = (StorageIndex(0), PieceIndex(0));
         let writer = || {
             Box::new(DiskJob {
+                pool_counters: None,
                 storage: StorageIndex(0),
                 flags: job_flags::CACHED,
                 ret: 0,

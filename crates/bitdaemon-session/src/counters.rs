@@ -46,22 +46,76 @@ pub fn disconnect_reason_counter(reason: &str) -> Option<Counter> {
     Some(match reason {
         // `upload_upload_connection || uninteresting_upload_peer ||
         // torrent_aborted || self_connection || torrent_paused`
-        // upstream — closes that carry no blame.
+        // upstream — closes that carry no blame. `session_closing`
+        // is *not* in the upstream list (its only leg is the uTP
+        // close-reason `torrent_removed`).
         "self_connection"
-        | "upload-upload"
+        | "upload_upload_connection"
         | "torrent_paused"
-        | "session_closing"
         | "torrent_aborted"
         | "uninteresting_upload_peer" => Counter::UninterestingPeers,
         "too_many_connections" => Counter::TooManyPeers,
-        "out of memory" => Counter::NoMemoryPeers,
-        "timed_out" | "transport timed out" => Counter::TransportTimeoutPeers,
+        "no_memory" => Counter::NoMemoryPeers,
+        // `errors::timed_out || error::timed_out` upstream — the
+        // `timed_out` name covers both the libtorrent error and a
+        // transport timeout reported as an lt reason.
+        "timed_out" => Counter::TransportTimeoutPeers,
         "timed_out_inactivity" | "timed_out_no_request" | "timed_out_no_interest" => {
             Counter::TimeoutPeers
         }
         "timed_out_no_handshake" => Counter::ConnectTimeouts,
         _ => return None,
     })
+}
+
+/// `peer_connection::disconnect`'s per-`ec` transport legs — the
+/// `ec == error::*` (asio/system) side. `ErrorKind` alone cannot
+/// split EPERM from EACCES (both `PermissionDenied`) and std maps
+/// ENOBUFS/ECANCELED to `Uncategorized`, so the raw OS code is
+/// authoritative where present — errno and WSA literals, matching
+/// the codebase's existing convention (`file_pool`, `utp_socket`).
+#[must_use]
+pub fn transport_error_counter(kind: std::io::ErrorKind, raw: Option<i32>) -> Option<Counter> {
+    use std::io::ErrorKind as K;
+    if let Some(code) = raw {
+        match code {
+            // EPERM — upstream `error::no_permission`.
+            1 => return Some(Counter::PermPeers),
+            // EACCES / ERROR_ACCESS_DENIED / WSAEACCES —
+            // `error::access_denied`.
+            13 | 5 | 10013 => return Some(Counter::NoAccessPeers),
+            // EINVAL / ERROR_INVALID_PARAMETER / WSAEINVAL —
+            // `error::invalid_argument`.
+            22 | 87 | 10022 => return Some(Counter::InvalidArgPeers),
+            // ENOBUFS (linux 105 / BSD-macOS 55 / WSAENOBUFS) —
+            // `error::no_buffer_space`.
+            105 | 55 | 10055 => return Some(Counter::BufferPeers),
+            // EHOSTUNREACH (linux 113 / BSD-macOS 65 /
+            // WSAEHOSTUNREACH) — `error::host_unreachable`.
+            113 | 65 | 10065 => return Some(Counter::UnreachablePeers),
+            // ECANCELED (linux 125 / BSD-macOS 89 /
+            // WSA_OPERATION_ABORTED + ERROR_OPERATION_ABORTED 995) —
+            // `error::operation_aborted`.
+            125 | 89 | 995 => return Some(Counter::AbortedPeers),
+            _ => {}
+        }
+    }
+    match kind {
+        K::ConnectionReset => Some(Counter::ConnresetPeers),
+        K::UnexpectedEof => Some(Counter::EofPeers),
+        K::ConnectionRefused => Some(Counter::ConnrefusedPeers),
+        K::ConnectionAborted => Some(Counter::ConnabortedPeers),
+        K::NotConnected => Some(Counter::NotconnectedPeers),
+        // no raw code to split EPERM/EACCES — socket-side denials
+        // are overwhelmingly access_denied upstream.
+        K::PermissionDenied => Some(Counter::NoAccessPeers),
+        K::BrokenPipe => Some(Counter::BrokenPipePeers),
+        K::AddrInUse => Some(Counter::AddrinusePeers),
+        K::TimedOut => Some(Counter::TransportTimeoutPeers),
+        K::HostUnreachable => Some(Counter::UnreachablePeers),
+        K::InvalidInput => Some(Counter::InvalidArgPeers),
+        _ => None,
+    }
 }
 
 /// `stats_counter_t` + `stats_gauge_t` — the full upstream index set
@@ -1096,6 +1150,12 @@ impl Counters {
     pub fn value(&self, c: Counter) -> i64 {
         self.v[c as usize].load(Ordering::Relaxed)
     }
+    /// `counters[idx]` by raw index — the read side of `set_idx`/
+    /// `inc_idx`/`add_idx` (histogram buckets, contiguous groups).
+    #[must_use]
+    pub fn value_idx(&self, idx: usize) -> i64 {
+        self.v.get(idx).map_or(0, |c| c.load(Ordering::Relaxed))
+    }
 }
 
 /// `ses.stats_counters()` — the picker stats sink. Upstream's
@@ -1152,6 +1212,46 @@ pub fn utp_counter_sink(counters: &Arc<Counters>) -> UtpCounterSink {
         UtpStat::InvalidPktsIn => c.add(Counter::UtpInvalidPktsIn, delta),
         UtpStat::RedundantPktsIn => c.add(Counter::UtpRedundantPktsIn, delta),
         UtpStat::StateGauge(state) => c.add_idx(Counter::NumUtpIdle as usize + state, delta),
+    })
+}
+
+/// `dht_tracker`'s counter bridge — lands the DHT sink increments
+/// in this bank. `DhtStat::IpOverheadIn` folds into
+/// `recv_ip_overhead_bytes` (upstream incs it inline in
+/// `incoming_packet`); the `*_out`/dropped and `dht_bytes_out`
+/// legs are stamped at the engine's actual socket-send edge
+/// (`send_packet` upstream).
+#[must_use]
+pub fn dht_counter_sink(counters: &Arc<Counters>) -> bitdaemon_dht::dht_tracker::DhtCounterSink {
+    use bitdaemon_dht::dht_tracker::DhtStat;
+    let c = counters.clone();
+    std::sync::Arc::new(move |stat, delta| {
+        let counter = match stat {
+            DhtStat::MessagesIn => Counter::DhtMessagesIn,
+            DhtStat::MessagesInDropped => Counter::DhtMessagesInDropped,
+            DhtStat::BytesIn => Counter::DhtBytesIn,
+            DhtStat::IpOverheadIn => Counter::RecvIpOverheadBytes,
+            DhtStat::PingIn => Counter::DhtPingIn,
+            DhtStat::FindNodeIn => Counter::DhtFindNodeIn,
+            DhtStat::GetPeersIn => Counter::DhtGetPeersIn,
+            DhtStat::AnnouncePeerIn => Counter::DhtAnnouncePeerIn,
+            DhtStat::GetIn => Counter::DhtGetIn,
+            DhtStat::PutIn => Counter::DhtPutIn,
+            DhtStat::SampleInfohashesIn => Counter::DhtSampleInfohashesIn,
+            DhtStat::PingOut => Counter::DhtPingOut,
+            DhtStat::GetPeersOut => Counter::DhtGetPeersOut,
+            DhtStat::AnnouncePeerOut => Counter::DhtAnnouncePeerOut,
+            DhtStat::GetOut => Counter::DhtGetOut,
+            DhtStat::PutOut => Counter::DhtPutOut,
+            DhtStat::SampleInfohashesOut => Counter::DhtSampleInfohashesOut,
+            DhtStat::InvalidAnnounce => Counter::DhtInvalidAnnounce,
+            DhtStat::InvalidGetPeers => Counter::DhtInvalidGetPeers,
+            DhtStat::InvalidFindNode => Counter::DhtInvalidFindNode,
+            DhtStat::InvalidPut => Counter::DhtInvalidPut,
+            DhtStat::InvalidGet => Counter::DhtInvalidGet,
+            DhtStat::InvalidSampleInfohashes => Counter::DhtInvalidSampleInfohashes,
+        };
+        c.add(counter, delta);
     })
 }
 
@@ -1531,6 +1631,18 @@ pub fn metrics() -> Vec<StatsMetric> {
             }
         })
         .collect()
+}
+
+/// `find_metric_idx` — resolve a `"category.name"` metric string to
+/// its `value_index` into the stats snapshot (upstream returns -1
+/// for unknown names; `None` here).
+#[must_use]
+pub fn find_metric_idx(name: &str) -> Option<usize> {
+    let short = name.split('.').nth(1).unwrap_or(name);
+    if !METRIC_NAMES.contains(&name) {
+        return None;
+    }
+    COUNTER_NAMES.iter().position(|c| *c == short)
 }
 
 #[cfg(test)]

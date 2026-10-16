@@ -188,7 +188,7 @@ fn new_peer_connection_and_message_fanout() {
     // attach a peer → `new_peer_connection` fires once.
     let mut c = PeerConn::new(2, PeerPipeline::new(1000, 30, 250), 0);
     c.remote = Some("10.0.0.1:6881".parse().unwrap());
-    t.add_peer(9, c);
+    t.add_peer(9, c, &bitdaemon_session::counters::Counters::default());
     assert_eq!(rec.new_conns.load(Ordering::Relaxed), 1);
     assert_eq!(t.peers.get(&9).unwrap().plugins.len(), 1);
 
@@ -306,7 +306,7 @@ fn ut_metadata_requires_announced_extension() {
     let mut t = torrent(ih);
     let mut c = announced_conn();
     c.ext_ut_metadata = 0;
-    t.add_peer(9, c);
+    t.add_peer(9, c, &bitdaemon_session::counters::Counters::default());
     let mut out = Vec::new();
     t.on_peer_message(
         9,
@@ -330,7 +330,11 @@ fn ut_metadata_requires_announced_extension() {
 fn ut_metadata_malformed_disconnects_peer_error() {
     let ih = Sha1Hash::from_bytes(&[12; 20]).unwrap();
     let mut t = torrent(ih);
-    t.add_peer(9, announced_conn());
+    t.add_peer(
+        9,
+        announced_conn(),
+        &bitdaemon_session::counters::Counters::default(),
+    );
     let s = set();
     let counters = Counters::default();
     for body in [
@@ -373,7 +377,11 @@ fn ut_metadata_request_serving_and_counter_timing() {
     let ih = Sha1Hash::from_bytes(&[13; 20]).unwrap();
     let mut t = torrent(ih);
     t.metadata_raw = Some(vec![7u8; 32 * 1024]);
-    t.add_peer(9, announced_conn());
+    t.add_peer(
+        9,
+        announced_conn(),
+        &bitdaemon_session::counters::Counters::default(),
+    );
     let s = set();
     let counters = Counters::default();
     let mut out = Vec::new();
@@ -451,7 +459,7 @@ fn ut_metadata_piece_chains_next_request() {
     let mut c = announced_conn();
     c.ext_ut_metadata = 2;
     c.metadata_size = Some(32 * 1024);
-    t.add_peer(9, c);
+    t.add_peer(9, c, &bitdaemon_session::counters::Counters::default());
     let s = set();
     let counters = Counters::default();
     let mut out = Vec::new();
@@ -527,7 +535,7 @@ fn allowed_fast_deferred_to_first_interested() {
     let mut t = torrent(ih);
     let mut c = announced_conn();
     c.supports_fast = true;
-    t.add_peer(9, c);
+    t.add_peer(9, c, &bitdaemon_session::counters::Counters::default());
     let s = set();
     let counters = Counters::default();
     let mut out = Vec::new();
@@ -566,7 +574,7 @@ fn suggest_negative_index_dropped() {
     let mut t = torrent(ih);
     let mut c = announced_conn();
     c.supports_fast = true;
-    t.add_peer(9, c);
+    t.add_peer(9, c, &bitdaemon_session::counters::Counters::default());
     let mut out = Vec::new();
     t.on_peer_message(
         9,
@@ -589,7 +597,7 @@ fn ut_pex_severities() {
     let mut t = torrent(ih);
     let mut c = announced_conn();
     c.ext_ut_pex = 1;
-    t.add_peer(9, c);
+    t.add_peer(9, c, &bitdaemon_session::counters::Counters::default());
     let s = set();
     let counters = Counters::default();
 
@@ -655,7 +663,11 @@ fn pex_tick_per_conn_first_list() {
         c.remote = Some(format!("{ip}:6881").parse().unwrap());
         c
     };
-    t.add_peer(9, mk("10.0.0.9"));
+    t.add_peer(
+        9,
+        mk("10.0.0.9"),
+        &bitdaemon_session::counters::Counters::default(),
+    );
     let now = Instant::now();
     let mut out = Vec::new();
 
@@ -667,7 +679,11 @@ fn pex_tick_per_conn_first_list() {
 
     // second conn attaches — the very next tick sends both peers a
     // full list, no torrent-global 60 s delay.
-    t.add_peer(10, mk("10.0.0.10"));
+    t.add_peer(
+        10,
+        mk("10.0.0.10"),
+        &bitdaemon_session::counters::Counters::default(),
+    );
     t.pex_tick(now + Duration::from_secs(5), &mut out);
     let pex_to = |out: &[TorrentEffect], id: u64| {
         out.iter()
@@ -694,7 +710,11 @@ fn pex_tick_per_conn_first_list() {
     // a third conn attaching now gets its own first list on the
     // next tick — its `m_last_msg` starts at `min_time()`, it does
     // not wait out the others' window (this is the N14 regression).
-    t.add_peer(11, mk("10.0.0.11"));
+    t.add_peer(
+        11,
+        mk("10.0.0.11"),
+        &bitdaemon_session::counters::Counters::default(),
+    );
     t.pex_tick(now + Duration::from_secs(7), &mut out);
     assert_eq!(pex_to(&out, 11), 1, "fresh conn must get its first list");
     assert_eq!(pex_to(&out, 9), 0);
@@ -721,8 +741,8 @@ fn pex_seed_flag_uses_valid_metadata() {
     // receiver conn.
     let mut recv = announced_conn();
     recv.ext_ut_pex = 1;
-    t.add_peer(9, seed);
-    t.add_peer(10, recv);
+    t.add_peer(9, seed, &bitdaemon_session::counters::Counters::default());
+    t.add_peer(10, recv, &bitdaemon_session::counters::Counters::default());
     let mut out = Vec::new();
     t.pex_tick(Instant::now(), &mut out);
     let body = out
@@ -755,7 +775,7 @@ fn pex_known_capped_per_family() {
     let mut t = torrent(ih);
     let mut c = announced_conn();
     c.ext_ut_pex = 1;
-    t.add_peer(9, c);
+    t.add_peer(9, c, &bitdaemon_session::counters::Counters::default());
     // 60 v4 + 30 v6, remote is local so the is_local filter lets
     // private-space addrs through.
     let peers: Vec<(std::net::SocketAddr, u8)> = (0..60u16)
@@ -802,9 +822,21 @@ fn allowed_set_gates_on_remote_upload_only() {
         }
         c
     };
-    t.add_peer(9, mk(true, false)); // BEP-21 upload-only
-    t.add_peer(10, mk(false, true)); // seed
-    t.add_peer(11, mk(false, false)); // leecher
+    t.add_peer(
+        9,
+        mk(true, false),
+        &bitdaemon_session::counters::Counters::default(),
+    ); // BEP-21 upload-only
+    t.add_peer(
+        10,
+        mk(false, true),
+        &bitdaemon_session::counters::Counters::default(),
+    ); // seed
+    t.add_peer(
+        11,
+        mk(false, false),
+        &bitdaemon_session::counters::Counters::default(),
+    ); // leecher
     let mut out = Vec::new();
     for id in [9u64, 10, 11] {
         t.on_peer_message(id, &PeerMessage::Interested, 0, &s, &counters, &mut out);
@@ -832,7 +864,7 @@ fn allowed_set_gates_on_remote_upload_only() {
     t.upload_mode = true;
     let mut c = mk(false, false);
     c.remote = Some("10.0.0.12:6881".parse().unwrap());
-    t.add_peer(12, c);
+    t.add_peer(12, c, &bitdaemon_session::counters::Counters::default());
     out.clear();
     t.on_peer_message(12, &PeerMessage::Interested, 0, &s, &counters, &mut out);
     assert!(
@@ -857,8 +889,16 @@ fn interested_sets_has_metadata_donthave_doesnt() {
     let mut t = torrent(ih);
     let s = set();
     let counters = Counters::default();
-    t.add_peer(9, announced_conn());
-    t.add_peer(10, announced_conn());
+    t.add_peer(
+        9,
+        announced_conn(),
+        &bitdaemon_session::counters::Counters::default(),
+    );
+    t.add_peer(
+        10,
+        announced_conn(),
+        &bitdaemon_session::counters::Counters::default(),
+    );
     let mut out = Vec::new();
     // `m_has_metadata` ctor is `true` upstream — only a peer that
     // advertised `ut_metadata` without `metadata_size` starts out
@@ -906,7 +946,7 @@ fn dont_have_on_disconnecting_conn_is_silent() {
     // BEP-6 DontHave arm.
     let mut c = announced_conn();
     c.disconnecting = true;
-    t.add_peer(9, c);
+    t.add_peer(9, c, &bitdaemon_session::counters::Counters::default());
     let mut out = Vec::new();
     t.on_peer_message(
         9,
@@ -930,7 +970,7 @@ fn dont_have_on_disconnecting_conn_is_silent() {
     c.ext_dont_have = 7;
     c.local_dont_have = 7;
     c.disconnecting = true;
-    t.add_peer(10, c);
+    t.add_peer(10, c, &bitdaemon_session::counters::Counters::default());
     out.clear();
     t.on_peer_message(
         10,
@@ -970,7 +1010,7 @@ fn send_upload_only_full_not_interested_legs() {
     c9.has_metadata = true;
     c9.pipeline.slow_start = true;
     counters.add(Counter::NumPeersDownInterested, 1);
-    t.add_peer(9, c9);
+    t.add_peer(9, c9, &bitdaemon_session::counters::Counters::default());
     // conn 10 — uninterested upload-only seed: `disconnect_if_redundant`
     // fires instead of a wire message.
     let mut c10 = announced_conn();
@@ -981,7 +1021,7 @@ fn send_upload_only_full_not_interested_legs() {
     c10.peer_pieces.set_all();
     c10.num_pieces = 2;
     c10.remote = Some("10.0.0.10:6881".parse().unwrap());
-    t.add_peer(10, c10);
+    t.add_peer(10, c10, &bitdaemon_session::counters::Counters::default());
 
     let mut out = Vec::new();
     t.set_upload_mode(true, &s, &counters, &mut out);
@@ -1032,7 +1072,7 @@ fn disconnect_if_redundant_honors_plugin_veto() {
     c.peer_pieces.set_all();
     c.num_pieces = 2;
     c.plugins.push(Arc::new(VetoDisconnect));
-    t.add_peer(9, c);
+    t.add_peer(9, c, &bitdaemon_session::counters::Counters::default());
     t.upload_mode = true;
     let mut out = Vec::new();
     assert!(!t.disconnect_if_redundant(9, &mut out));
@@ -1078,8 +1118,8 @@ fn smart_ban_fed_by_hash_job_digests() {
     let c10 = mk(8, "10.0.0.10");
     let key9 = c9.peer_key().unwrap();
     let key10 = c10.peer_key().unwrap();
-    t.add_peer(9, c9);
-    t.add_peer(10, c10);
+    t.add_peer(9, c9, &bitdaemon_session::counters::Counters::default());
+    t.add_peer(10, c10, &bitdaemon_session::counters::Counters::default());
     // swarm entries `find_peers`/`peer_index` resolve for the ban
     // and the trust-points legs.
     for ip in ["10.0.0.9:6881", "10.0.0.10:6881"] {

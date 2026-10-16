@@ -50,6 +50,11 @@ struct Pending {
 pub struct RpcManager {
     /// `m_transactions` (multimap tid → pending).
     transactions: HashMap<u16, Vec<Pending>>,
+    /// `m_counters` — the query-type `dht_*_out` legs count inside
+    /// `invoke`, like upstream's per-`invoke` inc sites (the
+    /// send-failure path counts too — upstream incs before
+    /// `m_rpc.invoke` resolves the transport).
+    pub counter_sink: Option<crate::dht_tracker::DhtCounterSink>,
 }
 
 /// Outcome of [`RpcManager::incoming`].
@@ -90,6 +95,28 @@ impl RpcManager {
         native_v6: bool,
         send: impl FnOnce(Entry, SocketAddr) -> bool,
     ) -> Option<u16> {
+        // upstream `*_invoke` incs `dht_<q>_out` before the
+        // transaction registers — same edge here, one funnel.
+        // (`dht_find_node_out` is declared but dead upstream —
+        // `find_data::invoke` never incs it.)
+        if let Some(s) = &self.counter_sink {
+            use crate::dht_tracker::DhtStat;
+            let stat = q.dict().ok().and_then(|d| match d.get(b"q".as_slice()) {
+                Some(Entry::String(n)) => match n.as_slice() {
+                    b"ping" => Some(DhtStat::PingOut),
+                    b"get_peers" => Some(DhtStat::GetPeersOut),
+                    b"announce_peer" => Some(DhtStat::AnnouncePeerOut),
+                    b"get" => Some(DhtStat::GetOut),
+                    b"put" => Some(DhtStat::PutOut),
+                    b"sample_infohashes" => Some(DhtStat::SampleInfohashesOut),
+                    _ => None,
+                },
+                _ => None,
+            });
+            if let Some(stat) = stat {
+                s(stat, 1);
+            }
+        }
         let tid: u16 = rand::random();
         let e = q.dict_mut().ok()?;
         e.entry("y".into()).or_insert(Entry::String(b"q".to_vec()));
