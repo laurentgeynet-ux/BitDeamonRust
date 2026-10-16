@@ -59,7 +59,7 @@ fn peer_bitfield_refcounts_picker() {
         &bitdaemon_session::counters::Counters::default(),
         &mut eff,
     );
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
     let mut out = Vec::new();
     t.apply_peer_effects(
         1,
@@ -95,8 +95,16 @@ fn peer_bitfield_refcounts_picker() {
 fn piece_verified_broadcasts_have() {
     let mut t = torrent(4);
     t.init_picker(true);
-    t.add_peer(1, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
-    t.add_peer(2, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
+    t.add_peer(
+        1,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        &bitdaemon_session::counters::Counters::default(),
+    );
+    t.add_peer(
+        2,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        &bitdaemon_session::counters::Counters::default(),
+    );
     finish_piece(&mut t, PieceIndex(0));
     // `announce_piece` skips conns still in handshake.
     for c in t.peers.values_mut() {
@@ -170,7 +178,7 @@ fn rates_stay_nonnegative_on_disconnect() {
     let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
     c.stat_down_total = 1_000_000;
     c.stat_up_total = 500_000;
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
     let t0 = std::time::Instant::now();
     t.update_rates(t0, &mut Vec::new());
     // peer leaves between ticks — its totals vanish from the sum
@@ -200,7 +208,7 @@ fn payload_totals_survive_disconnect() {
     let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
     c.stat_down_total = 1_000_000;
     c.stat_up_total = 500_000;
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
     assert_eq!(t.total_download(), 1_000_000);
     assert_eq!(t.total_upload(), 500_000);
     let mut eff = Vec::new();
@@ -288,7 +296,7 @@ fn fill_send_buffer_gates_reads_on_watermark() {
         start: 0,
         length: 0x4000,
     });
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
 
     let mut out = Vec::new();
     t.fill_send_buffer(
@@ -364,7 +372,7 @@ fn fill_send_buffer_gates_reads_on_watermark() {
             length: 0x4000,
         });
     }
-    t.add_peer(2, c2);
+    t.add_peer(2, c2, &bitdaemon_session::counters::Counters::default());
     let mut out4 = Vec::new();
     t.fill_send_buffer(
         2,
@@ -550,7 +558,7 @@ fn hash_fail_penalizes_dead_conn_culprit() {
     c.remote = Some(remote);
     c.peer_id = Some(bitdaemon_common::PeerId::from_bytes(&[0x42; 20]).unwrap());
     let key = c.peer_key().unwrap();
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
     // attribute every block of piece 1 to that downloader, all
     // written (finished blocks keep their `block_info.peer`).
     if let Some(p) = t.picker.as_mut() {
@@ -616,7 +624,7 @@ fn piece_pass_rewards_dead_conn_downloader() {
     c.remote = Some(remote);
     c.peer_id = Some(bitdaemon_common::PeerId::from_bytes(&[0x42; 20]).unwrap());
     let key = c.peer_key().unwrap();
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
     if let Some(p) = t.picker.as_mut() {
         for b in 0..p.blocks_in_piece(PieceIndex(1)) {
             let blk = PieceBlock {
@@ -669,7 +677,7 @@ fn choke_emits_choke_before_rejects() {
             length: 0x4000,
         });
     }
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
 
     let counters = Counters::default();
     let mut out = Vec::new();
@@ -712,7 +720,7 @@ fn missing_piece_request_counts_invalid() {
         start: 0,
         length: 0x4000,
     });
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
 
     let counters = Counters::default();
     let mut out = Vec::new();

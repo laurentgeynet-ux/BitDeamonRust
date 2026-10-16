@@ -332,6 +332,8 @@ fn connect_candidates_backoff_on_failure() {
             .get_mut(&ih)
             .unwrap()
             .try_connect_peer(0, &st, &[])
+            .0
+            .into_dial()
             .is_none()
     );
     // dial fails → backoff window blocks re-dial at t=1
@@ -341,6 +343,8 @@ fn connect_candidates_backoff_on_failure() {
             .get_mut(&ih)
             .unwrap()
             .try_connect_peer(1, &st, &[])
+            .0
+            .into_dial()
             .is_none()
     );
     // after min_reconnect_time*(failcount+1)=120s it's a candidate again
@@ -348,7 +352,9 @@ fn connect_candidates_backoff_on_failure() {
         .torrents
         .get_mut(&ih)
         .unwrap()
-        .try_connect_peer(200, &st, &[]);
+        .try_connect_peer(200, &st, &[])
+        .0
+        .into_dial();
     assert_eq!(c.map(|x| x.0), Some(ep));
 }
 
@@ -378,7 +384,11 @@ fn ip_filter_bans_and_disconnects() {
         bitdaemon_common::flags::PeerSourceFlags::TRACKER,
         &mut Vec::new(),
     );
-    t.add_peer(1, PeerConn::new(1, PeerPipeline::new(1, 1, 1), 0));
+    t.add_peer(
+        1,
+        PeerConn::new(1, PeerPipeline::new(1, 1, 1), 0),
+        &bitdaemon_session::counters::Counters::default(),
+    );
     s.add_torrent(t);
     // pretend peer 1 is connected from `bad`
     s.torrents
@@ -509,7 +519,11 @@ fn do_pause_disconnects_peers() {
         StorageIndex(0),
     );
     let pid = 7;
-    t.add_peer(pid, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
+    t.add_peer(
+        pid,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        &bitdaemon_session::counters::Counters::default(),
+    );
     s.add_torrent(t);
 
     // non-graceful pause → disconnect_all(errors::torrent_paused)
@@ -539,7 +553,7 @@ fn idle_peer_times_out() {
     let mut c = PeerConn::new(1, PeerPipeline::new(1, 1, 1), 0);
     c.connecting = false;
     c.handshake_done = true;
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
     s.add_torrent(t);
     // last_receive_ms=0; now_ms≈0 → no timeout yet
     let mut out = Vec::new();
@@ -1350,8 +1364,13 @@ fn dht_announce_tick_issues_get_peers() {
     let mut out = Vec::new();
     s.tick(&mut out);
     let to_router = out.iter().any(|e| {
-        matches!(e, SessionOut::UdpPacket(pkt, to)
-            if to.port() == 51413 && pkt.windows(9).any(|w| w == b"get_peers"))
+        // DHT datagrams ride `DhtPacket` (own counter legs); generic
+        // `UdpPacket` remains for LSD.
+        let (pkt, to) = match e {
+            SessionOut::DhtPacket(pkt, to) | SessionOut::UdpPacket(pkt, to) => (pkt, to),
+            _ => return false,
+        };
+        to.port() == 51413 && pkt.windows(9).any(|w| w == b"get_peers")
     });
     assert!(to_router, "expected get_peers datagram to router node");
 }

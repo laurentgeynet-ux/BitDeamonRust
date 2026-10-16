@@ -71,7 +71,7 @@ fn request_timeout_requires_reading_socket() {
     c.now_ms = 40_000;
     c.bw.quota[DOWNLOAD_CHANNEL].store(1, Relaxed);
     t.now_ms = 40_000;
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
 
     let s = SessionSettings::default();
     let counters = Counters::default();
@@ -149,7 +149,7 @@ fn redundant_piece_keeps_snub_and_skips_graceful() {
         eff.iter().any(|e| matches!(e, PeerEffect::Unsnub)),
         "window evaluated at receipt: {eff:?}"
     );
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
     let mut out = Vec::new();
     t.apply_peer_effects(
         1,
@@ -208,7 +208,7 @@ fn live_piece_unsnubs_and_runs_graceful_check() {
         &Counters::default(),
         &mut eff,
     );
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
     let mut out = Vec::new();
     t.apply_peer_effects(
         1,
@@ -252,7 +252,7 @@ fn down_requests_gauge_reconciles_once() {
     let mut c = conn(4);
     c.pipeline.download_queue.push(PendingBlock::new(b));
     c.pipeline.outstanding_bytes = 0x4000;
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
     t.sync_down_requests(&counters);
     assert_eq!(counters.value(Counter::NumPeersDownRequests), 1);
 
@@ -313,7 +313,7 @@ fn aborted_torrent_drops_incoming_piece() {
         &Counters::default(),
         &mut eff,
     );
-    t.add_peer(1, c);
+    t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
     let counters = Counters::default();
     let mut pool = PeerClassPool::new();
     let mut abort_out = Vec::new();

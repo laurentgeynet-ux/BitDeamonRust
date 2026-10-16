@@ -118,7 +118,11 @@ fn smart_ban_disconnects_corrupt_peer() {
     let ih = Sha1Hash::from_bytes(&[9; 20]).unwrap();
     let mut t = Torrent::new(ih, 1, 16384, Bitfield::with_size(1), StorageIndex(0));
     t.init_picker(true);
-    t.add_peer(7, PeerConn::new(1, PeerPipeline::new(1000, 30, 250), 0));
+    t.add_peer(
+        7,
+        PeerConn::new(1, PeerPipeline::new(1000, 30, 250), 0),
+        &bitdaemon_session::counters::Counters::default(),
+    );
     // upstream `on_piece_verified` ignores pieces the picker doesn't
     // consider finished — simulate the download completing.
     if let Some(p) = t.picker.as_mut() {
@@ -180,7 +184,11 @@ fn pex_feeds_swarm_and_broadcasts() {
 
     let ih = Sha1Hash::from_bytes(&[3; 20]).unwrap();
     let mut t = Torrent::new(ih, 4, 16384, Bitfield::with_size(4), StorageIndex(0));
-    t.add_peer(7, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
+    t.add_peer(
+        7,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        &bitdaemon_session::counters::Counters::default(),
+    );
     let mut out = Vec::new();
 
     // peer advertises ut_pex id 2
@@ -226,7 +234,11 @@ fn pex_feeds_swarm_and_broadcasts() {
 
     // a second connected peer — upstream's peer tick skips pex
     // entirely when `num_peers() <= 1`
-    t.add_peer(8, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
+    t.add_peer(
+        8,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        &bitdaemon_session::counters::Counters::default(),
+    );
 
     // tick → we emit a pex diff to the peer (contains peer 7? we
     // advertise remote endpoints of our connections — none have
@@ -268,7 +280,11 @@ fn pex_advertises_only_completed_dialable_peers() {
 
     // recipient conn — speaks ut_pex but stays "connecting" so it is
     // not itself advertised
-    t.add_peer(7, PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0));
+    t.add_peer(
+        7,
+        PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0),
+        &bitdaemon_session::counters::Counters::default(),
+    );
     let mut m = BTreeMap::new();
     m.insert("ut_pex".to_string(), 2);
     let hs = ExtendedHandshake {
@@ -305,7 +321,7 @@ fn pex_advertises_only_completed_dialable_peers() {
     seed.outgoing = true;
     seed.num_pieces = 4;
     seed.peer_pieces.set_all(); // seed → pex_seed flag
-    t.add_peer(8, seed);
+    t.add_peer(8, seed, &bitdaemon_session::counters::Counters::default());
 
     // inbound conn that shared `p` — advertised at the listen port,
     // not the ephemeral source port
@@ -313,7 +329,11 @@ fn pex_advertises_only_completed_dialable_peers() {
     let mut inbound = mk(inbound_src);
     inbound.received_listen_port = true;
     inbound.peer_listen_port = Some(6883);
-    t.add_peer(9, inbound);
+    t.add_peer(
+        9,
+        inbound,
+        &bitdaemon_session::counters::Counters::default(),
+    );
 
     // inbound without `p` — never advertised
     let mut nop = mk(SocketAddr::new(
@@ -321,7 +341,7 @@ fn pex_advertises_only_completed_dialable_peers() {
         55001,
     ));
     nop.outgoing = false;
-    t.add_peer(10, nop);
+    t.add_peer(10, nop, &bitdaemon_session::counters::Counters::default());
 
     // outgoing but pre-handshake — never advertised (the prod bug:
     // these fields stayed false forever)
@@ -331,7 +351,11 @@ fn pex_advertises_only_completed_dialable_peers() {
     ));
     hs_pending.outgoing = true;
     hs_pending.handshake_done = false;
-    t.add_peer(11, hs_pending);
+    t.add_peer(
+        11,
+        hs_pending,
+        &bitdaemon_session::counters::Counters::default(),
+    );
 
     let mut out = Vec::new();
     t.pex_tick(std::time::Instant::now(), &mut out);
@@ -631,7 +655,7 @@ fn set_metadata_disconnects_redundant_peers() {
     t.upload_mode = true;
     let mut c = PeerConn::new(1, PeerPipeline::new(1000, 30, 250), 0);
     c.remote_upload_only = true;
-    t.add_peer(7, c);
+    t.add_peer(7, c, &bitdaemon_session::counters::Counters::default());
 
     let r = t.on_ut_metadata_data(&info, 0, info.len() as i64, 7, 30 * 1024 * 1024);
     assert_eq!(r, MetadataResult::Complete);

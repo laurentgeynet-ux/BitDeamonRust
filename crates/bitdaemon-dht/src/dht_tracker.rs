@@ -21,8 +21,78 @@ use crate::node_id::NodeId;
 /// secret rotation cadence upstream (`refresh_key_timer`, 5 min).
 pub const SECRET_ROTATION: Duration = Duration::from_secs(300);
 
+/// Upstream `counters` channels the DHT layer increments, mirroring
+/// `performance_counters.hpp`. Emitted through
+/// [`DhtTracker::set_counter_sink`]; a `None` sink skips the call like
+/// upstream's `inc_stats_counter` on the session counters — a pure
+/// observability hook (same pattern as `UtpCounterSink`).
+///
+/// `dht_find_node_out` is declared upstream but *never*
+/// incremented (`find_data::invoke` skips it) — verbatim dead.
+/// `dht_messages_out`/`dht_bytes_out`/`dht_messages_out_dropped`
+/// and the `sent_ip_overhead_bytes` leg are stamped at the actual
+/// send edge (`send_packet` upstream): they live on the session
+/// side, where the socket send's success/failure is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DhtStat {
+    /// `dht_messages_in` — a datagram that passed the `d…e` sniff.
+    MessagesIn,
+    /// `dht_messages_in_dropped` — dark-internet, ip-filter,
+    /// dos-blocker, bdecode/non-dict drops and quota-refused
+    /// queries.
+    MessagesInDropped,
+    /// `dht_bytes_in` — payload is the datagram size.
+    BytesIn,
+    /// `recv_ip_overhead_bytes` for a DHT datagram — payload is
+    /// 28 (v4) or 48 (v6).
+    IpOverheadIn,
+    /// `dht_ping_in`.
+    PingIn,
+    /// `dht_find_node_in`.
+    FindNodeIn,
+    /// `dht_get_peers_in`.
+    GetPeersIn,
+    /// `dht_announce_peer_in`.
+    AnnouncePeerIn,
+    /// `dht_get_in`.
+    GetIn,
+    /// `dht_put_in`.
+    PutIn,
+    /// `dht_sample_infohashes_in`.
+    SampleInfohashesIn,
+    /// `dht_ping_out`.
+    PingOut,
+    /// `dht_get_peers_out`.
+    GetPeersOut,
+    /// `dht_announce_peer_out`.
+    AnnouncePeerOut,
+    /// `dht_get_out`.
+    GetOut,
+    /// `dht_put_out`.
+    PutOut,
+    /// `dht_sample_infohashes_out`.
+    SampleInfohashesOut,
+    /// `dht_invalid_announce`.
+    InvalidAnnounce,
+    /// `dht_invalid_get_peers`.
+    InvalidGetPeers,
+    /// `dht_invalid_find_node`.
+    InvalidFindNode,
+    /// `dht_invalid_put`.
+    InvalidPut,
+    /// `dht_invalid_get`.
+    InvalidGet,
+    /// `dht_invalid_sample_infohashes`.
+    InvalidSampleInfohashes,
+}
+
+/// `m_counters.inc_stats_counter(stat, delta)` sink.
+pub type DhtCounterSink = std::sync::Arc<dyn Fn(DhtStat, i64) + Send + Sync>;
+
 /// Per-family node map (`m_nodes` keyed by listen socket).
 pub struct DhtTracker {
+    /// `m_counters` — session counter bank sink.
+    counter_sink: Option<DhtCounterSink>,
     /// v4 node (`"n4"`/`"nodes"` protocol).
     pub v4: Option<DhtNode>,
     /// v6 node (`"n6"`/`"nodes6"`).
@@ -42,6 +112,7 @@ pub struct DhtTracker {
 impl Default for DhtTracker {
     fn default() -> Self {
         Self {
+            counter_sink: None,
             v4: None,
             v6: None,
             last_key_rotation: None,
@@ -66,7 +137,8 @@ impl DhtTracker {
         let stored = id.or_else(|| st.nids.iter().find(|(a, _)| *a == bind_ip).map(|(_, i)| *i));
         self.settings = settings.clone();
         self.send_quota = i64::from(settings.upload_rate_limit);
-        let node = DhtNode::new(stored, bind_ip, bind_ip.is_ipv6(), settings);
+        let mut node = DhtNode::new(stored, bind_ip, bind_ip.is_ipv6(), settings);
+        node.set_counter_sink(self.counter_sink.clone());
         if bind_ip.is_ipv6() {
             self.v6 = Some(node);
         } else {
@@ -91,6 +163,36 @@ impl DhtTracker {
         } else {
             self.v4.as_ref()
         }
+    }
+
+    /// install the session counter bank — propagates to both live
+    /// nodes (and any node `bind` creates later).
+    pub fn set_counter_sink(&mut self, sink: Option<DhtCounterSink>) {
+        self.counter_sink = sink;
+        for n in [&mut self.v4, &mut self.v6].into_iter().flatten() {
+            n.set_counter_sink(self.counter_sink.clone());
+        }
+    }
+
+    /// `dht_tracker::update_stats_counters` — the snapshot gauges
+    /// (`dht_torrents`/`dht_peers`/`dht_immutable`/`dht_mutable`
+    /// from storage, `dht_nodes`/`dht_node_cache`/
+    /// `dht_allocated_observers` summed over the nodes).
+    #[must_use]
+    pub fn stats_counters(&self) -> DhtGaugeSnapshot {
+        let mut snap = DhtGaugeSnapshot::default();
+        for n in [&self.v4, &self.v6].into_iter().flatten() {
+            let (nodes, repl, _confirmed) = n.table.size();
+            snap.nodes += nodes as i64;
+            snap.node_cache += repl as i64;
+            snap.allocated_observers += n.rpc.outstanding() as i64;
+            let sc = n.storage.counters();
+            snap.torrents += i64::from(sc.torrents);
+            snap.peers += i64::from(sc.peers);
+            snap.immutable_data += i64::from(sc.immutable_data);
+            snap.mutable_data += i64::from(sc.mutable_data);
+        }
+        snap
     }
 
     /// `dht_tracker::has_quota` — token-bucket refill; `false` when
@@ -136,7 +238,15 @@ impl DhtTracker {
     }
 
     /// feed a datagram; returns any immediate reply to send.
-    pub fn incoming(&mut self, from: SocketAddr, buf: &[u8]) -> Option<(Vec<u8>, SocketAddr)> {
+    /// `filtered` carries the session's `apply_filter_to_dht` +
+    /// `ip_filter.access` verdict (upstream reads the filter inside
+    /// `incoming_packet`, after the dark-internet drop).
+    pub fn incoming(
+        &mut self,
+        from: SocketAddr,
+        buf: &[u8],
+        filtered: bool,
+    ) -> Option<(Vec<u8>, SocketAddr)> {
         // `dht_tracker::incoming_packet` — anything that doesn't
         // look like a bencoded dict isn't DHT at all: it is dropped
         // before counters, ip_filter and the dos-blocker, so other
@@ -144,6 +254,13 @@ impl DhtTracker {
         // tracker replies) never consume rate-limit budget.
         if buf.len() <= 20 || buf.first() != Some(&b'd') || buf.last() != Some(&b'e') {
             return None;
+        }
+        // upstream counts bytes/messages + IP overhead right after
+        // the sniff, before every drop leg below.
+        if let Some(s) = &self.counter_sink {
+            s(DhtStat::BytesIn, buf.len() as i64);
+            s(DhtStat::IpOverheadIn, if from.is_ipv6() { 48 } else { 28 });
+            s(DhtStat::MessagesIn, 1);
         }
         // `dht_ignore_dark_internet` — drop packets from the class-A
         // ranges that can't be public internet (v4 only).
@@ -154,8 +271,19 @@ impl DhtTracker {
                 3, 6, 7, 9, 11, 19, 21, 22, 25, 26, 28, 29, 30, 33, 34, 48, 56,
             ];
             if CLASS_A.contains(&a.octets()[0]) {
+                if let Some(s) = &self.counter_sink {
+                    s(DhtStat::MessagesInDropped, 1);
+                }
                 return None;
             }
+        }
+        // `apply_filter_to_dht` + `ip_filter::blocked` — the verdict
+        // is computed by the caller (the filter lives in session).
+        if filtered {
+            if let Some(s) = &self.counter_sink {
+                s(DhtStat::MessagesInDropped, 1);
+            }
+            return None;
         }
 
         let quota_ok = self.has_quota();
@@ -234,4 +362,26 @@ impl DhtTracker {
             self.v4.as_mut()
         }
     }
+}
+
+/// `dht_tracker::update_stats_counters` output — the gauge values
+/// the caller `set_value`s into the session bank (upstream zeroes
+/// `dht_nodes`/`dht_node_cache`/`dht_allocated_observers` then
+/// accumulates per node — equivalent to a plain sum here).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DhtGaugeSnapshot {
+    /// `dht_nodes` — live routing-table entries, both families.
+    pub nodes: i64,
+    /// `dht_node_cache` — replacement cache entries.
+    pub node_cache: i64,
+    /// `dht_allocated_observers` — in-flight RPC transactions.
+    pub allocated_observers: i64,
+    /// `dht_torrents` — storage info-hash count.
+    pub torrents: i64,
+    /// `dht_peers` — stored announce endpoints.
+    pub peers: i64,
+    /// `dht_immutable_data` — BEP-44 immutable items held.
+    pub immutable_data: i64,
+    /// `dht_mutable_data` — BEP-44 mutable items held.
+    pub mutable_data: i64,
 }

@@ -982,6 +982,34 @@ pub struct PeerAttach {
     pub out_enabled: bool,
 }
 
+/// `torrent::try_connect_peer` verdict — the caller picks the
+/// right `*_connection_attempts` counter leg (upstream
+/// `try_connect_peer` returns bool but incs `no_peer_` vs
+/// `missed_` on the two failure paths).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectOutcome {
+    /// `connect_to_peer` accepted — a dial was handed out.
+    Dial(std::net::SocketAddr, bitdaemon_common::PeerId),
+    /// `connect_one_peer` returned nullptr —
+    /// `no_peer_connection_attempts`.
+    ListEmpty,
+    /// `connect_to_peer` refused the entry —
+    /// `missed_connection_attempts`.
+    Refused,
+}
+
+impl ConnectOutcome {
+    /// The `Option<(endpoint, pid)>` shape callers that don't care
+    /// about the failure-leg distinction can consume.
+    #[must_use]
+    pub fn into_dial(self) -> Option<(std::net::SocketAddr, bitdaemon_common::PeerId)> {
+        match self {
+            Self::Dial(ep, pid) => Some((ep, pid)),
+            Self::ListEmpty | Self::Refused => None,
+        }
+    }
+}
+
 impl Torrent {
     /// `peer_connection::send_allowed_set` — BEP-6: when the peer
     /// negotiated the FAST extension, advertise a deterministic
@@ -1915,7 +1943,7 @@ impl Torrent {
         if body.len() > 17 * 1024 {
             out.push(TorrentEffect::DisconnectPeer {
                 peer,
-                reason: "invalid metadata message",
+                reason: "invalid_metadata_message",
                 sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
             });
             return;
@@ -1932,7 +1960,7 @@ impl Torrent {
                 // `msg_type`|`piece` → `invalid_metadata_message`.
                 out.push(TorrentEffect::DisconnectPeer {
                     peer,
-                    reason: "invalid metadata message",
+                    reason: "invalid_metadata_message",
                     sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
                 });
                 return;
@@ -2289,7 +2317,7 @@ impl Torrent {
         if body.len() > 500 * 1024 {
             out.push(TorrentEffect::DisconnectPeer {
                 peer: peer_id,
-                reason: "pex message too large",
+                reason: "pex_message_too_large",
                 sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
             });
             return;
@@ -2305,7 +2333,7 @@ impl Torrent {
         {
             out.push(TorrentEffect::DisconnectPeer {
                 peer: peer_id,
-                reason: "too frequent pex",
+                reason: "too_frequent_pex",
                 // upstream `too_frequent_pex` disconnects at default
                 // (normal) severity.
                 sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
@@ -2321,7 +2349,7 @@ impl Torrent {
             // `ret != 0 || !dict` → `invalid_pex_message`.
             out.push(TorrentEffect::DisconnectPeer {
                 peer: peer_id,
-                reason: "invalid pex message",
+                reason: "invalid_pex_message",
                 sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
             });
             return;
@@ -3230,8 +3258,10 @@ impl Torrent {
                 .peers
                 .get(&pid)
                 .is_some_and(|c| c.interesting && !c.peer_choked && !c.connecting);
-            if kick {
-                self.drive_peer(pid, s, counters, out);
+            // `request_a_block` success → `unchoke_piece_picks`
+            // (torrent.cpp:9247 — same leg as `incoming_unchoke`).
+            if kick && self.drive_peer(pid, s, counters, out) {
+                counters.inc(crate::counters::Counter::UnchokePiecePicks);
             }
         }
         if !accepted {
@@ -3689,17 +3719,16 @@ impl Torrent {
 
     /// `torrent::try_connect_peer` — `connect_one_peer` + the dial
     /// bookkeeping; the session hands out one dial per call.
-    /// `None` = no usable candidate (`p->ip()` unresolvable — i2p
-    /// — counts as a missed attempt, like upstream's failed
-    /// `connect_to_peer`). The wire crypto is *not* decided here —
-    /// upstream's `on_connected` toggles `pe_support` once the
+    /// Returns the outcome plus the scan's `loop_counter` (fed to
+    /// `connection_attempt_loops`). The wire crypto is *not* decided
+    /// here — upstream's `on_connected` toggles `pe_support` once the
     /// stream exists; the engine calls [`Self::peer_link_up`].
     pub fn try_connect_peer(
         &mut self,
         session_time: i32,
         state: &bitdaemon_net::peer_list::PeerListState,
         fingerprint: &[u8],
-    ) -> Option<(std::net::SocketAddr, bitdaemon_common::PeerId)> {
+    ) -> (ConnectOutcome, u32) {
         // keep `finished` in sync so finished torrents skip
         // seed/upload-only candidates — upstream feeds
         // `torrent_state::is_finished` (`is_finished()`, which is
@@ -3711,22 +3740,36 @@ impl Torrent {
         self.peer_list_state = st.clone();
         // upstream `connect_to_peer`: `m_abort` → refuse the dial.
         if self.aborted {
-            return None;
+            return (ConnectOutcome::Refused, 0);
         }
-        let i = self.peer_list.connect_one_peer(session_time, &st)?;
+        let (i, loops) = self.peer_list.connect_one_peer(session_time, &st);
+        let Some(i) = i else {
+            // `p == nullptr` — upstream incs
+            // `no_peer_connection_attempts` and re-runs
+            // `update_want_peers`.
+            self.update_want_peers();
+            return (ConnectOutcome::ListEmpty, loops);
+        };
         let ep = {
-            let p = self.peer_list.peers_mut().get_mut(i)?;
+            let Some(p) = self.peer_list.peers_mut().get_mut(i) else {
+                // the picked index resolved but the entry is gone —
+                // unreachable with our key-stable cache; same verdict
+                // as an exhausted list.
+                self.update_want_peers();
+                return (ConnectOutcome::ListEmpty, loops);
+            };
             // upstream stamps `last_connected` at `connect_to_peer`
             // entry — a failed instantiate still counts as an
             // attempt for the reconnect cooldown.
             p.last_connected = session_time.max(0) as u16;
             let Some(ep) = p.ip() else {
                 // i2p or unresolvable — upstream's `connect_to_peer`
-                // fails → `inc_failcount` + `update_want_peers` (the
-                // peer was never marked connecting).
+                // fails → `missed_connection_attempts` +
+                // `inc_failcount` + `update_want_peers` (the peer was
+                // never marked connecting).
                 self.peer_list.inc_failcount(i);
                 self.update_want_peers();
-                return None;
+                return (ConnectOutcome::Refused, loops);
             };
             ep
         };
@@ -3757,7 +3800,7 @@ impl Torrent {
             self.num_connecting_seeds += 1;
         }
         self.update_want_peers();
-        Some((ep, our_pid))
+        (ConnectOutcome::Dial(ep, our_pid), loops)
     }
 
     /// `bt_peer_connection::on_connected` — runs on a freshly
@@ -3956,8 +3999,10 @@ impl Torrent {
     /// dials `m_connect_boost_counter` peers immediately instead of
     /// waiting for the next session tick. `num_connections` is the
     /// session's live count (incl. half-open). Returns the dial
-    /// requests — one `inc_boost_connections` each, deducted from
-    /// the next tick's `connection_speed` budget.
+    /// requests (one `inc_boost_connections` each, deducted from the
+    /// next tick's `connection_speed` budget) plus the summed
+    /// `loop_counter` — upstream incs `connection_attempt_loops`
+    /// inside the same while loop.
     #[must_use]
     pub fn do_connect_boost(
         &mut self,
@@ -3966,25 +4011,28 @@ impl Torrent {
         num_connections: i64,
         s: &crate::settings::SessionSettings,
         fingerprint: &[u8],
-    ) -> Vec<(std::net::SocketAddr, bitdaemon_common::PeerId)> {
+    ) -> (Vec<(std::net::SocketAddr, bitdaemon_common::PeerId)>, u32) {
         if self.connect_boost_counter == 0 {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         let mut conns = i64::from(self.connect_boost_counter)
             .min(i64::from(s.connections_limit) - num_connections);
         if conns <= 0 {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         let mut dials = Vec::new();
+        let mut loops = 0u32;
         while self.want_peers(s) && conns > 0 {
             conns -= 1;
             self.connect_boost_counter = self.connect_boost_counter.saturating_sub(1);
-            if let Some(d) = self.try_connect_peer(session_time, state, fingerprint) {
-                dials.push(d);
+            let (outcome, n) = self.try_connect_peer(session_time, state, fingerprint);
+            loops += n;
+            if let ConnectOutcome::Dial(ep, pid) = outcome {
+                dials.push((ep, pid));
             }
             self.update_want_peers();
         }
-        dials
+        (dials, loops)
     }
 
     /// `connect_to_peer` for a caller-specified endpoint (the
@@ -4363,7 +4411,7 @@ impl Torrent {
     /// `add_peer` — a new connection registered. Upstream runs
     /// `torrent_plugin::new_connection` for each extension at
     /// attach time (`peer_connection::init`).
-    pub fn add_peer(&mut self, id: u64, mut conn: PeerConn) {
+    pub fn add_peer(&mut self, id: u64, mut conn: PeerConn, counters: &crate::counters::Counters) {
         if let Some(remote) = conn.remote {
             // upstream `on_parole()` reads the `torrent_peer` flag
             // live — mirror it onto the conn at attach (a peer that
@@ -4385,6 +4433,18 @@ impl Torrent {
                 self.downloader_addrs.insert(key, remote);
             }
         }
+        // `peer_connection` ctor — the socket-type gauge moves with
+        // the conn (`num_tcp_peers + socket_type_idx`). Verbatim:
+        // upstream's gauge bank has no `rtc` slot, so rtc(5) lands
+        // on `num_ssl_peers` and tcp_ssl…utp_ssl shift one slot —
+        // `utp_ssl` ends up on `num_peers_half_open`. Attach-time
+        // inc means handshake-failed conns are never counted
+        // (upstream incs at socket-connect): the inc/dec pair stays
+        // balanced either way.
+        counters.add_idx(
+            crate::counters::Counter::NumTcpPeers as usize + conn.sock_type as usize,
+            1,
+        );
         self.peers.insert(id, conn);
     }
 
@@ -4420,6 +4480,16 @@ impl Torrent {
         let Some(c) = self.peers.remove(&id) else {
             return;
         };
+        // `peer_connection::disconnect` — the socket-type gauge
+        // decrement (ctor's `num_tcp_peers + socket_type_idx`
+        // verbatim, rtc-shift quirk included).
+        counters.add_idx(
+            crate::counters::Counter::NumTcpPeers as usize + c.sock_type as usize,
+            -1,
+        );
+        // reads the conn accumulated since the last tick still count
+        // — upstream already landed them at read time.
+        c.bw.drain_read_counters(counters);
         // `torrent::remove_peer` — picker refcounts only drop once
         // connections are initialized (a pre-metadata conn's raw
         // bitfield was never inc'd). Seeds drop via
@@ -4745,7 +4815,7 @@ impl Torrent {
                 if let Some(id) = id {
                     out.push(TorrentEffect::DisconnectPeer {
                         peer: id,
-                        reason: "too many corrupt pieces",
+                        reason: "too_many_corrupt_pieces",
                         // torrent.cpp:5200 — default (normal)
                         // severity; the ban itself is separate.
                         sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
@@ -5090,7 +5160,7 @@ impl Torrent {
                                 if c.num_invalid_requests > 300 && !c.peer_choked {
                                     reminder = Some(TorrentEffect::DisconnectPeer {
                                         peer: peer_id,
-                                        reason: "too many requests when choked",
+                                        reason: "too_many_requests_when_choked",
                                         sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
                                     });
                                 } else {
@@ -6484,9 +6554,9 @@ impl Torrent {
             return false;
         }
         let reason = if self.is_upload_only() {
-            Some("upload-upload connection")
+            Some("upload_upload_connection")
         } else if !c.interesting && c.bitfield_received && self.files_checked {
-            Some("uninteresting upload-only peer")
+            Some("uninteresting_upload_peer")
         } else {
             None
         };
@@ -6500,7 +6570,7 @@ impl Torrent {
         // (`upload_upload_connection`/`peer_no_support` — normal).
         out.push(TorrentEffect::DisconnectPeer {
             peer: peer_id,
-            reason: reason.unwrap_or("upload-upload connection"),
+            reason: reason.unwrap_or("upload_upload_connection"),
             sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
         });
         true
@@ -7645,16 +7715,21 @@ impl Torrent {
                 }
             }
             // `add_failed_bytes` — the whole piece, or just
-            // the identified bad blocks.
+            // the identified bad blocks; the session-level
+            // `recv_failed_bytes` counter moves with it.
             let psize = self
                 .files
                 .as_ref()
                 .map_or(self.piece_length, |f| i64::from(f.piece_size(piece)));
-            self.failed_bytes += if blocks.is_empty() {
+            let failed = if blocks.is_empty() {
                 psize
             } else {
                 blocks.len() as i64 * 16384
             };
+            // upstream saturates `m_total_failed_bytes` at i64::MAX;
+            // the counter still takes the full `b`.
+            self.failed_bytes = self.failed_bytes.saturating_add(failed);
+            counters.add(crate::counters::Counter::RecvFailedBytes, failed);
             // `torrent_plugin::on_piece_failed` — inside the
             // `!found_on_disk` leg upstream.
             for ext in &self.extensions {
@@ -7896,7 +7971,7 @@ impl Torrent {
                     for id in uo {
                         out.push(TorrentEffect::DisconnectPeer {
                             peer: id,
-                            reason: "torrent finished",
+                            reason: "torrent_finished",
                             sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                         });
                     }
@@ -9719,6 +9794,9 @@ impl Torrent {
             // upstream — only the `use_quota_overhead` channel debit
             // and its alert are `rate_limit_ip_overhead`-gated.
             use std::sync::atomic::Ordering::Relaxed;
+            // `on_read_counter`/`socket_recv_size*` — the conn's
+            // accumulated read-completions land in the session bank.
+            c.bw.drain_read_counters(counters);
             let amount_down = c.bw.ip_overhead[crate::peer_conn::DOWNLOAD_CHANNEL].swap(0, Relaxed);
             let amount_up = c.bw.ip_overhead[crate::peer_conn::UPLOAD_CHANNEL].swap(0, Relaxed);
             if amount_down != 0 || amount_up != 0 {
@@ -9796,17 +9874,17 @@ impl Torrent {
             {
                 // `errors::timed_out` → `connect_failed` — a conn
                 // still marked connecting past its budget.
-                Some("timed out: connect")
+                Some("timed_out")
             } else if !c.connecting && d_ms > peer_timeout_ms {
                 // `errors::timed_out_inactivity`
-                Some("timed out: inactivity")
+                Some("timed_out_inactivity")
             } else if !c.connecting
                 && !c.handshake_done
                 && d_ms
                     > s.handshake_timeout.as_millis() as i64 * if c.i2p.is_some() { 4 } else { 1 }
             {
                 // `errors::timed_out_no_handshake`
-                Some("timed out: no handshake")
+                Some("timed_out_no_handshake")
             } else if !c.connecting
                 && c.upload_queue.is_empty()
                 && !c.choked
@@ -9821,7 +9899,7 @@ impl Torrent {
                 // `errors::timed_out_no_request` — an unchoked,
                 // interested peer on an upload-only torrent that
                 // has asked for nothing for >60 s.
-                Some("timed out: no request")
+                Some("timed_out_no_request")
             } else if !c.interesting
                 && !c.peer_interested
                 && now_ms - c.became_uninterested_ms > inactivity_ms
@@ -9831,7 +9909,7 @@ impl Torrent {
             {
                 // `errors::timed_out_no_interest` — mutual
                 // disinterest while connection slots run short.
-                Some("timed out: no interest")
+                Some("timed_out_no_interest")
             } else {
                 None
             };
@@ -10415,6 +10493,47 @@ impl Torrent {
             }
         } else {
             TorrentState::Downloading
+        }
+    }
+
+    /// `torrent::current_stats_state` — which `num_*_torrents`
+    /// gauge bucket this torrent belongs to right now. `None` is
+    /// upstream's `no_gauge_state` (`m_abort || !m_added` — every
+    /// `Torrent` in the session map counts as added). Upstream
+    /// maintains the gauges incrementally via `update_gauge()`; we
+    /// recompute the buckets at stats-snapshot time — the exported
+    /// values are identical (upstream's own invariant check
+    /// recomputes and asserts equality, session_impl.cpp:7429).
+    #[must_use]
+    pub fn current_stats_state(&self) -> Option<crate::counters::Counter> {
+        use crate::counters::Counter as C;
+        if self.aborted {
+            return None;
+        }
+        if !self.last_error.is_empty() {
+            return Some(C::NumErrorTorrents);
+        }
+        if self.is_paused() || self.graceful_pause {
+            if !self.auto_managed {
+                return Some(C::NumStoppedTorrents);
+            }
+            if self.is_seed() {
+                return Some(C::NumQueuedSeedingTorrents);
+            }
+            return Some(C::NumQueuedDownloadTorrents);
+        }
+        if matches!(
+            self.state(),
+            crate::status::TorrentState::CheckingFiles
+                | crate::status::TorrentState::QueuedForChecking
+        ) {
+            Some(C::NumCheckingTorrents)
+        } else if self.is_seed() {
+            Some(C::NumSeedingTorrents)
+        } else if self.is_upload_only() {
+            Some(C::NumUploadOnlyTorrents)
+        } else {
+            Some(C::NumDownloadingTorrents)
         }
     }
 
@@ -11939,7 +12058,7 @@ impl Torrent {
             for id in seeds.into_iter().take(to_disconnect) {
                 out.push(TorrentEffect::DisconnectPeer {
                     peer: id,
-                    reason: "upload-upload",
+                    reason: "upload_upload_connection",
                     sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                 });
             }
@@ -12400,7 +12519,7 @@ impl Torrent {
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
-        self.add_peer(id, c);
+        self.add_peer(id, c, counters);
         // upstream `attach_peer` tail — a new swarm member changes
         // the share-mode rebalance inputs.
         if self.share_mode {

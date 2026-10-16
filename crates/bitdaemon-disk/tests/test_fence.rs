@@ -14,6 +14,7 @@ use bitdaemon_disk::disk_job_fence::{
 
 fn release_job() -> Box<DiskJob> {
     Box::new(DiskJob {
+        pool_counters: None,
         storage: bitdaemon_common::types::StorageIndex(u32::MAX),
         flags: 0,
         ret: 0,
@@ -26,6 +27,7 @@ fn release_job() -> Box<DiskJob> {
 
 fn read_job(piece: i32) -> Box<DiskJob> {
     Box::new(DiskJob {
+        pool_counters: None,
         storage: bitdaemon_common::types::StorageIndex(u32::MAX),
         flags: 0,
         ret: 0,

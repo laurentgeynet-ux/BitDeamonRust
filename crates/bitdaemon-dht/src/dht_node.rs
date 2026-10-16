@@ -173,6 +173,9 @@ pub struct DhtNode {
     /// (upstream keeps the id on the observer itself). Keyed by
     /// transaction id; several probes may share a tid.
     probe_targets: HashMap<u16, Vec<(SocketAddr, NodeId)>>,
+    /// `m_counters` — session counter bank sink (increments become
+    /// no-ops when unset, like upstream on a null counters ref).
+    counter_sink: Option<crate::dht_tracker::DhtCounterSink>,
 }
 
 impl DhtNode {
@@ -207,6 +210,21 @@ impl DhtNode {
             storage_ticks: 0,
             bind_addr: bind_ip,
             probe_targets: HashMap::new(),
+            counter_sink: None,
+        }
+    }
+
+    /// install the session counter sink — also forwards to the rpc
+    /// manager (`*_out` legs count inside `rpc_manager::invoke`).
+    pub fn set_counter_sink(&mut self, sink: Option<crate::dht_tracker::DhtCounterSink>) {
+        self.rpc.counter_sink = sink.clone();
+        self.counter_sink = sink;
+    }
+
+    /// `m_counters.inc_stats_counter` shorthand.
+    fn bump(&self, stat: crate::dht_tracker::DhtStat) {
+        if let Some(s) = &self.counter_sink {
+            s(stat, 1);
         }
     }
 
@@ -409,6 +427,8 @@ impl DhtNode {
         // (upstream calls it in `dht_tracker::incoming_packet`,
         // pre-bdecode).
         if !self.blocker.incoming(from.ip(), std::time::Instant::now()) {
+            // upstream's blocker leg counts `dht_messages_in_dropped`.
+            self.bump(crate::dht_tracker::DhtStat::MessagesInDropped);
             tracing::debug!(%from, "dht: dropping datagram from rate-limited source");
             self.events.push(DhtEvent::Log {
                 module: 1,
@@ -426,7 +446,10 @@ impl DhtNode {
         // with `depth_limit = 10, token_limit = 500` — tighter
         // than the crate defaults.
         let root = bitdaemon_bencode::bdecode_limits(buf, 10, 500);
-        if root.error().is_some() {
+        if root.error().is_some() || root.node_type() != bitdaemon_bencode::NodeType::Dict {
+            // bdecode failure or a non-dict message —
+            // `dht_messages_in_dropped` upstream.
+            self.bump(crate::dht_tracker::DhtStat::MessagesInDropped);
             return None;
         }
         // upstream `dht::node::on_bdecode` — a top-level `ip` key
@@ -455,12 +478,15 @@ impl DhtNode {
         match y[0] {
             b'q' => {
                 // `dht_read_only` — a read-only node never answers
-                // queries (upstream `node::incoming`).
+                // queries (upstream `node::incoming`) — silent, no
+                // counter leg.
                 if self.settings.read_only {
                     return None;
                 }
-                // `m_sock_man->has_quota()` — upload-quota gate.
+                // `m_sock_man->has_quota()` — upload-quota gate;
+                // refusal counts `dht_messages_in_dropped` upstream.
                 if !quota_ok {
+                    self.bump(crate::dht_tracker::DhtStat::MessagesInDropped);
                     return None;
                 }
                 Some(self.handle_query(&root, from, tid, foreign))
@@ -977,7 +1003,10 @@ impl DhtNode {
         let reply = &mut reply;
 
         match top[0].string_value() {
-            b"ping" => {}
+            b"ping" => {
+                // `dht_ping_in` — counted at handler entry upstream.
+                self.bump(crate::dht_tracker::DhtStat::PingIn);
+            }
             b"get_peers" => {
                 const D: &[KeyDesc] = &[
                     KeyDesc {
@@ -1007,8 +1036,10 @@ impl DhtNode {
                 ];
                 let mut k: [BdecodeNode<'_>; 4] = std::array::from_fn(|_| BdecodeNode::none());
                 if !crate::msg::verify_message(&arg, D, &mut k, &mut err) {
+                    self.bump(crate::dht_tracker::DhtStat::InvalidGetPeers);
                     return self.error(from, em, Some(reply.clone()), err.into_bytes(), 203);
                 }
+                self.bump(crate::dht_tracker::DhtStat::GetPeersIn);
                 let info_hash = Sha1Hash::from_bytes(k[0].string_value()).unwrap_or_default();
                 // `dht_observer::get_peers` — `dht_get_peers_alert`.
                 self.events
@@ -1063,8 +1094,10 @@ impl DhtNode {
                 ];
                 let mut k: [BdecodeNode<'_>; 2] = std::array::from_fn(|_| BdecodeNode::none());
                 if !crate::msg::verify_message(&arg, D, &mut k, &mut err) {
+                    self.bump(crate::dht_tracker::DhtStat::InvalidFindNode);
                     return self.error(from, em, Some(reply.clone()), err.into_bytes(), 203);
                 }
+                self.bump(crate::dht_tracker::DhtStat::FindNodeIn);
                 let target = NodeId::from_bytes(k[0].string_value()).unwrap_or_default();
                 self.write_nodes(&target, &k[1], reply, foreign);
             }
@@ -1109,6 +1142,7 @@ impl DhtNode {
                 ];
                 let mut k: [BdecodeNode<'_>; 6] = std::array::from_fn(|_| BdecodeNode::none());
                 if !crate::msg::verify_message(&arg, D, &mut k, &mut err) {
+                    self.bump(crate::dht_tracker::DhtStat::InvalidAnnounce);
                     return self.error(from, em, Some(reply.clone()), err.into_bytes(), 203);
                 }
                 // `implied_port` → use the packet's source port
@@ -1117,6 +1151,7 @@ impl DhtNode {
                     port = i64::from(from.port());
                 }
                 if !(0..65536).contains(&port) {
+                    self.bump(crate::dht_tracker::DhtStat::InvalidAnnounce);
                     return self.error(
                         from,
                         em,
@@ -1134,6 +1169,7 @@ impl DhtNode {
                     port: port as u16,
                 });
                 if !self.verify_token(k[2].string_value(), &info_hash, &from) {
+                    self.bump(crate::dht_tracker::DhtStat::InvalidAnnounce);
                     return self.error(
                         from,
                         em,
@@ -1142,6 +1178,9 @@ impl DhtNode {
                         203,
                     );
                 }
+                // `dht_announce_peer_in` — counted once the query is
+                // fully valid upstream (after the token check).
+                self.bump(crate::dht_tracker::DhtStat::AnnouncePeerIn);
                 // valid token ⇒ the sender isn't spoofing — let the
                 // table add it as a confirmed node (rtt unknown).
                 self.table.node_seen(id, from, 0xffff);
@@ -1159,8 +1198,14 @@ impl DhtNode {
                 );
             }
             b"put" => match self.handle_put(&arg, &from, id) {
-                Ok(()) => {}
+                Ok(()) => {
+                    self.bump(crate::dht_tracker::DhtStat::PutIn);
+                }
                 Err((msg, code)) => {
+                    // every `handle_put` rejection maps to
+                    // `dht_invalid_put` upstream (schema, size,
+                    // salt, token, …).
+                    self.bump(crate::dht_tracker::DhtStat::InvalidPut);
                     return self.error(from, em, Some(reply.clone()), msg.to_vec(), code);
                 }
             },
@@ -1187,8 +1232,10 @@ impl DhtNode {
                 ];
                 let mut k: [BdecodeNode<'_>; 3] = std::array::from_fn(|_| BdecodeNode::none());
                 if !crate::msg::verify_message(&arg, D, &mut k, &mut err) {
+                    self.bump(crate::dht_tracker::DhtStat::InvalidGet);
                     return self.error(from, em, Some(reply.clone()), err.into_bytes(), 203);
                 }
+                self.bump(crate::dht_tracker::DhtStat::GetIn);
                 let target = NodeId::from_bytes(k[1].string_value()).unwrap_or_default();
                 let tok = self.generate_token(&from, &target);
                 reply.insert("token".into(), Entry::String(tok.to_vec()));
@@ -1221,8 +1268,10 @@ impl DhtNode {
                 ];
                 let mut k: [BdecodeNode<'_>; 2] = std::array::from_fn(|_| BdecodeNode::none());
                 if !crate::msg::verify_message(&arg, D, &mut k, &mut err) {
+                    self.bump(crate::dht_tracker::DhtStat::InvalidSampleInfohashes);
                     return self.error(from, em, Some(reply.clone()), err.into_bytes(), 203);
                 }
+                self.bump(crate::dht_tracker::DhtStat::SampleInfohashesIn);
                 let target = NodeId::from_bytes(k[0].string_value()).unwrap_or_default();
                 let (interval, num, samples) = self.storage.get_infohashes_sample();
                 reply.insert("interval".into(), Entry::Int(i64::from(interval)));

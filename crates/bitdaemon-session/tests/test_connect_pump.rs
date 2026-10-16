@@ -251,7 +251,7 @@ fn utp_flags_follow_dial_outcome() {
     let st = s.peer_list_state();
     // drain one candidate manually so we control the outcome.
     let t = s.torrents.get_mut(&ih).unwrap();
-    let (ep1, _pid1) = t.try_connect_peer(0, &st, &[]).unwrap();
+    let (ep1, _pid1) = t.try_connect_peer(0, &st, &[]).0.into_dial().unwrap();
     // uTP failure → supports_utp cleared, no cooldown: the deferred
     // `connect_to_peer` retry rides `pending_out` (the entry was
     // re-marked connecting inside `peer_dial_failed`).
@@ -259,7 +259,7 @@ fn utp_flags_follow_dial_outcome() {
     let i = s.torrents[&ih].peer_list.find_peer(ep1.ip()).unwrap();
     assert!(!s.torrents[&ih].peer_list.peers()[i].supports_utp);
     let t = s.torrents.get_mut(&ih).unwrap();
-    let (ep2, pid2) = t.try_connect_peer(1, &st, &[]).unwrap();
+    let (ep2, pid2) = t.try_connect_peer(1, &st, &[]).0.into_dial().unwrap();
     assert_ne!(ep2, ep1);
     let t = s.torrents.get_mut(&ih).unwrap();
     t.peer_connected_outgoing(

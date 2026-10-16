@@ -882,6 +882,33 @@ Until `1.0.0`, breaking changes may occur in any release.
   `proxy_settings(m_settings)` so every purpose-slot reflects the
   pack.
 
+- **Session statistics parity sweep (A29)**: the remaining gaps in
+  the `performance_counters` export are closed. `DisconnectPeer`
+  reasons now carry the upstream `errors::*` spellings so both
+  `disconnect_reason_counter` and the uTP wire `close_reason` match
+  (previously `upload-upload`, `uninteresting upload-only peer` and
+  the `timed out: *` family matched nothing — the counters stayed at
+  zero *and* the FIN reason field was lost). Transport error legs
+  split on `raw_os_error()` so EPERM/EACCES, ENOBUFS/ECANCELED and
+  the WSA codes land in their own counters; a timed-out in-progress
+  dial counts `connect_timeouts`; `recv_failed_bytes` is fed.
+  Socket-type gauges increment `num_tcp_peers + sock_type` verbatim —
+  including the upstream RTC index-shift quirk — and torrent-state
+  gauges are recomputed per snapshot from `current_stats_state`.
+  `find_connect_candidates` feeds `boost_connection_attempts`/
+  `missed`/`loops`; the `on_*` event counters,
+  `num_outstanding_accept` and the socket send/recv size histograms
+  are wired. DHT traffic counts through an injected
+  `DhtCounterSink` (per-kind `*_in`/`*_out`, dropped messages, bytes
+  and IP overhead) and the DHT node/storage gauges snapshot into the
+  session bank. Disk stats gained the job-pool gauges
+  (`num_jobs`/`num_read_jobs`/`num_write_jobs` via `mk_job`/`free_job`),
+  `num_read_back` for blocks hashing actually pulled off disk, and
+  the `disk_{read,write,hash,job}_time` accumulators. Added the
+  upstream `find_metric_idx` lookup; `↑x` counters
+  (`num_blocks_hashed`, `sequential_loops`) are kept and the
+  dead-upstream slots are documented.
+
 ### Added
 
 - **UI-facing API completeness (upstream parity sweep)**: every

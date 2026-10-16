@@ -230,7 +230,7 @@ fn finished_disconnects_upload_only_only_when_close_redundant() {
         }
         let mut c = PeerConn::new(4, PeerPipeline::new(1000, 30, 250), 0);
         c.remote_upload_only = true;
-        t.add_peer(1, c);
+        t.add_peer(1, c, &bitdaemon_session::counters::Counters::default());
         let mut out = Vec::new();
         // verify the last piece → `finished()` runs.
         if let Some(p) = t.picker.as_mut() {

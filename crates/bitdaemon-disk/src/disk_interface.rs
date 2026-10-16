@@ -322,6 +322,26 @@ pub struct DiskQueueStats {
     pub num_write_ops: i64,
     /// `counters::num_read_ops` — cumulative read syscalls.
     pub num_read_ops: i64,
+    /// `counters::num_read_back` — blocks re-read off disk for hashing.
+    pub num_read_back: i64,
+    /// `counters::disk_read_time` — cumulative µs in read jobs.
+    pub disk_read_time: i64,
+    /// `counters::disk_write_time` — cumulative µs in flush writev.
+    pub disk_write_time: i64,
+    /// `counters::disk_hash_time` — cumulative µs in hash jobs.
+    pub disk_hash_time: i64,
+    /// `counters::disk_job_time` — cumulative µs across all I/O legs.
+    pub disk_job_time: i64,
+    /// `counters::num_read_jobs` — live `job::read` objects.
+    pub num_read_jobs: i64,
+    /// `counters::num_write_jobs` — live `job::write` objects.
+    pub num_write_jobs: i64,
+    /// `counters::num_jobs` — all live job objects.
+    pub num_jobs: i64,
+    /// `counters::num_running_disk_jobs` — inside `perform_job`.
+    pub num_running_disk_jobs: i64,
+    /// `counters::num_writing_threads` — inside a flush writev.
+    pub num_writing_threads: i64,
     /// `counters::file_pool_size` + hit/miss/stall/race gauges.
     pub file_pool_size: i64,
     /// `counters::file_pool_hits`.

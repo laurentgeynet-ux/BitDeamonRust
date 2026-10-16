@@ -154,7 +154,7 @@ fn candidates_and_failcount() {
     l.inc_failcount(i);
     l.inc_failcount(i);
     assert_eq!(l.num_connect_candidates(), 4);
-    let cands = l.find_connect_candidates(1000, &st);
+    let cands = l.find_connect_candidates(1000, &st).0;
     assert_eq!(cands.len(), 4);
     // candidate keys are `(PeerAddr, port)` — stable under erasure
     // unlike the Vec indices upstream uses pointers for.
@@ -174,6 +174,7 @@ fn candidates_and_failcount() {
     let j = l.find_peer(ep(2, 6881).ip()).unwrap();
     assert!(
         !l.find_connect_candidates(1000, &st)
+            .0
             .contains(&key_of(&l, j))
     );
 }
@@ -243,7 +244,7 @@ fn ranking_prefers_low_failcount_local() {
     );
     let bad = l.find_peer("8.8.8.8".parse().unwrap()).unwrap();
     l.inc_failcount(bad);
-    let cands = l.find_connect_candidates(0, &st);
+    let cands = l.find_connect_candidates(0, &st).0;
     assert_eq!(cands.len(), 3);
     // lowest failcount first; tie → local first
     assert_eq!(cands[0].0.address(), Some(ep(9, 6881).ip()));
@@ -272,7 +273,7 @@ fn ranking_uses_full_source_mask() {
     );
     // single-source LSD.
     let (s, _) = add(&mut l, ep(2, 6881), PeerSourceFlags::LSD).unwrap();
-    let cands = l.find_connect_candidates(0, &st);
+    let cands = l.find_connect_candidates(0, &st).0;
     let pos = |i: usize| {
         cands
             .iter()
@@ -339,7 +340,7 @@ fn weeding_over_capacity() {
     l.inc_failcount(i);
     l.inc_failcount(i);
     l.inc_failcount(i);
-    l.find_connect_candidates(0, &st);
+    let _ = l.find_connect_candidates(0, &st);
     assert!(l.num_peers() < 12);
     assert!(l.find_peer(ep(1, 6881).ip()).is_none());
 }

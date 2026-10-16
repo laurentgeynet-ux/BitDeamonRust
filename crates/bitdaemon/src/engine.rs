@@ -1377,6 +1377,39 @@ impl Engine {
                         trace!(%to, "udp send dropped — no datagram socket");
                     }
                 }
+                SessionOut::DhtPacket(buf, to) => {
+                    // `dht_tracker::send_packet` — the send edge:
+                    // success stamps `dht_bytes_out` + UDP overhead +
+                    // `dht_messages_out`; failure counts
+                    // `dht_messages_out_dropped`.
+                    if let Some(d) = self.datagram.as_ref() {
+                        match d.send_to(&buf, to).await {
+                            Ok(sent) => {
+                                let ses = slock(&self.session);
+                                use bitdaemon_session::counters::Counter as C;
+                                ses.counters.add(C::DhtBytesOut, sent as i64);
+                                ses.counters.add(
+                                    C::SentIpOverheadBytes,
+                                    if to.is_ipv6() { 48 } else { 28 },
+                                );
+                                ses.counters.inc(C::DhtMessagesOut);
+                            }
+                            Err(e) => {
+                                let mut ses = slock(&self.session);
+                                ses.counters.inc(
+                                    bitdaemon_session::counters::Counter::DhtMessagesOutDropped,
+                                );
+                                ses.alerts.post(Alert::UdpError {
+                                    remote: to.to_string(),
+                                    op: "send_to".into(),
+                                    error: e.to_string(),
+                                });
+                            }
+                        }
+                    } else {
+                        trace!(%to, "dht send dropped — no datagram socket");
+                    }
+                }
                 SessionOut::TrackerAnnounce {
                     ih,
                     url,
@@ -3647,6 +3680,10 @@ impl Engine {
                             bitdaemon_net::NetError::Transport(io) => io.kind(),
                             _ => std::io::ErrorKind::Other,
                         },
+                        match &e {
+                            bitdaemon_net::NetError::Transport(io) => io.raw_os_error(),
+                            _ => None,
+                        },
                         false,
                     ),
                 );
@@ -3685,6 +3722,7 @@ impl Engine {
                         remote,
                         &bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
                             std::io::ErrorKind::Other,
+                            None,
                             false,
                         ),
                     );
@@ -3702,6 +3740,7 @@ impl Engine {
                         remote,
                         &bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
                             std::io::ErrorKind::Other,
+                            None,
                             false,
                         ),
                     );
@@ -3727,6 +3766,7 @@ impl Engine {
                 remote,
                 &bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
                     std::io::ErrorKind::Other,
+                    None,
                     false,
                 ),
             );
@@ -4105,6 +4145,7 @@ impl Engine {
                         Err(_) => {
                             send_err(bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
                                 std::io::ErrorKind::Other,
+                                None,
                                 utp_sock,
                             ));
                             return;
@@ -4143,6 +4184,7 @@ impl Engine {
                         Err(_) => {
                             send_err(bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
                                 std::io::ErrorKind::Other,
+                                None,
                                 utp_sock,
                             ));
                             return;
@@ -4160,6 +4202,7 @@ impl Engine {
                     });
                     send_err(bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
                         std::io::ErrorKind::Other,
+                        None,
                         utp_sock,
                     ));
                     return;
@@ -4179,6 +4222,10 @@ impl Engine {
                         match &e {
                             bitdaemon_net::NetError::Transport(io) => io.kind(),
                             _ => std::io::ErrorKind::Other,
+                        },
+                        match &e {
+                            bitdaemon_net::NetError::Transport(io) => io.raw_os_error(),
+                            _ => None,
                         },
                         utp_sock,
                     ));
@@ -4210,6 +4257,7 @@ impl Engine {
                     Err(_) => {
                         send_err(bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
                             std::io::ErrorKind::Other,
+                            None,
                             utp_sock,
                         ));
                         return;
@@ -4220,6 +4268,7 @@ impl Engine {
                     Err(_) => {
                         send_err(bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
                             std::io::ErrorKind::Other,
+                            None,
                             utp_sock,
                         ));
                         return;
@@ -4237,6 +4286,7 @@ impl Engine {
             else {
                 send_err(bitdaemon_net::bt_peer_conn::DialFail::connect_failed(
                     std::io::ErrorKind::Other,
+                    None,
                     utp_sock,
                 ));
                 return;
@@ -4347,7 +4397,23 @@ impl Engine {
         };
         let h = tokio::spawn(async move {
             loop {
+                // `num_outstanding_accept` — upstream incs at
+                // `async_accept` issue and decs at
+                // `on_accept_connection` entry (which also bumps
+                // `on_accept_counter`, error or not).
+                slock(&session)
+                    .counters
+                    .inc(bitdaemon_session::counters::Counter::NumOutstandingAccept);
                 let acc = acceptor.clone().accept().await;
+                {
+                    let ses = slock(&session);
+                    ses.counters
+                        .inc(bitdaemon_session::counters::Counter::OnAcceptCounter);
+                    ses.counters.add(
+                        bitdaemon_session::counters::Counter::NumOutstandingAccept,
+                        -1,
+                    );
+                }
                 let (s0, remote) = match acc {
                     Ok(pair) => pair,
                     Err(e) => {
@@ -4563,7 +4629,23 @@ impl Engine {
         };
         let h = tokio::spawn(async move {
             loop {
+                // `num_outstanding_accept` — upstream incs at
+                // `async_accept` issue and decs at
+                // `on_accept_connection` entry (which also bumps
+                // `on_accept_counter`, error or not).
+                slock(&session)
+                    .counters
+                    .inc(bitdaemon_session::counters::Counter::NumOutstandingAccept);
                 let acc = acceptor.clone().accept().await;
+                {
+                    let ses = slock(&session);
+                    ses.counters
+                        .inc(bitdaemon_session::counters::Counter::OnAcceptCounter);
+                    ses.counters.add(
+                        bitdaemon_session::counters::Counter::NumOutstandingAccept,
+                        -1,
+                    );
+                }
                 let (s0, remote) = match acc {
                     Ok(pair) => pair,
                     Err(e) => {
@@ -5364,6 +5446,9 @@ impl Engine {
                                 );
                                 bw.ip_overhead[DOWNLOAD_CHANNEL].fetch_add(oh, Relaxed);
                                 bw.ip_overhead[UPLOAD_CHANNEL].fetch_add(oh, Relaxed);
+                                // `on_read_counter` + `received_buffer`
+                                // — per completed socket read.
+                                bw.record_read(n);
                                 buf.extend_from_slice(&tmp[..n]);
                                 // RC4 stream decryption happens in
                                 // place before frame decode.

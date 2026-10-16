@@ -894,11 +894,14 @@ impl PeerList {
     /// `find_connect_candidates` — round-robin scan of at most 300
     /// peers, top-10 sorted by `compare_peer`, weeding past 95% of
     /// `max_peerlist_size`. Returns candidate indices.
+    /// `find_connect_candidates` — returns the candidate keys plus
+    /// `loop_counter` (`++state->loop_counter` per scan iteration
+    /// upstream — a `connection_attempt_loops` input).
     pub fn find_connect_candidates(
         &mut self,
         session_time: i32,
         state: &PeerListState,
-    ) -> Vec<(crate::torrent_peer::PeerAddr, u16)> {
+    ) -> (Vec<(crate::torrent_peer::PeerAddr, u16)>, u32) {
         const CANDIDATE_COUNT: usize = 10;
         // keys, not indices — `erase_peer` below shifts `m_peers`;
         // upstream holds allocator-stable `torrent_peer*`.
@@ -915,8 +918,11 @@ impl PeerList {
         }
 
         let mut iterations = self.peers.len().min(300);
+        let mut loops = 0u32;
         while iterations > 0 {
             iterations -= 1;
+            // `++state->loop_counter` — `connection_attempt_loops`.
+            loops += 1;
             if self.round_robin >= self.peers.len() {
                 self.round_robin = 0;
             }
@@ -988,7 +994,7 @@ impl PeerList {
         if let Some(ec) = erase_candidate {
             self.erase_peer(ec);
         }
-        peers
+        (peers, loops)
     }
 
     /// Resolve a `candidate_cache` key back to a live index.
@@ -1004,8 +1010,17 @@ impl PeerList {
     /// entries are re-validated (`is_connect_candidate` only — the
     /// reconnect delay already gated them at fill time), an empty
     /// cache is refilled by `find_connect_candidates`, then the
-    /// front peer is handed out. Returns the peer's index.
-    pub fn connect_one_peer(&mut self, session_time: i32, state: &PeerListState) -> Option<usize> {
+    /// front peer is handed out. Returns the peer's index plus
+    /// `loop_counter` — the upstream scan-iteration count, only
+    /// non-zero on a refill (upstream rescans every call; our
+    /// candidate cache amortizes it, so the counter reports the
+    /// real work done).
+    pub fn connect_one_peer(
+        &mut self,
+        session_time: i32,
+        state: &PeerListState,
+    ) -> (Option<usize>, u32) {
+        let mut loops = 0u32;
         if self.finished != state.is_finished {
             self.recalculate_connect_candidates(state);
         }
@@ -1022,17 +1037,25 @@ impl PeerList {
         }
 
         if self.candidate_cache.is_empty() {
-            self.candidate_cache = self.find_connect_candidates(session_time, state).into();
-            self.candidate_cache.front()?;
+            let (cands, n) = self.find_connect_candidates(session_time, state);
+            loops = n;
+            self.candidate_cache = cands.into();
+            if self.candidate_cache.front().is_none() {
+                return (None, loops);
+            }
         }
 
-        let key = self.candidate_cache.pop_front()?;
-        let i = self.resolve_cached(&key)?;
+        let Some(key) = self.candidate_cache.pop_front() else {
+            return (None, loops);
+        };
+        let Some(i) = self.resolve_cached(&key) else {
+            return (None, loops);
+        };
         // upstream `TORRENT_ASSERT`s: in_use, !banned, !connection,
         // connectable, finished → !seed — all inside
         // `is_connect_candidate`.
         debug_assert!(self.is_connect_candidate(&self.peers[i]));
-        Some(i)
+        (Some(i), loops)
     }
 
     /// `apply_ip_filter` — every filtered entry is erased; for
