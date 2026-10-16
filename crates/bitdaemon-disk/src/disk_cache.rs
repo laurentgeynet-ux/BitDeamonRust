@@ -14,9 +14,11 @@
 //! the *state machine* and counters are what callers depend on.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bitdaemon_common::PieceIndex;
 use bitdaemon_common::types::StorageIndex;
+use sha1::{Digest as _, Sha1};
 
 use crate::disk_job::DiskJob;
 
@@ -27,16 +29,23 @@ pub const DEFAULT_BLOCK_SIZE: i64 = 0x4000;
 pub type PieceLocation = (StorageIndex, PieceIndex);
 
 /// A contiguous run taken for flushing: `(first_block, bufs,
-/// writers)` — `writers[i]` is the write job parked on the block
-/// `bufs[i]` came from (upstream `write_state == disk_job*`, moved
-/// out by `take_write_job`); `None` for blocks with no parked writer
-/// (e.g. a buffer restored after a failed flush). Aligned with `bufs`
-/// so [`DiskCache::restore_run`] can put both back.
-pub type TakenRun = (i32, Vec<Vec<u8>>, Vec<Option<Box<DiskJob>>>);
+/// writers)` — `bufs[i]` shares the `Arc` still resident on its cache
+/// block (upstream `borrowed_buf`: the in-flight buffer stays readable
+/// until the write lands); `writers[i]` is the write job parked on the
+/// block `bufs[i]` came from (upstream `write_state == disk_job*`,
+/// moved out by `take_write_job`); `None` for blocks with no parked
+/// writer. Aligned with `bufs` so [`DiskCache::restore_run`] can put
+/// both back.
+pub type TakenRun = (i32, Vec<Arc<Vec<u8>>>, Vec<Option<Box<DiskJob>>>);
 
 /// [`DiskCache::take_oldest_run`]/located variants: `(loc,
 /// first_block, bufs, writers)`.
-pub type LocatedRun = (PieceLocation, i32, Vec<Vec<u8>>, Vec<Option<Box<DiskJob>>>);
+pub type LocatedRun = (
+    PieceLocation,
+    i32,
+    Vec<Arc<Vec<u8>>>,
+    Vec<Option<Box<DiskJob>>>,
+);
 
 /// [`DiskCache::take_coalesced`]'s return: `(job_loc, first_block,
 /// spans, bufs, writers)` where `spans` splits `bufs` into per-piece
@@ -46,19 +55,24 @@ pub type CoalescedFlush = (
     PieceLocation,
     i32,
     Vec<(PieceIndex, i32, usize)>,
-    Vec<Vec<u8>>,
+    Vec<Arc<Vec<u8>>>,
     Vec<Option<Box<DiskJob>>>,
 );
 
 /// `cached_block_entry`.
 #[derive(Debug)]
 pub struct CachedBlockEntry {
-    /// `buf` — owned buffer; `None` once the write job took it.
-    pub buf: Option<Vec<u8>>,
+    /// `buf` — the cached bytes, shared (`Arc`) with any in-flight
+    /// flush job so reads/hash keep seeing them until the write
+    /// lands — upstream's `borrowed_buf` on `write_state ==
+    /// disk_buffer_ref`. `None` once `run_flushed` retires it.
+    pub buf: Option<Arc<Vec<u8>>>,
     /// `is_flushed()` — already on disk.
     pub flushed: bool,
-    /// `write_state == disk_buffer_ref` — the buffer is in flight
-    /// inside a flush job (not readable until it lands or returns).
+    /// `write_state == disk_buffer_ref` — a flush job holds a clone
+    /// of `buf` and is writing it out (the buffer stays readable —
+    /// upstream's borrowed view; `has_write_job` alone marks the
+    /// flight).
     pub has_write_job: bool,
     /// `piece_hasher` result — block SHA-256 computed at flush time
     /// (ADR-0016); `hash2` jobs reuse it instead of re-reading.
@@ -74,7 +88,7 @@ impl CachedBlockEntry {
     /// `data()`/`buf()` — the cached bytes.
     #[must_use]
     pub fn data(&self) -> Option<&[u8]> {
-        self.buf.as_deref()
+        self.buf.as_deref().map(Vec::as_slice)
     }
 }
 
@@ -168,6 +182,16 @@ pub struct CachedPieceEntry {
     pub v1: bool,
     /// v2 piece.
     pub v2: bool,
+    /// `piece_hasher` — the incremental SHA-1 context, fed block by
+    /// block from [`DiskCache::insert`] over the contiguous buffered
+    /// prefix at `hasher_cursor` (upstream `kick_hasher`). Only
+    /// allocated for `v1` pieces.
+    pub ph: Option<Sha1>,
+    /// The finalized piece SHA-1 once `hasher_cursor` reached
+    /// `blocks_in_piece` — upstream `ph->final_hash()` served by
+    /// `try_hash_piece`'s inline completion. `None` until then, and
+    /// invalidated by any rewrite below the cursor.
+    pub piece_hash: Option<bitdaemon_common::Sha1Hash>,
     /// when the first dirty block arrived — drives `cache_expiry`.
     pub dirty_since: std::time::Instant,
     /// this piece's contribution to [`DiskCache::num_unhashed`].
@@ -321,6 +345,8 @@ impl DiskCache {
                 flags: 0,
                 v1: params.v1,
                 v2: params.v2,
+                ph: params.v1.then(Sha1::new),
+                piece_hash: None,
                 dirty_since: std::time::Instant::now(),
                 unhashed: 0,
             }
@@ -334,20 +360,56 @@ impl DiskCache {
         if buf.is_some() {
             self.dirty_sorted.insert(loc);
         }
+        // `need_hasher_kick` reports an insert landing exactly on the
+        // hasher cursor — upstream wakes a hasher thread; ours feeds
+        // `ph` inline below, so the flag is advisory (nothing
+        // consumes it). Evaluated pre-feed, like upstream.
+        let mut ret = InsertResult::default();
+        if params.v1
+            && piece.hasher_cursor as usize == block_idx
+            && piece.flags & piece_flags::PIECE_HASH_RETURNED == 0
+            && piece.flags & piece_flags::NEEDS_HASHER_KICK == 0
+        {
+            ret.need_hasher_kick = true;
+            piece.flags |= piece_flags::NEEDS_HASHER_KICK;
+        }
+        // a rewrite below the hasher's consumed prefix invalidates
+        // the stored piece hash — upstream rules this out by assert
+        // (`block_idx >= hasher_cursor`); our graceful path re-dirties
+        // and rehashes instead of answering a stale digest.
+        let invalidate = buf.is_some()
+            && block_idx < piece.hasher_cursor as usize
+            && block_idx < piece.blocks.len();
+        if invalidate {
+            piece.piece_hash = None;
+            piece.ph = params.v1.then(Sha1::new);
+            piece.hasher_cursor = 0;
+            piece.flags &= !(piece_flags::PIECE_HASH_RETURNED | piece_flags::NEEDS_HASHER_KICK);
+        }
         let mut added = false;
         if let Some(b) = piece.blocks.get_mut(block_idx) {
-            // `m_num_unhashed` counts cached blocks the hasher has
-            // not consumed — only a freshly landed buffer adds one;
-            // a duplicate insert replaces the buffer in place.
-            if params.v1 && buf.is_some() && b.buf.is_none() {
-                piece.unhashed += 1;
-                self.num_unhashed += 1;
+            if buf.is_some() {
+                // `m_num_unhashed` counts cached v1 blocks ahead of
+                // the hasher cursor — only a freshly landed buffer
+                // adds one; a duplicate replaces the buffer in place.
+                if !invalidate && b.buf.is_none() && block_idx >= piece.hasher_cursor as usize {
+                    piece.unhashed += 1;
+                    self.num_unhashed += 1;
+                }
+                // a buffer landing on an already-`flushed` block is a
+                // rewrite (upstream asserts `block_idx >=
+                // flushed_cursor`) — clear the flag so the next flush
+                // pass can take it instead of leaving it parked
+                // forever with a writer that never completes.
+                if b.flushed {
+                    b.flushed = false;
+                }
             }
             // `++m_blocks` upstream only fires when a buffer actually
             // moves into the slot (`if (wjob.buf)`); a duplicate write
             // replaces the buffer in place — the slot stays count 1.
             added = buf.is_some() && b.buf.is_none();
-            b.buf = buf;
+            b.buf = buf.map(Arc::new);
             // upstream `blk.write_state = write_job` — the writer
             // rides the block until a flush takes it (`take_write_job`)
             // or the piece is torn down (`aborted`).
@@ -367,12 +429,70 @@ impl DiskCache {
                     piece.num_jobs -= 1;
                 }
             }
+            piece.num_jobs += 1;
         } else if let Some(mut w) = writer {
             // upstream asserts `block_idx < blocks_in_piece` — a stray
-            // write must still complete, aborted, once.
-            debug_assert!(false, "write block index out of piece");
+            // write must still complete, aborted, once. Its charged
+            // `write_blocks` slot never covered a cache slot — clear
+            // `CACHED` so `job_done` releases it (same rule as the
+            // superseded writer).
+            w.flags &= !crate::disk_job::job_flags::CACHED;
             crate::disk_completed::abort(&mut w);
             self.orphans.push_back(w);
+        }
+        if invalidate {
+            // the new `ph` re-consumes every buffered block — recount
+            // `unhashed` over the whole piece (the cursor restart
+            // re-unhashes the old prefix too).
+            let now_unhashed =
+                i32::try_from(piece.blocks.iter().filter(|b| b.buf.is_some()).count())
+                    .unwrap_or(i32::MAX);
+            self.num_unhashed += i64::from(now_unhashed) - i64::from(piece.unhashed);
+            piece.unhashed = now_unhashed;
+        }
+        // upstream `kick_hasher`: feed the incremental piece_hasher
+        // every contiguous buffered block from `hasher_cursor` — the
+        // SHA-1 runs as data lands, before any flush takes it, so a
+        // piece that's complete-and-hashed flushes *after* hashing
+        // and a later `hash` job answers from `piece_hash` without
+        // re-reading the file.
+        if params.v1
+            && piece.flags & piece_flags::PIECE_HASH_RETURNED == 0
+            && piece.piece_hash.is_none()
+        {
+            while let Some(b) = piece.blocks.get(piece.hasher_cursor as usize) {
+                let Some(buf) = b.buf.as_deref() else {
+                    break;
+                };
+                let need = usize::try_from(
+                    (piece.piece_size - i64::from(piece.hasher_cursor) * DEFAULT_BLOCK_SIZE)
+                        .min(DEFAULT_BLOCK_SIZE),
+                )
+                .unwrap_or(0);
+                // upstream asserts the cached buffer covers the whole
+                // block (`TORRENT_ASSERT_VAL` in `buf()`) — a short
+                // buffer stalls the cursor rather than feeding pad.
+                if buf.len() < need {
+                    break;
+                }
+                if let Some(ph) = piece.ph.as_mut() {
+                    ph.update(&buf[..need]);
+                }
+                piece.hasher_cursor += 1;
+                piece.flags &= !piece_flags::NEEDS_HASHER_KICK;
+                if piece.unhashed > 0 {
+                    piece.unhashed -= 1;
+                    self.num_unhashed -= 1;
+                }
+            }
+            if piece.hasher_cursor as usize == piece.blocks.len()
+                && piece.piece_hash.is_none()
+                && let Some(ph) = piece.ph.take()
+            {
+                piece.piece_hash = Some(
+                    bitdaemon_common::Sha1Hash::from_bytes(&ph.finalize()).unwrap_or_default(),
+                );
+            }
         }
         // the piece just became complete (every block buffered or
         // already flushed) → candidate for a large contiguous flush
@@ -386,17 +506,7 @@ impl DiskCache {
         if force_flush || compute_force_flush(piece) {
             piece.flags |= piece_flags::FORCE_FLUSH;
         }
-        piece.num_jobs += 1;
 
-        let mut ret = InsertResult::default();
-        if params.v1
-            && piece.hasher_cursor as usize == block_idx
-            && piece.flags & piece_flags::PIECE_HASH_RETURNED == 0
-            && piece.flags & piece_flags::NEEDS_HASHER_KICK == 0
-        {
-            ret.need_hasher_kick = true;
-            piece.flags |= piece_flags::NEEDS_HASHER_KICK;
-        }
         self.refresh_run_index(loc);
         ret
     }
@@ -419,7 +529,10 @@ impl DiskCache {
         let mut bufs = 0i64;
         for p in self.pieces.values_mut() {
             for b in &mut p.blocks {
-                if b.buf.is_some() {
+                // in-flight buffers die with their Flush job — its
+                // `job_done` releases the `write_blocks` slots, so
+                // only resident buffers count here.
+                if b.buf.is_some() && !b.has_write_job {
                     bufs += 1;
                 }
                 if let Some(mut w) = b.writer.take() {
@@ -441,7 +554,11 @@ impl DiskCache {
         if count_jobs(&p.blocks) > 0 || p.flags & piece_flags::HASHING != 0 {
             return false;
         }
-        let freed = p.blocks.iter().filter(|b| b.buf.is_some()).count() as i64;
+        let freed = p
+            .blocks
+            .iter()
+            .filter(|b| b.buf.is_some() && !b.has_write_job)
+            .count() as i64;
         self.num_cached_blocks -= freed;
         self.remove_piece(loc);
         true
@@ -450,11 +567,17 @@ impl DiskCache {
     /// `free_piece` — bookkeeping when a piece leaves the cache.
     /// Returns the number of cache blocks freed (for the caller's
     /// `write_blocks` back-pressure accounting) — writers parked on
-    /// the piece are queued on `orphans`.
+    /// the piece are queued on `orphans`. Buffers out inside an
+    /// in-flight flush don't count: the Flush job's `job_done`
+    /// releases their `write_blocks` slots (they'd double-release).
     pub fn free_piece(&mut self, loc: PieceLocation) -> i64 {
         let mut freed = 0i64;
         if let Some(p) = self.pieces.get(&loc) {
-            freed = p.blocks.iter().filter(|b| b.buf.is_some()).count() as i64;
+            freed = p
+                .blocks
+                .iter()
+                .filter(|b| b.buf.is_some() && !b.has_write_job)
+                .count() as i64;
             self.num_cached_blocks -= freed;
         }
         self.remove_piece(loc);
@@ -552,10 +675,13 @@ impl DiskCache {
     }
 
     /// `try_flush_blocks` — take the first contiguous run of dirty,
-    /// not-in-flight blocks of `loc` for a coalesced write. Buffers
-    /// are moved out *with their parked writers* (upstream
-    /// `take_write_job` per block); blocks are marked `has_write_job`
-    /// until [`Self::run_flushed`] retires them.
+    /// not-in-flight blocks of `loc` for a coalesced write. The
+    /// buffers are *shared* with the Flush job (`borrowed_buf`
+    /// upstream): the block keeps serving its bytes to reads and the
+    /// hasher until `run_flushed` retires them. The parked writers
+    /// move out (upstream `take_write_job` per block); blocks are
+    /// marked `has_write_job` until [`Self::run_flushed`] retires
+    /// them.
     pub fn take_flush_run(&mut self, loc: PieceLocation) -> Option<TakenRun> {
         let p = self.pieces.get_mut(&loc)?;
         let start = p
@@ -565,15 +691,18 @@ impl DiskCache {
         let mut bufs = Vec::new();
         let mut writers = Vec::new();
         for b in &mut p.blocks[start..] {
-            let Some(buf) = b.buf.take() else {
-                break;
-            };
-            if b.flushed {
+            // an in-flight block keeps its buffer (borrowed view) —
+            // `has_write_job` must bound the run or the same bytes
+            // would be handed to a second Flush job.
+            if b.flushed || b.has_write_job {
                 break;
             }
+            let Some(buf) = b.buf.as_ref() else {
+                break;
+            };
             b.has_write_job = true;
             writers.push(b.writer.take());
-            bufs.push(buf);
+            bufs.push(Arc::clone(buf));
         }
         let out = (!bufs.is_empty()).then_some((start as i32, bufs, writers));
         if let Some((_, bufs, _)) = &out {
@@ -613,12 +742,12 @@ impl DiskCache {
         let mut bufs = Vec::with_capacity(best_len);
         let mut writers = Vec::new();
         for b in &mut p.blocks[best_start..best_start + best_len] {
-            let Some(buf) = b.buf.take() else {
+            let Some(buf) = b.buf.as_ref() else {
                 break;
             };
             b.has_write_job = true;
             writers.push(b.writer.take());
-            bufs.push(buf);
+            bufs.push(Arc::clone(buf));
         }
         let out = (!bufs.is_empty()).then_some((best_start as i32, bufs, writers));
         if let Some((_, bufs, _)) = &out {
@@ -818,59 +947,71 @@ impl DiskCache {
         None
     }
 
-    /// Put a flush's buffers back — upstream `flush_piece` only sets
+    /// Put a flush's run back — upstream `flush_piece` only sets
     /// `is_flushed` after a successful `writev`; a region whose write
-    /// failed stays dirty so the next `take_*_run` retries it. Blocks
-    /// already re-inserted (a duplicate write landed while the flush
-    /// was in flight) keep their newer buffer. `writers` (aligned to
-    /// `bufs`) restores parked write jobs — used when a taken run is
-    /// put back unflushed; a *failed* flush completes its writers
-    /// with the error instead and passes an empty vec.
+    /// failed stays dirty so the next `take_*_run` retries it. The
+    /// buffers never left their cache slot (`borrowed_buf` — the job
+    /// held `Arc` clones): restoring only clears the in-flight flag
+    /// and re-parks the writers. A block re-inserted while the run
+    /// was out keeps its newer buffer; the returned writer is then
+    /// superseded and completes aborted once.
     pub fn restore_run(
         &mut self,
         loc: PieceLocation,
         first: usize,
-        bufs: Vec<Vec<u8>>,
+        bufs: Vec<Arc<Vec<u8>>>,
         mut writers: Vec<Option<Box<DiskJob>>>,
     ) {
-        // every buffer handed in leaves the in-flight state — back to
-        // the cache slot, or dropped on a re-written block.
+        // every buffer handed in leaves the in-flight state.
         self.in_flight_blocks -= bufs.len() as i64;
         let ready = {
             let Some(p) = self.pieces.get_mut(&loc) else {
                 return;
             };
-            for (i, buf) in bufs.into_iter().enumerate() {
+            for (i, buf) in bufs.iter().enumerate() {
                 let Some(b) = p.blocks.get_mut(first + i) else {
                     continue;
                 };
                 let w = writers.get_mut(i).and_then(Option::take);
-                if b.buf.is_none() {
-                    b.buf = Some(buf);
-                    b.has_write_job = false;
-                    // the run's job left the piece when the flush
-                    // completed — a writer put back re-parks it;
-                    // a bare buffer (failed flush) settles the count.
-                    if w.is_none() {
-                        p.num_jobs -= 1;
+                let same = b.buf.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, buf));
+                b.has_write_job = false;
+                if same {
+                    // the slot still holds the buffer that went out —
+                    // plain put-back: re-park the writer if the slot
+                    // is free, else the re-written block's newer write
+                    // owns it and the returned one is superseded.
+                    match b.writer {
+                        None => {
+                            // the run's job left the piece when the
+                            // flush completed — a writer put back
+                            // re-parks it; a bare buffer (failed
+                            // flush) settles the count.
+                            if w.is_none() {
+                                p.num_jobs -= 1;
+                            }
+                            b.writer = w;
+                        }
+                        Some(_) => {
+                            if let Some(mut w) = w {
+                                w.flags &= !crate::disk_job::job_flags::CACHED;
+                                crate::disk_completed::abort(&mut w);
+                                self.orphans.push_back(w);
+                            }
+                            p.num_jobs -= 1;
+                        }
                     }
-                    b.writer = w;
                 } else {
                     // the block was re-written while the run was
-                    // out — its new buffer owns the slot; the put-back
-                    // buffer is dropped and releases its charge.
-                    self.num_cached_blocks -= 1;
+                    // out — its new buffer owns the slot; the
+                    // returned buffer is dropped (the newer write
+                    // keeps its own charge). The job's writer is
+                    // superseded by the parked newer one.
                     if let Some(mut w) = w {
-                        // its slot charge transferred to the newer
-                        // write — clear `CACHED` so `job_done`
-                        // releases the back-pressure slot instead of
-                        // leaking it (same rule as the duplicate
-                        // insert in `insert`).
                         w.flags &= !crate::disk_job::job_flags::CACHED;
                         crate::disk_completed::abort(&mut w);
                         self.orphans.push_back(w);
-                        p.num_jobs -= 1;
                     }
+                    p.num_jobs -= 1;
                 }
             }
             p.blocks.iter().all(|b| b.buf.is_some() || b.flushed)
@@ -894,33 +1035,54 @@ impl DiskCache {
         out
     }
 
-    /// Mark a flushed region durable — frees the buffers' cache
-    /// slots, advances `flushed_cursor`, drops fully-flushed pieces.
+    /// Mark a flushed region durable — retires each block's buffer
+    /// (`flushed`), advances `flushed_cursor`, drops fully-flushed
+    /// pieces. `bufs` is the span the flush actually wrote — the same
+    /// `Arc`s as the cache slots. A block re-inserted while the write
+    /// was in flight holds a *different* `Arc`: it keeps its newer
+    /// buffer dirty (and its parked writer) instead of being clobbered
+    /// by the retiring pass (upstream asserts the rewrite can't
+    /// happen; we degrade gracefully).
     /// The writers the flush carried were already moved onto the
     /// `FlushJob` (`take_write_job`) and complete with it.
-    pub fn run_flushed(&mut self, loc: PieceLocation, first: usize, len: usize) {
+    pub fn run_flushed(&mut self, loc: PieceLocation, first: usize, bufs: &[Arc<Vec<u8>>]) {
         let mut free = false;
         let mut retired = 0i64;
         let mut inflight = 0i64;
         if let Some(p) = self.pieces.get_mut(&loc) {
-            for b in p.blocks.iter_mut().skip(first).take(len) {
+            for (i, b) in p.blocks.iter_mut().skip(first).take(bufs.len()).enumerate() {
                 if b.has_write_job {
                     p.num_jobs -= 1;
                     inflight += 1;
                 }
                 b.has_write_job = false;
-                b.flushed = true;
-                b.buf = None;
-                retired += 1;
+                let same = b.buf.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &bufs[i]));
+                if same {
+                    b.buf = None;
+                    b.flushed = true;
+                    retired += 1;
+                    // upstream `flush_piece_impl`: retiring an unhashed
+                    // v1 block (`block_index >= hasher_cursor`) removes
+                    // its `m_num_unhashed` contribution — the counter
+                    // tracks *cached* unhashed blocks only.
+                    if p.v1 && first + i >= usize::from(p.hasher_cursor) && p.unhashed > 0 {
+                        p.unhashed -= 1;
+                        self.num_unhashed -= 1;
+                    }
+                }
             }
             self.in_flight_blocks -= inflight;
             self.num_cached_blocks -= retired;
             p.flushed_cursor = compute_flushed_cursor(&p.blocks);
-            // the entry leaves the cache once every block is on disk —
-            // except v2 pieces keep their (tiny) entry for the stored
-            // `block_hash`s that `hash2` jobs consume (ADR-0016).
+            // upstream evicts the cpe only once every block is flushed
+            // *and* the piece hash has been delivered
+            // (`piece_hash_returned_flag`) — the entry keeps the
+            // `piece_hasher`'s final digest so `try_hash_piece` can
+            // answer inline instead of re-reading the file. (v2
+            // entries also carry the per-block `block_hash`s that
+            // `hash2` consumes — same retention rule, ADR-0016.)
             free = p.blocks.iter().all(|b| b.flushed)
-                && (!p.v2 || p.flags & piece_flags::PIECE_HASH_RETURNED != 0);
+                && p.flags & piece_flags::PIECE_HASH_RETURNED != 0;
         }
         if free {
             self.remove_piece(loc);
@@ -1118,9 +1280,9 @@ mod tests {
             params(),
         );
         assert!(!c.try_clear_piece(loc));
-        let (_first, _bufs, writers) = c.take_flush_run(loc).unwrap();
+        let (_first, bufs, writers) = c.take_flush_run(loc).unwrap();
         assert!(writers.iter().flatten().count() == 1);
-        c.run_flushed(loc, 0, 1);
+        c.run_flushed(loc, 0, &bufs);
         assert!(c.try_clear_piece(loc));
     }
 
@@ -1291,7 +1453,7 @@ mod tests {
         assert_eq!(c.in_flight_blocks, 0);
         assert_eq!(c.num_cached_blocks, 3);
         let (first, bufs, _w) = c.take_flush_run(loc).unwrap();
-        c.run_flushed(loc, usize::try_from(first).unwrap_or(0), bufs.len());
+        c.run_flushed(loc, usize::try_from(first).unwrap_or(0), &bufs);
         assert_eq!(c.in_flight_blocks, 0);
         assert_eq!(c.num_cached_blocks, 0);
     }
@@ -1337,5 +1499,203 @@ mod tests {
         c.insert(loc2, 0, Some(vec![1; 4]), None, false, params());
         let _run = c.take_flush_run(loc2);
         assert_eq!(c.abort_all_writers(), 2);
+    }
+
+    /// A16 E1 — `kick_hasher`: v1 inserts feed the incremental
+    /// `piece_hasher` as contiguous blocks land; completing the
+    /// buffered prefix finalizes the digest and raises
+    /// `FORCE_FLUSH` (upstream `ph->final_hash()` +
+    /// `force_flush_flag`) so a later `hash` job answers without
+    /// re-reading the file.
+    #[test]
+    fn incremental_hasher_stores_piece_hash() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        let bs = usize::try_from(DEFAULT_BLOCK_SIZE).unwrap_or(0);
+        c.insert(loc, 0, Some(vec![0xAA; bs]), None, false, params());
+        assert_eq!(c.piece(loc).unwrap().hasher_cursor, 1);
+        // out-of-order tail: the cursor waits on block 1
+        c.insert(loc, 2, Some(vec![0xCC; bs]), None, false, params());
+        assert_eq!(c.piece(loc).unwrap().hasher_cursor, 1);
+        c.insert(loc, 1, Some(vec![0xBB; bs]), None, false, params());
+        let p = c.piece(loc).unwrap();
+        assert_eq!(p.hasher_cursor, 3, "the feed drains the contiguous tail");
+        let expect = {
+            let mut h = Sha1::new();
+            for fill in [0xAAu8, 0xBB, 0xCC] {
+                h.update(vec![fill; bs]);
+            }
+            bitdaemon_common::Sha1Hash::from_bytes(&h.finalize()).unwrap_or_default()
+        };
+        assert_eq!(p.piece_hash, Some(expect));
+        assert!(p.flags & piece_flags::FORCE_FLUSH != 0);
+    }
+
+    /// A16 E1 — a rewrite below the hasher's consumed prefix
+    /// invalidates the stored digest (upstream asserts the case
+    /// away; we re-hash from the new bytes instead of serving a
+    /// stale `piece_hash`).
+    #[test]
+    fn low_rewrite_invalidates_piece_hash() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        let bs = usize::try_from(DEFAULT_BLOCK_SIZE).unwrap_or(0);
+        for (i, fill) in [0xAAu8, 0xBB, 0xCC].iter().enumerate() {
+            c.insert(loc, i, Some(vec![*fill; bs]), None, false, params());
+        }
+        let first_hash = c.piece(loc).unwrap().piece_hash;
+        assert!(first_hash.is_some());
+        // rewrite block 0 — the digest must track the new bytes
+        c.insert(loc, 0, Some(vec![0xDD; bs]), None, false, params());
+        let p = c.piece(loc).unwrap();
+        let expect = {
+            let mut h = Sha1::new();
+            for fill in [0xDDu8, 0xBB, 0xCC] {
+                h.update(vec![fill; bs]);
+            }
+            bitdaemon_common::Sha1Hash::from_bytes(&h.finalize()).unwrap_or_default()
+        };
+        assert_eq!(p.piece_hash, Some(expect));
+        assert_ne!(p.piece_hash, first_hash);
+    }
+
+    /// A16 E2 — `borrowed_buf`: a buffer out in an in-flight flush
+    /// keeps serving reads until `run_flushed` retires it (upstream
+    /// keeps the block readable; taking the buffer out opened a
+    /// stale-read window).
+    #[test]
+    fn in_flight_buffer_stays_readable() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        c.insert(loc, 0, Some(vec![7; 4]), None, false, params());
+        let (_first, bufs, _w) = c.take_flush_run(loc).unwrap();
+        assert_eq!(c.in_flight_blocks, 1);
+        assert_eq!(
+            c.get(loc, 0),
+            Some(&[7u8; 4][..]),
+            "in-flight buffer keeps serving its bytes"
+        );
+        // and the run must not extend onto it a second time
+        assert!(c.take_flush_run(loc).is_none());
+        c.run_flushed(loc, 0, &bufs);
+        assert!(c.get(loc, 0).is_none(), "retired once the write lands");
+    }
+
+    /// A16 E3 — a re-insert during the flush's flight installs a
+    /// *newer* buffer on the slot: `run_flushed` must retire only
+    /// the buffer the job actually wrote (`Arc` identity), leaving
+    /// the newer one dirty for the next pass instead of clobbering it.
+    #[test]
+    fn reinsert_during_flush_keeps_newer_buffer() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        c.insert(loc, 0, Some(vec![1; 4]), None, false, params());
+        let (_first, bufs, _w) = c.take_flush_run(loc).unwrap();
+        // the write races the in-flight flush — new buffer, new writer
+        c.insert(loc, 0, Some(vec![2; 4]), None, false, params());
+        c.run_flushed(loc, 0, &bufs);
+        assert_eq!(
+            c.get(loc, 0),
+            Some(&[2u8; 4][..]),
+            "the newer buffer survives the retiring pass"
+        );
+        assert!(
+            !c.piece(loc).unwrap().blocks[0].flushed,
+            "and stays dirty — the written-out bytes were the old ones"
+        );
+        // the next flush pass takes the newer buffer
+        let (_f2, bufs2, _w2) = c.take_flush_run(loc).unwrap();
+        assert_eq!(bufs2.len(), 1);
+        c.run_flushed(loc, 0, &bufs2);
+        assert!(c.piece(loc).unwrap().blocks[0].flushed);
+    }
+
+    /// A16 E3 — a buffer landing on an already-`flushed` block is a
+    /// rewrite: the flag must clear or the block (and its parked
+    /// writer) would sit in the cache forever, never flushable.
+    #[test]
+    fn reinsert_flushed_block_redirties() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        c.insert(loc, 0, Some(vec![1; 4]), None, false, params());
+        let (_f, bufs, _w) = c.take_flush_run(loc).unwrap();
+        c.run_flushed(loc, 0, &bufs);
+        assert!(c.piece(loc).unwrap().blocks[0].flushed);
+        c.insert(
+            loc,
+            0,
+            Some(vec![9; 4]),
+            Some(parked_write()),
+            false,
+            params(),
+        );
+        let b = &c.piece(loc).unwrap().blocks[0];
+        assert!(!b.flushed, "rewrite re-dirties the block");
+        let (_f2, bufs2, writers2) = c.take_flush_run(loc).unwrap();
+        assert_eq!(bufs2.len(), 1);
+        assert_eq!(writers2.iter().flatten().count(), 1, "writer rides along");
+    }
+
+    /// A16 E4 — a write whose block index is out of the piece never
+    /// covered a cache slot: its orphan must complete aborted with
+    /// `CACHED` cleared, or `job_done` would double-release the
+    /// `write_blocks` charge.
+    #[test]
+    fn oob_write_orphan_aborted_uncached() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        let mut w = parked_write();
+        w.flags |= crate::disk_job::job_flags::CACHED;
+        c.insert(loc, 99, Some(vec![1; 4]), Some(w), false, params());
+        let orphans = c.take_orphans();
+        assert_eq!(orphans.len(), 1);
+        assert_ne!(orphans[0].flags & crate::disk_job::job_flags::ABORTED, 0);
+        assert_eq!(
+            orphans[0].flags & crate::disk_job::job_flags::CACHED,
+            0,
+            "no cache slot was taken — no charge to release"
+        );
+    }
+
+    /// A16 E5 — `m_num_unhashed` tracks *cached* unhashed v1 blocks:
+    /// retiring a block the hasher never consumed must settle its
+    /// contribution, not leave it for `hash_returned`.
+    #[test]
+    fn retiring_unhashed_block_settles_counter() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        // block 1 lands without block 0 — the feed stalls at cursor
+        // 0, so block 1 stays unhashed-but-cached.
+        let bs = usize::try_from(DEFAULT_BLOCK_SIZE).unwrap_or(0);
+        c.insert(loc, 1, Some(vec![5; bs]), None, false, params());
+        assert_eq!(c.num_unhashed, 1);
+        let (_f, bufs, _w) = c.take_flush_run(loc).unwrap();
+        c.run_flushed(loc, 1, &bufs);
+        assert_eq!(
+            c.num_unhashed, 0,
+            "the retired block's contribution is settled"
+        );
+    }
+
+    /// A16 — upstream keeps the cpe until `piece_hash_returned_flag`
+    /// even when every block is flushed: the stored digest must
+    /// survive for `try_hash_piece`'s inline answer.
+    #[test]
+    fn flushed_entry_lingers_until_hash_returned() {
+        let mut c = DiskCache::default();
+        let loc = (StorageIndex(0), PieceIndex(0));
+        let bs = usize::try_from(DEFAULT_BLOCK_SIZE).unwrap_or(0);
+        for i in 0..3 {
+            c.insert(loc, i, Some(vec![0x33; bs]), None, false, params());
+        }
+        let (_f, bufs, _w) = c.take_flush_run(loc).unwrap();
+        c.run_flushed(loc, 0, &bufs);
+        assert!(
+            c.piece(loc).is_some(),
+            "flushed but unhashed — the cpe keeps the digest"
+        );
+        assert!(c.piece(loc).unwrap().piece_hash.is_some());
+        c.hash_returned(loc);
+        assert!(c.piece(loc).is_none(), "hash delivered → the entry retires");
     }
 }

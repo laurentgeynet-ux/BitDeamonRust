@@ -437,3 +437,66 @@ Cosmétique — à documenter ou retirer.
 - `cargo test -p bitdaemon-disk` : ✓ 0 échec (round 2).
 - **Note** : `docs/audits/changelog/A16.md` absent du dépôt —
   fragment du round 1 à réintroduire ou à régénérer.
+
+## Résultat — round 2 (apply)
+
+Correctifs appliqués sur `audit/16-disk-cache-pool` —
+`crates/bitdaemon-disk` (`disk_cache.rs`, `disk_io.rs`,
+`disk_job.rs`) :
+
+- **E1 — hasher incrémental v1** : `CachedPieceEntry` porte un
+  `piece_hasher` (SHA-1) alimenté à `insert` sur le préfixe
+  contigu (`kick_hasher`) ; le digest final est stocké
+  (`piece_hash`) et la pièce passe `FORCE_FLUSH` à complétion.
+  `hash_job` consulte le digest avant le disque — jambe inline de
+  `try_hash_piece` — donc une pièce complète ne paie plus de
+  re-lecture. La cpe survit au flush jusqu'à
+  `PIECE_HASH_RETURNED` (règle d'éviction upstream
+  `disk_cache.cpp:996-1006`, v1 inclus). Réécriture sous le
+  curseur → digest invalidé, hasher reparti, `unhashed`
+  recompté.
+- **E2 — `borrowed_buf`** : les `FlushJob` portent des clones
+  `Arc` des buffers ; le bloc reste lisible
+  (`get`/`get2`/hash) pendant le vol — la fenêtre de lecture
+  stale est fermée.
+- **E3 — re-inserts** : `run_flushed` retire par identité
+  `Arc` (`ptr_eq`) — un bloc ré-inséré pendant le vol garde son
+  buffer plus récent dirty et son writer parké ; une réécriture
+  sur bloc `flushed` re-dirty le flag au lieu de l'échouer
+  silencieusement ; `restore_run` ne réinstalle plus le buffer
+  (il n'a jamais quitté le slot) et re-parque/aborte le writer
+  selon que le slot est libre ou repris.
+- **E4** : abort hors-bornes avec `CACHED` retiré — la charge
+  `write_blocks` est relâchée par `job_done`, pas fuyée.
+- **E5** : `run_flushed` solde la contribution `unhashed` des
+  blocs retirés encore sous `hasher_cursor` (`m_num_unhashed`
+  upstream ne suit que les blocs *cachés* non hashés).
+- **E6** : le bras parké de `async_write` appelle
+  `flush_after_insert` — équivalent du `schedule_flush` que
+  `insert_write` exécute même sous `is_blocked` ; le drain global
+  démarre pendant le park (tous storages).
+
+Tests ajoutés :
+
+- `disk_cache.rs` : `incremental_hasher_stores_piece_hash`,
+  `low_rewrite_invalidates_piece_hash`,
+  `in_flight_buffer_stays_readable`,
+  `reinsert_during_flush_keeps_newer_buffer`,
+  `reinsert_flushed_block_redirties`,
+  `oob_write_orphan_aborted_uncached`,
+  `retiring_unhashed_block_settles_counter`,
+  `flushed_entry_lingers_until_hash_returned`.
+- `test_disk_io.rs` : `hash_served_from_stored_digest_without_reread`
+  (zéro appel `read`/`hash_with` sur une pièce complète),
+  `read_during_inflight_flush_serves_cached_bytes` (barrière dans
+  `storage::write`, lecture servie depuis le buffer emprunté),
+  `parked_write_over_watermark_schedules_flush` (le drain d'un
+  storage non fencé part pendant le park).
+
+Gates : `cargo fmt --all` · `cargo clippy --workspace
+--all-targets -D warnings` · `cargo test --workspace` (115
+suites, 0 échec — disk : 37 unit + 27 io + fences/pool/storage)
+· `cargo doc --workspace --no-deps` — toutes passées.
+
+Commit : `6ef08cc` (`fix(bitdaemon-disk): disk-cache
+parity — incremental piece_hasher + borrowed_buf`).

@@ -7,6 +7,7 @@
 //! `FnOnce` — the job's completion callback.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use bitdaemon_common::types::{DownloadPriority, FileIndex, PieceIndex, StorageIndex};
 use bitdaemon_common::{Sha1Hash, Sha256Hash};
@@ -286,8 +287,10 @@ pub struct FlushJob {
     /// `spans` splits `bufs` back into `(piece, first_block, n_bufs)`
     /// for completion bookkeeping; empty for a single-piece flush.
     pub spans: Vec<(PieceIndex, i32, usize)>,
-    /// contiguous block buffers (≤ 16 KiB each, last may be short).
-    pub bufs: Vec<Vec<u8>>,
+    /// contiguous block buffers (≤ 16 KiB each, last may be short) —
+    /// `Arc` clones of the cache slots: upstream's `borrowed_buf`, the
+    /// block keeps serving its bytes to reads until `run_flushed`.
+    pub bufs: Vec<Arc<Vec<u8>>>,
     /// Write jobs parked on the flushed blocks (upstream
     /// `cached_block_entry::write_state = disk_job*`, moved out by
     /// `take_write_job`): they complete *here*, with this job's

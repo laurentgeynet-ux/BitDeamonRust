@@ -2052,3 +2052,428 @@ fn duplicate_write_releases_back_pressure_slot() {
     io.abort_jobs(true);
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// A16 round-2 — incremental piece hasher, borrowed_buf reads, fence drain
+// ---------------------------------------------------------------------------
+
+/// Storage probe for the A16 tests: `read`/`hash_with` are counted
+/// (a digest or data byte coming from disk would trip the assert);
+/// `write` can hold at a barrier to keep a flush in flight.
+struct ProbeStorage {
+    inner: PreadStorage,
+    reads: Arc<AtomicUsize>,
+    /// `(entered, release)` — `write` signals arrival then holds.
+    write_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+}
+impl bitdaemon_disk::storage::DiskStorage for ProbeStorage {
+    fn set_storage_index(&self, idx: StorageIndex) {
+        self.inner.set_storage_index(idx);
+    }
+    fn files(&self) -> &FileStorage {
+        self.inner.files()
+    }
+    fn file_priorities(&self) -> &[DownloadPriority] {
+        self.inner.file_priorities()
+    }
+    fn read(
+        &self,
+        buf: &mut [u8],
+        piece: PieceIndex,
+        offset: i64,
+        mode: bitdaemon_disk::open_mode::OpenMode,
+        volatile: bool,
+    ) -> bitdaemon_disk::storage_error::StorageResult<i64> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read(buf, piece, offset, mode, volatile)
+    }
+    fn write(
+        &self,
+        buf: &[u8],
+        piece: PieceIndex,
+        offset: i64,
+        mode: bitdaemon_disk::open_mode::OpenMode,
+    ) -> bitdaemon_disk::storage_error::StorageResult<i64> {
+        if let Some((entered, release)) = &self.write_gate {
+            entered.wait();
+            release.wait();
+        }
+        self.inner.write(buf, piece, offset, mode)
+    }
+    fn hash_with(
+        &self,
+        feed: &mut dyn FnMut(&[u8]),
+        len: i64,
+        piece: PieceIndex,
+        offset: i64,
+        mode: bitdaemon_disk::open_mode::OpenMode,
+        volatile: bool,
+    ) -> bitdaemon_disk::storage_error::StorageResult<i64> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .hash_with(feed, len, piece, offset, mode, volatile)
+    }
+    fn release_files(&self) -> bitdaemon_disk::storage_error::StorageResult<()> {
+        self.inner.release_files()
+    }
+    fn move_storage(
+        &self,
+        _p: PathBuf,
+        _f: bitdaemon_disk::storage::MoveFlags,
+    ) -> (
+        u8,
+        PathBuf,
+        Option<bitdaemon_disk::storage_error::StorageError>,
+    ) {
+        unimplemented!()
+    }
+    fn delete_files(&self, _o: u8) -> bitdaemon_disk::storage_error::StorageResult<()> {
+        unimplemented!()
+    }
+    fn rename_file(
+        &mut self,
+        _i: FileIndex,
+        _n: &[u8],
+    ) -> bitdaemon_disk::storage_error::StorageResult<()> {
+        unimplemented!()
+    }
+    fn set_file_priority(
+        &mut self,
+        _p: &[DownloadPriority],
+    ) -> bitdaemon_disk::storage_error::StorageResult<()> {
+        unimplemented!()
+    }
+    fn verify_resume_data(
+        &self,
+        _h: &bitdaemon_common::bitfield::Bitfield,
+        _s: bool,
+        _l: &[PathBuf],
+    ) -> (bool, Option<bitdaemon_disk::storage_error::StorageError>) {
+        unimplemented!()
+    }
+}
+
+/// A16 E1 — `try_hash_piece`'s `job_completed` case: with the
+/// incremental `piece_hasher` fed at insert time, `async_hash` on a
+/// fully-flushed piece answers from the stored digest — upstream
+/// keeps the cpe alive until `piece_hash_returned` precisely so the
+/// hash never re-reads the file.
+#[test]
+fn hash_served_from_stored_digest_without_reread() {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::{DiskIo, flags};
+
+    let d = dir("hash_inline");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    let (io, _drained) = make_io(1);
+    let reads = Arc::new(AtomicUsize::new(0));
+    io.insert_storage(
+        StorageIndex(0),
+        Box::new(ProbeStorage {
+            inner: storage(&make_fs(), &d),
+            reads: Arc::clone(&reads),
+            write_gate: None,
+        }),
+    );
+
+    // one full 1024-byte piece — the block lands complete, feeds the
+    // incremental hasher and force-flushes.
+    let wdone = Arc::new(AtomicUsize::new(0));
+    let wd = Arc::clone(&wdone);
+    io.async_write(
+        StorageIndex(0),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start: 0,
+            length: 1024,
+        },
+        DiskBufferHolder::from_owned(vec![0x5A; 1024]),
+        None,
+        Box::new(move |e| {
+            assert!(!e.is_err(), "write must succeed: {e:?}");
+            wd.fetch_add(1, Ordering::Relaxed);
+        }),
+        0,
+    );
+    wait_done(&io, &wdone, 1);
+
+    let hashed = Arc::new(AtomicUsize::new(0));
+    let got = Arc::new(Mutex::new(Sha1Hash::default()));
+    let (h2, g2) = (Arc::clone(&hashed), Arc::clone(&got));
+    io.async_hash(
+        StorageIndex(0),
+        PieceIndex(0),
+        Vec::new(),
+        flags::V1_HASH,
+        Box::new(move |_, h, _, _digests, e| {
+            assert!(!e.is_err(), "hash must succeed: {e:?}");
+            *g2.lock().unwrap() = h;
+            h2.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    wait_done(&io, &hashed, 1);
+
+    use sha1::{Digest as _, Sha1};
+    let expect = Sha1::digest([0x5Au8; 1024]);
+    assert_eq!(&got.lock().unwrap().as_bytes()[..], &expect[..]);
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "the piece hash must come from the incremental digest, not a re-read"
+    );
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// A16 E2 — `borrowed_buf`: while a Flush job is in flight the
+/// block's buffer stays on the cache slot, so `prepare_read` still
+/// serves the (correct) bytes instead of falling through to a stale
+/// disk read.
+#[test]
+fn read_during_inflight_flush_serves_cached_bytes() {
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::DiskIo;
+
+    let d = dir("read_inflight");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    // two threads: the flush job holds one at the write gate, the
+    // read needs the other.
+    let (io, _drained) = make_io(2);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(std::sync::Barrier::new(2));
+    let release = Arc::new(std::sync::Barrier::new(2));
+    io.insert_storage(
+        StorageIndex(0),
+        Box::new(ProbeStorage {
+            inner: storage(&make_fs(), &d),
+            reads: Arc::clone(&reads),
+            write_gate: Some((Arc::clone(&entered), Arc::clone(&release))),
+        }),
+    );
+
+    // complete 1024-byte piece → insert → eager flush → the writev
+    // blocks at the gate with the buffer in flight.
+    let wdone = Arc::new(AtomicUsize::new(0));
+    let wd = Arc::clone(&wdone);
+    io.async_write(
+        StorageIndex(0),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start: 0,
+            length: 1024,
+        },
+        DiskBufferHolder::from_owned(vec![0x77; 1024]),
+        None,
+        Box::new(move |e| {
+            assert!(!e.is_err(), "write must succeed: {e:?}");
+            wd.fetch_add(1, Ordering::Relaxed);
+        }),
+        0,
+    );
+    entered.wait(); // the flush is now inside storage::write
+
+    let done = Arc::new(AtomicUsize::new(0));
+    let got = Arc::new(Mutex::new(Vec::new()));
+    ar(&io, 0, 1024, Arc::clone(&got), Arc::clone(&done));
+    wait_done(&io, &done, 1);
+    {
+        let got = got.lock().unwrap();
+        assert!(got.len() >= 1024);
+        assert!(
+            got[..1024].iter().all(|&b| b == 0x77),
+            "in-flight flush must still serve the write's bytes"
+        );
+    }
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        0,
+        "a borrowed buffer must not fall through to disk"
+    );
+
+    release.wait(); // release the writev — flush lands, writer completes
+    wait_done(&io, &wdone, 1);
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// A16 E6 — upstream `async_write` runs `insert_write` →
+/// `schedule_flush` even for a write parked behind a fence: the
+/// parked charge still counts toward `buffer_level()`, so an
+/// over-watermark park must schedule the drain immediately (the
+/// Flush job itself queues behind the fence like upstream's pool
+/// job, and runs at repost).
+#[test]
+fn parked_write_over_watermark_schedules_flush() {
+    use std::sync::Barrier;
+
+    use bitdaemon_common::types::PeerRequest;
+    use bitdaemon_disk::disk_interface::DiskIo;
+    use bitdaemon_disk::open_mode::OpenMode;
+    use bitdaemon_disk::storage::{DiskStorage, MoveFlags};
+    use bitdaemon_disk::storage_error::{StorageError, StorageResult};
+
+    struct GateRel {
+        inner: PreadStorage,
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+    impl DiskStorage for GateRel {
+        fn set_storage_index(&self, idx: StorageIndex) {
+            self.inner.set_storage_index(idx);
+        }
+        fn files(&self) -> &FileStorage {
+            self.inner.files()
+        }
+        fn file_priorities(&self) -> &[DownloadPriority] {
+            self.inner.file_priorities()
+        }
+        fn read(
+            &self,
+            buf: &mut [u8],
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+            volatile: bool,
+        ) -> StorageResult<i64> {
+            self.inner.read(buf, piece, offset, mode, volatile)
+        }
+        fn write(
+            &self,
+            buf: &[u8],
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+        ) -> StorageResult<i64> {
+            self.inner.write(buf, piece, offset, mode)
+        }
+        fn hash_with(
+            &self,
+            feed: &mut dyn FnMut(&[u8]),
+            len: i64,
+            piece: PieceIndex,
+            offset: i64,
+            mode: OpenMode,
+            volatile: bool,
+        ) -> StorageResult<i64> {
+            self.inner
+                .hash_with(feed, len, piece, offset, mode, volatile)
+        }
+        fn release_files(&self) -> StorageResult<()> {
+            self.entered.wait();
+            self.release.wait();
+            self.inner.release_files()
+        }
+        fn move_storage(&self, _p: PathBuf, _f: MoveFlags) -> (u8, PathBuf, Option<StorageError>) {
+            unimplemented!()
+        }
+        fn delete_files(&self, _o: u8) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn rename_file(&mut self, _i: FileIndex, _n: &[u8]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn set_file_priority(&mut self, _p: &[DownloadPriority]) -> StorageResult<()> {
+            unimplemented!()
+        }
+        fn verify_resume_data(
+            &self,
+            _h: &bitdaemon_common::bitfield::Bitfield,
+            _s: bool,
+            _l: &[PathBuf],
+        ) -> (bool, Option<StorageError>) {
+            unimplemented!()
+        }
+    }
+
+    let d = dir("fence_sched");
+    std::fs::create_dir_all(d.join("t")).unwrap();
+    let d2 = dir("fence_sched2");
+    std::fs::create_dir_all(d2.join("t")).unwrap();
+    let (io, _drained) = make_io(2);
+    // storage 0 carries the fence; storage 1 holds a dirty block the
+    // global drain must reach while the fence is still up.
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    io.insert_storage(
+        StorageIndex(0),
+        Box::new(GateRel {
+            inner: storage(&make_fs_big(), &d),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+    );
+    io.insert_storage(StorageIndex(1), Box::new(storage(&make_fs_big(), &d2)));
+
+    // a dirty partial-piece block on storage 1 — buffered under the
+    // default watermark, writer still pending.
+    let bdone = Arc::new(AtomicUsize::new(0));
+    let bd = Arc::clone(&bdone);
+    io.async_write(
+        StorageIndex(1),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start: 0,
+            length: 0x4000,
+        },
+        DiskBufferHolder::from_owned(vec![0xAB; 0x4000]),
+        None,
+        Box::new(move |e| {
+            assert!(!e.is_err(), "storage-1 write must succeed: {e:?}");
+            bd.fetch_add(1, Ordering::Relaxed);
+        }),
+        0,
+    );
+
+    // fence up on storage 0.
+    let rf_done = Arc::new(AtomicUsize::new(0));
+    let rfd = Arc::clone(&rf_done);
+    io.async_release_files(
+        StorageIndex(0),
+        Box::new(move || {
+            rfd.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    entered.wait();
+
+    // high watermark = 1 block; the parked write on the fenced
+    // storage charges level 2 → upstream `insert_write` would still
+    // `schedule_flush`, and the global drain reaches storage 1's
+    // dirty block *now* — its writer completes while the fence holds.
+    io.set_max_queued_bytes(0x4000);
+    let wdone = Arc::new(AtomicUsize::new(0));
+    let wd = Arc::clone(&wdone);
+    let mut buf = io.buffer_pool().allocate_buffer("w");
+    for b in buf.data_mut().unwrap() {
+        *b = 0xCD;
+    }
+    io.async_write(
+        StorageIndex(0),
+        PeerRequest {
+            piece: PieceIndex(0),
+            start: 0x4000,
+            length: 0x4000,
+        },
+        buf,
+        None,
+        Box::new(move |_| {
+            wd.fetch_add(1, Ordering::Relaxed);
+        }),
+        0,
+    );
+    assert_eq!(
+        wdone.load(Ordering::Relaxed),
+        0,
+        "the fenced write must stay parked"
+    );
+    // storage 1's dirty block flushed on schedule — its writer
+    // completes even though storage 0's fence is still raised.
+    wait_done(&io, &bdone, 1);
+
+    release.wait();
+    wait_done(&io, &rf_done, 1);
+    // the reposted write lands, flushes, completes.
+    wait_done(&io, &wdone, 1);
+    io.abort_jobs(true);
+    std::fs::remove_dir_all(&d).unwrap();
+    std::fs::remove_dir_all(&d2).unwrap();
+}
