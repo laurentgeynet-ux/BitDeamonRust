@@ -597,6 +597,39 @@ mode rapport.
   `desired_queue_size` + gater la section sur
   `self.connections_initialized`. Sévérité : **mineure**
   (alerte/état interne).
+- **D12 — `update_interest` eager au lieu du flag différé
+  `m_need_interest_update` (coût CPU acteur + fenêtre dirty
+  absente).** Upstream (`peer_connection.cpp:467-481`) :
+  `update_interest()` pose `m_need_interest_update` et poste un
+  unique `do_update_interest` — N marquages dirty → 1 scan après
+  le flush de la file de messages. Les sites de marquage sont
+  restreints à la famille have : `incoming_bitfield` (`:2317`),
+  les legs `has_piece` de have/dont_have (`:825`, `:988`), plus le
+  côté torrent (`torrent.cpp:1080/1099` upload_mode, `:1261`
+  piece_failed restore, `:4694` `we_have`, `:6267` sweep de
+  priorités). Jamais sur `Piece`. Rust appelle
+  `Torrent::update_interest` **en fin de `apply_peer_effects` pour
+  chaque message décodé** (`torrent.rs:5596`) — y compris chaque
+  `Piece` — et le scan `(0..num_pieces).any(...)` (`:6330-6337`)
+  coûte 3 lookups par pièce sans early-exit quand le pair n'a plus
+  rien de voulu (cas stable courant : pair non-intéressant, torrent
+  presque fini). À ~5000 `Piece`/s et ~25k pièces : jusqu'à ~125 M
+  d'itérations/s de bitfield+priority+have sur le thread acteur
+  unique — gaspillage pur qui plafonne le débit. Divergences
+  sémantiques résiduelles (convergentes, un tour io d'écart) :
+  Interested/NotInterested partent dans le même batch au lieu du
+  tour suivant ; `disconnect_if_redundant` n'a pas le gate dirty
+  (`peer_connection.cpp:2323` — le commentaire `torrent.rs:6390`
+  l'admet) ; et les lecteurs d'`m_interesting` lisent la valeur
+  *stale* pendant la fenêtre dirty upstream (`can_request_time_
+  critical` `:3575`, `peer_is_interesting` `:2092`) — Rust
+  réévalue à chaud intra-batch. Fix : `need_interest_update: bool`
+  sur `PeerConn` ; marquer dans les handlers have-family +
+  changements propres (piece_passed, priorités, upload_mode) ;
+  drainer une fois en fin de batch (ou avant `drive_peer`) via le
+  `update_interest` actuel qui clear le flag ; ajouter le early-out
+  dirty à `disconnect_if_redundant`. Sévérité : **majeure**
+  (perf acteur — divergence sémantique mineure).
 
 ### Parité confirmée au round 2
 
@@ -680,3 +713,6 @@ mode rapport.
 - Course `cancel`→arrivée (bloc `not_wanted` consommé) — couverte
   pour le chemin `start_receive_piece` inconnu, pas pour
   `cancel_block` sur entrée en vol (cf. D9).
+- Réévaluation d'intérêt différée (D12) — aucun test ne vérifie le
+  collapsing « N dirty → 1 scan », le gate dirty de
+  `disconnect_if_redundant`, ni l'absence de scan sur `Piece`.
