@@ -296,6 +296,92 @@ fn counter_sink_observes_wire_activity() {
     );
 }
 
+// R1 — a `write` after `close()` is `broken_pipe` upstream
+// (`write_some` rejects past `m_out_eof`): it must return 0 and
+// must not append payload — the bytes could otherwise ride a
+// packet stamped after the queued FIN.
+#[test]
+fn write_after_close_is_broken_pipe() {
+    let (mut a, ..) = connected_pair();
+    a.close();
+    assert_eq!(a.write(b"late"), 0);
+    // the FIN still leaves — and nothing carries the post-close
+    // payload
+    let dgrams: Vec<_> = a.drain_outbox().collect();
+    assert!(
+        dgrams
+            .iter()
+            .all(|d| !d.bytes.windows(4).any(|w| w == b"late")),
+        "post-close payload must not be queued"
+    );
+    assert!(
+        dgrams
+            .iter()
+            .any(|d| UtpHeader::parse(&d.bytes).unwrap().ty == UtpType::Fin),
+        "expected the FIN to flush"
+    );
+}
+
+// R9 — upstream erases the packet's `m_needs_resend` link inside
+// `resend_packet`. A timeout-driven resend that left `seq` queued
+// made the next `send_pkt` transmit a second copy (double resend,
+// inflated `num_transmissions`).
+#[test]
+fn timeout_resend_unlinks_needs_resend() {
+    let (mut a, ..) = connected_pair();
+    a.write(b"one-packet");
+    let first: Vec<_> = a.drain_outbox().collect();
+    assert_eq!(first.len(), 1);
+    let seq = UtpHeader::parse(&first[0].bytes).unwrap().seq_nr;
+
+    // the peer never acks — drive a timeout (packet_timeout() is
+    // ≥ min_timeout = 500 ms by default; jump past it)
+    a.tick(Instant::now() + std::time::Duration::from_secs(10));
+    let resent: Vec<_> = a.drain_outbox().collect();
+    assert_eq!(resent.len(), 1, "timeout must resend the packet once");
+    assert_eq!(UtpHeader::parse(&resent[0].bytes).unwrap().seq_nr, seq);
+
+    // any send_pkt trigger must NOT resend it a second time —
+    // the resend queue entry was unlinked inside resend_packet_seq
+    a.write(b"");
+    assert!(
+        a.drain_outbox().next().is_none(),
+        "stale needs_resend entry resent the packet a second time"
+    );
+}
+
+// R3 — `send_pkt`'s send-error legs: EMSGSIZE clamps the MTU
+// ceiling and requeues without DF; a hard transport error stores
+// `m_error` and walks `error_wait → deleting`.
+#[test]
+fn send_error_legs() {
+    use bitdaemon_net::utp_socket::OutDatagram;
+    let (mut a, _b, _a_addr, b_addr, _now) = connected_pair();
+
+    // EMSGSIZE (90): a DF-flagged datagram is requeued without DF
+    // and the socket stays connected — the MTU-probe fallback
+    a.write(b"probe-sized-payload");
+    let mut d = a.pop_outbox().unwrap();
+    d.dont_fragment = true; // pretend it was a DF-flagged probe
+    let refused = std::io::Error::from_raw_os_error(90);
+    a.note_send_error(d, &refused);
+    assert_eq!(a.state(), UtpState::Connected);
+    let retried = a.pop_outbox().unwrap();
+    assert!(!retried.dont_fragment, "EMSGSIZE retry must drop DF");
+
+    // a hard error (e.g. ECONNREFUSED) kills the connection
+    a.note_send_error(
+        OutDatagram {
+            to: b_addr,
+            bytes: vec![0u8; 20],
+            dont_fragment: false,
+        },
+        &std::io::Error::from_raw_os_error(111),
+    );
+    assert!(matches!(a.error(), Some(UtpError::Io(_))));
+    assert_eq!(a.state(), UtpState::Deleting);
+}
+
 // D8 — `UtpSocketDemux` allocates random ids (upstream
 // `random(0xffff)`, recv = send−1) and routes by `(remote, id)` —
 // upstream `match(ep, id)`.

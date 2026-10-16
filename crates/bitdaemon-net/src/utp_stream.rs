@@ -45,6 +45,10 @@ pub enum InboundMsg {
     Datagram(Vec<u8>, SocketAddr),
     /// The datagram transport this socket is bound to went away.
     Abort,
+    /// Hot-applied settings — upstream sockets read the shared
+    /// `session_settings` live; here the manager pushes the new
+    /// snapshot (`UtpSocket::update_cfg`).
+    SetConfig(UtpConfig),
 }
 
 /// Write-side commands from the `UtpStream` — payload bytes, a
@@ -77,6 +81,17 @@ pub struct UtpManager {
     /// applies it to `m_close_reason`, so the next FIN/data packet
     /// carries the extension header.
     close_slots: Arc<std::sync::Mutex<HashMap<SocketAddr, Arc<std::sync::atomic::AtomicU16>>>>,
+    /// the live `UtpConfig` — upstream's `utp_socket_manager` reads
+    /// `session_settings` through `m_sm` getters on every call, so
+    /// settings apply to existing sockets instantly; the pumps pull
+    /// the snapshot via `InboundMsg::SetConfig`.
+    cfg: std::sync::RwLock<UtpConfig>,
+    /// `settings_pack::connections_limit` — SYN-flood guard, atomics
+    /// so the session's sync `apply_settings` path can hot-apply it.
+    conn_limit: std::sync::atomic::AtomicUsize,
+    /// `enable_incoming_utp` — upstream drops unmatched SYNs before
+    /// creating a socket when the flag is off.
+    accept_incoming: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -88,9 +103,6 @@ struct ManagerInner {
     listener: Option<mpsc::Sender<InboundMsg>>,
     /// tasks we spawned (kept alive; aborted with the manager).
     tasks: Vec<JoinHandle<()>>,
-    /// `connections_limit` — unmatched SYNs are dropped once
-    /// `sockets.len() > limit * 2` (upstream SYN-flood guard).
-    conn_limit: usize,
     /// `m_restrict_mtu`/`m_mtu_idx` — rolling window of failed
     /// path-MTU probes; the cap is the max of the last 3.
     restrict_mtu: [i32; 3],
@@ -103,8 +115,6 @@ impl Default for ManagerInner {
             sockets: HashMap::new(),
             listener: None,
             tasks: Vec::new(),
-            // upstream `settings_pack::connections_limit` default
-            conn_limit: 200,
             restrict_mtu: [65536; 3],
             mtu_idx: 0,
         }
@@ -126,18 +136,55 @@ impl UtpManager {
         Self {
             inner: Arc::new(Mutex::new(ManagerInner::default())),
             close_slots: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            cfg: std::sync::RwLock::new(UtpConfig::default()),
+            // upstream `settings_pack::connections_limit` default
+            conn_limit: std::sync::atomic::AtomicUsize::new(200),
+            accept_incoming: std::sync::atomic::AtomicBool::new(true),
         }
+    }
+
+    /// the manager's live socket configuration — `connect`/
+    /// `accept_syn` callers pass `manager.config()` so new sockets
+    /// see hot-applied settings, like upstream's `m_sm` getters.
+    #[must_use]
+    pub fn config(&self) -> UtpConfig {
+        self.cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Hot-apply `cfg`: stored for future `connect`/`accept_syn`
+    /// *and* broadcast to every live socket pump
+    /// (`InboundMsg::SetConfig` → `UtpSocket::update_cfg`) — upstream
+    /// sockets observe `session_settings` mutations immediately.
+    pub fn set_config(&self, cfg: UtpConfig) {
+        *self.cfg.write().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
+        if let Ok(inner) = self.inner.try_lock() {
+            for e in inner.sockets.values() {
+                let _ = e.tx.try_send(InboundMsg::SetConfig(cfg.clone()));
+            }
+        }
+    }
+
+    /// `enable_incoming_utp` — unmatched SYNs are dropped (not
+    /// counted) when off, matching upstream's check before the
+    /// listen-socket branch.
+    pub fn set_accept_incoming(&self, on: bool) {
+        self.accept_incoming
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `utp_socket_manager::incoming_packet` — demux to the right
     /// socket by `(remote, conn_id)`. The header gates mirror
     /// upstream (`< 20` or `version != 1` are dropped here, before
-    /// any socket sees them). Dispatch is `try_send` outside the
-    /// lock: datagrams are lossy by nature and a full socket queue
-    /// must not stall the shared receive pump.
-    pub async fn route(&self, from: SocketAddr, buf: &[u8]) {
+    /// any socket sees them — the *type* nibble is deliberately not
+    /// filtered, upstream counts unknown types at socket level).
+    /// Dispatch is `try_send` outside the lock: datagrams are lossy
+    /// by nature and a full socket queue must not stall the shared
+    /// receive pump. Returns false when nothing consumed the packet
+    /// (no matching socket and not a SYN the listener takes —
+    /// upstream falls through to the other UDP consumers).
+    pub async fn route(&self, from: SocketAddr, buf: &[u8]) -> bool {
         if buf.len() < UTP_HEADER_LEN || buf[0] & 0xf != 1 {
-            return;
+            return false;
         }
         let id = u16::from_be_bytes([buf[2], buf[3]]);
         let (tx, listener) = {
@@ -146,10 +193,19 @@ impl UtpManager {
             // incoming conn-id is always the *receiver's* recv_id, so
             // an exact `(ep, id)` hit is the upstream shape
             let tx = inner.sockets.get(&(from, id)).map(|e| e.tx.clone());
-            // unmatched ST_SYN (type nibble 4) → the listen queue,
-            // unless we're over the upstream SYN-flood cap
-            // (`connections_limit * 2` sockets)
-            let listener = if buf[0] >> 4 == 4 && inner.sockets.len() <= inner.conn_limit * 2 {
+            // unmatched ST_SYN (type nibble 4) → the listen queue —
+            // only when `enable_incoming_utp` is on and we're under
+            // the upstream SYN-flood cap (`connections_limit * 2`)
+            let listener = if buf[0] >> 4 == 4
+                && self
+                    .accept_incoming
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && inner.sockets.len()
+                    <= self
+                        .conn_limit
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .saturating_mul(2)
+            {
                 inner.listener.clone()
             } else {
                 None
@@ -158,15 +214,26 @@ impl UtpManager {
         };
         let msg = InboundMsg::Datagram(buf.to_vec(), from);
         if let Some(tx) = tx {
-            let _ = tx.try_send(msg);
+            if tx.try_send(msg).is_err() {
+                // socket queue full — the datagram is lost; upstream
+                // processes inline so there is no equivalent counter
+                tracing::trace!("utp demux: dropping datagram for {from} (socket queue full)");
+            }
+            true
         } else if let Some(tx) = listener {
-            let _ = tx.try_send(msg);
+            if tx.try_send(msg).is_err() {
+                tracing::trace!("utp demux: dropping SYN from {from} (listener queue full)");
+            }
+            true
+        } else {
+            false
         }
     }
 
     /// `settings_pack::connections_limit` for the SYN-flood guard.
-    pub async fn set_connection_limit(&self, limit: usize) {
-        self.inner.lock().await.conn_limit = limit;
+    pub fn set_connection_limit(&self, limit: usize) {
+        self.conn_limit
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `utp_socket_manager::restrict_mtu` — record a failed MTU.
@@ -243,6 +310,7 @@ impl UtpManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(from, close_slot.clone());
+        let their_close = Arc::new(std::sync::atomic::AtomicU16::new(0));
 
         let dg2 = dg.clone();
         let pump = tokio::spawn(socket_pump(
@@ -250,10 +318,11 @@ impl UtpManager {
             dg2,
             rx,
             wr_rx,
-            rd_tx,
+            Some(rd_tx),
             st_tx,
             last_error.clone(),
             close_slot.clone(),
+            their_close.clone(),
             (from, recv_id),
             self.clone(),
         ));
@@ -263,7 +332,9 @@ impl UtpManager {
             wr_tx,
             st_rx: Arc::new(Mutex::new(st_rx)),
             last_error,
+            their_close_reason: their_close,
             read_buf: std::collections::VecDeque::new(),
+            closed: false,
         })
     }
 
@@ -358,6 +429,7 @@ impl UtpManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(remote, close_slot.clone());
+        let their_close = Arc::new(std::sync::atomic::AtomicU16::new(0));
 
         let dg2 = dg.clone();
         let pump = tokio::spawn(socket_pump(
@@ -365,10 +437,11 @@ impl UtpManager {
             dg2,
             rx,
             wr_rx,
-            rd_tx,
+            Some(rd_tx),
             st_tx,
             last_error.clone(),
             close_slot.clone(),
+            their_close.clone(),
             (remote, recv_id),
             self.clone(),
         ));
@@ -379,7 +452,9 @@ impl UtpManager {
             wr_tx,
             st_rx: Arc::new(Mutex::new(st_rx)),
             last_error,
+            their_close_reason: their_close,
             read_buf: std::collections::VecDeque::new(),
+            closed: false,
         })
     }
 }
@@ -398,17 +473,24 @@ async fn socket_pump(
     dg: Arc<dyn DatagramSocket>,
     mut inbound_rx: mpsc::Receiver<InboundMsg>,
     mut wr_rx: mpsc::UnboundedReceiver<WriterMsg>,
-    rd_tx: mpsc::Sender<Vec<u8>>,
+    rd_tx: Option<mpsc::Sender<Vec<u8>>>,
     st_tx: tokio::sync::watch::Sender<UtpState>,
     last_error: Arc<std::sync::Mutex<Option<UtpError>>>,
     close_slot: Arc<std::sync::atomic::AtomicU16>,
+    their_close: Arc<std::sync::atomic::AtomicU16>,
     key: (SocketAddr, u16),
     mgr: Arc<UtpManager>,
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut readbuf = vec![0u8; 16 * 1024];
     let mut last_state = UtpState::None;
-    let mut write_closed = false;
+    let mut rd_tx = rd_tx;
+    // `close_seen`: Close delivered or writer gone — the socket's
+    // `m_out_eof` analogue for the *channel* side; `wr_dead` marks
+    // the channel itself closed (recv() returns None forever — the
+    // select arm must be disarmed or it would busy-loop).
+    let mut close_seen = false;
+    let mut wr_dead = false;
     loop {
         // `set_close_reason` — a stamped reason rides every
         // subsequent packet until close (upstream mirrors it on
@@ -418,8 +500,11 @@ async fn socket_pump(
             sock.set_close_reason(cr);
         }
         // drain outgoing datagrams — `dont_fragment` rides
-        // `udp_socket::send`'s flags (MTU probes only)
-        for d in sock.drain_outbox() {
+        // `udp_socket::send`'s flags (MTU probes only). Send errors
+        // feed back into the socket (`utp_stream.cpp:1786-1831`):
+        // EMSGSIZE clamps the MTU ceiling and retries without DF,
+        // WouldBlock stalls, anything else kills the conn.
+        while let Some(d) = sock.pop_outbox() {
             tracing::trace!(
                 "pump {key:?} -> ty={} seq={} ack={} len={}",
                 d.bytes[0] >> 4,
@@ -435,24 +520,36 @@ async fn socket_pump(
                 DatagramSendFlags::NONE
             }
             .or(DatagramSendFlags::PEER_CONNECTION);
-            let _ = dg.send_to_flags(&d.bytes, d.to, flags).await;
+            match dg.send_to_flags(&d.bytes, d.to, flags).await {
+                Ok(_) => {
+                    if sock.stalled() {
+                        sock.on_writable();
+                    }
+                }
+                Err(e) => sock.note_send_error(d, &e),
+            }
         }
         // push received payload toward the reader — only while the
         // read channel has capacity. A stalled reader must never
         // park the pump: ACKs, ticks and the rest of the receive
         // path keep running upstream-style.
-        if rd_tx.capacity() > 0 {
+        if let Some(tx) = rd_tx.as_ref().filter(|t| t.capacity() > 0) {
             match sock.read(&mut readbuf) {
                 Ok(n) if n > 0 => {
-                    if rd_tx.send(readbuf[..n].to_vec()).await.is_err() {
-                        break;
+                    if tx.send(readbuf[..n].to_vec()).await.is_err() {
+                        // reader gone — upstream `destroy()`:
+                        // `close()` keeps flushing so the FIN leaves,
+                        // but unsent buffered data is dropped
+                        drop(rd_tx.take());
+                        sock.destroy();
                     }
                 }
-                // EOF/reset surface on the stream via `last_error`;
-                // the socket's own state machine decides when the
-                // pump ends (CloseWait semantics upstream)
                 Err(e) => {
                     *last_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                    // a pending `poll_read` must observe EOF/error
+                    // *now* — upstream delivers it to the read
+                    // handler as soon as the FIN'd data drains
+                    drop(rd_tx.take());
                 }
                 _ => {}
             }
@@ -461,6 +558,15 @@ async fn socket_pump(
             last_state = sock.state();
             let _ = st_tx.send(last_state);
         }
+        // `get_close_reason` — publish the peer's reason as soon as
+        // the FIN carries it (upstream `peer_connection` reads it at
+        // disconnect, long before socket deletion)
+        if sock.their_close_reason != 0 {
+            their_close.store(
+                sock.their_close_reason,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if matches!(last_state, UtpState::Deleting | UtpState::ErrorWait) {
             break;
         }
@@ -468,6 +574,7 @@ async fn socket_pump(
             Some(msg) = inbound_rx.recv() => {
                 match msg {
                     InboundMsg::Abort => sock.abort(),
+                    InboundMsg::SetConfig(cfg) => sock.update_cfg(cfg),
                     InboundMsg::Datagram(buf, from) => {
                         tracing::trace!("pump {key:?} <- ty={} seq={} ack={} len={}", buf[0]>>4,
                             u16::from_be_bytes([buf[16],buf[17]]),
@@ -483,6 +590,7 @@ async fn socket_pump(
                                     sock.abort();
                                     break;
                                 }
+                                InboundMsg::SetConfig(cfg) => sock.update_cfg(cfg),
                                 InboundMsg::Datagram(buf, from) => {
                                     sock.incoming_packet(&buf, from, Instant::now());
                                 }
@@ -492,18 +600,30 @@ async fn socket_pump(
                     }
                 }
             }
-            msg = wr_rx.recv(), if !write_closed => {
+            msg = wr_rx.recv(), if !wr_dead => {
                 match msg {
-                    Some(WriterMsg::Data(buf)) => {
+                    Some(WriterMsg::Data(buf)) if !close_seen => {
                         let _ = sock.write(&buf);
                     }
-                    Some(WriterMsg::Close) | None => {
-                        // poll_shutdown or stream dropped — upstream
-                        // `close()`: FIN once the queue drains
-                        write_closed = true;
+                    // post-close payload — upstream `broken_pipe`;
+                    // dropped, it must not be packetized past the FIN
+                    Some(WriterMsg::Data(_)) => {}
+                    Some(WriterMsg::CloseReason(code)) => sock.set_close_reason(code),
+                    Some(WriterMsg::Close) => {
+                        // poll_shutdown — upstream `close()`: FIN
+                        // once the queue drains
+                        close_seen = true;
                         sock.close();
                     }
-                    Some(WriterMsg::CloseReason(code)) => sock.set_close_reason(code),
+                    None => {
+                        // stream dropped — `destroy()` upstream:
+                        // FIN out, unsent buffers dropped, reader
+                        // side already handled by rd_tx
+                        close_seen = true;
+                        wr_dead = true;
+                        drop(rd_tx.take());
+                        sock.destroy();
+                    }
                 }
             }
             _ = tick.tick() => {
@@ -518,6 +638,13 @@ async fn socket_pump(
     if let Some(e) = sock.error() {
         *last_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
     }
+    if sock.their_close_reason != 0 {
+        tracing::debug!("pump {key:?} peer close_reason={}", sock.their_close_reason);
+        their_close.store(
+            sock.their_close_reason,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     mgr.unregister(key).await;
 }
 
@@ -530,7 +657,30 @@ pub struct UtpStream {
     /// last socket-level error — read failures surface this rather
     /// than collapsing everything to EOF (upstream keeps `m_error`).
     last_error: Arc<std::sync::Mutex<Option<UtpError>>>,
+    /// the peer's `close_reason` extension value — stamped by the
+    /// pump at teardown (upstream `get_close_reason` is read by
+    /// `peer_connection` at disconnect). 0 = none received.
+    their_close_reason: Arc<std::sync::atomic::AtomicU16>,
     read_buf: std::collections::VecDeque<u8>,
+    /// `poll_shutdown` ran — writes past this point are
+    /// `broken_pipe` (upstream rejects them in `write_some`).
+    closed: bool,
+}
+
+/// socket error → `io::Error` (upstream propagates `m_error` to the
+/// connect/read/write handlers unchanged).
+fn utp_error_to_io(e: UtpError) -> io::Error {
+    match e {
+        UtpError::Eof => io::Error::new(io::ErrorKind::UnexpectedEof, "utp peer closed"),
+        UtpError::ConnectionReset => {
+            io::Error::new(io::ErrorKind::ConnectionReset, "utp connection reset")
+        }
+        UtpError::TimedOut => io::Error::new(io::ErrorKind::TimedOut, "utp timed out"),
+        UtpError::Aborted => {
+            io::Error::new(io::ErrorKind::ConnectionAborted, "utp connection aborted")
+        }
+        UtpError::Io(k) => io::Error::from(k),
+    }
 }
 
 impl UtpStream {
@@ -541,7 +691,12 @@ impl UtpStream {
             match *rx.borrow() {
                 UtpState::Connected => return Ok(()),
                 UtpState::ErrorWait | UtpState::Deleting => {
-                    return Err(io::Error::other("utp connect failed"));
+                    // the socket's `m_error` — reset, timeout,
+                    // transport failure — not a generic message
+                    return Err(match self.take_error() {
+                        Some(e) => utp_error_to_io(e),
+                        None => io::Error::other("utp connect failed"),
+                    });
                 }
                 _ => {}
             }
@@ -556,6 +711,14 @@ impl UtpStream {
     /// `poll_shutdown`/drop; the extension rides the FIN.
     pub fn set_close_reason(&self, code: u16) {
         let _ = self.wr_tx.send(WriterMsg::CloseReason(code));
+    }
+
+    /// `get_close_reason` — the peer's `close_reason` code (0 when
+    /// the FIN carried none / socket still live).
+    #[must_use]
+    pub fn their_close_reason(&self) -> u16 {
+        self.their_close_reason
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// the last socket error surfaced by the pump, if any.
@@ -589,18 +752,7 @@ impl AsyncRead for UtpStream {
             Poll::Ready(None) => match self.take_error() {
                 // upstream: `m_error == eof`/none → clean EOF
                 None | Some(UtpError::Eof) => Poll::Ready(Ok(())),
-                Some(UtpError::ConnectionReset) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    "utp connection reset",
-                ))),
-                Some(UtpError::TimedOut) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "utp timed out",
-                ))),
-                Some(UtpError::Aborted) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "utp connection aborted",
-                ))),
+                Some(e) => Poll::Ready(Err(utp_error_to_io(e))),
             },
             Poll::Pending => Poll::Pending,
         }
@@ -609,37 +761,49 @@ impl AsyncRead for UtpStream {
 
 impl AsyncWrite for UtpStream {
     fn poll_write(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        // upstream `write_some` on a closed stream → `broken_pipe`;
+        // the pump also drops post-Close payload as backstop
+        if self.closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "utp write after close",
+            )));
+        }
         match self.wr_tx.send(WriterMsg::Data(buf.to_vec())) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(_) => Poll::Ready(Err(io::Error::other("utp closed"))),
+            Err(_) => {
+                self.closed = true;
+                Poll::Ready(Err(io::Error::other("utp closed")))
+            }
         }
     }
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Poll::Ready(Ok(()))
     }
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // upstream `utp_stream::close` → `m_impl.close()` — the FIN
         // leaves once the write buffer and nagle packet drain; the
         // pump keeps running until `FinSent` resolves
+        self.closed = true;
         let _ = self.wr_tx.send(WriterMsg::Close);
         Poll::Ready(Ok(()))
     }
 }
 
 /// `UtpConnector` — `PeerConnector` impl: dial uTP over any
-/// injected `DatagramSocket` (the OnionBit seam).
+/// injected `DatagramSocket` (the OnionBit seam). Socket settings
+/// come from [`UtpManager::config`] so hot-applied values reach new
+/// connections (upstream reads `session_settings` per socket).
 #[derive(Debug)]
 pub struct UtpConnector {
     /// demux manager (share across all connections on the transport).
     pub manager: Arc<UtpManager>,
     /// datagram transport.
     pub datagram: Arc<dyn DatagramSocket>,
-    /// socket config.
-    pub cfg: UtpConfig,
 }
 
 /// `UtpAcceptor` — `PeerAcceptor` impl: unmatched SYNs on the
@@ -650,24 +814,17 @@ pub struct UtpAcceptor {
     pub manager: Arc<UtpManager>,
     /// datagram transport replies go out on.
     pub datagram: Arc<dyn DatagramSocket>,
-    /// socket config.
-    pub cfg: UtpConfig,
     /// SYN queue (from `UtpManager::set_listener`).
     rx: Mutex<mpsc::Receiver<InboundMsg>>,
 }
 
 impl UtpAcceptor {
     /// install the listener on `manager`.
-    pub async fn new(
-        manager: Arc<UtpManager>,
-        datagram: Arc<dyn DatagramSocket>,
-        cfg: UtpConfig,
-    ) -> Self {
+    pub async fn new(manager: Arc<UtpManager>, datagram: Arc<dyn DatagramSocket>) -> Self {
         let rx = Mutex::new(manager.set_listener().await);
         Self {
             manager,
             datagram,
-            cfg,
             rx,
         }
     }
@@ -681,7 +838,7 @@ impl crate::transport::PeerAcceptor for UtpAcceptor {
             let (syn, from) = loop {
                 match rx.recv().await {
                     Some(InboundMsg::Datagram(b, f)) => break (b, f),
-                    Some(InboundMsg::Abort) => continue,
+                    Some(InboundMsg::Abort | InboundMsg::SetConfig(_)) => continue,
                     None => {
                         return Err(crate::NetError::NoTransport("utp listener closed"));
                     }
@@ -689,7 +846,7 @@ impl crate::transport::PeerAcceptor for UtpAcceptor {
             };
             let s = me
                 .manager
-                .accept_syn(me.datagram.clone(), from, &syn, me.cfg.clone())
+                .accept_syn(me.datagram.clone(), from, &syn, me.manager.config())
                 .await?;
             Ok((Box::new(s) as BoxedPeerStream, Some(from)))
         })
@@ -721,7 +878,7 @@ impl PeerConnector for UtpConnector {
             let _ = bind; // uTP shares the datagram socket — no per-connect bind
             let mut s = me
                 .manager
-                .connect(me.datagram.clone(), addr, me.cfg.clone())
+                .connect(me.datagram.clone(), addr, me.manager.config())
                 .await?;
             s.wait_connected().await?;
             // the conn's `local_endpoint()` is the shared datagram

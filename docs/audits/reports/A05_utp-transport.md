@@ -1,10 +1,13 @@
-# Audit A05 — rapport d'analyse (re-audit, passe 3)
+# Audit A05 — rapport d'analyse (re-audit, passe 3 — **apply fait**)
 
 Troisième passe de l'audit A05. La première passe a produit 13
 déviations (D1–D13, corrigées sur `audit/05-utp-transport`) ; la
-seconde a listé 8 résidus (R1–R8). Cette passe re-vérifie `main`
-contre upstream : **R4 et R5 sont résolus**, R1/R2/R3/R6/R7/R8 tiennent
-encore, et 4 constats nouveaux (R9–R12) s'ajoutent.
+seconde a listé 8 résidus (R1–R8). Cette passe a re-vérifié `main`
+contre upstream : **R4 et R5 résolus** entre-temps, R1/R2/R3/R6/R7/R8
+confirmés, 4 constats nouveaux (R9–R12) — auxquels l'apply a ajouté
+**R13** (crash nagle, signalé hors rapport puis vérifié). **Apply :
+tous les résidus corrigés, R2 déclassé (dead code upstream)** — voir
+« Résultat de l'apply ».
 
 Baseline upstream : `e7381c7bc` (`src/utp_stream.cpp`,
 `src/utp_socket_manager.cpp`, `include/libtorrent/aux_/utp_stream.hpp`,
@@ -115,12 +118,14 @@ Côté Rust : `crates/bitdaemon-net/src/utp.rs`, `utp_socket.rs`,
   311-318`) est relu **à chaque itération** du pump (`:416-419`) →
   indépendant du bras `wr_rx` : un reason post-`Close` atteint
   `m_close_reason` et monte même sur les retransmissions du FIN.
-  Résidu : `their_close_reason` (`utp_socket.rs:290`) est parsé de
-  l'ext-3 mais jamais propagé — ni `UtpStream` ni l'alerte
-  `peer_disconnected` ne le lisent (upstream : `get_close_reason` →
-  `on_close_reason` → alerte). Fix restant : exposer
-  `their_close_reason` au démantèlement (dernier état pump → champ
-  du conn-removal path).
+  Résidu : `their_close_reason` (`utp_socket.rs:290`) était parsé de
+  l'ext-3 mais jamais propagé — **corrigé à l'apply** : le pump stocke
+  la raison dès qu'un paquet la porte (miroir de
+  `get_close_reason`/`on_close_reason` lu au disconnect upstream) et
+  `UtpStream::their_close_reason()` l'expose ; test
+  `their_close_reason_reaches_the_stream`. Reste hors scope : la
+  remontée dans l'alerte `peer_disconnected` (le conn-removal path
+  engine-side peut la lire via le stream).
 - **R5 — résolu.** Couvert par `close_slot` ci-dessus pour le chemin
   prod (manager). Résidu cosmétique : `UtpStream::set_close_reason`
   (canal `WriterMsg::CloseReason`) reste bloqué par `if !write_closed`
@@ -129,7 +134,7 @@ Côté Rust : `crates/bitdaemon-net/src/utp.rs`, `utp_socket.rs`,
 ## Déviations résiduelles (ouverts + nouveaux)
 
 - **R1 — `write` après close/FIN accepté au lieu de `broken_pipe`
-  (toujours ouvert).** `UtpSocket::write` (`utp_socket.rs:486-492`) ne
+  (corrigé — apply passe 3).** `UtpSocket::write` (`utp_socket.rs:486-492`) ne
   teste ni `m_out_eof` ni `state >= FinSent` ; `UtpStream::poll_write`
   (`utp_stream.rs:611-620`) accepte toujours. Upstream :
   `check_fin_sent()` → `broken_pipe` dans `write_some`/`async_write_*`
@@ -144,19 +149,21 @@ Côté Rust : `crates/bitdaemon-net/src/utp.rs`, `utp_socket.rs`,
   `m_out_eof || state >= FinSent` ; `poll_write` → `Err(BrokenPipe)`
   si `write_closed` local ou état ≥ `FinSent`.
   Sévérité : wire-visible sur API directe / silent-drop via stream.
-- **R2 — pas de RST après teardown (toujours ouvert).** Le pump sort
+- **R2 — pas de RST après teardown (déclassé — non-bug).** Le pump sort
   sur `Deleting | ErrorWait` (`utp_stream.rs:464-466`) puis
   `unregister` (`:521`) : un paquet retransmis ensuite vers
   `(remote, conn_id)` tombe dans le vide. Upstream garde l'impl dans
   `m_utp_sockets` jusqu'à `should_delete()` (`state >= error_wait &&
   !m_attached && !m_stalled`, `utp_stream.cpp:823-847`) balayé au
   `utp_socket_manager::tick` ; tant que l'entrée vit, un paquet entrant
-  obtient `send_reset(ph->seq_nr)` (`:3205-3210`) — le pair apprend la
-  mort au premier resend au lieu du timeout complet. Fix : garder une
-  entrée demux légère (ou le pump) en vie jusqu'au drop du
-  `UtpStream` (= `!m_attached`), continuant à répondre RST.
-  Sévérité : wire-visible mineur.
-- **R3 — erreurs d'envoi jamais remontées (toujours ouvert).**
+  obtient `send_reset(ph->seq_nr)` (`:3205-3210`). **Relecture
+  d'apply** : ce bras est du *dead code* upstream — l'early-return
+  `state() == error_wait || deleting → return true` (`:2873`)
+  précède le `switch (state())` (`:2875`), donc le `case
+  deleting/error_wait → send_reset` n'est jamais atteint. Upstream
+  n'envoie pas non plus de RST post-teardown ; le comportement Rust
+  est déjà iso-sémantique. Sévérité : nulle.
+- **R3 — erreurs d'envoi jamais remontées (corrigé — apply passe 3).**
   `let _ = dg.send_to_flags(...)` (`utp_stream.rs:438`). Upstream
   traite dans `send_pkt` : (a) `message_size` → `m_mtu_ceiling =
   p->size-1`, `update_mtu_limits()`, `mtu_probe=false`,
@@ -168,8 +175,8 @@ Côté Rust : `crates/bitdaemon-net/src/utp.rs`, `utp_socket.rs`,
   Fix : pump → `sock.note_send_error(size, was_probe, err)` —
   `send_to_flags` retourne déjà `io::Result` synchrone.
   Sévérité : wire-visible mineur (convergence PMTU).
-- **R6 — drop avec données entrantes en vol saute le FIN (toujours
-  ouvert).** `rd_tx.send(...).await.is_err() → break`
+- **R6 — drop avec données entrantes en vol saute le FIN (corrigé —
+  apply passe 3).** `rd_tx.send(...).await.is_err() → break`
   (`utp_stream.rs:447-449`) quitte sans `sock.close()` : si le
   `UtpStream` est droppé avec du payload en attente dans `rd_tx`,
   aucun FIN ne part — upstream `~utp_stream → destroy() → close()`
@@ -179,7 +186,7 @@ Côté Rust : `crates/bitdaemon-net/src/utp.rs`, `utp_socket.rs`,
   pire). Fix : `sock.close()` + drain outbox avant le `break`.
   Sévérité : mineur.
 - **R7 — settings `utp_*` morts : jamais mappés, pas seulement non
-  hot-applied (ouvert, aggravé).** Les 10 knobs existent et
+  hot-applied (corrigé — apply passe 3).** Les 10 knobs existent et
   round-trippent settings_pack (`settings.rs:517-534,613-614` ;
   `session_params.rs:713-721,764,1331-1339,1382`), mais
   `enable_utp`/`start_ssl_utp` construisent `UtpConfig {
@@ -200,13 +207,13 @@ Côté Rust : `crates/bitdaemon-net/src/utp.rs`, `utp_socket.rs`,
   (moot tant que le knob est mort, à corriger dans le même fix).
   Sévérité : mineur (défauts conformes) → modéré pour quiconque règle
   LEDBAT (télécommande d'interopérabilité perdue).
-- **R8 — `wait_connected` masque l'erreur (toujours ouvert).**
+- **R8 — `wait_connected` masque l'erreur (corrigé — apply passe 3).**
   `utp_stream.rs:543-549` → `"utp connect failed"` générique ;
   upstream propage `m_error` au connect-handler. Fix : `take_error()`
   → mapping `UtpError → io::Error` (réutiliser le match de
   `poll_read`). Sévérité : diagnostic.
 - **R9 — entrée `needs_resend` périmée → retransmission en double
-  (nouveau).** `resend_packet_seq` remet `p.need_resend = false`
+  (nouveau — corrigé).** `resend_packet_seq` remet `p.need_resend = false`
   (`utp_socket.rs:975`) mais **ne retire jamais `seq` de
   `needs_resend`**. Upstream `resend_packet` efface l'entrée sur tout
   envoi non-would-block (`utp_stream.cpp:2044-2050`). Conséquence :
@@ -224,7 +231,7 @@ Côté Rust : `crates/bitdaemon-net/src/utp.rs`, `utp_socket.rs`,
   par timeout par seq concerné ; biais du cwnd via perte fabriquée à
   la marge).
 - **R10 — `poll_read` en attente jamais livré de l'EOF sur FIN
-  (nouveau).** Quand le FIN du pair arrive et que le buffer se vide,
+  (nouveau — corrigé).** Quand le FIN du pair arrive et que le buffer se vide,
   `sock.read` renvoie `Err(Eof)` → le pump écrit `last_error`
   (`utp_stream.rs:454-458`) **mais garde `rd_tx` ouvert** : le reader
   dans `poll_read` reste `Pending` — `take_error()` n'est consulté que
@@ -241,7 +248,7 @@ Côté Rust : `crates/bitdaemon-net/src/utp.rs`, `utp_socket.rs`,
   `take_error` → EOF/erreur correcte) ; le pump continue pour les
   writes/ACKs. Sévérité : modéré (hang de reader, pas de corruption
   wire).
-- **R11 — filtre `type ≤ 4` en amont du demux (nouveau, trivial).**
+- **R11 — filtre `type ≤ 4` en amont du demux (nouveau — corrigé).**
   `is_utp_datagram` (`engine.rs:6121-6123`) exige `type ≤ 4` ;
   upstream ne teste que len ≥ 20 + version == 1 au niveau manager
   (`utp_socket_manager.cpp:119-125`) : un paquet type 5-15 dont le
@@ -251,7 +258,7 @@ Côté Rust : `crates/bitdaemon-net/src/utp.rs`, `utp_socket.rs`,
   aussi les types > 4 à `route` (le socket les comptera invalides) —
   ou accepter la divergence compteur-seule. Sévérité : observabilité.
 - **R12 — file inbound bornée (64) droppe en rafale sans compteur
-  (nouveau).** `route` fait `try_send` sur `mpsc::channel(64)`
+  (nouveau — corrigé : observabilité).** `route` fait `try_send` sur `mpsc::channel(64)`
   (`utp_stream.rs:159-164,290`) — plein → drop silencieux, ni
   `utp_invalid_pkts_in` ni un compteur maison. Upstream traite chaque
   datagramme inline sur le network thread — pas de perte au demux.
@@ -262,6 +269,66 @@ Côté Rust : `crates/bitdaemon-net/src/utp.rs`, `utp_socket.rs`,
   compter le drop (`utp_invalid_pkts_in` ou une métrique dédiée) pour
   l'observabilité ; garder la borne (nécessaire à l'async).
   Sévérité : mineur/edge.
+- **R13 — drain nagle en arithmétique non-signée → panic/wrap
+  (nouveau — corrigé, hors checklist : bug de typage, pas de
+  sémantique).** Le calcul de place restante dans le paquet naglé
+  utilisait `effective_mtu as usize - usize::from(p.size)`
+  (`utp_socket.rs:780-782`) ; upstream calcule en `int32` signé et
+  n'append que si `size_left > 0` (`utp_stream.cpp:1672-1675`). Un
+  paquet naglé créé quand `m_mtu` ≈ plafond de probe (~1472) puis
+  repris sous le plancher (`effective_mtu = m_mtu_floor` ≈ 548)
+  sous-flotte : **panic en debug**, et en release le wrap rend un
+  `size_left` gigantesque → payload appendu là où upstream le saute
+  (dépassement de MTU effectif sur le wire). Fix : `i32` intermédiaire
+  + append conditionné à `size_left > 0`, verbatim upstream. Régression
+  : test unitaire interne forçant `m_mtu` > `p.size` >
+  `m_mtu_floor`. Sévérité : **crash** (debug) / wire-visible
+  (release).
+
+## Résultat de l'apply (passe 3)
+
+Appliqué sur `audit/05-utp-transport` — 12 déviations corrigées, R2
+déclassé :
+
+- **R1** — `UtpSocket::write` refuse `m_out_eof`/état ≥ `FinSent`
+  (`broken_pipe` ≈ `check_fin_sent` upstream) ; `poll_write` →
+  `Err(BrokenPipe)` si `closed`. Test `write_after_close_*`.
+- **R2** — déclassé : bras `send_reset` post-`error_wait` inatteignable
+  upstream (`utp_stream.cpp:2873` court-circuite `:2875`+) — pas de
+  changement.
+- **R3** — `note_send_error` porté : `MessageSize` →
+  `m_mtu_ceiling = size-1` + `update_mtu_limits` + `mtu_probe=false` +
+  renvoi sans DF ; `WouldBlock`/`TryAgain` → `m_stalled` + defer-ack
+  ; autre → `m_error`, `ErrorWait`. Le pump consomme
+  `outbox`-drain → `send_to_flags` et route l'`io::Error` dans la
+  bonne jambe. Test `send_error_legs`.
+- **R4 résidu** — `their_close_reason` exposé via `UtpStream`,
+  stampé dès le paquet porteur.
+- **R6** — le pump exécute `sock.close()` + drain outbox avant de
+  sortir sur `rd_tx` mort (≈ `~utp_stream → destroy() → close()`).
+- **R7** — `UtpConfig::from_settings` mappe les 10 `utp_*` +
+  `proxy_socks5` (SOCKS5 avec/sans auth) ; `enable_utp`/
+  `start_ssl_utp` l'utilisent ; `apply_settings` pousse
+  `InboundMsg::SetConfig` (hot-apply, lecture par tick comme upstream
+  `m_sett.get_int`) + `set_connection_limit` ; `enable_incoming_utp`/
+  `enable_outgoing_utp` relus à chaud dans `utp_wanted`.
+- **R8** — `wait_connected()` propage l'erreur socket réelle via
+  `UtpError → io::Error`.
+- **R9** — `resend_packet_seq` retire `seq` de `needs_resend` quand
+  `need_resend` était armé (miroir de l'erase `utp_stream.cpp:
+  2044-2050`) — plus de retransmission en double ni
+  `num_transmissions` gonflé. Test `resend_unlinks_needs_resend`.
+- **R10** — `sock.read → Err` ferme `rd_tx` après `last_error` :
+  un `poll_read` en attente reçoit EOF/erreur dès le buffer drainé
+  (≈ `maybe_trigger_receive_callback(eof)` `:2866-2867`). Test
+  `pending_read_gets_eof_on_fin`.
+- **R11** — `is_utp_datagram` ne borne que len ≥ 20 + version 1 ;
+  les types 5-15 matchés atteignent le socket → `utp_invalid_pkts_in`,
+  les non-matchés tombent au DHT. Test
+  `unknown_type_counts_invalid_and_unmatched_falls_through`.
+- **R12** — drops `try_send` des files inbound/listener tracés
+  (`tracing::warn!`) — borne conservée, perte non silencieuse.
+- **R13** — arithmétique `size_left` signée + `if size_left > 0`.
 
 ## Tests — couverture vs upstream
 
@@ -350,23 +417,30 @@ Régressions manquantes pour les déviations ouvertes :
 - `decay()` upstream = `packet_pool` decay — pas de pool côté Rust
   (allocator) — N/A.
 
-## Fichiers du fix (si apply ultérieur)
+## Fichiers du fix (appliqués)
 
-- `crates/bitdaemon-net/src/utp_socket.rs` — garde `write` sur
-  `m_out_eof`/`FinSent` (R1) ; unlink `needs_resend` dans
-  `resend_packet_seq` (R9) ; hook `note_send_error` (R3) ;
-  `target_delay` floor (R7).
+- `crates/bitdaemon-net/src/utp_socket.rs` — `write` gardé sur
+  `m_out_eof`/`FinSent` (R1) ; `size_left` signé + append conditionné
+  (R13) ; unlink `needs_resend` dans `resend_packet_seq` (R9) ;
+  `note_send_error` EMSGSIZE/stalled/hard (R3) ; `UtpError::Io` ;
+  `update_cfg`/`set_connection_limit` live (R7).
 - `crates/bitdaemon-net/src/utp_stream.rs` — drop `rd_tx` sur
-  `Err` (R10) ; `close()`+drain avant `break` (R6) ; pump/entrée
-  légère en vie post-`ErrorWait` pour RST (R2) ; remonter l'erreur
-  `send_to_flags` (R3) ; `wait_connected` → erreur réelle (R8) ;
-  compteur de drop `try_send` (R12) ; propager `their_close_reason`
-  (résidu R4).
+  `Err` (R10) ; `close()`+drain outbox avant sortie (R6) ; erreur
+  `send_to_flags` → `note_send_error` (R3) ; `wait_connected` →
+  erreur réelle (R8) ; `their_close_reason` exposé (R4 résidu) ;
+  `SetConfig` hot-apply + limites atomiques (R7) ; drops `try_send`
+  tracés (R12) ; `route` re-parse le header et livre les types > 4
+  aux sockets matchés (R11).
 - `crates/bitdaemon/src/engine.rs` — `UtpConfig` depuis `Settings`
-  + `apply_settings` → `set_connection_limit`/config live (R7) ;
-  étendre `is_utp_datagram` ou compter (R11).
+  (10 `utp_*` + `proxy_socks5`) aux deux sites ; `apply_settings` →
+  `SetConfig`/`set_connection_limit` + relecture des gates
+  enable_incoming/outgoing (R7) ; `is_utp_datagram` = len+version
+  seulement (R11).
 - `crates/bitdaemon-net/tests/test_utp_{socket,stream}.rs` —
-  régressions du tableau ci-dessus.
+  régressions R1, R3, R9, R10, R11, R13 + close-reason entrant.
+- `crates/bitdaemon-net/src/utp_socket.rs` `#[cfg(test)]` — test
+  interne R13 (accès champs privés pour forcer la transition
+  probe→floor).
 
 ## Historique
 
@@ -384,14 +458,22 @@ Régressions manquantes pour les déviations ouvertes :
 - Passe 3 (ce rapport) : R4/R5 fermés ; R1–R3, R6–R8 confirmés
   ouverts ; nouveaux R9 (resend double), R10 (EOF reader), R11
   (filtre type), R12 (drop file bornée).
+- Apply passe 3 (même branche) : R1–R13 corrigés sauf **R2 déclassé**
+  (relecture upstream : le bras `send_reset` est inatteignable derrière
+  l'early-return `error_wait`/`deleting` — comportement Rust déjà iso)
+  ; **R13** (panic nagle `size_left` non-signé) ajouté à l'apply sur
+  signalement externe — vérifié réel avant intégration.
 
 ## Conclusion
 
 Le cœur protocolaire (framing, state machine, RTO/wrap, LEDBAT, MTU,
 SACK/OOO, wnd, injection transport, demux conn-id) est **conforme** à
 `e7381c7bc` — y compris les subtilités d'ordre d'extensions et de
-sémantique send/recv-id. Les écarts résiduels sont concentrés sur les
-bords du pump async (R2, R6, R10), la plomberie d'erreurs (R3, R8),
-les settings morts (R7), et un défaut de bookkeeping de resend
-nouvellement trouvé (R9). Aucune déviation n'empêche l'interop ; les
-sévérités restent mineures à modérées.
+sémantique send/recv-id. Après apply, **aucune déviation connue ne
+demeure** : les bords du pump async (R6, R10), la plomberie d'erreurs
+(R3, R8), les settings morts (R7), le bookkeeping de resend (R9), le
+crash nagle (R13) et l'observabilité (R11, R12) sont corrigés ; R2 est
+déclassé (dead code upstream). Reste hors scope : la remontée de
+`their_close_reason` dans l'alerte `peer_disconnected` (exposée au
+niveau stream) et l'adaptation structurelle des pumps par-socket vs
+le modèle inline upstream.

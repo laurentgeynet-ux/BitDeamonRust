@@ -16,6 +16,7 @@
 //!   pollable state: `UtpSocket::state`, `UtpSocket::error`.
 
 use std::collections::VecDeque;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -71,6 +72,10 @@ pub enum UtpError {
     /// `asio::error::connection_aborted`.
     #[error("connection aborted")]
     Aborted,
+    /// transport-level send/recv `error_code` (upstream stores the
+    /// raw `error_code` in `m_error`; we keep the `io::ErrorKind`).
+    #[error("socket i/o error: {0:?}")]
+    Io(io::ErrorKind),
 }
 
 /// Upstream `counters` channels the uTP layer increments, in the
@@ -430,6 +435,13 @@ impl UtpSocket {
         self.outbox.drain(..)
     }
 
+    /// Pop the next queued datagram — the pump prefers this over
+    /// [`UtpSocket::drain_outbox`] so send errors can requeue while
+    /// iterating (`note_send_error`).
+    pub fn pop_outbox(&mut self) -> Option<OutDatagram> {
+        self.outbox.pop_front()
+    }
+
     /// `m_sm.inc_stats_counter`.
     fn inc(&self, stat: UtpStat, delta: i64) {
         if let Some(sink) = &self.cfg.counter_sink {
@@ -476,14 +488,41 @@ impl UtpSocket {
         self.test_socket_state();
     }
 
+    /// `utp_socket_impl::destroy()` — the owner went away: `close()`
+    /// (the FIN still flushes queued/Nagle data), then drop the
+    /// unsent write buffer and the undelivered read queue. With no
+    /// reader or writer left, an un-established or already-failed
+    /// socket is deleted outright (`operation_aborted` on every
+    /// handler upstream).
+    pub fn destroy(&mut self) {
+        self.close();
+        self.receive_buffer.clear();
+        self.m_receive_buffer_size = 0;
+        self.write_buffer.clear();
+        self.m_write_buffer_size = 0;
+        while self.send_pkt(0) {}
+        if matches!(
+            self.state,
+            UtpState::ErrorWait | UtpState::None | UtpState::SynSent
+        ) {
+            self.set_state(UtpState::Deleting);
+        }
+    }
+
     /// `m_close_reason` setter — carried by extension 3 on the next
     /// packet(s) (and the FIN), per upstream `set_close_reason`.
     pub fn set_close_reason(&mut self, code: u16) {
         self.m_close_reason = code;
     }
 
-    /// `utp_stream::write_some` — queue payload.
+    /// `utp_stream::write_some` — queue payload. A write after
+    /// `close()`/`FIN` is a `broken_pipe` upstream — return 0 without
+    /// touching the buffer (appending could otherwise be picked up
+    /// by a packet stamped *after* the queued FIN).
     pub fn write(&mut self, buf: &[u8]) -> usize {
+        if self.m_out_eof || self.state >= UtpState::FinSent {
+            return 0;
+        }
         self.write_buffer.extend(buf);
         self.m_write_buffer_size += buf.len() as i32;
         // issue_write → drain while send_pkt() returns true
@@ -550,6 +589,87 @@ impl UtpSocket {
             bytes: bytes.to_vec(),
             dont_fragment,
         });
+    }
+
+    /// `send_pkt`'s send-error legs (`utp_stream.cpp:1786-1831`) —
+    /// the pump reports the transport's verdict here.
+    /// - `EMSGSIZE`/`WSAEMSGSIZE`: clamp the MTU ceiling below the
+    ///   refused size; the packet is requeued without DF (upstream
+    ///   clears `mtu_probe` and resends inline — push_front is the
+    ///   immediate retry).
+    /// - `WouldBlock`/`Interrupted`: `m_stalled` + queue back — the
+    ///   pump calls [`UtpSocket::on_writable`] on the next
+    ///   successful send (upstream `subscribe_writable`).
+    /// - anything else: `m_error` + `error_wait` (`release_packet`).
+    pub fn note_send_error(&mut self, mut d: OutDatagram, err: &io::Error) {
+        if matches!(err.raw_os_error(), Some(90) | Some(10040)) {
+            self.m_mtu_ceiling = u16::try_from(d.bytes.len().saturating_sub(1)).unwrap_or(u16::MAX);
+            self.update_mtu_limits();
+            self.m_mtu_seq = 0;
+            if d.bytes.len() >= UTP_HEADER_LEN {
+                let seq = u16::from_be_bytes([d.bytes[16], d.bytes[17]]);
+                if let Some(p) = self.outbuf.at_mut(u32::from(seq)) {
+                    if u16::from_be_bytes([p.buf[16], p.buf[17]]) == seq {
+                        p.mtu_probe = false;
+                    }
+                }
+            }
+            d.dont_fragment = false;
+            self.outbox.push_front(d);
+            return;
+        }
+        if matches!(
+            err.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
+            // `m_stalled` — retried at the next drain; upstream
+            // defers a queued ACK, our requeued STATE rides again
+            // the same way
+            self.m_stalled = true;
+            self.outbox.push_front(d);
+            return;
+        }
+        // the failed send counted `m_out_packets`/`num_transmissions`
+        // at queue time; upstream increments only on success
+        self.m_out_packets = self.m_out_packets.saturating_sub(1);
+        self.inc(UtpStat::PacketsOut, -1);
+        if self.m_error.is_none() {
+            self.m_error = Some(UtpError::Io(err.kind()));
+            self.set_state(UtpState::ErrorWait);
+            self.test_socket_state();
+        }
+    }
+
+    /// `m_stalled` — transport refused a send with `WouldBlock`.
+    #[must_use]
+    pub fn stalled(&self) -> bool {
+        self.m_stalled
+    }
+
+    /// `writable()` — a send succeeded after a `WouldBlock`; clear
+    /// the stall and flush pending writes (`issue_write`).
+    pub fn on_writable(&mut self) {
+        if !self.m_stalled {
+            return;
+        }
+        self.m_stalled = false;
+        if matches!(self.state, UtpState::Deleting | UtpState::ErrorWait) {
+            return;
+        }
+        while self.send_pkt(0) {}
+    }
+
+    /// Refresh the settings snapshot — upstream reads the shared
+    /// `session_settings` live (`m_sm` getters); the manager pushes
+    /// hot-applied `UtpConfig` updates through here.
+    pub fn update_cfg(&mut self, cfg: UtpConfig) {
+        // keep this socket's counter sink — `m_stats` (the manager's
+        // counters object) does not change identity on reconfig
+        let sink = self.cfg.counter_sink.clone();
+        self.cfg = cfg;
+        if self.cfg.counter_sink.is_none() {
+            self.cfg.counter_sink = sink;
+        }
     }
 
     /// `send_syn`.
@@ -668,7 +788,12 @@ impl UtpSocket {
                 }
                 break;
             }
-            self.needs_resend.pop_front();
+            // `resend_packet_seq` unlinks its own entry (upstream
+            // erases inside `resend_packet`); a still-matching head
+            // is a stale entry — pop it
+            if self.needs_resend.front() == Some(&seq) {
+                self.needs_resend.pop_front();
+            }
             // don't fast-resend this packet
             if self.m_fast_resend_seq_nr == seq {
                 self.m_fast_resend_seq_nr = self.m_fast_resend_seq_nr.wrapping_add(1) & ACK_MASK;
@@ -777,14 +902,17 @@ impl UtpSocket {
             // close_reason extension is not updated on nagle packets
             close_reason = 0;
 
-            let size_left = (p.allocated - usize::from(p.size))
-                .min(self.m_write_buffer_size as usize)
-                .min(effective_mtu as usize - usize::from(p.size));
+            // signed arithmetic, like upstream's `std::int32_t`
+            // `size_left`: when the packet was allocated against a
+            // larger MTU than the current `effective_mtu`, the third
+            // operand goes negative — the append must be skipped,
+            // not wrap to a huge unsigned value
+            let size_left = (i32::try_from(p.allocated).unwrap_or(i32::MAX) - i32::from(p.size))
+                .min(self.m_write_buffer_size)
+                .min(effective_mtu - i32::from(p.size));
             if size_left > 0 {
                 let start = usize::from(p.size);
-                let (before, after) = p.buf.split_at_mut(start);
-                let _ = before;
-                self.write_payload(&mut after[..size_left]);
+                self.write_payload(&mut p.buf[start..start + size_left as usize]);
                 p.size += size_left as u16;
             }
 
@@ -996,6 +1124,14 @@ impl UtpSocket {
         self.send_packet(&send_bytes, false);
         self.m_out_packets += 1;
         self.inc(UtpStat::PacketsOut, 1);
+        // upstream erases the packet's `m_needs_resend` link inside
+        // `resend_packet` — without this a timeout-driven resend
+        // leaves `seq` queued and `send_pkt` sends it a second time
+        if need_resend {
+            if let Some(pos) = self.needs_resend.iter().position(|&s| s == seq) {
+                self.needs_resend.remove(pos);
+            }
+        }
         true
     }
 
@@ -1303,12 +1439,17 @@ impl UtpSocket {
         if in_flight <= 0 || acked_bytes <= 0 {
             return;
         }
-        let target_delay = self.cfg.target_delay_ms.max(1) * 1000;
+        // upstream `max(1, m_sm.target_delay())` — the getter
+        // already multiplies the setting by 1000, so the clamp
+        // applies to the *µs* value; wrapping matches upstream int32
+        // arithmetic on absurd settings without panicking
+        let target_delay = self.cfg.target_delay_ms.wrapping_mul(1000).max(1);
         let cwnd_saturated = self.m_bytes_in_flight + acked_bytes + i32::from(self.m_mtu)
             > (self.m_cwnd >> 16) as i32;
 
         let window_factor = (i64::from(acked_bytes) << 16) / i64::from(in_flight);
-        let delay_factor = (i64::from(target_delay - delay) << 16) / i64::from(target_delay);
+        let delay_factor =
+            (i64::from(target_delay.wrapping_sub(delay)) << 16) / i64::from(target_delay);
         let scaled_gain: i64;
 
         if delay >= target_delay {
@@ -1900,4 +2041,44 @@ fn micros_now() -> u32 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(Instant::now);
     (start.elapsed().as_micros() as u64 & 0xffff_ffff) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A05/R13 — a Nagle packet allocated against the probe MTU is
+    /// picked up when the current `effective_mtu` (`m_mtu_floor`, a
+    /// probe is already in flight) is *smaller* than `p.size`:
+    /// upstream's signed `size_left` goes negative and the append is
+    /// skipped — the old `usize` arithmetic underflowed (debug
+    /// panic, release wraparound → bogus payload splice).
+    #[test]
+    fn nagle_pickup_below_effective_mtu_skips_append() {
+        let mut s = UtpSocket::new(1, 2, UtpConfig::default());
+        s.remote = "127.0.0.1:6881".parse().unwrap();
+        s.set_state(UtpState::Connected);
+        s.m_adv_wnd = 1_000_000;
+        s.m_mtu_seq = 7; // probe in flight → effective_mtu = m_mtu_floor
+        s.m_bytes_in_flight = 100;
+        // queued payload waiting to be appended
+        s.write_buffer.extend(std::iter::repeat_n(0xABu8, 500));
+        s.m_write_buffer_size = 500;
+        // the held Nagle packet: allocated at probe size (~1010),
+        // already larger than the floor (548)
+        let mut p = Packet::new(1010);
+        p.size = 20 + 700;
+        p.header_size = 20;
+        p.buf[0] = 1; // ST_DATA v1
+        p.buf[16..18].copy_from_slice(&42u16.to_be_bytes());
+        s.m_seq_nr = 42;
+        s.nagle_packet = Some(Box::new(p));
+
+        // must not panic and must not append — the packet leaves
+        // with its original size, buffered data stays queued
+        let _ = s.send_pkt(0);
+        let sent = s.pop_outbox().unwrap();
+        assert_eq!(sent.bytes.len(), 720);
+        assert_eq!(s.m_write_buffer_size, 500);
+    }
 }

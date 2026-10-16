@@ -430,6 +430,9 @@ pub struct Engine {
     pub utp_manager: Option<Arc<bitdaemon_net::utp_stream::UtpManager>>,
     /// uTP dialer (`enable_outgoing_utp`).
     utp_connector: Option<Arc<bitdaemon_net::utp_stream::UtpConnector>>,
+    /// SSL-over-uTP managers (`…s` listen interfaces) — kept for
+    /// settings hot-apply (`UtpManager::set_config`).
+    utp_ssl_managers: Vec<Arc<bitdaemon_net::utp_stream::UtpManager>>,
     /// when true, `spawn_dial` prefers uTP and falls back to TCP —
     /// opt-in for now: upstream defaults `enable_*_utp` to true but
     /// our uTP path is newer than the TCP one.
@@ -723,6 +726,7 @@ impl Engine {
                 .unwrap_or_else(Instant::now),
             utp_manager: None,
             utp_connector: None,
+            utp_ssl_managers: Vec::new(),
             utp_enabled: false,
             ssl_resolver: Arc::new(bitdaemon_net::ssl_stream::SniResolver::new(None)),
             ssl_roots: Arc::new(bitdaemon_net::ssl_stream::SslTorrentRoots::new()),
@@ -759,34 +763,68 @@ impl Engine {
         self.disk_notify.clone()
     }
 
+    /// `settings_pack` → `UtpConfig` — the ten `utp_*` session
+    /// settings upstream's `utp_socket_manager` reads live through
+    /// `m_sm` getters (previously `..Default::default()` silently
+    /// ignored them). The counter sink mirrors `m_stats`.
+    fn utp_cfg(
+        s: &bitdaemon_session::settings::SessionSettings,
+        sink: bitdaemon_net::utp_socket::UtpCounterSink,
+    ) -> bitdaemon_net::utp_socket::UtpConfig {
+        bitdaemon_net::utp_socket::UtpConfig {
+            target_delay_ms: i32::try_from(s.utp_target_delay.as_millis()).unwrap_or(i32::MAX),
+            gain_factor: s.utp_gain_factor,
+            min_timeout: i32::try_from(s.utp_min_timeout.as_millis()).unwrap_or(i32::MAX),
+            syn_resends: u32::try_from(s.utp_syn_resends).unwrap_or(0),
+            fin_resends: u32::try_from(s.utp_fin_resends).unwrap_or(0),
+            num_resends: u32::try_from(s.utp_num_resends).unwrap_or(0),
+            connect_timeout: i32::try_from(s.utp_connect_timeout.as_millis()).unwrap_or(i32::MAX),
+            loss_multiplier: i64::from(s.utp_loss_multiplier),
+            cwnd_reduce_timer: i64::try_from(s.utp_cwnd_reduce_timer.as_millis())
+                .unwrap_or(i64::MAX),
+            proxy_socks5: matches!(
+                s.proxy_type,
+                bitdaemon_net::proxy::ProxyType::Socks5
+                    | bitdaemon_net::proxy::ProxyType::Socks5Password
+            ),
+            counter_sink: Some(sink),
+        }
+    }
+
+    /// push the current session settings onto a uTP manager —
+    /// `UtpManager::set_config` hot-applies to live sockets and the
+    /// atomics gate incoming SYNs / the SYN-flood cap.
+    fn apply_utp_settings(&self, mgr: &bitdaemon_net::utp_stream::UtpManager) {
+        let ses = slock(&self.session);
+        mgr.set_config(Self::utp_cfg(
+            &ses.settings,
+            bitdaemon_session::counters::utp_counter_sink(&ses.counters),
+        ));
+        mgr.set_connection_limit(usize::try_from(ses.settings.connections_limit).unwrap_or(0));
+        mgr.set_accept_incoming(ses.settings.enable_incoming_utp);
+    }
+
     /// `enable_outgoing_utp`/`enable_incoming_utp` wiring — build the
     /// uTP manager on the injected datagram transport, route uTP
     /// datagrams in `tick`, and (incoming) accept SYNs through
     /// [`Self::start_acceptor`]. Call once, before `start_udp_pump`.
+    /// The connector/acceptor install unconditionally like upstream's
+    /// `utp_socket_manager` — the `enable_*_utp` flags gate usage
+    /// (dial-time check / SYN drop), not installation.
     pub async fn enable_utp(&mut self) {
         let Some(dg) = self.datagram.clone() else {
             return;
         };
-        let cfg = bitdaemon_net::utp_socket::UtpConfig {
-            counter_sink: Some(bitdaemon_session::counters::utp_counter_sink(
-                &slock(&self.session).counters.clone(),
-            )),
-            ..Default::default()
-        };
         let manager = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
-        if slock(&self.session).settings.enable_outgoing_utp {
-            self.utp_connector = Some(Arc::new(bitdaemon_net::utp_stream::UtpConnector {
-                manager: manager.clone(),
-                datagram: dg.clone(),
-                cfg: cfg.clone(),
-            }));
-        }
-        if slock(&self.session).settings.enable_incoming_utp {
-            let acc = bitdaemon_net::utp_stream::UtpAcceptor::new(manager.clone(), dg, cfg).await;
-            // `socket_type_t::utp` = 3 — the tag feeds alerts and
-            // `peer_class_type_filter` (`set_peer_classes`).
-            self.start_acceptor_at(Arc::new(acc), None, 3);
-        }
+        self.apply_utp_settings(&manager);
+        self.utp_connector = Some(Arc::new(bitdaemon_net::utp_stream::UtpConnector {
+            manager: manager.clone(),
+            datagram: dg.clone(),
+        }));
+        let acc = bitdaemon_net::utp_stream::UtpAcceptor::new(manager.clone(), dg).await;
+        // `socket_type_t::utp` = 3 — the tag feeds alerts and
+        // `peer_class_type_filter` (`set_peer_classes`).
+        self.start_acceptor_at(Arc::new(acc), None, 3);
         self.utp_manager = Some(manager);
         self.utp_enabled = true;
     }
@@ -802,22 +840,18 @@ impl Engine {
         local: SocketAddr,
         kind: u8,
     ) {
-        let cfg = bitdaemon_net::utp_socket::UtpConfig {
-            counter_sink: Some(bitdaemon_session::counters::utp_counter_sink(
-                &slock(&self.session).counters.clone(),
-            )),
-            ..Default::default()
-        };
         let manager = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
-        let acc =
-            bitdaemon_net::utp_stream::UtpAcceptor::new(manager.clone(), dg.clone(), cfg).await;
+        self.apply_utp_settings(&manager);
+        let acc = bitdaemon_net::utp_stream::UtpAcceptor::new(manager.clone(), dg.clone()).await;
         self.start_ssl_acceptor_at(Arc::new(acc), Some(local), kind);
+        let pump = manager.clone();
         self.tasks.push(tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
             while let Ok((n, from)) = dg.recv_from(&mut buf).await {
-                manager.route(from, &buf[..n]).await;
+                let _ = pump.route(from, &buf[..n]).await;
             }
         }));
+        self.utp_ssl_managers.push(manager);
     }
 
     /// start the datagram pump — every received packet is queued
@@ -840,8 +874,7 @@ impl Engine {
                 match dg.recv_from(&mut buf).await {
                     Ok((n, from)) => {
                         if let Some(mgr) = &utp {
-                            if is_utp_datagram(&buf[..n]) {
-                                mgr.route(from, &buf[..n]).await;
+                            if is_utp_datagram(&buf[..n]) && mgr.route(from, &buf[..n]).await {
                                 continue;
                             }
                         }
@@ -3727,6 +3760,15 @@ impl Engine {
         // upstream keeps them separate).
         self.max_out_request_queue = s.max_out_request_queue.clamp(0, i32::from(u16::MAX)) as u16;
         slock(&self.session).apply_settings(s);
+        // `utp_socket_manager` reads `session_settings` live —
+        // push the new snapshot (uTP knobs, connections_limit,
+        // enable_incoming_utp) onto every manager
+        if let Some(mgr) = &self.utp_manager {
+            self.apply_utp_settings(mgr);
+        }
+        for mgr in &self.utp_ssl_managers {
+            self.apply_utp_settings(mgr);
+        }
     }
 
     /// `session_handle` for downstream — shares this engine's
@@ -3868,7 +3910,9 @@ impl Engine {
                         .map(|i| &t.peer_list.peers()[i])
                 })
                 .is_some_and(|p| p.supports_utp || p.confirmed_supports_utp);
-            let utp_wanted = self.utp_enabled && (!ses.settings.enable_outgoing_tcp || peer_utp);
+            let utp_wanted = self.utp_enabled
+                && ses.settings.enable_outgoing_utp
+                && (!ses.settings.enable_outgoing_tcp || peer_utp);
             (
                 ses.settings.enable_dht,
                 ssl,
@@ -6119,7 +6163,11 @@ fn is_fd_exhausted(e: &bitdaemon_net::NetError) -> bool {
 }
 
 fn is_utp_datagram(buf: &[u8]) -> bool {
-    buf.len() >= 20 && buf[0] & 0x0f == 1 && (buf[0] >> 4) <= 4
+    // upstream `utp_socket_manager::incoming_packet` gates on
+    // `size >= sizeof(utp_header) && get_version() == 1` — the type
+    // nibble is *not* filtered: unknown types (5..15) reach the
+    // socket and count `utp_invalid_pkts_in`
+    buf.len() >= 20 && buf[0] & 0x0f == 1
 }
 
 /// upstream `read_pe_cryptofield`'s `crypto_select` — intersect the
