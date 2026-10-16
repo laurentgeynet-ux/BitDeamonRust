@@ -498,5 +498,5 @@ Gates : `cargo fmt --all` · `cargo clippy --workspace
 suites, 0 échec — disk : 37 unit + 27 io + fences/pool/storage)
 · `cargo doc --workspace --no-deps` — toutes passées.
 
-Commit : `6ef08cc` (`fix(bitdaemon-disk): disk-cache
+Commit : `0132262` (`fix(bitdaemon-disk): disk-cache
 parity — incremental piece_hasher + borrowed_buf`).
