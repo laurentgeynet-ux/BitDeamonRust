@@ -464,3 +464,219 @@ request_blocks,torrent,session,piece_picker,peer_info,counters}.rs` ;
 - PR : https://github.com/laurentgeynet-ux/BitDeamonRust/pull/4
 - Fragment changelog : `docs/audits/changelog/A08.md`
   (agrégé au prochain passage de `_aggregate_changelog.py`)
+
+## Ré-audit — round 2 (post-apply)
+
+Re-vérification des fixes D1–D6 contre le code actuel et nouveau
+passage sur les zones non couvertes par le round 1
+(`update_desired_queue_size`, échelle de déconnexion complète,
+`cancel_request`/`cancel_block`, complétion d'écriture orpheline,
+alerte `outstanding_request_limit_reached`). Analyse read-only,
+mode rapport.
+
+### Fixes D1–D6 — vérifiés appliqués
+
+- **D1 (`start_receive_piece`)** — implémenté
+  (`peer_conn.rs:1062-1093`) : migration `request_queue` → tête
+  `download_queue` avec ajustement `queued_time_critical` pour les
+  entrées connues (`:1074-1086`), insertion `not_wanted` en tête +
+  `outstanding_bytes += len` pour l'inconnu (`:1087-1091`), skip
+  `disconnecting`. `UnwantedBlock` reste pour le bras assert-upstream.
+- **D2 (`validate_piece_request`)** — implémenté : `invalid_piece`
+  disconnect sur validation de forme (`peer_conn.rs:1607-1632`),
+  `packet_too_large` conservé (`:1597-1605`).
+- **D3 (`reading_socket` sur `request_timeout`)** — implémenté :
+  `channel_state[DOWNLOAD] & NETWORK` gate la leg `request_timed_out`
+  (`torrent.rs:9825-9838`) — la leg `piece_timeout` reste sans gate,
+  conforme (`:5141-5143` upstream). Test `request_timeout_requires_
+  reading_socket` (`test_download_path.rs:51`).
+- **D4 (unsnub post-`is_downloaded`)** — implémenté : `Unsnub` armé
+  au dispatch (`peer_conn.rs:1724-1730`), appliqué ou jeté par le bras
+  `DiskWrite` selon la classification waste (`torrent.rs:4912-4917`).
+  Tests `redundant_piece_keeps_snub_and_skips_graceful` /
+  `live_piece_unsnubs_and_runs_graceful_check`.
+- **D5 (double-dec bras seed)** — le dec inline a été retiré :
+  `peer_conn.rs:1683-1690` ne touche plus `NumPeersDownRequests`, le
+  reconcile `sync_down_requests` couvre la transition.
+- **D6 (queue reject/choke)** — implémenté : `GracefulCheck` +
+  `MaybePick` gaté `request_queue.empty() && download_queue < 2` +
+  `FlushRequests` inconditionnel par reject (`peer_conn.rs:1784-1801`)
+  ; le bras Choke non-FAST rejoue `on_reject` par entrée avec
+  graceful-check et re-pick (`:1147-1192`). Tests
+  `reject_aborts_and_frees_inflight_block`, `malformed_reject_is_a_
+  noop`, `reject_of_timed_out_block_does_not_reabort`,
+  `parole_reject_requeues_request`,
+  `choke_without_fast_rejects_download_queue`.
+
+### Nouvelles déviations
+
+- **D7 — `update_desired_queue_size` alimenté en débit
+  tout-canal au lieu du débit payload.** Upstream lit
+  `statistics().download_payload_rate()`
+  (`peer_connection.cpp:4813`) ; les deux call-sites Rust passent
+  `rate_down_speed` (EMA tout-canal = payload + protocole +
+  ip-overhead) : `peer_conn.rs:1670` (`on_piece_received`) et
+  `torrent.rs:10894` (tick AIMD). Le paramètre s'appelle pourtant
+  `download_payload_rate` (`peer_pipeline.rs:223`) et le commentaire
+  `torrent.rs:10892` « upstream's `m_download_rate` = all-channel
+  rate » est faux — `m_download_rate` n'est pas ce que
+  `update_desired_queue_size` lit. `rate_down_payload` existe et est
+  maintenu à côté (`torrent.rs:10854-10862`) ; `drive_peer` et le
+  retry endgame passent bien le payload (`:6481`, `:9788`). Effet :
+  `desired_queue_size` surestimé de la part overhead (plus marqué sur
+  uTP/i2p où `trancieve_ip_packet` gonfle le canal) → profondeur de
+  pipeline supérieure à cible, `outstanding_request_limit_reached`
+  atteint plus tôt. Fix : `rate_down_payload` aux deux sites +
+  corriger le commentaire. Sévérité : **mineure** (état interne,
+  self-corrigeant au clamp `max_out_request_queue`).
+- **D8 — échelle de déconnexion sans gates `reading_socket` /
+  `m_reading_bytes == 0`** (report du round 1, confirmé toujours
+  absent). Upstream gate **les quatre** legs sur `reading_socket`
+  (`bw_network` canal download) — `timed_out_inactivity` `:4988`,
+  `no_handshake` `:5004`, `no_request` `:5025`, `no_interest`
+  `:5061` — et exige en plus `m_reading_bytes == 0` sur
+  inactivity + no-request. Rust (`torrent.rs:9690-9733`) n'a ni
+  l'un ni l'autre : un pair silencieux *parce que nous ne le lisons
+  pas* (quota download épuisé → `bw_limit`, ou `disk_blocked`) est
+  déconnecté à `peer_timeout`/`handshake_timeout`/60 s-no-request/
+  `inactivity_timeout` là où upstream le garde. L'infrastructure
+  existe (`c.bw.channel_state[DOWNLOAD] & NETWORK` est utilisé à
+  `:9832`, `c.reading_bytes` à `:9752`). Wire-visible : déconnexions
+  prématurées de pairs sains sous throttling ou back-pressure disque.
+  Fix : ajouter `reading_socket` aux quatre legs +
+  `reading_bytes == 0` aux legs inactivity/no-request ; à coordonner
+  avec A07 (lifecycle). Sévérité : **majeure**.
+- **D9 — `cancel_request`/`cancel_block` : sémantique divergente,
+  actuellement inerte.** Upstream `cancel_request(b, force)`
+  (`peer_connection.cpp:3763-3815`) : gate `is_requested` → entrée
+  dlq **conservée** avec `not_wanted = true`, `abort_download`
+  seulement si `force`, `Cancel` filaire seulement si
+  `m_outstanding_bytes >= r.length` (suppression sous requêtes
+  fusionnées). Rust : `PeerConn::cancel_request` **retire** l'entrée
+  (`peer_conn.rs:2062-2092`) et `torrent::cancel_block` émet
+  `abort_download` + `Cancel` inconditionnels (`torrent.rs:10140-
+  10168`). Inerte aujourd'hui : l'unique caller vivant (write-fail,
+  `session.rs:1844`) vise un bloc `writing` → `is_requested` faux
+  des deux côtés → early-return identique (le `cancel_block`
+  post-`mark_as_writing` est du code mort upstream préservé inerte).
+  Latent si un caller atteint un bloc encore `requested` en vol :
+  (a) `Cancel` filaire émis là où upstream le supprime sous
+  `outstanding < len` ; (b) payload en course arrivant après le
+  retrait est ré-inséré `not_wanted` par `start_receive_piece` avec
+  `outstanding_bytes += len` une seconde fois → dérive `+len`
+  permanente jusqu'à purge des queues (upstream garde l'entrée :
+  `-len` net à l'arrivée) ; (c) libération picker immédiate là où
+  `force=false` conserve l'attribution jusqu'à consommation. Fix :
+  marquer `not_wanted` au lieu de retirer dans le bras dlq de
+  `cancel_request` quand l'appel est une annulation (séparer la
+  primitive « pop à l'arrivée » de `on_piece`, qui elle doit retirer)
+  + gate `outstanding_bytes >= len` sur le `Cancel` + `force` en
+  paramètre. Sévérité : **latente** (inerte aujourd'hui).
+- **D10 — `on_disk_write_complete` sans torrent ne déconnecte
+  pas.** Upstream : `!t` → `disconnect(error.ec, file_write)`
+  (`peer_connection.cpp:3197-3201`), **avant** le check
+  `picker_gen`. Rust : `torrents.get(&ih).is_none_or(gen mismatch)`
+  → `continue` silencieux (`session.rs:1814-1820`). Inerte en
+  pratique — `remove_torrent` détruit les conns avant qu'une
+  complétion n'arrive — mais un orphelin (race teardown) resterait
+  ouvert. Fix : `DisconnectPeer` quand le torrent est absent avant
+  le check `picker_gen`. Sévérité : **latente**.
+- **D11 — `outstanding_request_limit_reached` évalué sur la valeur
+  repliée + tail AIMD sans gate `ready_for_connections`.** Upstream
+  compare le **membre** `m_desired_queue_size >= max_out_request_
+  queue` (`:5132`) — en endgame le membre reste à sa valeur AIMD
+  alors que l'accesseur `desired_queue_size()` retourne 1
+  (`peer_connection.hpp:522` `(endgame || snubbed) ? 1 : member`).
+  Rust évalue `desired_queue_size()` (`torrent.rs:10898-10905`) →
+  alerte supprimée en endgame. De plus upstream gate tout le bloc
+  (update + alerte) sur `t->ready_for_connections()` (`:5128`,
+  `m_connections_initialized`) ; la boucle stat Rust
+  (`torrent.rs:10824+`) itère tous les pairs sans ce gate → les
+  conns d'un torrent non initialisé voient leur `dqs` ajustée (et
+  l'alerte peut théoriquement tirer). Fix : comparer le membre
+  `desired_queue_size` + gater la section sur
+  `self.connections_initialized`. Sévérité : **mineure**
+  (alerte/état interne).
+
+### Parité confirmée au round 2
+
+- `send_block_requests` — boucle `dlq < member || queued_tc > 0`,
+  décrément `queued_time_critical` par pop (y compris dans la boucle
+  de merge), drop sans picker, purge `is_downloaded` + abort,
+  `send_buffer_offset` partagé entre blocs fusionnés (17 o = 4+1+12
+  par requête émise), `last_request_ms` par requête,
+  `last_piece_ms` inconditionnel, `requested_ms` sur transition
+  vide→non-vide (`peer_pipeline.rs:344-408` =
+  `peer_connection.cpp:4046-4193`). `RequestMerger` =
+  `aux::request_merger` verbatim (`merge_block_requests.hpp`).
+- `snub_peer` — séquence complète conforme (voir round 1 +
+  `torrent.rs:9843-9965` = `:5165-5259`, ordre alerte→repick→
+  `timed_out`+abort→flush vérifié ligne à ligne).
+- `incoming_reject_request` — queue complète conforme (validation
+  forme, `remove_from_picker` = `!timed_out && !not_wanted`, parole
+  requeue tête, allowed-fast/suggest selon choke, graceful-check
+  puis repick gaté, flush inconditionnel).
+- `on_disk_write_complete` — drain inconditionnel
+  `queued_write_bytes`/`outstanding_writing_bytes`, clear `bw_disk`
+  à zéro + `PeerDrain` (release watermark), gate `picker_gen`,
+  chemin erreur (aborted → `mark_as_canceled` ; sinon
+  `cancel_block`+`write_failed`+fence `clear_piece`→
+  `on_piece_fail_sync`+`handle_disk_error`), succès →
+  `mark_as_finished`+`disconnect_if_redundant`+`block_finished`+
+  check graceful (`session.rs:1784-1973` = `:3169-3300`).
+- `second_tick` — ordre du ladder + `keep_alive` (timeout/2, gates
+  connecting/handshake) + retry endgame 5 s (`torrent.rs:9765-9813`
+  = `:5020-5025`) + `fill_send_buffer` par pair — modulo D8.
+- `second_tick` stats — sortie slow-start (`prev + 5 KiB >= cur`,
+  `!choked`, `prev > 0`), EMA 5 s par canal, pics
+  `upload_rate_peak`/`download_rate_peak` en payload, échantillon
+  `request_time` = `now - requested_ms` pré-réarmement
+  (`peer_conn.rs:1037`), réarmement si dlq non vide.
+- `cancel_non_critical` — sémantique `force=true` fidèle
+  (`not_wanted` conservé, gate `is_requested`, `Cancel` filaire
+  gaté `outstanding_bytes >= len`, tc-prefix ajusté, abort picker
+  groupé ; `torrent.rs:10057-10133` = `torrent.cpp:5621-5630` +
+  `peer_connection.cpp:3763-3815`).
+
+### Différences architecturales confirmées (non-déviations)
+
+- `m_deferred_send_block_requests` → appels inline par batch
+  d'effets (round 1, reconfirmé — `route`→`drive_peer` coalesce de
+  la même façon que le `defer` io_service).
+- `num_peers_down_requests` par reconcile `sync_down_requests`
+  (fin de batch `route`, `session.rs:9631-9637`) — écart observable
+  nul à quiescence ; appelé après chaque batch d'effets dont les
+  `remove_peer`.
+- `incoming_piece_fragment` par fragment → message complet (codec
+  livre des messages entiers ; `outstanding_bytes` net identique).
+- `verify_piece` déclenché à la complétion de la **dernière
+  écriture** (`session.rs:1929-1973`) là où upstream le lance à la
+  réception dès `is_piece_finished` (`:3127-3131`, les jobs disque
+  ordonnancés par la fence) — même résultat (hash voit tous les
+  blocs), latence d'une complétion d'écriture en plus ; seam A14.
+- Hooks d'extension `write_request` intercepteurs — non portés
+  (A02) ; sans effet sur les conns BT standards.
+- `wanted_transfer`/quota par octet lu (`account_received_bytes`,
+  `:6084-6096`) — débit dans le bandwidth manager session-side
+  (seam A28), hors du périmètre direct de cet audit.
+
+### Tests manquants identifiés (round 2)
+
+- Canal de débit de `update_desired_queue_size` (D7) — aucun test
+  ne distingue payload vs all-channel.
+- Gates `reading_socket`/`reading_bytes` du ladder de déconnexion
+  (D8) — `test_download_path.rs` ne couvre que la leg
+  request-timeout.
+- `RequestMerger` sur pièce tronquée — `merge_stops_after_truncated_
+  piece`/`merge_within_truncated_piece_unaffected` upstream non
+  portés (seul `merger_contiguous` teste le franchissement plein,
+  `test_piece_picker.rs:749-799`).
+- Back-pressure `exceeded && outstanding_writing_bytes > 0` (droit
+  aux deux blocs) — le test `PeerDrain` (`test_session.rs:183-220`)
+  couvre le release, pas le gate d'entrée ni
+  `num_peers_down_disk` à la transition.
+- Retry endgame 5 s et legs du ladder `no_request`/`no_interest` —
+  non couverts côté `check_request_timeouts`.
+- Course `cancel`→arrivée (bloc `not_wanted` consommé) — couverte
+  pour le chemin `start_receive_piece` inconnu, pas pour
+  `cancel_block` sur entrée en vol (cf. D9).
