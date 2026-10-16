@@ -289,3 +289,151 @@ abort_all_writers_reports_buffers}`,
 
 Gates : `cargo fmt` ✓ · `clippy -D warnings` ✓ · `cargo test
 --workspace` ✓ (0 échec) · `cargo doc` ✓.
+
+## Re-contrôle (round 2) — 2026-10-16
+
+Point de contrôle vérifié : `flush_after_insert` (`disk_io.rs:974-987`)
+flushe inconditionnellement toute pièce complète à l'insert — ni
+watermark ni état de hash testés. Upstream, le seul déclencheur
+hors-pression est `force_flush_flag` (posé par `kick_hasher`
+`disk_cache.cpp:629/:658-659`, `hash_piece` `:490`,
+`try_hash_piece` `:437-438`, write-flag `:811`) : **le hash précède le
+flush hors pression**. Les deux derniers maillons de la chaîne
+étaient à confirmer sur le code post-apply.
+
+### Maillons confirmés
+
+1. **Parking du hash derrière le flush (`piece_in_flight`) — présent.**
+   `perform_job` reposte `Hash`/`Hash2` quand `piece_in_flight` voit un
+   bloc `has_write_job && !flushed` (`disk_io.rs:1529-1532`, prédicat
+   `:1803-1807` — modèle du `write_state == disk_buffer_ref` upstream :
+   buffer possédé par la passe de flush, ni cache ni disque lisibles).
+   Le repost re-passe `gate_consult` → `PieceGate::blocked` tant que
+   `writes > 0` (`disk_io.rs:825-841`), libéré à la complétion du
+   dernier Flush de la pièce (`:1300-1323`). Équivalent du hash-job
+   upstream parqué sur la cpe (`try_hash_piece` `disk_cache.cpp:456-466`,
+   `flush_piece_impl` → `queue_jobs`). Test :
+   `test_disk_io::hash_parked_behind_inflight_write_is_released`. ✓
+2. **Complétion du hash → `PIECE_HASH_RETURNED` + flush — présent.**
+   Bras `JobKind::Hash` de `job_done` (`disk_io.rs:640-660`) :
+   `cache.hash_returned` pose `PIECE_HASH_RETURNED`
+   (`disk_cache.rs:968`), solde `unhashed`, re-queue `ready`
+   (`:979-985`), puis `take_all_runs` enfile les `Flush` hors watermark.
+   Équivalent exact du `force_flush_flag` upstream → passe optimiste —
+   la chaîne « hash ⇒ flag ⇒ drain » existe donc aussi chez nous.
+   `Hash2` ne pose **pas** le flag (`disk_io.rs:679-682`) ==
+   lookup pur upstream. ✓
+
+3. **Chaîne de déclenchement — pourquoi le flush eager tient debout.**
+   Le dispatch du hash est *write-completion-driven*
+   (`session.rs:1894-1972` : `DiskCompleted::Write` → `piece_complete`
+   → `async_hash`), et le write ne complète qu'au flush. Sans le bras
+   `complete` de `flush_after_insert`, le dernier write resterait parké
+   (rien ne schedule le flush : ni watermark, ni flag) → `async_hash`
+   jamais émis → pièce bloquée jusqu'à `cache_expiry`. Upstream
+   échappe au cycle par le hasher incrémental (`kick_hasher` par
+   insert) : hashé dès l'arrivée → `force_flush` → flush optimiste →
+   write complète → `async_hash` → `job_completed` inline. Le flush
+   eager est donc structurellement nécessaire *dans le design actuel*
+   — mais il inverse l'ordre amont : chez nous **flush puis re-lecture
+   pour hasher**, upstream **hash (depuis le cache) puis flush**.
+   Coût réel → E1.
+
+### Nouvelles déviations (E1–E6)
+
+- **E1 — hash v1 = re-lecture disque complète d'une pièce qui vient
+  d'être écrite (perf).** `hash_job` copie les blocs encore cachés puis
+  `read` chaque trou (`disk_io.rs:2077-2107` ; commentaire
+  « expensive path » `:2089-2094`). Comme le bras `complete` retire la
+  pièce du cache *avant* que le hash soit demandé, chaque pièce v1/
+  hybride paye une re-lecture pleine pièce — upstream ne re-lit rien
+  (`piece_hasher` alimenté par `insert`/`kick_hasher` depuis les
+  buffers). Le chemin v2 évite déjà le coût : SHA-256 par bloc calculé
+  *au flush* dans `perform_job` (`disk_io.rs:1505-1528`). Sévérité :
+  état-interne/perf — invisible sur le fil mais réel en disque.
+  **Sketch** : port de `piece_hasher` en mode flush-time — contexte
+  `Sha1` + `sha1_cursor` sur `CachedPieceEntry`, alimenté dans
+  `run_flushed` quand le run fournit le bloc contigu au curseur ;
+  `hash_job` répond inline quand le hash est prêt (= `try_hash_piece`
+  upstream, E6). Ne change ni timing ni ordonnancement, supprime la
+  re-lecture.
+- **E2 — fenêtre in-flight : les reads passent à côté des buffers
+  sortis vers un Flush (wire-adjacent).** `get`/`get2`/`overlay_cached`
+  ne voient que `b.buf` ; entre `take_flush_run` et `run_flushed` le
+  block est `buf=None + has_write_job` → `prepare_read` miss → lecture
+  disque **stale** (les nouveaux octets ne sont pas encore posés).
+  Upstream garde `borrowed_buf` lisible dans la fenêtre
+  (`disk_cache.hpp:379-388`, `get`/`get2` le servent). Hash/Hash2 sont
+  déjà couverts par `piece_gate` — seul le bras Read est exposé.
+  `overlay_cached` (`disk_io.rs:1727-1758`) a le même trou après la
+  lecture disque. Sévérité : état-interne, fenêtre ~durée d'un writev ;
+  un peer re-demandant le bloc peut recevoir des octets pré-write.
+  **Sketch** : `buf: Option<Arc<[u8]>>` — `take_flush_run` clone l'Arc
+  vers le `FlushJob` au lieu de le déplacer ; `data()` reste serviable
+  jusqu'à `run_flushed`.
+- **E3 — re-insert pendant flush ou sur bloc `flushed` : buffer
+  invisible/écrasé, writer parké à vie.** `insert` écrit `b.buf = buf`
+  sans regarder `flushed`/`has_write_job` (`disk_cache.rs:346-379`) :
+  (a) bloc en vol (`has_write_job`) → `run_flushed` fait
+  `b.buf = None; b.flushed = true` (`disk_cache.rs:873-877`) → le
+  nouveau buffer est droppé, le nouveau writer jamais complété ;
+  (b) bloc déjà `flushed` → nouveau `buf` ignoré par tous les
+  `take_*_run` (`!b.flushed` requis) → writer parké à vie,
+  `num_cached_blocks` +1 permanent. Upstream asserte les trois
+  impossibilités : `!blk.has_buf()`, `get_write_job()==nullptr`,
+  `block_idx >= flushed_cursor && >= hasher_cursor`
+  (`disk_cache.cpp:290-293`). Inatteignable si le contrat moteur tient
+  — mais upstream l'asserte, nous le rendons silencieusement fuyard.
+  Sévérité : état-interne latent. **Sketch** : `insert` → si
+  `b.flushed`, `b.flushed = false` (re-write = dirty) ; `run_flushed` →
+  si `b.buf.is_some()` à l'atterrissage, garder le nouveau buffer
+  dirty au lieu de `None` ; `debug_assert` sur le cas
+  `has_write_job && buf` comme upstream.
+- **E4 — abort hors-bornes sans retrait de `CACHED` → slot
+  `write_blocks` fuité.** `insert` abort le writer quand
+  `block_idx >= blocks_in_piece` (`disk_cache.rs:370-375`) mais
+  `insert_write` a déjà posé `CACHED` (`disk_io.rs:2420-2423`) →
+  `job_done` bras Write saute le décrément (`:559-563` exige
+  `!CACHED`). Même classe que le bras OOB : inatteignable-sous-contrat,
+  fuite comptable. **Sketch** : `w.flags &= !CACHED` avant `abort`
+  (miroir du bras supersede `:364`) — mais attention : le slot chargé
+  pour ce write n'est jamais « inséré », donc `check_buffer_level`
+  doit suivre. Cosmétique.
+- **E5 — `num_unhashed` non décrémenté à `run_flushed`.** Upstream
+  `--m_num_unhashed` par bloc retiré non hashé
+  (`disk_cache.cpp:839-841` — invariant « blocs cachés non hashés »).
+  Chez nous `p.unhashed` ne se solde qu'à `hash_returned`/
+  `remove_piece` → dérive transitoire entre flush et hash, exposée
+  dans `stats()/queue_stats`. Cosmétique.
+- **E6 — pas de `schedule_flush` équivalent pour les writes parkées
+  derrière une fence.** Upstream `insert_write` appelle
+  `schedule_flush()` *même* quand `is_blocked` parque le job
+  (`pread_disk_io.cpp:523-550`) → le drain watermark démarre
+  immédiatement. Chez nous `async_write` retourne `pressure` sans
+  évaluer le flush (`disk_io.rs:2442-2454`) → sous rafale parkée, la
+  pression monte sans drain jusqu'à la chute de la fence (le repost
+  relance `flush_after_insert` — auto-correctif mais retardé).
+  Sévérité : état-interne mineur. **Sketch** : évaluer
+  `should_flush(write_blocks)` sur le chemin parké et enfiler les
+  runs des *autres* pièces dirty (boucle multi-storages déjà écrite).
+
+### Surface API sans consommateur (résidu de port)
+
+`write_job_done`, `hashed_block`, `try_clear_piece`, `count_jobs`,
+`InsertResult.exceeded_limit`, `need_hasher_kick` (émis, ignoré par
+`insert_write`) — transitions portées pour complétude ; les vraies
+transitions passent par `run_flushed`/`hash_returned`/orphans.
+Cosmétique — à documenter ou retirer.
+
+### Verdicts checklist réaffirmés
+
+- Watermark/hystérésis : **conforme** post-D1 (boucle sur
+  `write_blocks` global − `in_flight` prédit, `disk_io.rs:1008-1061`).
+- Force-flush : **conforme** — bras `forced` + `hash_returned` ==
+  passe 1 upstream.
+- Exactly-once writers : **conforme**.
+- Read-side : **conforme avec trou E2** (fenêtre in-flight).
+- `cache_expiry` : extension gardée (choix humain, D4).
+- `cargo test -p bitdaemon-disk` : ✓ 0 échec (round 2).
+- **Note** : `docs/audits/changelog/A16.md` absent du dépôt —
+  fragment du round 1 à réintroduire ou à régénérer.
