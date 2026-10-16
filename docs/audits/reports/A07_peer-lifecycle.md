@@ -540,3 +540,250 @@ Côté Rust : `crates/bitdaemon-session/src/{session,torrent,peer_conn,counters,
   `fix(peer-lifecycle): upstream-fidelity apply of audit A07`
 - PR : https://github.com/laurentgeynet-ux/BitDeamonRust/pull/6
 - Fragment changelog : `docs/audits/changelog/A07.md`.
+
+## Re-audit (round 2 — re-vérification post-apply)
+
+Passe de vérification sur l'arbre `main` post-merge (`f33ab0d` et
+suivants). Les corrections D1–D15 tiennent. La passe a relu
+`torrent::attach_peer` (`torrent.cpp:8540-8720`), `remove_peer`
+(`:6597-6740`), `find_disconnect_candidate_torrent` /
+`compare_disconnect_torrent` (`session_impl.cpp:4904-4935`), le sweep
+`peer_turnover` (`session_impl.cpp:3861-3908`),
+`session_impl::update_connections_limit` (`:6909-6970`),
+`peer_list::{compare_peer, compare_peer_erase, is_erase_candidate,
+should_erase_immediately, update_peer_port, connect_one_peer,
+find_connect_candidates}` (`peer_list.cpp:65-135, 321-345, 881-960,
+494-580, 1275-1330`), `peer_connection::init`/`m_connecting`
+(`peer_connection.cpp:140-190, 855-890, 4210-4230, 4440-4460`),
+`attach_peer`'s conn-cap ladder + `maybe_replace_peer`
+(`torrent.cpp:8549-8670`) et la collision `update_peer_port`
+(`peer_list.cpp:881-960`).
+
+Six déviations nouvelles (D16–D21) — dont deux faux « conforme » du
+round 1 (`compare_peer` source-mask, éviction `>10%` connecting).
+
+### Déviations (round 2)
+
+- **D16 — `primary_source` au lieu du bitmask `peer_source()`.**
+  sévérité : **état-interne** (ordre de dial + weeding) — lentilles
+  [Cycle de vie], [Limites]. `TorrentPeer::source` est le bitmap cumulé
+  des sources (`torrent_peer.hpp:149-154` « a bitmap combining the
+  peer_source flags ») ; upstream `peer_source()` rend le masque entier
+  et `aux::source_rank` accumule tracker `1<<5` + lsd `1<<4` + dht
+  `1<<3` + pex `1<<2` (`request_blocks.cpp:27-35`). Le helper Rust
+  `primary_source` (`peer_list.rs:26-40`) n'est légitime que sur une
+  source mono-bit (entrée fraîche, `insert_peer:370`).
+  - `peer_list.rs:117-118` — `compare_peer` calcule
+    `source_rank(primary_source(src))` au lieu de
+    `source_rank(src)` (`peer_list.cpp:109-110`). Un pair
+    `TRACKER|PEX` vaut 36 upstream vs 32 chez nous ; `DHT|PEX`
+    vaut 12 vs 8 — les pairs multi-sources passent après les
+    mono-sources au classement des candidats de dial.
+  - `peer_list.rs:899` (`is_erase_candidate`), `:909`
+    (`should_erase_immediately`), `:1228-1229`
+    (`compare_peer_for_erase`) — `primary_source(p.source)
+    == RESUME_DATA` au lieu de `p.source == RESUME_DATA`
+    (`peer_list.cpp:74-76, 321-338`) : upstream exige l'égalité exacte
+    du masque (source = `resume_data` *seule*). Une entrée
+    `RESUME_DATA|INCOMING` est weeded/effacée chez nous, conservée
+    upstream.
+  - `torrent.rs:5501` — le handler `PeerEffect::ListenPort` passe
+    `peers()[i].source` (auto-OR, no-op) comme `src` ; upstream
+    `on_extended` passe `peer_info::incoming` inconditionnellement
+    (`bt_peer_connection.cpp:2060-2065`) — le bit `incoming` ne se
+    pose jamais sur l'entrée (observable via `list_peers`/`source`
+    et interacte avec le weeding `== resume_data` ci-dessus).
+    (Le second site `:5356` — application différée du port — passe
+    bien `INCOMING`.)
+  - **sketch** : remplacer `source_rank(primary_source(x.source))`
+    par `source_rank(x.source)` ; remplacer les trois tests
+    `primary_source(p.source) == RESUME_DATA` par
+    `p.source == PeerSourceFlags::RESUME_DATA` ; passer
+    `PeerSourceFlags::INCOMING` à `update_peer_port` à
+    `torrent.rs:5501`. Garder `primary_source` pour `insert_peer`
+    (`:370`, source mono-bit).
+  - **test de régression** : entrée tracker+pex vs entrée pex-seule
+    dans `find_connect_candidates` — la multi-source doit passer
+    devant (`peer_info_comparison`, `test_peer_list.cpp:1159`) ;
+    entrée `RESUME_DATA|INCOMING` survivant le sweep à 95% de
+    `max_peerlist_size`. **Réécrire `ranking_uses_primary_source`
+    (`test_peer_list.rs:259-282`)** — sa prémisse (« upstream ranks
+    the primary source bit ») est fausse et le test fige la
+    déviation.
+
+- **D17 — leg « éviction du conn la plus ancienne en connexion »
+  morte.** sévérité : **wire-visible** (issue admission) — lentilles
+  [Disconnect], [Cycle de vie]. `session.rs:4148-4188` cherche la
+  victime dans `t.peers` filtré `c.connecting` — or `connecting`
+  est remis à `false` côté engine avant tout `add_peer`
+  (`engine.rs:3804, 3899, 5181` ; `PeerConn::new` le pose `true`
+  `peer_conn.rs:639` mais aucune conn `t.peers` ne le conserve).
+  → `victim == None` systématique → la conn entrante est toujours
+  tuée. Upstream `attach_peer` (`torrent.cpp:8570-8585`) itère
+  `m_connections` — qui inclut les dials en vol (conn créée dès le
+  `connect_to_peer`, `m_connecting` posé au ctor jusqu'à `init()`,
+  `peer_connection.cpp:173, 873-877`) — et tue la plus ancienne
+  (`max_element(connecting_time_compare)` = plus petit `m_connect`)
+  à `errors::too_many_connections` sévérité normale, puis admet
+  l'entrante (`peer_disconnected_other()` → `m_exceeded_limit=false`,
+  `peer_connection.hpp:308-309`). Équivalent Rust de la population
+  `is_connecting()` : les marques de dial (`conn_key == 0 &&
+  connection.is_some()`), ordonnées par `last_connected` (stamp de
+  début de dial = `m_connect`).
+  - **sketch** : remplacer le scan `t.peers` par le scan des marques
+    ; sur victime, `peer_disconnected_addr(remote, now, false, false,
+    0)` — nettoie marque + `dial_locals`/`dial_pids`,
+    `dec_num_connecting`(+seeds), `connection_closed` restampe
+    `last_connected` sans failcount (déjà implémenté
+    `torrent.rs:4287-4317`, même résultat que le `disconnect()` +
+    `remove_peer` upstream d'une conn encore `m_connecting`) ;
+    `conn.exceeded_limit = false` ; puis laisser l'attach entrant
+    continuer.
+  - **test de régression** : torrent à `max_connections` avec
+    `num_connecting > max/10` marques de dial — une conn entrante
+    s'attache et la marque la plus ancienne est libérée (pas de
+    failcount sur l'entrée, `num_connecting` décrémenté).
+
+- **D18 — base de comptage des conns : attachées seules vs
+  `m_connections`.** sévérité : **wire-visible** (admission,
+  éviction, turnover) — lentilles [Limites], [Compteurs]. Upstream
+  compte `m_connections` — les dials en vol y figurent dès
+  `create_peer_connection` (`torrent.cpp:8196`) — moins
+  `m_peers_to_disconnect` pour `num_peers()`
+  (`aux_/torrent.hpp:788`). Cinq sites Rust comptent trop peu — ou
+  trop — de conns :
+  - `session.rs:7979-7985, 8000-8012` — `peer_turnover` sélectionne
+    le torrent à `t.peer_list.num_peers()` = taille de la *liste de
+    pairs* (entrées jamais connectées incluses) alors que
+    `session_impl.cpp:3877-3884` prend `num_peers()` =
+    **conns vivantes**. Le même mauvais compte sert le %
+    `peer_turnover` (`:3899-3903`) et le cutoff par torrent
+    (`:3897-3899`). Le commentaire de code `session.rs:7980-7981`
+    (« `num_peers()` is the *peer-list* size upstream ») inverse la
+    sémantique — upstream `num_peers()` *est* le compte de conns.
+    (Le cutoff global `:7976` est juste : `num_connections()`
+    `session.rs:1263-1269` inclut déjà `NumPeersHalfOpen` =
+    `m_connections` upstream. Le clamp `min(num_connect_candidates)`
+    et le guard `max < 6` sont conformes — upstream les a tous les
+    deux.)
+  - `session.rs:1530-1531` — `find_disconnect_candidate_torrent`
+    compare `t.peers.len()` (attachées seules) ;
+    `compare_disconnect_torrent` utilise `num_peers()`
+    (`session_impl.cpp:4908-4916`).
+  - `session.rs:4433-4436` — comparaison `this_n`/`cand_n` de
+    `exceeded_limit` sur `t.peers.len()` ; upstream
+    `peer_connection.cpp:1425` `other_t->num_peers() <=
+    t->num_peers()`.
+  - `session.rs:4145` — cap par torrent `t.peers.len() >= limit` ;
+    upstream `m_connections.end_index() >= limit`
+    (`torrent.cpp:8563`) inclut les dials en vol (les
+    `m_peers_to_disconnect` y comptent aussi ici — conns en teardown
+    toujours dans le conteneur).
+  - `session.rs:6739, 6752, 6773` — `update_connections_limit` somme
+    `t.peers.len()` ; upstream somme `t->num_peers()`
+    (`session_impl.cpp:6920-6960`).
+  - Résidu assumé : `lowest_ranking_peer` (`torrent.rs:4252-4258`)
+    ne peut élire une marque de dial (pas de conn) alors que
+    `find_lowest_ranking_peer` upstream peut déconnecter une conn
+    `is_connecting()` — conséquence architecturale, la marque
+    gagnante n'est jamais la cible la moins bien classée en
+    pratique (son rank n'est pas moindre que les attachées).
+  - **sketch** : helper `Torrent::live_conn_count()` =
+    `peers.values().filter(|c| !c.disconnecting).count()
+    + num_connecting` (analogue `m_connections -
+    m_peers_to_disconnect`) pour les sites `num_peers()` ; pour le
+    cap par torrent (`m_connections.end_index()`) inclure aussi les
+    conns `disconnecting` : `peers.len() + num_connecting`.
+  - **test de régression** : turnover entre un torrent à liste de
+    pairs large mais peu de conns vs un torrent à conns nombreuses →
+    le second est choisi ; cap par torrent atteint en comptant les
+    dials en vol.
+
+- **D19 — taxonomie de la collision `ListenPort`.**
+  sévérité : **wire-visible** (alerte + compteurs) — lentilles
+  [Disconnect], [Compteurs]. `torrent.rs:5506-5510` émet
+  `DisconnectPeer{ reason: "duplicate peer id", sev: PeerError }` ;
+  upstream `peer_list::update_peer_port` appelle
+  `disconnect(errors::duplicate_peer_id, operation_t::bittorrent)`
+  (`peer_list.cpp:923-925`) — sévérité par défaut `normal`
+  (`peer_connection.hpp:483`) → `peer_disconnected_alert` +
+  `disconnected_peers`, **pas** de `peer_error_alert`/`error_peers`,
+  pas de bump `failcount`. La chaîne `"duplicate peer id"` (avec
+  espace) rate aussi le bucket `disconnect_reason_counter`
+  (contrast : le site `:5362-5366` fait déjà
+  `"duplicate_peer_id"` + `Normal`).
+  - **sketch** : `reason: "duplicate_peer_id"`,
+    `sev: DisconnectSeverity::Normal`.
+  - **test de régression** : conn dont le `p` BEP-10 entre en
+    collision avec un endpoint live (`allow_multiple_connections_`
+    `per_ip`) → `PeerDisconnected`, compteur `disconnected_peers`,
+    `failcount` inchangé sur l'entrée survivante
+    (`update_peer_port_collide`, `test_peer_list.cpp:370`).
+
+- **D20 — ordre `recalc_share_mode` vs insertion.**
+  sévérité : **état-interne** — lentille [Cycle de vie].
+  `session.rs:4668-4675` insère la conn (`t.add_peer`) puis recalc ;
+  upstream `attach_peer` lance `recalc_share_mode()`
+  (`torrent.cpp:8687-8690`) **avant** `sorted_insert(m_connections)`
+  (`:8697`) — la nouvelle conn n'entre pas dans le diviseur de
+  rebalance.
+  - **sketch** : déplacer le bloc `if t.share_mode
+    { t.recalc_share_mode(...) }` avant `t.add_peer(peer, conn)`.
+
+- **D21 — gate `ban_web_seeds` absent.**
+  sévérité : **état-interne** (setting non-défaut) — lentille
+  [Limites]. `Torrent::ban_peer(remote)` → `peer_list.ban_peer`
+  inconditionnel (`torrent.rs:8551-8556`) ; upstream
+  `torrent::ban_peer` refuse quand `tp->web_seed &&
+  !ban_web_seeds` (`torrent.cpp:11918-11926`). Le défaut `true`
+  (`settings.rs:769`) rend l'écart inerte en config standard ;
+  sous `ban_web_seeds=false`, un web seed dont les blocs échouent
+  est banni chez nous, épargné upstream.
+  - **sketch** : passer `s.ban_web_seeds` à `ban_peer` (les call
+    sites `session.rs:4544` et `apply_smart_ban:4574` ont
+    `settings`/`s` en main) et court-circuiter sur `web_seed`.
+
+### Verdicts checklist corrigés (round 2)
+
+- **Half-open, backoff, priorité récents** — le verdict « conforme »
+  du round 1 est corrigé en **déviation** : la leg `>10%` est morte
+  (D17) et le tri candidats sous-évalue les sources multiples (D16).
+  Le backoff `(failcount+1)*min_reconnect_time` est bien linéaire
+  comme upstream (`peer_list.cpp:556-558` = `peer_list.rs:971-975`) —
+  pas « exponentiel » (libellé checklist) des deux côtés.
+- **Admission entrante** — le cap per-torrent, `exceeded_limit` et le
+  turnover utilisent une base de comptage différente d'upstream (D18) ;
+  la collision `ListenPort` a la mauvaise taxonomie (D19).
+- **`remove_peer` / attach / taxonomie / ip_filter / web seeds** —
+  confirmés conformes à la relecture (aucune régression introduite
+  par les merges post-`05fbb80`).
+
+### Couverture des tests — ajouts round 2
+
+- `test_peer_list.cpp::peer_info_comparison` — partiel : le tri
+  `compare_peer` existe (`ranking_prefers_low_failcount_local`) mais
+  le leg multi-source est figé faux par
+  `ranking_uses_primary_source` → réécrire + ajouter le cas
+  `TRACKER|PEX > TRACKER > PEX` (→ D16).
+- `test_peer_list.cpp::update_peer_port_collide` — partiel : la
+  mécanique existe mais la taxonomie `Normal`/`disconnected_peers`/
+  pas-de-failcount n'est pas testée (→ D19).
+- Éviction `>10% connecting` — absent (la leg était morte, aucun
+  test ne la couvrait) → test attach-entrant vs marques de dial
+  (→ D17).
+- `peer_turnover` sélection par conns vivantes — absent (→ D18).
+
+### Fichiers du fix (round 2)
+
+- `crates/bitdaemon-net/src/peer_list.rs` — `compare_peer`,
+  `is_erase_candidate`, `should_erase_immediately`,
+  `compare_peer_for_erase` (D16) + test `test_peer_list.rs`.
+- `crates/bitdaemon-session/src/torrent.rs` — `ListenPort` effect
+  (D16 src + D19), `ban_peer` gate (D21), `live_conn_count` (D18).
+- `crates/bitdaemon-session/src/session.rs` — leg éviction
+  connecting (D17), cap per-torrent / `find_disconnect_candidate_`
+  `torrent` / `exceeded_limit` / `peer_turnover` /
+  `update_connections_limit` (D18), ordre `recalc_share_mode` (D20).
+- `crates/bitdaemon-session/tests/test_peer_lifecycle_a07.rs` +
+  `crates/bitdaemon-net/tests/test_peer_list.rs` — régressions D16,
+  D17, D18, D19.
