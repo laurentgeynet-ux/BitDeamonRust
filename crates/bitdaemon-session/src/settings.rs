@@ -66,12 +66,17 @@ impl DiskIoMode {
 }
 
 /// `settings_pack::mixed_mode_algorithm` (`bandwidth_mixed_algo_t`).
+///
+/// Deliberate default deviation: upstream defaults to
+/// `peer_proportional` (`settings_pack.cpp:326`); BitDaemon defaults
+/// to `prefer_tcp` — the TCP class is never throttled by the uTP/TCP
+/// split unless the session opts into `PeerProportional`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BandwidthMixedAlgo {
     /// `prefer_tcp` = 0 — no uTP/TCP balancing.
+    #[default]
     PreferTcp,
     /// `peer_proportional` = 1 (upstream default).
-    #[default]
     PeerProportional,
 }
 
@@ -907,7 +912,7 @@ impl Default for SessionSettings {
             utp_connect_timeout: Duration::from_millis(3000),
             utp_delayed_ack: 0,
             utp_loss_multiplier: 50,
-            mixed_mode_algorithm: BandwidthMixedAlgo::PeerProportional,
+            mixed_mode_algorithm: BandwidthMixedAlgo::PreferTcp,
             listen_queue_size: 5,
             torrent_connect_boost: 30,
             alert_queue_size: 2000,

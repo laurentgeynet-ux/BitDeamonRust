@@ -184,6 +184,13 @@ struct Args {
     #[arg(long)]
     prefer_rc4: bool,
 
+    /// uTP/TCP balance policy (upstream
+    /// `settings_pack::mixed_mode_algorithm`). `prefer-tcp` leaves
+    /// the TCP class unthrottled; `peer-proportional` splits the
+    /// global rate between TCP and uTP conns.
+    #[arg(long, default_value = "prefer-tcp")]
+    mixed_mode: MixedModeArg,
+
     /// Extra DHT bootstrap node `host:port`, repeatable (upstream
     /// `dht_bootstrap_nodes`) — replaces the public-router defaults
     /// when given.
@@ -205,6 +212,13 @@ enum EncLevelArg {
     Plaintext,
     Rc4,
     Both,
+}
+
+/// `settings_pack::mixed_mode_algorithm` CLI mapping.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum MixedModeArg {
+    PreferTcp,
+    PeerProportional,
 }
 
 fn load_atp(
@@ -403,6 +417,12 @@ async fn main() -> anyhow::Result<()> {
         s.pe_settings.allowed_enc_level = lvl;
         s.pe_settings.prefer_rc4 = args.prefer_rc4;
     }
+    slock(&eng.session).settings.mixed_mode_algorithm = match args.mixed_mode {
+        MixedModeArg::PreferTcp => bitdaemon::session::settings::BandwidthMixedAlgo::PreferTcp,
+        MixedModeArg::PeerProportional => {
+            bitdaemon::session::settings::BandwidthMixedAlgo::PeerProportional
+        }
+    };
     slock(&eng.session).set_disk(disk.clone());
     slock(&eng.session).set_listen_port(args.port);
     slock(&eng.session).set_dht_port(udp_port);
@@ -480,6 +500,7 @@ async fn main() -> anyhow::Result<()> {
                 s.settings.allowed_enc_level,
                 s.settings.prefer_rc4,
                 s.settings.download_rate_limit,
+                s.settings.mixed_mode_algorithm,
             )
         };
         let mut out = Vec::new();
@@ -497,6 +518,7 @@ async fn main() -> anyhow::Result<()> {
             s.settings.allowed_enc_level = prev.5;
             s.settings.prefer_rc4 = prev.6;
             s.settings.download_rate_limit = prev.7;
+            s.settings.mixed_mode_algorithm = prev.8;
         }
         println!("session restored: {n} torrent(s)");
         // `--peer` reaches torrents restored from `.session` too

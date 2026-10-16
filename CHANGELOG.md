@@ -7,6 +7,21 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ## [Unreleased]
 
+### Added
+
+- `bitdaemon-cli` `--mixed-mode prefer-tcp|peer-proportional` flag
+  mapping `settings_pack::mixed_mode_algorithm` (uTP/TCP balance
+  policy); the value survives `.session` restore like the other
+  flag-driven settings.
+
+### Changed
+
+- `Settings::default().mixed_mode_algorithm` is now
+  `BandwidthMixedAlgo::PreferTcp` — a deliberate deviation from
+  upstream (`settings_pack.cpp` defaults to `peer_proportional`):
+  the TCP peer class is never throttled by the uTP/TCP split unless
+  the session opts into `PeerProportional`.
+
 ### Fixed
 
 - **Tracker parity, round 2 (A04)**: the residual deviations from the
