@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use bitdaemon_net::transport::{DatagramSocket, PeerConnector};
-use bitdaemon_net::utp_socket::{UtpConfig, UtpSocket};
+use bitdaemon_net::utp_socket::{UtpConfig, UtpSocket, UtpStat};
 use bitdaemon_net::utp_stream::{UtpConnector, UtpManager};
 use tokio::sync::{Mutex, mpsc};
 
@@ -84,7 +84,6 @@ async fn connect_handshake_and_echo() {
     let conn = Arc::new(UtpConnector {
         manager: mgr,
         datagram: wa.clone(),
-        cfg: UtpConfig::default(),
     });
 
     // scripted responder at b(): accept SYN, relay everything
@@ -199,9 +198,7 @@ async fn acceptor_handshake_and_echo() {
     // responder side: one manager routes dg_b, acceptor yields streams
     let mgr_b = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
     let _pump = mgr_b.pump_in(dg_b.clone());
-    let acceptor = Arc::new(
-        UtpAcceptor::new(mgr_b, dg_b, bitdaemon_net::utp_socket::UtpConfig::default()).await,
-    );
+    let acceptor = Arc::new(UtpAcceptor::new(mgr_b, dg_b).await);
 
     // initiator side
     let mgr_a = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
@@ -209,7 +206,6 @@ async fn acceptor_handshake_and_echo() {
     let connector = Arc::new(UtpConnector {
         manager: mgr_a,
         datagram: dg_a,
-        cfg: bitdaemon_net::utp_socket::UtpConfig::default(),
     });
 
     let acc = acceptor.clone();
@@ -298,16 +294,13 @@ async fn bulk_transfer_throughput() {
 
     let mgr_b = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
     let _pb = mgr_b.pump_in(dg_b.clone());
-    let acceptor = Arc::new(
-        UtpAcceptor::new(mgr_b, dg_b, bitdaemon_net::utp_socket::UtpConfig::default()).await,
-    );
+    let acceptor = Arc::new(UtpAcceptor::new(mgr_b, dg_b).await);
 
     let mgr_a = Arc::new(bitdaemon_net::utp_stream::UtpManager::new());
     let _pa = mgr_a.pump_in(dg_a.clone());
     let connector = Arc::new(UtpConnector {
         manager: mgr_a,
         datagram: dg_a,
-        cfg: bitdaemon_net::utp_socket::UtpConfig::default(),
     });
 
     const TOTAL: usize = 1024 * 1024;
@@ -866,4 +859,249 @@ async fn mtu_probe_carries_dont_fragment() {
             .any(|f| f.contains(DatagramSendFlags::DONT_FRAGMENT)),
         "no DF-flagged datagram on the transport: {seen:?}"
     );
+}
+
+// ---------- A05 round-3 apply regressions ----------
+
+/// datagram transport that swallows sends and never answers —
+/// drives the connect-timeout path.
+#[derive(Debug)]
+struct Blackhole;
+
+impl DatagramSocket for Blackhole {
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        _to: SocketAddr,
+    ) -> bitdaemon_net::transport::BoxFut<'a, usize> {
+        Box::pin(async move { Ok(buf.len()) })
+    }
+    fn recv_from<'a>(
+        &'a self,
+        _buf: &'a mut [u8],
+    ) -> bitdaemon_net::transport::BoxFut<'a, (usize, SocketAddr)> {
+        Box::pin(std::future::pending())
+    }
+    fn local_addr(&self) -> SocketAddr {
+        a()
+    }
+}
+
+// R1 — writes past `poll_shutdown` are `broken_pipe` upstream; the
+// stream surface must refuse them (the pump also drops post-Close
+// payload as backstop).
+#[tokio::test(flavor = "current_thread")]
+async fn write_after_shutdown_is_broken_pipe() {
+    use tokio::io::AsyncWriteExt;
+    let (wa, wb) = wire_pair();
+    let (wa, wb) = (Arc::new(wa), Arc::new(wb));
+    let mgr = Arc::new(UtpManager::new());
+    let _pump = mgr.pump_in(wa.clone());
+    let (_peer, _tap) = spawn_peer(wb);
+    let mut stream = connect_stream(&mgr, &wa).await;
+    stream.shutdown().await.unwrap();
+    let err = stream.write_all(b"late").await.unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+// R7+R8 — `UtpConnector` reads the manager's live config (upstream
+// sockets consult the shared `session_settings` getters) and
+// `wait_connected` propagates the socket's `m_error` — a connect
+// timeout must surface `TimedOut`, not a generic failure.
+#[tokio::test(flavor = "current_thread")]
+async fn connect_failure_surfaces_real_error() {
+    let mgr = Arc::new(UtpManager::new());
+    mgr.set_config(UtpConfig {
+        connect_timeout: 50,
+        ..UtpConfig::default()
+    });
+    let conn = Arc::new(UtpConnector {
+        manager: mgr,
+        datagram: Arc::new(Blackhole),
+    });
+    match conn.connect(b()).await {
+        Err(bitdaemon_net::NetError::Transport(e)) => {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut,
+                "expected the real TimedOut error, got {e:?}"
+            );
+        }
+        Err(other) => panic!("expected transport error, got {other:?}"),
+        Ok(_) => panic!("connect must fail against a blackhole"),
+    }
+}
+
+// R10 — a `poll_read` pending when the peer's FIN arrives must
+// observe EOF immediately (upstream fires `eof` on the read handler
+// once the FIN'd data drains); pre-fix the reader hung until full
+// teardown.
+#[tokio::test(flavor = "current_thread")]
+async fn fin_wakes_pending_read() {
+    use tokio::io::AsyncReadExt;
+    let (wa, wb) = wire_pair();
+    let (wa, wb) = (Arc::new(wa), Arc::new(wb));
+    let mgr = Arc::new(UtpManager::new());
+    let _pump = mgr.pump_in(wa.clone());
+    let peer = tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let Ok((n, from)) = wb.recv_from(&mut buf).await else {
+            return;
+        };
+        let id = u16::from_be_bytes([buf[2], buf[3]]);
+        let mut sock = UtpSocket::new(id.wrapping_add(1), id, UtpConfig::default());
+        assert!(sock.incoming_packet(&buf[..n], from, std::time::Instant::now()));
+        sock.send_deferred_ack();
+        sock.close(); // FIN with no payload behind it
+        for d in sock.drain_outbox() {
+            let _ = wb.send_to(&d.bytes, d.to).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    });
+    let mut stream = mgr
+        .connect(wa.clone(), b(), UtpConfig::default())
+        .await
+        .unwrap();
+    stream.wait_connected().await.unwrap();
+    let mut b = [0u8; 8];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut b))
+        .await
+        .expect("pending read hung on FIN")
+        .unwrap();
+    assert_eq!(n, 0);
+    peer.await.unwrap();
+}
+
+// R4 (residual) — the peer's `close_reason` extension is parsed by
+// the socket; it must reach the stream so the session can surface
+// it (upstream `peer_connection` calls `get_close_reason`).
+#[tokio::test(flavor = "current_thread")]
+async fn their_close_reason_reaches_the_stream() {
+    use tokio::io::AsyncReadExt;
+    let (wa, wb) = wire_pair();
+    let (wa, wb) = (Arc::new(wa), Arc::new(wb));
+    let mgr = Arc::new(UtpManager::new());
+    let _pump = mgr.pump_in(wa.clone());
+    let _peer = tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let Ok((n, from)) = wb.recv_from(&mut buf).await else {
+            return;
+        };
+        let id = u16::from_be_bytes([buf[2], buf[3]]);
+        let mut sock = UtpSocket::new(id.wrapping_add(1), id, UtpConfig::default());
+        assert!(sock.incoming_packet(&buf[..n], from, std::time::Instant::now()));
+        sock.send_deferred_ack();
+        sock.set_close_reason(7); // `close_reason_t` — ext 3 on the FIN
+        sock.close();
+        for d in sock.drain_outbox() {
+            let _ = wb.send_to(&d.bytes, d.to).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    });
+    let mut stream = mgr
+        .connect(wa.clone(), b(), UtpConfig::default())
+        .await
+        .unwrap();
+    stream.wait_connected().await.unwrap();
+    let mut b = [0u8; 8];
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut b)).await;
+    for _ in 0..40 {
+        if stream.their_close_reason() == 7 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!(
+        "peer close_reason never surfaced: {}",
+        stream.their_close_reason()
+    );
+}
+
+// R6/R10 — dropping the stream (`destroy()` upstream) still flushes
+// the FIN: `close()` drains the queued data then sends FIN, only
+// the unsent *write buffer* is dropped.
+#[tokio::test(flavor = "current_thread")]
+async fn drop_still_flushes_fin() {
+    use tokio::io::AsyncWriteExt;
+    let (wa, wb) = wire_pair();
+    let (wa, wb) = (Arc::new(wa), Arc::new(wb));
+    let mgr = Arc::new(UtpManager::new());
+    let _pump = mgr.pump_in(wa.clone());
+    let (_peer, mut tap) = spawn_peer(wb);
+    let mut stream = connect_stream(&mgr, &wa).await;
+    stream.write_all(b"queued").await.unwrap();
+    drop(stream);
+    let types = collect_tap(&mut tap, true, std::time::Duration::from_secs(2), 1).await;
+    assert!(
+        types.contains(&1),
+        "FIN must reach the wire when the stream is dropped: {types:?}"
+    );
+}
+
+// R11 — the demux gate is `size >= 20 && version == 1` upstream:
+// packets with an unknown type (5..15) are *delivered* to a
+// matching socket, which counts `utp_invalid_pkts_in`; an unmatched
+// conn-id is not consumed (falls through to the other UDP users).
+#[tokio::test(flavor = "current_thread")]
+async fn unknown_type_counts_invalid_and_unmatched_falls_through() {
+    let (wa, wb) = wire_pair();
+    let (wa, wb) = (Arc::new(wa), Arc::new(wb));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let s2 = seen.clone();
+    let cfg = UtpConfig {
+        counter_sink: Some(Arc::new(move |stat, _delta| {
+            s2.lock().unwrap_or_else(|p| p.into_inner()).push(stat);
+        })),
+        ..UtpConfig::default()
+    };
+    let mgr = Arc::new(UtpManager::new());
+    let _stream = mgr.connect(wa.clone(), b(), cfg).await.unwrap();
+
+    // our recv_id travels in the SYN's conn_id field
+    let mut buf = vec![0u8; 2048];
+    let (n, _f) = tokio::time::timeout(std::time::Duration::from_secs(2), wb.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(n >= 20);
+    let conn_id = u16::from_be_bytes([buf[2], buf[3]]);
+
+    // a type-5 packet addressed to the live socket
+    let mut p = vec![0u8; 20];
+    p[0] = (5 << 4) | 1;
+    p[2..4].copy_from_slice(&conn_id.to_be_bytes());
+    assert!(
+        mgr.route(b(), &p).await,
+        "a matching socket must consume unknown-type packets"
+    );
+
+    // same packet, unmatched conn-id — upstream falls through
+    p[2..4].copy_from_slice(&conn_id.wrapping_add(9).to_be_bytes());
+    assert!(!mgr.route(b(), &p).await);
+
+    for _ in 0..40 {
+        if seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&UtpStat::InvalidPktsIn)
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("unknown packet type did not bump utp_invalid_pkts_in");
+}
+
+// R7 — `enable_incoming_utp` gates SYN acceptance on the manager,
+// not acceptor installation: off → `route` drops unmatched SYNs
+// (upstream returns false before the listen-socket branch).
+#[tokio::test(flavor = "current_thread")]
+async fn accept_incoming_gate_drops_syn() {
+    let mgr = Arc::new(UtpManager::new());
+    let _rx = mgr.set_listener().await;
+    let mut syn = vec![0u8; 20];
+    syn[0] = (4 << 4) | 1; // ST_SYN v1
+    assert!(mgr.route(b(), &syn).await, "listener must take the SYN");
+    mgr.set_accept_incoming(false);
+    assert!(!mgr.route(b(), &syn).await, "enable_incoming_utp=off drops");
 }

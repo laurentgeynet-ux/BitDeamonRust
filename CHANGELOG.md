@@ -9,6 +9,31 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- **uTP transport parity, round 3 (A05)**: the nagle drain no longer
+  computes remaining space with unsigned arithmetic — a buffered
+  packet resumed under a lower effective MTU (probe → floor
+  transition) underflowed `size_left`, panicking debug builds and
+  appending over-MTU payload in release; upstream's signed
+  `size_left > 0` gate is now verbatim. Write-after-close returns
+  `BrokenPipe` (upstream `check_fin_sent`) instead of overwriting a
+  queued FIN. Datagram send errors reach the socket:
+  `EMSGSIZE` → MTU ceiling lowered + immediate DF-less retransmit,
+  `WouldBlock`/`TryAgain` → stalled leg, others → stored error +
+  `ErrorWait`. Timeout resends unlink `needs_resend` so the next
+  `send_pkt` no longer re-emits an in-flight packet; a pending
+  `poll_read` wakes to EOF as soon as the buffer drains to the
+  peer's FIN; teardown with in-flight inbound data still emits FIN.
+  The ten `utp_*` session settings (target delay, LEDBAT gain,
+  timeouts/resend caps, loss multiplier, cwnd reduce) plus
+  `proxy_socks5` are mapped into `UtpConfig` — previously dead
+  knobs — and hot-applied via `apply_settings` along with
+  `connections_limit` and the `enable_{in,out}going_utp` gates.
+  `wait_connected` propagates the socket's stored error; the peer's
+  close reason is stamped on arrival and exposed as
+  `UtpStream::their_close_reason()`; the demux filter accepts any
+  version-1 packet type so unknown types matching a socket count as
+  `utp_invalid_pkts_in` instead of leaking to the DHT consumer; and
+  inbound-queue drops are traced rather than silent.
 - **uTP transport parity (A05)**: `UtpSocket::close()` now carries
   upstream's `nagle_packet`/`outbuf` guards — a FIN can no longer
   leave the wire with piggybacked payload; `poll_shutdown` and stream
