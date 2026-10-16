@@ -124,8 +124,9 @@ fn peer_turnover_disconnects_worst_at_cap() {
         ..Default::default()
     });
     let mut t = torrent(1);
-    // upstream sizes the sweep off `num_peers()` — the *peer-list*
-    // size, not the live-conn count; the last four stay candidates.
+    // upstream sizes the sweep off `num_peers()` = live connections
+    // (`m_connections.size() - m_peers_to_disconnect.size()`), not the
+    // peer-list pool; the last four entries stay connect candidates.
     for b in 1..=10u8 {
         t.add_swarm_peer(peer_ep(b), PeerSourceFlags::TRACKER, &mut Vec::new());
     }
@@ -159,6 +160,6 @@ fn peer_turnover_disconnects_worst_at_cap() {
             .count();
     }
     // 6 conns ≥ 6*90% of the global limit → the largest swarm sheds
-    // min(10*50%, num_connect_candidates=4) worst peers.
-    assert_eq!(disconnects, 4);
+    // min(6 live*50%, num_connect_candidates=4) = 3 worst peers.
+    assert_eq!(disconnects, 3);
 }

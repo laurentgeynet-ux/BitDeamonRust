@@ -18,27 +18,6 @@ use crate::ip_helpers::is_local;
 use crate::ip_voter::ExternalIp;
 use crate::torrent_peer::{PeerAddr, TorrentPeer};
 
-/// `peer_source` — the *primary* source a peer was added through:
-/// upstream records the first source bit. Used by
-/// `is_erase_candidate`/`should_erase_immediately` (resume-data
-/// peers are weeded first).
-#[must_use]
-pub fn primary_source(src: PeerSourceFlags) -> PeerSourceFlags {
-    for f in [
-        PeerSourceFlags::TRACKER,
-        PeerSourceFlags::DHT,
-        PeerSourceFlags::PEX,
-        PeerSourceFlags::LSD,
-        PeerSourceFlags::RESUME_DATA,
-        PeerSourceFlags::INCOMING,
-    ] {
-        if src.contains(f) {
-            return f;
-        }
-    }
-    src
-}
-
 /// `aux::source_rank` (`request_blocks.cpp`) — tracker 1<<5,
 /// lsd 1<<4, dht 1<<3, pex 1<<2.
 #[must_use]
@@ -97,8 +76,8 @@ impl Default for PeerListState {
 /// `compare_peer` — swarm-connectivity ranking (upstream
 /// `peer_list.cpp` anonymous namespace). `true` = `lhs` preferred.
 /// Order: failcount, local-first, oldest `last_connected`, finished→
-/// deprioritize `maybe_upload_only`, primary-source rank, then the
-/// lazy BEP-40 `rank()`.
+/// deprioritize `maybe_upload_only`, `source_rank` over the full
+/// `peer_source` bitmask, then the lazy BEP-40 `rank()`.
 fn compare_peer(lhs: &TorrentPeer, rhs: &TorrentPeer, st: &PeerListState) -> bool {
     if lhs.failcount != rhs.failcount {
         return lhs.failcount < rhs.failcount;
@@ -114,8 +93,8 @@ fn compare_peer(lhs: &TorrentPeer, rhs: &TorrentPeer, st: &PeerListState) -> boo
     if st.is_finished && lhs.maybe_upload_only != rhs.maybe_upload_only {
         return rhs.maybe_upload_only;
     }
-    let lr = source_rank(primary_source(lhs.source));
-    let rr = source_rank(primary_source(rhs.source));
+    let lr = source_rank(lhs.source);
+    let rr = source_rank(rhs.source);
     if lr != rr {
         return lr > rr;
     }
@@ -367,7 +346,7 @@ impl PeerList {
     ) -> Option<usize> {
         let mut pos = self.insert_pos(&key);
         if state.max_peerlist_size > 0 && self.peers.len() as i32 >= state.max_peerlist_size {
-            if primary_source(p.source) == PeerSourceFlags::RESUME_DATA {
+            if p.source == PeerSourceFlags::RESUME_DATA {
                 return None;
             }
             self.erase_peers(state, force);
@@ -896,7 +875,10 @@ impl PeerList {
         if p.connection.is_some() || self.is_connect_candidate(p) {
             return false;
         }
-        p.failcount > 0 || primary_source(p.source) == PeerSourceFlags::RESUME_DATA
+        // upstream `peer_source() == resume_data` — the whole
+        // bitmask must be resume-data alone; a resume peer also
+        // seen incoming/tracker keeps its entry.
+        p.failcount > 0 || p.source == PeerSourceFlags::RESUME_DATA
     }
 
     /// `is_force_erase_candidate` — any disconnected peer.
@@ -904,9 +886,9 @@ impl PeerList {
         p.connection.is_none()
     }
 
-    /// `should_erase_immediately` — resume-data peers first.
+    /// `should_erase_immediately` — resume-data-only peers first.
     fn should_erase_immediately(&self, p: &TorrentPeer) -> bool {
-        primary_source(p.source) == PeerSourceFlags::RESUME_DATA
+        p.source == PeerSourceFlags::RESUME_DATA
     }
 
     /// `find_connect_candidates` — round-robin scan of at most 300
@@ -1225,8 +1207,8 @@ fn compare_peer_for_erase(lhs: &TorrentPeer, rhs: &TorrentPeer) -> bool {
     if lhs.failcount != rhs.failcount {
         return lhs.failcount > rhs.failcount;
     }
-    let lr = primary_source(lhs.source) == PeerSourceFlags::RESUME_DATA;
-    let rr = primary_source(rhs.source) == PeerSourceFlags::RESUME_DATA;
+    let lr = lhs.source == PeerSourceFlags::RESUME_DATA;
+    let rr = rhs.source == PeerSourceFlags::RESUME_DATA;
     if lr != rr {
         return lr;
     }

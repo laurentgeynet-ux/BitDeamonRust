@@ -370,6 +370,199 @@ fn graceful_pause_posts_paused_on_last_drain() {
     );
 }
 
+// ---------------- D17: oldest pending-dial eviction (round 2) ----------------
+
+#[test]
+fn full_torrent_evicts_oldest_pending_dial() {
+    let mut s = Session::new();
+    s.settings.torrent_connect_boost = 0;
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    // cap 2 with two pending dials → the incoming conn can only get
+    // a slot by evicting the longest-waiting half-open dial
+    // (upstream `m_connections` counts dials from
+    // `create_peer_connection`; `num_connecting > max_conn / 10`).
+    t.max_connections = 2;
+    t.add_swarm_peer(ep(1, 6881), PeerSourceFlags::TRACKER, &mut Vec::new());
+    t.add_swarm_peer(ep(2, 6881), PeerSourceFlags::TRACKER, &mut Vec::new());
+    let ih = s.add_torrent(t);
+    let st = PeerListState::default();
+    let (ea, _pa);
+    let (eb, _pb);
+    {
+        let t = s.torrents.get_mut(&ih).unwrap();
+        // dial A stamped at t=0, dial B at t=5 — A is the oldest.
+        (ea, _pa) = t.try_connect_peer(0, &st, &[]).unwrap();
+        (eb, _pb) = t.try_connect_peer(5, &st, &[]).unwrap();
+        assert_ne!(ea, eb);
+        assert_eq!(t.num_connecting, 2);
+    }
+    let mut out = Vec::new();
+    s.peer_connected(&ih, 7, incoming_conn(), ep(9, 40000), &mut out);
+    let t = &s.torrents[&ih];
+    // the incoming conn attached; the oldest dial mark died.
+    assert!(t.peers.contains_key(&7));
+    assert_eq!(t.num_connecting, 1);
+    let ia = t.peer_list.find_peer(ea.ip()).unwrap();
+    assert!(t.peer_list.peers()[ia].connection.is_none());
+    let ib = t.peer_list.find_peer(eb.ip()).unwrap();
+    assert!(t.peer_list.peers()[ib].connection.is_some());
+    assert!(!t.dial_pids.contains_key(&ea));
+    assert!(t.dial_pids.contains_key(&eb));
+    // no DisconnectPeer for the incoming conn itself.
+    assert!(!disconnects(&out).iter().any(|(p, _)| *p == 7));
+    // and the evicted entry got its dial-cooldown restamp via
+    // `connection_closed` (upstream `disconnect` on the conn).
+    assert_eq!(t.peer_list.peers()[ia].failcount, 0);
+}
+
+// ---------------- D18: live-conn count basis (round 2) ----------------
+
+#[test]
+fn num_connections_counts_live_not_peer_list() {
+    let mut s = Session::new();
+    s.settings.torrent_connect_boost = 0;
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    for n in 1..=4 {
+        t.add_swarm_peer(ep(n, 6881), PeerSourceFlags::TRACKER, &mut Vec::new());
+    }
+    let ih = s.add_torrent(t);
+    let st = PeerListState::default();
+    let mut out = Vec::new();
+    s.peer_connected(&ih, 1, incoming_conn(), ep(9, 40000), &mut out);
+    let t = s.torrents.get_mut(&ih).unwrap();
+    t.try_connect_peer(0, &st, &[]).unwrap();
+    t.peers.get_mut(&1).unwrap().disconnecting = true;
+    // upstream `num_peers()` = m_connections − m_peers_to_disconnect:
+    // 0 live attached + 1 in-flight dial = 1 — while the peer-list
+    // pool sits at 5 entries (4 tracker + 1 incoming).
+    assert_eq!(t.num_connections(), 1);
+    assert_eq!(t.peer_list.num_peers(), 5);
+}
+
+// ---------------- D19: ListenPort collision severity (round 2) ----------------
+
+#[test]
+fn listen_port_collision_is_normal_severity() {
+    use bitdaemon_net::bt_peer_conn::DisconnectSeverity;
+    use bitdaemon_session::peer_conn::PeerEffect;
+
+    let mut s = Session::new();
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    // two entries on the same IP can only coexist under
+    // `allow_multiple_connections_per_ip` — the collision the
+    // upstream check guards.
+    t.peer_list_state.allow_multiple_connections_per_ip = true;
+    let ih = s.add_torrent(t);
+    let mut out = Vec::new();
+    // two live conns on the same IP, distinct ports.
+    s.peer_connected(&ih, 5, incoming_conn(), ep(1, 40000), &mut out);
+    s.peer_connected(&ih, 6, incoming_conn(), ep(1, 6881), &mut out);
+    {
+        let t = s.torrents.get_mut(&ih).unwrap();
+        let mut eff = Vec::new();
+        // conn 5 advertises listen port 6881 → its entry collides
+        // with conn 6's live endpoint → `update_peer_port` false →
+        // `disconnect(errors::duplicate_peer_id)` at *normal*
+        // severity upstream (never peer_error).
+        t.apply_peer_effects(
+            5,
+            vec![PeerEffect::ListenPort(6881)],
+            &s.settings,
+            &s.counters,
+            &mut eff,
+        );
+        assert!(eff.iter().any(|e| matches!(
+            e,
+            TorrentEffect::DisconnectPeer { peer: 5, reason, sev }
+                if *reason == "duplicate_peer_id" && *sev == DisconnectSeverity::Normal
+        )));
+    }
+}
+
+// ---------------- D20: share-mode recalc ordering (round 2) ----------------
+
+#[test]
+fn share_mode_recalc_excludes_incoming_conn() {
+    use bitdaemon_common::DownloadPriority;
+    use bitdaemon_common::types::PieceIndex;
+
+    let mut s = Session::new();
+    // `share_mode_target` 0 → the rarity-vs-peers gate passes on
+    // the first eligible piece.
+    s.settings.share_mode_target = 0;
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.share_mode = true;
+    {
+        // nothing wanted yet — piece 0 becomes the only rarest
+        // candidate once the picker sees a peer holding it.
+        let p = t.picker.as_mut().unwrap();
+        for i in 0..4 {
+            p.set_piece_priority(PieceIndex(i), DownloadPriority::DONT_DOWNLOAD);
+        }
+        // piece 0 has one holder (the conn about to attach — its
+        // bitfield lands on the conn, not the picker, at attach).
+        p.inc_refcount(PieceIndex(0));
+    }
+    let ih = s.add_torrent(t);
+    let mut out = Vec::new();
+    let mut c = incoming_conn();
+    c.connecting = false;
+    c.peer_pieces.resize_with(4, false);
+    c.peer_pieces.set_bit(0);
+    c.num_pieces = 1;
+    s.peer_connected(&ih, 1, c, ep(1, 40000), &mut out);
+    assert!(s.torrents[&ih].peers.contains_key(&1));
+    // upstream `attach_peer` recalculates BEFORE inserting the
+    // conn → num_peers=0 → early return, piece 0 stays
+    // dont_download. Post-insert (the old bug) the new conn alone
+    // makes num_peers=1 → the rarest pick promotes piece 0.
+    let t = &s.torrents[&ih];
+    assert_eq!(
+        t.picker.as_ref().unwrap().piece_priority(PieceIndex(0)),
+        DownloadPriority::DONT_DOWNLOAD,
+        "share-mode recalc must run before the conn joins the census"
+    );
+}
+
+// ---------------- D21: ban_web_seeds gate (round 2) ----------------
+
+#[test]
+fn ban_peer_respects_ban_web_seeds() {
+    let mut s = Session::new();
+    // upstream default is `true` — drop it to exercise the gate.
+    s.settings.ban_web_seeds = false;
+    let mut t = mk_torrent(4);
+    t.init_picker(true);
+    t.add_swarm_peer(ep(1, 6881), PeerSourceFlags::TRACKER, &mut Vec::new());
+    t.add_swarm_peer(ep(2, 6881), PeerSourceFlags::TRACKER, &mut Vec::new());
+    let ih = s.add_torrent(t);
+    {
+        let t = s.torrents.get_mut(&ih).unwrap();
+        let i = t.peer_list.find_peer(ep(1, 0).ip()).unwrap();
+        t.peer_list.peers_mut()[i].web_seed = true;
+        // `ban_web_seeds` off → upstream `ban_peer` refuses
+        // (`torrent.cpp:11919`) and the entry keeps its flag.
+        assert!(!t.ban_peer(ep(1, 6881), &s.settings, &s.counters));
+        assert!(!t.peer_list.peers()[i].banned);
+        // a regular entry bans fine under the same setting.
+        assert!(t.ban_peer(ep(2, 6881), &s.settings, &s.counters));
+        let j = t.peer_list.find_peer(ep(2, 0).ip()).unwrap();
+        assert!(t.peer_list.peers()[j].banned);
+    }
+    // flip the setting → the web-seed entry bans too.
+    s.settings.ban_web_seeds = true;
+    {
+        let t = s.torrents.get_mut(&ih).unwrap();
+        assert!(t.ban_peer(ep(1, 6881), &s.settings, &s.counters));
+        let i = t.peer_list.find_peer(ep(1, 0).ip()).unwrap();
+        assert!(t.peer_list.peers()[i].banned);
+    }
+}
+
 // ---------------- D8: abort gate on remove_peer ----------------
 
 #[test]

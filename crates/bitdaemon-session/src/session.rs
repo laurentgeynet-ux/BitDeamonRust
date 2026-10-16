@@ -1527,8 +1527,10 @@ impl Session {
     fn find_disconnect_candidate_torrent(&self) -> Option<Sha1Hash> {
         self.torrents
             .iter()
-            .filter(|(_, t)| !t.peers.is_empty())
-            .max_by_key(|(_, t)| (t.is_finished(), t.peers.len()))
+            // `num_peers()` upstream — live conns (incl. in-flight
+            // dials, excl. disconnecting), not the peer-list size.
+            .filter(|(_, t)| t.num_connections() > 0)
+            .max_by_key(|(_, t)| (t.is_finished(), t.num_connections()))
             .map(|(ih, _)| *ih)
     }
 
@@ -1575,7 +1577,11 @@ impl Session {
         self.alerts.post(Alert::Performance {
             warning: "too_few_file_descriptors".into(),
         });
-        if let Some(t) = self.torrents.values_mut().max_by_key(|t| t.peers.len()) {
+        if let Some(t) = self
+            .torrents
+            .values_mut()
+            .max_by_key(|t| t.num_connections())
+        {
             let mut eff = Vec::new();
             t.disconnect_peers(1, "too_many_files_open", &mut eff);
             for e in eff {
@@ -4142,33 +4148,50 @@ impl Session {
                 let factor = i64::from(if factor == 0 { 100 } else { factor });
                 let limit = max_conn * 100 / factor;
                 let mut maybe_replace = false;
-                if t.peers.len() as i64 >= limit {
+                // `m_connections.end_index() >= limit` upstream —
+                // in-flight dials sit in `m_connections` from
+                // `create_peer_connection` on, so pending marks
+                // (`num_connecting`) count toward the cap here.
+                if t.peers.len() as i64 + i64::from(t.num_connecting) >= limit {
                     // >10% still-connecting → the longest-waiting
                     // half-open conn yields its slot instead.
                     if i64::from(t.num_connecting) > max_conn / 10 {
+                        // upstream picks `max_element` over
+                        // `m_connections` where `is_connecting()` —
+                        // conns created at `connect_to_peer`, still
+                        // pre-`init`. Our equivalent population is
+                        // the dial marks (`conn_key` 0 + `connection`
+                        // set); `last_connected` is the dial-start
+                        // stamp, the `m_connect` analogue. The mark
+                        // is abandoned — the still-flying dial lands
+                        // on the zombie path (`dial_pids` no longer
+                        // maps it) instead of being torn down
+                        // mid-flight (no conn object to disconnect).
                         let victim = t
-                            .peers
+                            .peer_list
+                            .peers()
                             .iter()
-                            .filter(|(_, c)| c.connecting && !c.disconnecting)
-                            .min_by_key(|(_, c)| c.connect_ms)
-                            .map(|(id, _)| *id);
+                            .filter(|p| p.conn_key == 0 && p.connection.is_some())
+                            .min_by_key(|p| p.last_connected)
+                            .and_then(|p| p.ip());
                         match victim {
-                            Some(v) => {
-                                if let Some(r) = t.peers.get(&v).and_then(|c| c.remote) {
-                                    t.peer_disconnected_addr(r, self.session_time, false, false, v);
-                                }
-                                let mut eff = Vec::new();
-                                t.remove_peer(v, &self.counters, &self.peer_class_pool, &mut eff);
-                                debug_assert!(eff.is_empty());
+                            Some(victim_remote) => {
+                                // `disconnect(too_many_connections)`
+                                // on the connecting conn — normal
+                                // severity: `connection_closed`
+                                // restamps `last_connected` (dial
+                                // cooldown), no failcount bump.
+                                t.peer_disconnected_addr(
+                                    victim_remote,
+                                    self.session_time,
+                                    false,
+                                    false,
+                                    0,
+                                );
                                 self.alerts.post(Alert::PeerDisconnected {
                                     ih: *ih,
-                                    reason: format!("peer {v}: too_many_connections"),
+                                    reason: format!("peer {victim_remote}: too_many_connections"),
                                 });
-                                out.push(SessionOut::Torrent(TorrentEffect::DisconnectPeer {
-                                    peer: v,
-                                    reason: "too_many_connections",
-                                    sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
-                                }));
                                 // `peer_disconnected_other` — the
                                 // slack debt is settled.
                                 conn.exceeded_limit = false;
@@ -4235,7 +4258,7 @@ impl Session {
                         // (`ec == self_connection` → `ban_peer`) —
                         // by index, not endpoint (`update_peer_port`
                         // may have rewritten the stored port).
-                        t.peer_list.ban_peer(index);
+                        t.ban_peer_at(index, &self.settings, &self.counters);
                         if other_key != 0 {
                             t.peer_disconnected_addr(
                                 other_remote,
@@ -4430,10 +4453,12 @@ impl Session {
                 // it must hold strictly more conns than ours, else
                 // we drop ourselves.
                 let cand = self.find_disconnect_candidate_torrent();
-                let this_n = self.torrents.get(ih).map_or(0, |t| t.peers.len());
+                // `p->num_peers() > t->num_peers()` upstream —
+                // live conn counts on both sides.
+                let this_n = self.torrents.get(ih).map_or(0, |t| t.num_connections());
                 let cand_n = cand
                     .and_then(|cih| self.torrents.get(&cih))
-                    .map_or(0, |t| t.peers.len());
+                    .map_or(0, |t| t.num_connections());
                 let victim = if let Some(cih) = cand
                     && cand_n > this_n
                 {
@@ -4541,7 +4566,7 @@ impl Session {
             // `disconnect` → `ban_peer(m_peer_info)` upstream: the
             // entry stops being a candidate and rejects re-attach.
             if t.outgoing_pids.contains(&rpid) || rpid == self.peer_id {
-                t.ban_peer(remote);
+                t.ban_peer(remote, &self.settings, &self.counters);
                 t.peer_disconnected_addr(remote, self.session_time, false, false, peer);
                 self.alerts.post(Alert::PeerDisconnected {
                     ih: *ih,
@@ -4665,14 +4690,17 @@ impl Session {
             remote: remote.to_string(),
             msg: "peer connected".into(),
         });
+        let mut eff = Vec::new();
+        // upstream `attach_peer` runs `recalc_share_mode` BEFORE
+        // `sorted_insert(m_connections)` (`torrent.cpp:8687-8697`) —
+        // the new conn is not part of the rebalance divisor. Its
+        // effects are routed with the attach tail (same dispatch
+        // order upstream).
+        if t.share_mode {
+            t.recalc_share_mode(&self.settings, &self.counters, &mut eff);
+        }
         t.add_peer(peer, conn);
         {
-            let mut eff = Vec::new();
-            // upstream `attach_peer` tail — a new swarm member
-            // changes the share-mode rebalance inputs.
-            if t.share_mode {
-                t.recalc_share_mode(&self.settings, &self.counters, &mut eff);
-            }
             // upstream does NOT `send_allowed_set` at attach —
             // it fires once on the first inbound `Interested`
             // (`m_sent_allowed_fast` in `on_interested`).
@@ -4896,7 +4924,7 @@ impl Session {
     pub fn ban_peer(&mut self, ih: &Sha1Hash, remote: SocketAddr, out: &mut Vec<SessionOut>) {
         let mut eff = Vec::new();
         if let Some(t) = self.torrents.get_mut(ih) {
-            t.ban_peer(remote);
+            t.ban_peer(remote, &self.settings, &self.counters);
             let conn_id = t
                 .peers
                 .iter()
@@ -6736,7 +6764,13 @@ impl Session {
             return;
         }
         let limit = self.settings.connections_limit as usize;
-        let num_conns: usize = self.torrents.values().map(|t| t.peers.len()).sum();
+        // `num_connections()` upstream — live conns incl. in-flight
+        // dials, never the peer-list size.
+        let num_conns: usize = self
+            .torrents
+            .values()
+            .map(|t| t.num_connections() as usize)
+            .sum();
         if num_conns <= limit || self.torrents.is_empty() {
             return;
         }
@@ -6749,7 +6783,7 @@ impl Session {
         for _ in 0..4 {
             let mut num_above = 0usize;
             for t in self.torrents.values() {
-                let num = t.peers.len();
+                let num = t.num_connections() as usize;
                 if num <= last_average {
                     continue;
                 }
@@ -6770,7 +6804,7 @@ impl Session {
         }
         let mut pending = Vec::new();
         for t in self.torrents.values_mut() {
-            let num = t.peers.len();
+            let num = t.num_connections() as usize;
             if num <= average {
                 continue;
             }
@@ -7693,11 +7727,12 @@ impl Session {
         // and the web-seed `connections_limit` gate; in-flight web
         // fetches count as connections upstream
         // (`peer_info.connection`).
-        let session_conns: i64 = self
-            .torrents
-            .values()
-            .map(|t| t.peers.len() as i64 + t.web_seed_inflight() as i64)
-            .sum();
+        let session_conns: i64 = self.num_connections()
+            + self
+                .torrents
+                .values()
+                .map(|t| t.web_seed_inflight() as i64)
+                .sum::<i64>();
         // `disk_observer` gate — stop issuing block requests while
         // the write queue sits above `max_queued_disk_bytes`.
         let disk_bp = self.disk.as_ref().is_some_and(|d| d.write_queue_exceeded());
@@ -7973,19 +8008,18 @@ impl Session {
             if self.settings.connections_limit > 5 {
                 let limit = i64::from(self.settings.connections_limit.min(i32::MAX / 100));
                 let cutoff = i64::from(self.settings.peer_turnover_cutoff.min(100));
+                // `num_connections()`/`num_peers()` upstream are the
+                // *live conn* counts (`m_connections` incl. dials,
+                // minus disconnecting) — never the peer-list size.
                 if self.num_connections() >= limit * cutoff / 100 && !self.torrents.is_empty() {
                     // disconnect the worst peers of the largest
-                    // swarm every `peer_turnover_interval` —
-                    // `num_peers()` is the *peer-list* size upstream,
-                    // not the live-conn count.
+                    // swarm every `peer_turnover_interval`.
                     if let Some(t) = self
                         .torrents
                         .values_mut()
-                        .max_by_key(|t| t.peer_list.num_peers())
+                        .max_by_key(|t| t.num_connections())
                     {
-                        let n = (t.peer_list.num_peers() as i64
-                            * i64::from(self.settings.peer_turnover)
-                            / 100)
+                        let n = (t.num_connections() * i64::from(self.settings.peer_turnover) / 100)
                             .max(1)
                             .min(t.peer_list.num_connect_candidates() as i64)
                             as usize;
@@ -7996,20 +8030,17 @@ impl Session {
                     }
                 } else {
                     // below the global cap — enforce per-torrent
-                    // `max_connections` cutoffs instead (same
-                    // peer-list sizing as the global leg).
+                    // `max_connections` cutoffs instead.
                     let ihs: Vec<Sha1Hash> = self.torrents.keys().copied().collect();
                     for ih in ihs {
                         let Some(t) = self.torrents.get_mut(&ih) else {
                             continue;
                         };
                         let max = i64::from(t.max_connections.min(i32::MAX / 100));
-                        if (t.peer_list.num_peers() as i64) < max * cutoff / 100 || max < 6 {
+                        if t.num_connections() < max * cutoff / 100 || max < 6 {
                             continue;
                         }
-                        let n = (t.peer_list.num_peers() as i64
-                            * i64::from(self.settings.peer_turnover)
-                            / 100)
+                        let n = (t.num_connections() * i64::from(self.settings.peer_turnover) / 100)
                             .max(1)
                             .min(t.peer_list.num_connect_candidates() as i64)
                             as usize;
