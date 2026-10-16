@@ -716,3 +716,43 @@ mode rapport.
 - Réévaluation d'intérêt différée (D12) — aucun test ne vérifie le
   collapsing « N dirty → 1 scan », le gate dirty de
   `disconnect_if_redundant`, ni l'absence de scan sur `Piece`.
+
+## Résultat (apply D12)
+
+**D12 corrigé** — le modèle différé `m_need_interest_update` est
+porté verbatim :
+
+- `PeerConn::need_interest_update: bool` ajouté ; les handlers
+  have-family (`on_bitfield`, `on_have`, `on_have_all`,
+  `on_have_none`, `on_suggest`, `on_allowed_fast`) posent le flag —
+  jamais `Piece`/`Request`/keepalive.
+- `Torrent::update_interest` devient mark-only (signature amincie) ;
+  `do_update_interest` contient l'ancien corps (clear du flag avant
+  les early-outs comme upstream, rescan, émission
+  `Interested`/`NotInterested`, tail `disconnect_if_redundant`) ;
+  `drain_interest_updates` fait le sweep de tous les conns dirty.
+- Drain en fin de `apply_peer_effects` (une fois par batch de
+  messages) + après chaque loop de marquage torrent-side
+  (`piece_passed` announce + interest re-check, `piece_failed`
+  re-pick, les deux legs `set_upload_mode`, `update_peer_interest`,
+  `update_interest_all`) — N marquages → 1 rescan par conn.
+- `disconnect_if_redundant` gagne le early-out dirty
+  (`peer_connection.cpp:2323`) — le conn garde son bit stale pendant
+  la fenêtre et n'est jamais lâché avant la réévaluation.
+- Le coût acteur disparaît : le scan O(num_pieces) par `Piece`
+  décodé (jusqu'à ~125 M itérations/s en charge) est réduit à une
+  réévaluation par batch quand un événement l'a réellement dirty.
+
+**Tests ajoutés** (`test_interest.rs`, 3 nouveaux) :
+`piece_does_not_mark_interest` (flag clean après `Piece`, aucune
+réémission Interested/NotInterested),
+`dirty_flag_gates_disconnect_if_redundant` (conn dirty survit au
+gate, le drain la droppe via son propre tail),
+`have_burst_sends_interested_once` (3 `Have` → 1 `Interested`).
+
+**Gates** : `fmt`, `clippy -D warnings`, `cargo test --workspace`,
+`cargo doc --no-deps` — tous verts.
+
+D7–D11 restent ouverts (hors scope de cet apply).
+
+Fix commit : `ae5e217`

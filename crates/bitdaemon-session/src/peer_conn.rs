@@ -134,6 +134,10 @@ pub struct PeerConn {
     pub peer_pieces: Bitfield,
     /// `m_interesting` — they have something we want.
     pub interesting: bool,
+    /// `m_need_interest_update` — a have-family event dirtied the
+    /// interest evaluation; `Torrent::do_update_interest` drains it
+    /// once per message batch (upstream posts a deferred callback).
+    pub need_interest_update: bool,
     /// `m_choked` — we are choking their download.
     pub choked: bool,
     /// `m_peer_choked` — they are choking our download.
@@ -532,6 +536,7 @@ impl PeerConn {
             peer_id: None,
             peer_pieces: Bitfield::with_size(num_pieces),
             interesting: false,
+            need_interest_update: false,
             choked: true,
             peer_choked: true,
             peer_interested: false,
@@ -659,15 +664,20 @@ impl PeerConn {
         (index.0 as usize) < self.peer_pieces.size() && self.peer_pieces.get_bit(index.0 as usize)
     }
 
-    /// `incoming_bitfield` — store the peer's have-set.
+    /// `incoming_bitfield` — store the peer's have-set. Marks the
+    /// interest dirty like upstream's tail `update_interest()`
+    /// (`peer_connection.cpp:2317`); the drain re-scans once.
     pub fn on_bitfield(&mut self, bits: &Bitfield) {
         self.peer_pieces.clone_from(bits);
         self.bitfield_received = true;
         self.num_pieces = bits.iter().filter(|&b| b).count() as i32;
+        self.need_interest_update = true;
     }
 
     /// `incoming_have(index)` — update the bitfield; returns whether
-    /// the peer became interesting (we lack that piece).
+    /// the peer became interesting (we lack that piece). A new bit
+    /// also marks the interest dirty — the drained rescan stands in
+    /// for upstream's eager `peer_is_interesting` leg.
     pub fn on_have(&mut self, index: PieceIndex, have: impl Fn(PieceIndex) -> bool) -> bool {
         if (index.0 as usize) >= self.peer_pieces.size() {
             return false;
@@ -677,6 +687,7 @@ impl PeerConn {
         }
         self.peer_pieces.set_bit(index.0 as usize);
         self.num_pieces += 1;
+        self.need_interest_update = true;
         if !have(index) {
             self.interesting = true;
             return true;
@@ -736,6 +747,9 @@ impl PeerConn {
         self.bitfield_received = true;
         self.peer_pieces.clear_all();
         self.num_pieces = 0;
+        // upstream answers with the eager `send_not_interested`
+        // leg — the drain emits it after re-evaluation.
+        self.need_interest_update = true;
     }
 
     /// `incoming_have_all` — a seed.
@@ -743,6 +757,10 @@ impl PeerConn {
         self.peer_pieces.set_all();
         self.num_pieces = self.peer_pieces.size() as i32;
         self.bitfield_received = true;
+        // upstream fires the eager `peer_is_interesting`/
+        // `send_not_interested` legs — the drain emits whichever
+        // the re-scan computes.
+        self.need_interest_update = true;
     }
 
     /// `incoming_choke` / `incoming_unchoke`.
@@ -780,11 +798,17 @@ impl PeerConn {
                 .truncate((max_suggest_pieces - 1).max(0) as usize);
         }
         self.suggested_pieces.insert(0, index);
+        // upstream `incoming_suggest` fires the eager
+        // `peer_is_interesting` leg — the drain emits `Interested`
+        // if the suggestion is one we want.
+        self.need_interest_update = true;
     }
 
     /// `incoming_allowed_fast` — BEP-6 allowed-fast.
     pub fn on_allowed_fast(&mut self, index: PieceIndex) {
         self.allowed_fast.push(index);
+        // same eager-interest upstream leg as `incoming_suggest`.
+        self.need_interest_update = true;
     }
 
     /// `send_allowed_set` — deterministic BEP-6 allowed-fast set.
