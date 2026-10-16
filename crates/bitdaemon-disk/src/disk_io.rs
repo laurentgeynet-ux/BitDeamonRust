@@ -576,7 +576,7 @@ impl PreadDiskIo {
                             cache.run_flushed(
                                 (j.storage, piece),
                                 usize::try_from(first).unwrap_or(0),
-                                f.bufs[at..at + n].len(),
+                                &f.bufs[at..at + n],
                             );
                             at += n;
                         }
@@ -601,12 +601,14 @@ impl PreadDiskIo {
                             "flush failed; buffers retired, writers complete with error"
                         );
                         self.flush_errors.fetch_add(1, Ordering::Relaxed);
+                        let mut at = 0usize;
                         for &(piece, first, n) in &f.spans {
                             cache.run_flushed(
                                 (j.storage, piece),
                                 usize::try_from(first).unwrap_or(0),
-                                n,
+                                &f.bufs[at..at + n],
                             );
+                            at += n;
                         }
                     }
                 }
@@ -976,12 +978,16 @@ impl PreadDiskIo {
                 };
                 let complete = p.blocks.iter().all(|b| b.buf.is_some() || b.flushed);
                 let forced = p.flags & crate::disk_cache::piece_flags::FORCE_FLUSH != 0;
-                if complete {
-                    if let Some((first, bufs, writers)) = cache.take_flush_run(loc) {
+                if forced {
+                    // pass 1 drains *every* dirty run of a forced
+                    // piece — including ones split by an in-flight
+                    // gap (upstream `flush_to_disk` pass 1 iterates
+                    // the whole entry, not just the first run).
+                    for (first, bufs, writers) in cache.take_all_runs(loc) {
                         runs.push((loc, first, vec![(loc.1, first, bufs.len())], bufs, writers));
                     }
-                } else if forced {
-                    for (first, bufs, writers) in cache.take_all_runs(loc) {
+                } else if complete {
+                    if let Some((first, bufs, writers)) = cache.take_flush_run(loc) {
                         runs.push((loc, first, vec![(loc.1, first, bufs.len())], bufs, writers));
                     }
                 }
@@ -1553,10 +1559,10 @@ impl PreadDiskIo {
                 // coalesced region write — contiguous `store_buffer`
                 // blocks concatenated into one syscall (ADR-0012);
                 // `Storage::write` already flattens internally.
-                let flat_len: usize = f.bufs.iter().map(Vec::len).sum();
+                let flat_len: usize = f.bufs.iter().map(|b| b.len()).sum();
                 let mut flat = Vec::with_capacity(flat_len);
                 for b in &f.bufs {
-                    flat.extend_from_slice(b);
+                    flat.extend_from_slice(b.as_slice());
                 }
                 // `no_cache` opens come from `PreadStorage::open_file`
                 // (keyed on `disk_io_write_mode`, all opens) — the job
@@ -2052,6 +2058,29 @@ fn hash_job(
     const BS: usize = crate::disk_cache::DEFAULT_BLOCK_SIZE as usize;
     let nblocks = piece_len.div_ceil(BS);
     let loc = (storage, h.piece);
+    let mut piece_hash = None;
+    {
+        let g = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(p) = g.piece(loc) {
+            // upstream `try_hash_piece`: `hasher_cursor ==
+            // blocks_in_piece` (the incremental `piece_hasher` ran at
+            // insert time) → `job_completed` — answer from the stored
+            // digest instead of re-reading the piece.
+            if h.v1_hash {
+                piece_hash = p.piece_hash;
+            }
+            // flush-time SHA-256s stored on the entry fill v2 slots
+            // without a re-read — upstream's equivalent for a still-
+            // cached piece is the `v2_hash_queue`→`precomputed` path.
+            for (i, bh) in h.block_hashes.iter_mut().enumerate() {
+                if bh.is_all_zeros()
+                    && let Some(h2) = p.blocks.get(i).and_then(|b| b.block_hash)
+                {
+                    *bh = h2;
+                }
+            }
+        }
+    }
     // `fill_precomputed_v2` — slots still zero get any block hash the
     // storage already knows (upstream preserves non-zero entries and
     // only hashes what's still missing).
@@ -2068,20 +2097,30 @@ fn hash_job(
         .iter()
         .map(Sha256Hash::is_all_zeros)
         .collect();
-    let mut bufs: Vec<Option<Vec<u8>>> = std::iter::repeat_with(|| None).take(nblocks).collect();
-    // Blocks whose buffer was moved into an in-flight flush job are
-    // neither in the cache nor on disk yet — the piece gate parked
-    // this job behind the write (`perform_job` reposts when it still
-    // observes them), so by the time we run, no block is in flight:
-    // a `buf == None` block here is genuinely absent.
+    // `v1_pending`: the stored digest doesn't cover this request —
+    // the SHA-1 pass needs every block's bytes (cache or disk).
+    let v1_pending = h.v1_hash && piece_hash.is_none();
+    let mut bufs: Vec<Option<Arc<Vec<u8>>>> =
+        std::iter::repeat_with(|| None).take(nblocks).collect();
+    // `try_hash_piece`'s `job_completed` case: the incremental hasher
+    // already produced the v1 digest and every v2 block hash is known
+    // — answer without touching the file.
+    if !v1_pending && needed.iter().all(|n| !n) {
+        if let Some(ph) = piece_hash {
+            h.piece_hash = ph;
+        }
+        return StorageError::default();
+    }
     {
         let g = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = g.piece(loc) {
             for (i, b) in p.blocks.iter().enumerate().take(nblocks) {
-                if bufs[i].is_none()
-                    && let Some(d) = b.data()
+                let want = v1_pending || needed.get(i).copied().unwrap_or(false);
+                if want
+                    && bufs[i].is_none()
+                    && let Some(d) = &b.buf
                 {
-                    bufs[i] = Some(d.to_vec());
+                    bufs[i] = Some(Arc::clone(d));
                 }
             }
         }
@@ -2090,15 +2129,25 @@ fn hash_job(
     let mut r: Result<(), StorageError> = Ok(());
     let mut i = 0usize;
     while i < nblocks {
+        let want = v1_pending || needed.get(i).copied().unwrap_or(false);
         if let Some(b) = bufs[i].take() {
-            let off = i * BS;
-            let n = b.len().min(piece_len - off);
-            buf[off..off + n].copy_from_slice(&b[..n]);
+            if want {
+                let off = i * BS;
+                let n = b.len().min(piece_len - off);
+                buf[off..off + n].copy_from_slice(&b[..n]);
+            }
+            i += 1;
+            continue;
+        }
+        if !want {
             i += 1;
             continue;
         }
         let start = i;
-        while i < nblocks && bufs[i].is_none() {
+        while i < nblocks
+            && bufs[i].is_none()
+            && (v1_pending || needed.get(i).copied().unwrap_or(false))
+        {
             i += 1;
         }
         let off = start * BS;
@@ -2128,7 +2177,7 @@ fn hash_job(
     let piece_len2 = usize::try_from(i64::from(st.files().piece_size2(h.piece)))
         .unwrap_or(0)
         .min(piece_len);
-    if h.v1_hash {
+    if v1_pending {
         sha1.update(&buf);
     }
     if blocks_wanted {
@@ -2165,20 +2214,30 @@ fn hash_job(
     match r {
         Ok(_) => {
             if h.v1_hash {
-                h.piece_hash = Sha1Hash::from_bytes(&sha1.finalize()).unwrap_or_default();
+                // `piece_hash` was already fed incrementally at
+                // insert time → serve it; otherwise the SHA-1 over
+                // the assembled buffer just ran.
+                h.piece_hash = piece_hash
+                    .unwrap_or_else(|| Sha1Hash::from_bytes(&sha1.finalize()).unwrap_or_default());
                 // per-block SHA-1 digests — upstream's `smart_ban`
                 // re-reads each block off disk after the verdict;
                 // the whole piece is already in `buf`, so the same
                 // values are emitted here (empty on read error —
-                // the `error → skip` leg upstream).
-                h.block_digests = buf
-                    .chunks(BS)
-                    .map(|b| {
-                        let mut d = Sha1::new();
-                        d.update(b);
-                        Sha1Hash::from_bytes(&d.finalize()).unwrap_or_default()
-                    })
-                    .collect();
+                // the `error → skip` leg upstream). On the inline
+                // path (`piece_hash` precomputed) `buf` only holds
+                // the spans v2 still needed — upstream's `do_job`
+                // didn't run, so digests stay empty there too.
+                h.block_digests = if v1_pending {
+                    buf.chunks(BS)
+                        .map(|b| {
+                            let mut d = Sha1::new();
+                            d.update(b);
+                            Sha1Hash::from_bytes(&d.finalize()).unwrap_or_default()
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             }
             // `store_precomputed_v2` — v2 block hashes are kept on the
             // storage so later `hash2` piece-layer requests answer
@@ -2493,11 +2552,16 @@ impl DiskIo for PreadDiskIo {
         let level = self.write_blocks.fetch_add(1, Ordering::Relaxed) + 1;
         let pressure = self.back_pressure.has_back_pressure(level, o);
         match entry.fence.is_blocked(j, &self.fence_counters) {
-            // parked behind the fence — upstream still returns
-            // `exceeded`: `account_pending_write` ran before
-            // `is_blocked`, so the parked block counts toward
-            // back-pressure like an inserted one.
-            None => pressure,
+            None => {
+                // parked behind the fence — upstream still returns
+                // `exceeded` (`account_pending_write` ran before
+                // `is_blocked`) *and* still calls `schedule_flush`:
+                // the parked charge pushes `buffer_level()` over the
+                // watermark, so the drain must start now — not when
+                // the fence eventually reposts the job.
+                self.flush_after_insert(&entry, std::iter::empty());
+                pressure
+            }
             Some(j) => {
                 // past the fence — `gate_or_enqueue` folds the write
                 // into the cache (upstream `insert_write`), schedules
