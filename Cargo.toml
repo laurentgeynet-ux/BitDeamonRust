@@ -72,11 +72,14 @@ socket2 = "0.6"
 # safe setsockopt for the uTP dont_fragment send flag
 # (IP_MTU_DISCOVER) — Linux only; tokio/socket2 don't expose it and
 # our crates forbid unsafe (ADR-0007).
+# `std` is required so `rustix::fd::AsFd` re-exports `std::os::fd`
+# (without it rustix falls back to a no_std polyfill `AsFd` that
+# `tokio::net::UdpSocket` doesn't implement).
 # `time` is a workaround for rustix 1.1.5: `net/sockopt.rs` uses
 # `crate::timespec` but `mod timespec` is gated on fs|event|process|
 # runtime|thread|time — `net` alone doesn't enable it (build failure
 # on Linux). Revisit on the next rustix release.
-rustix = { version = "1", default-features = false, features = ["net", "time"] }
+rustix = { version = "1", default-features = false, features = ["net", "std", "time"] }
 # Win32 FFI for NTFS file controls (FSCTL_SET_SPARSE, SetFileValidData)
 # — confined to bitdaemon-disk::file::win32, see ADR-0022.
 windows-sys = { version = "0.59", features = [
