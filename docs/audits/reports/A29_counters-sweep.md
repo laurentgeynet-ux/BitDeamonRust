@@ -609,3 +609,42 @@ sont émis, filtrés par le matcher, et le `close_reason` uTP part à
 - Les compteurs sont tous `AtomicI64` dans une seule bank plate —
   fidèle à `aux::counters` (même index space, mêmes opérations
   relaxed) ; pas de risque de race interne.
+
+## Résultat
+
+Apply landé : merge `a7fad1b` (`audit: apply A29 counters-sweep —
+session_stats parity legs`, 33 fichiers, +1765/−241).
+
+- Strings de raisons : tous les emitters `DisconnectPeer.reason`
+  renommés en noms `errors::*` canoniques (`upload_upload`,
+  `uninteresting_upload`, `timed_out*`…) — `disconnect_reason_counter`
+  et `reason_to_close_reason` matchent, le `close_reason` uTP part
+  correctement sur la FIN (la déviation wire-visible est fermée).
+- Legs io transport : `DialFail::os_err` + `transport_error_counter`
+  split sur `raw_os_error` (EPERM/EACCES, ENOBUFS/ECANCELED, WSA) ;
+  `connect_failed` sur dial en cours inc `connect_timeouts` ;
+  `recv_failed_bytes` câblé ; clé `session_closing` retirée.
+- Gauges : `num_tcp_peers + sock_type` à `add_peer`/`remove_peer`
+  (quirk rtc-shift verbatim, documentée) ; gauges d'état torrent
+  recomputées au snapshot via `current_stats_state` (sémantique
+  upstream : aborted → aucun gauge).
+- Attempts : `find_connect_candidates` alimente
+  `boost_connection_attempts`/`missed`/`loops` ; `on_*` ×8,
+  `num_outstanding_accept`, histogrammes send/recv câblés.
+- DHT : `DhtCounterSink` injecté (legs `*_in`/`*_out` par query,
+  drops, bytes, IP overhead) + gauges node/storage snapshotées ;
+  `SessionOut::DhtPacket` porte les sends DHT (compteurs au send
+  edge), `UdpPacket` reste LSD.
+- Disk : `DiskQueueStats` étendu — `num_jobs`/`num_read_jobs`/
+  `num_write_jobs` via `mk_job`/`Drop`, `num_read_back` (blocs
+  réellement relus, hits cache exclus), `disk_{read,write,hash,
+  job}_time` en µs sur succès seulement.
+- API : `find_metric_idx` ajouté (lookup upstream par nom qualifié).
+
+Gates : `cargo fmt`/`clippy -D warnings`/`test --workspace` (117
+suites)/`doc --no-deps` tous verts. 22 tests de régression ajoutés
+(test_stats ×10, test_dht_tracker ×3, test_disk_io ×1, +
+mise à jour des call-sites). `↑x` conservés : `num_blocks_hashed`,
+`sequential_loops` (observabilité supplémentaire, exportés sous le
+même nom qu'upstream — divergence documentée). Commit fix :
+`9042a41`.
