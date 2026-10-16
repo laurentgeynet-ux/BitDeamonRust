@@ -4562,6 +4562,7 @@ impl Torrent {
         &mut self,
         key: u64,
         addr: std::net::IpAddr,
+        s: &crate::settings::SessionSettings,
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
@@ -4571,9 +4572,16 @@ impl Torrent {
         if self.peer_list.peers()[i].banned {
             return;
         }
-        self.peer_list.ban_peer(i);
-        counters.inc(crate::counters::Counter::NumBannedPeers);
-        self.update_want_peers();
+        // `torrent::ban_peer` — `web_seed` entries are off-limits
+        // unless `ban_web_seeds`; upstream still runs the
+        // `peer_banned` disconnect below when the ban is refused
+        // (`smart_ban.cpp` disconnects on `p->connection`
+        // unconditionally after `ban_peer`).
+        if !(self.peer_list.peers()[i].web_seed && !s.ban_web_seeds) {
+            self.peer_list.ban_peer(i);
+            counters.inc(crate::counters::Counter::NumBannedPeers);
+            self.update_want_peers();
+        }
         let conn = self.conn_by_key(key).or_else(|| {
             self.peers
                 .iter()
@@ -4713,16 +4721,22 @@ impl Torrent {
                 p.trust_points <= -7 || (known_bad && allow_disconnect)
             };
             if ban {
-                self.peer_list.ban_peer(i);
-                counters.add(crate::counters::Counter::BannedForHashFailure, 1);
-                // `update_want_peers` — a banned peer is no longer a
-                // connect candidate; upstream re-evaluates here.
-                self.update_want_peers();
+                // upstream posts `peer_ban_alert` BEFORE `ban_peer` —
+                // the alert fires even when the ban itself is refused.
                 out.push(TorrentEffect::Alert(crate::alerts::Alert::PeerBan {
                     ih: self.info_hash,
                     ip: remote,
                     pid,
                 }));
+                // `torrent::ban_peer`'s `ban_web_seeds` gate — a
+                // `web_seed` entry keeps its flag unless the setting
+                // allows it; `update_want_peers` runs inside upstream
+                // `ban_peer`, so it is gated too.
+                if !(self.peer_list.peers()[i].web_seed && !s.ban_web_seeds) {
+                    self.peer_list.ban_peer(i);
+                    self.update_want_peers();
+                }
+                counters.add(crate::counters::Counter::BannedForHashFailure, 1);
                 // `peer->disconnect(errors::too_many_corrupt_pieces)`
                 // — a peer-error disconnect, counted as a failure
                 // (the swarm entry's `failcount` grows). Upstream
@@ -5498,15 +5512,22 @@ impl Torrent {
                                 .and_then(|r| self.peer_index(r))
                         });
                     if let Some(i) = idx {
-                        let src = self.peer_list.peers()[i].source;
-                        if !self
-                            .peer_list
-                            .update_peer_port(port, i, src, &self.peer_list_state)
-                        {
+                        // upstream passes `peer_info::incoming` — the
+                        // peer advertising a listen port proves it
+                        // accepts inbound dials (`on_extended`).
+                        if !self.peer_list.update_peer_port(
+                            port,
+                            i,
+                            bitdaemon_common::flags::PeerSourceFlags::INCOMING,
+                            &self.peer_list_state,
+                        ) {
+                            // `errors::duplicate_peer_id` at default
+                            // (normal) severity — `peer_disconnected`
+                            // + no failcount bump, never `peer_error`.
                             out.push(TorrentEffect::DisconnectPeer {
                                 peer: peer_id,
-                                reason: "duplicate peer id",
-                                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::PeerError,
+                                reason: "duplicate_peer_id",
+                                sev: bitdaemon_net::bt_peer_conn::DisconnectSeverity::Normal,
                             });
                         }
                     }
@@ -7609,7 +7630,7 @@ impl Torrent {
                     &mut read_digest,
                 );
                 if let BanDecision::Ban(key, ip) = decision {
-                    self.apply_smart_ban(key, ip, counters, out);
+                    self.apply_smart_ban(key, ip, s, counters, out);
                 }
             }
             // `known_bad_peer` — lone downloader or a
@@ -7734,7 +7755,7 @@ impl Torrent {
         if !self.ti.as_ref().is_some_and(|ti| ti.v2()) {
             for d in self.smart_ban.on_piece_passed(piece, psize, read_digest) {
                 if let BanDecision::Ban(key, ip) = d {
-                    self.apply_smart_ban(key, ip, counters, out);
+                    self.apply_smart_ban(key, ip, s, counters, out);
                 }
             }
         }
@@ -8544,14 +8565,45 @@ impl Torrent {
         &self.web_seeds
     }
 
-    /// `set_ban` (upstream `torrent::set_ban`) — ban the swarm entry
-    /// for `remote`; an already-connected peer is dropped by the
-    /// session's disconnect pump via `peer_disconnected_addr` —
-    /// callers pass the effect through as `SessionOut::Disconnect`.
-    pub fn ban_peer(&mut self, remote: std::net::SocketAddr) {
-        if let Some(i) = self.peer_index(remote) {
-            self.peer_list.ban_peer(i);
+    /// `torrent::ban_peer(tp)` — ban the swarm entry for `remote`;
+    /// an already-connected peer is dropped by the session's
+    /// disconnect pump via `peer_disconnected_addr` — callers pass
+    /// the effect through as `SessionOut::Disconnect`. Upstream
+    /// refuses to ban `web_seed` entries unless `ban_web_seeds`
+    /// (`torrent.cpp:11918-11926`) and returns `false`; a real ban
+    /// re-evaluates `want_peers` and bumps `num_banned_peers`.
+    pub fn ban_peer(
+        &mut self,
+        remote: std::net::SocketAddr,
+        s: &crate::settings::SessionSettings,
+        counters: &crate::counters::Counters,
+    ) -> bool {
+        let Some(i) = self.peer_index(remote) else {
+            return false;
+        };
+        self.ban_peer_at(i, s, counters)
+    }
+
+    /// `torrent::ban_peer(tp)` by peer-list index — the
+    /// bound-connection callers (`self_connection` disconnect)
+    /// resolve the entry by index so an `update_peer_port` rewrite
+    /// cannot miss it.
+    pub fn ban_peer_at(
+        &mut self,
+        i: usize,
+        s: &crate::settings::SessionSettings,
+        counters: &crate::counters::Counters,
+    ) -> bool {
+        if i >= self.peer_list.peers().len() {
+            return false;
         }
+        if self.peer_list.peers()[i].web_seed && !s.ban_web_seeds {
+            return false;
+        }
+        self.peer_list.ban_peer(i);
+        self.update_want_peers();
+        counters.inc(crate::counters::Counter::NumBannedPeers);
+        true
     }
 
     /// `prioritize_pieces` (upstream `torrent_handle::prioritize_pieces`
@@ -12496,6 +12548,20 @@ impl Torrent {
     #[must_use]
     pub fn num_connecting(&self) -> i32 {
         self.num_connecting
+    }
+
+    /// `torrent::num_peers()` upstream — the *live conn* count, not
+    /// the peer-list size: attached conns minus the ones queued for
+    /// disconnect (`m_peers_to_disconnect`), plus in-flight dials
+    /// (upstream conn objects join `m_connections` at
+    /// `create_peer_connection` and stay through the handshake; our
+    /// dial marks carry that count in `num_connecting`). Distinct
+    /// from `peer_list.num_peers()` — the swarm-entry pool, which
+    /// upstream never consults for connection accounting.
+    #[must_use]
+    pub fn num_connections(&self) -> i64 {
+        let attached = self.peers.values().filter(|c| !c.disconnecting).count() as i64;
+        attached + i64::from(self.num_connecting)
     }
 
     /// `retry_web_seed` — reschedule a seed after a failure:

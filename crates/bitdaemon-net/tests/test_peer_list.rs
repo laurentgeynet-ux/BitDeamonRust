@@ -5,7 +5,7 @@
 //! `peer_list` — add/candidates/weeding/ban (`test_peer_list`-style).
 
 use bitdaemon_common::{PeerSourceFlags, PexFlags};
-use bitdaemon_net::peer_list::{PeerList, PeerListState, primary_source, source_rank};
+use bitdaemon_net::peer_list::{PeerList, PeerListState, source_rank};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 fn ep(a: u8, port: u16) -> SocketAddr {
@@ -32,10 +32,6 @@ fn add_and_source() {
     assert_eq!(
         l.peers()[i].source,
         PeerSourceFlags::TRACKER | PeerSourceFlags::PEX
-    );
-    assert_eq!(
-        primary_source(l.peers()[i].source),
-        PeerSourceFlags::TRACKER
     );
     assert_eq!(source_rank(l.peers()[i].source), (1 << 5) | (1 << 2));
     assert_eq!(l.num_connect_candidates(), 1);
@@ -256,21 +252,26 @@ fn ranking_prefers_low_failcount_local() {
 }
 
 #[test]
-fn ranking_uses_primary_source() {
-    // upstream `compare_peer` ranks `peer_source()` (the *primary*
-    // source bit), not the OR-combined set: a PEX-primary peer that
-    // also came from a tracker must NOT outrank a tracker-primary one.
+fn ranking_uses_full_source_mask() {
+    // upstream `compare_peer` ranks `source_rank(peer_source())` —
+    // the *whole* bitmask accumulates (tracker 1<<5, lsd 1<<4,
+    // dht 1<<3, pex 1<<2). An LSD peer also seen on PEX (16+4=20)
+    // outranks an LSD-only one (16); ranking only a primary bit
+    // would order them the other way.
     let st = PeerListState {
         min_reconnect_time: 0,
         ..Default::default()
     };
     let mut l = PeerList::new(&st);
-    // tracker-primary (later also seen on PEX)
-    let (t, _) = add(&mut l, ep(1, 6881), PeerSourceFlags::TRACKER).unwrap();
+    // multi-source: LSD first, PEX merges its bit on the re-announce.
+    let (m, _) = add(&mut l, ep(1, 6881), PeerSourceFlags::LSD).unwrap();
     add(&mut l, ep(1, 6881), PeerSourceFlags::PEX);
-    // pex-primary
-    let (p, _) = add(&mut l, ep(2, 6881), PeerSourceFlags::PEX).unwrap();
-    assert_eq!(primary_source(l.peers()[p].source), PeerSourceFlags::PEX);
+    assert_eq!(
+        l.peers()[m].source,
+        PeerSourceFlags::LSD | PeerSourceFlags::PEX
+    );
+    // single-source LSD.
+    let (s, _) = add(&mut l, ep(2, 6881), PeerSourceFlags::LSD).unwrap();
     let cands = l.find_connect_candidates(0, &st);
     let pos = |i: usize| {
         cands
@@ -278,7 +279,49 @@ fn ranking_uses_primary_source() {
             .position(|c| c.0 == l.peers()[i].addr && c.1 == l.peers()[i].port)
             .unwrap()
     };
-    assert!(pos(t) < pos(p), "tracker-primary must rank before pex-only");
+    assert!(
+        pos(m) < pos(s),
+        "LSD|PEX (rank 20) must outrank LSD-only (rank 16)"
+    );
+}
+
+#[test]
+fn resume_data_checks_use_exact_mask() {
+    // upstream `peer_source() == resume_data` is an *exact-mask*
+    // test: an entry carrying resume_data plus another bit is not
+    // resume-data-sourced — it survives both the capacity reject and
+    // the `should_erase_immediately` sweep.
+    let st = PeerListState {
+        max_peerlist_size: 2,
+        ..Default::default()
+    };
+    let mut l = PeerList::new(&st);
+    // mixed-source entry: resume_data merged with incoming — the
+    // discriminating case (a primary-source projection still
+    // reports resume_data for RESUME_DATA|INCOMING).
+    let add_st = |l: &mut PeerList, e: SocketAddr, src: PeerSourceFlags| {
+        l.add_peer(e, src, PexFlags::NONE, &st)
+    };
+    add_st(&mut l, ep(1, 6881), PeerSourceFlags::RESUME_DATA);
+    add_st(&mut l, ep(1, 6881), PeerSourceFlags::INCOMING);
+    assert_eq!(
+        l.peers()[l.find_peer(ep(1, 6881).ip()).unwrap()].source,
+        PeerSourceFlags::RESUME_DATA | PeerSourceFlags::INCOMING
+    );
+    // resume-data-only filler reaches the capacity.
+    add_st(&mut l, ep(2, 6881), PeerSourceFlags::RESUME_DATA);
+    // neither entry is dialable → not a connect candidate, so the
+    // sweep consults the source mask at all.
+    for i in 0..l.peers().len() {
+        l.peers_mut()[i].connectable = false;
+    }
+    // a resume-data-only *insert* is rejected at capacity
+    // (`insert_peer` returns false upstream).
+    assert!(add_st(&mut l, ep(3, 6881), PeerSourceFlags::RESUME_DATA).is_none());
+    // a normal insert weeds the resume-data-only entry instead.
+    assert!(add_st(&mut l, ep(4, 6881), PeerSourceFlags::TRACKER).is_some());
+    assert!(l.find_peer(ep(1, 6881).ip()).is_some());
+    assert!(l.find_peer(ep(2, 6881).ip()).is_none());
 }
 
 #[test]
