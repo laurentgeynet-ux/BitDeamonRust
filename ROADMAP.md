@@ -293,12 +293,21 @@ pool.
       `enable_set_file_valid_data` in `Settings` with upstream
       defaults; CLI flags `--aio-threads`/`--hashing-threads`/
       `--enable-set-file-valid-data`.
-- [ ] Re-benchmark 6 GiB torrent on D: vs qBittorrent baseline
-      (~58 MiB/s, ~2 min). *Code landed — validation run pending.*
+- [x] Re-benchmark 6 GiB torrent on D: vs qBittorrent baseline
+      (~58 MiB/s, ~2 min). **2026-10-16 run** (ubuntu-24.04.3-desktop,
+      24208 pieces, 150 s, `--utp`): peaks **86 MB/s**, sustained
+      ~45-65 MB/s — qBittorrent-class on the peaks; `have` progress
+      begins immediately (no allocation plateau), `wavg`/`favg` flat
+      ~1.3 ms — zero-fill stalls gone. Residual: back-pressure
+      plateaus still dip to ~19-31 MB/s when `write_blocks` hits the
+      cap — D: flushes at ~36 MiB/s sustained (HDD ceiling), so the
+      tail of the run drains the write queue.
 
 **Exit**: D: download sustains ≥ qBittorrent-class throughput with no
 zero-fill stalls; `have` progress begins without the ~2 min
-allocation/check plateau.
+allocation/check plateau. *(Met except under sustained >40 MiB/s
+ingress — the HDD flush ceiling still gates; remaining lever is
+flush-scheduling/OS-cache policy, not the write path.)*
 
 ---
 
