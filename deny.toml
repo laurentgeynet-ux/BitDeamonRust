@@ -14,7 +14,12 @@ yanked = "deny"
 # fields, never attacker-controlled RFC 2822 strings. The fix
 # (0.3.47) requires Rust 1.88, above our MSRV 1.85 — revisit when
 # the MSRV moves.
-ignore = ["RUSTSEC-2026-0009"]
+#
+# RUSTSEC-2024-0436 (`paste` 1.0.15 unmaintained): reaches us only via
+# `netroute` → `netlink-packet-*` (latest releases) as a build-time
+# proc-macro — no runtime code path, no advisory-worthy exposure.
+# Revisit if `netroute` releases a `paste`-free version.
+ignore = ["RUSTSEC-2026-0009", "RUSTSEC-2024-0436"]
 
 [licenses]
 # BSD-2-Clause project; allow the standard permissive set.
