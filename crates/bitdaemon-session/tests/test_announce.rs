@@ -21,6 +21,17 @@ fn ep(a: u8) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, a)), 6881)
 }
 
+/// the `sent_seq` a `TrackerAnnounce` effect was dispatched with —
+/// completions echo it back so the session can drop stale replies.
+fn seq_of(out: &[SessionOut], url: &str) -> u64 {
+    out.iter()
+        .find_map(|o| match o {
+            SessionOut::TrackerAnnounce { url: u, seq, .. } if u == url => Some(*seq),
+            _ => None,
+        })
+        .expect("announce effect")
+}
+
 #[test]
 fn announce_cycle() {
     let ih = Sha1Hash::from_bytes(&[4; 20]).unwrap();
@@ -54,6 +65,7 @@ fn announce_cycle() {
     // first announce carries `started` (BEP-3 event 2) and the
     // entry is held in-flight — no re-fire while it is out.
     assert_eq!(params.event, 2);
+    let first_seq = seq_of(&out, "udp://tr/announce");
     out.clear();
     s.tracker_announce_due(Instant::now(), 0, &mut out);
     assert!(out.is_empty(), "announce in flight must not re-fire");
@@ -78,6 +90,7 @@ fn announce_cycle() {
         &ih,
         "udp://tr/announce",
         ProtocolVersion::V1,
+        first_seq,
         Ok(resp),
         None,
         &mut Vec::new(),
@@ -89,7 +102,7 @@ fn announce_cycle() {
     assert_eq!(t.complete, 3);
     assert_eq!(t.num_seeds, 0);
     let i = t.trackers.find("udp://tr/announce").unwrap();
-    assert_eq!(t.trackers.trackers[i].tracker_id, "tid1");
+    assert_eq!(t.trackers.trackers[i].tracker_id, b"tid1");
     assert!(t.trackers.trackers[i].verified);
     // `announce_endpoint::sent` — start_sent latched, next announce
     // scheduled at the tracker interval (no per-tick re-fire), the
@@ -189,10 +202,16 @@ fn announce_failure_backs_off() {
     );
     let mut s = Session::new();
     s.add_torrent(t);
+    // a completion only counts against a live request — arm one
+    // (upstream responses always answer an in-flight connection).
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr");
     s.on_announce_response(
         &ih,
         "http://tr",
         ProtocolVersion::V1,
+        seq,
         Err(AnnounceError::TimedOut),
         None,
         &mut Vec::new(),

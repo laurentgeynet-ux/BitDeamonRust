@@ -420,3 +420,60 @@ plus les écarts nouvellement caractérisés ci-dessus (D1-D7, D9, D12-D20).
   audit A04` (branche `audit/04-trackers`)
 - PR : https://github.com/laurentgeynet-ux/BitDeamonRust/pull/5
 - Fragment changelog : `docs/audits/changelog/A04.md`
+
+## Application (round 2 — résiduel)
+
+Les déviations D1-D20 ci-dessus sont appliquées sur `main`.
+Récapitulatif :
+
+- **D1** `prioritize_udp_trackers` — réécrit : swap udp↔non-udp
+  **même hostname** hors tier (`tracker_list.cpp:100-132`), appelé
+  au ctor torrent et à `replace_trackers` sous
+  `prefer_udp_trackers`. ✅
+- **D2** — `add_tracker` marque `need_save_resume(if_metadata_changed)`
+  et `add_tracker`/`replace_trackers` annoncent immédiatement si
+  announcing (via `pending_out`). ✅
+- **D3** — `stop_tracker_timeout ≤ 0` supprime tout announce
+  `stopped` (collecte + dispatch). ✅
+- **D4** — `dispatch_announce` pose `next_announce = min_announce =
+  now` à l'émission. ✅
+- **D5** — `announce_udp` ignore les datagrammes dont la source
+  diffère de la cible (hors target hostname/unspecified). ✅
+- **D6** — `announce_params` émet `ipv4=`/`ipv6=` pour les torrents
+  private non-anonymes, depuis les listen sockets (`announce_ips`).
+  ✅
+- **D7** — `current_tracker` fallback verified : déjà conforme à
+  upstream (déviation infirmée à la re-vérification). ✅
+- **D8** — self `peer_id` sauté à l'ingestion des dict-peers. ✅
+- **D9/D12** — `trackerid` en `Vec<u8>` bout-en-bout, alerte émise
+  uniquement au changement. ✅
+- **D10** — `warning message` stocké dans `announce_endpoint.message`.
+  ✅
+- **D11** — `verified` non posé sur scrape. ✅
+- **D13** — force-annonce by-idx respecte `announce_trackers`. ✅
+- **D14** — cascade d'échec propage `high_priority`. ✅
+- **D15** — `set_session_paused` émet `AbortTrackerRequests` (vols
+  non-stopped → `announce_skipped` bookkeeping + cascade) avant
+  `stop_announcing` ; `sent_seq` par requête droppe les complétions
+  tardives/stales. ✅
+- **D16** — résolution DNS `cache_only` pour les announces stopped
+  (HTTP + UDP). ✅
+- **D17** — filtrage famille symétrique dans `udp_tracker_endpoints`
+  (v6 n'annonce pas vers v4 et réciproquement). ✅
+- **D18** — WS : `numwant` clampé `max_webtorrent_offers`, `offers`
+  toujours sérialisé, `num_want==0` → `torrent_aborted` sans
+  connexion, `failure reason` → `min_interval` 120 s. *Non porté* :
+  connexion ws persistante partagée + génération/routage d'offers
+  RTC (`m_websocket_conns`, `generate_rtc_offers`) — en attente de
+  la binding RTC (ADR-0011). ⚠️ partiel
+- **D19** — endpoint synthétique unique : archi assumée (ADR),
+  inchangé. —
+- **D20** — `udp_tracker::udp_announce` standalone utilise `new_tid`
+  (0/`0xffffffff` exclus). ✅
+
+Tests ajoutés : trio `test_prioritize_udp{,_noop,_tier}` +
+10 cas A04 (suppression stopped, abort session + stale drop,
+`sent_seq`, `min_announce` reset, add/replace immediate announce,
+self-peer skip, trackerid change/binary, warning→message, scrape
+verified). Validation : `fmt`, `clippy -D warnings`,
+`cargo test --workspace`, `cargo doc` — tout vert.

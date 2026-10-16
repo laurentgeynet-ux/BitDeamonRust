@@ -47,6 +47,20 @@ fn ok_reply() -> TrackerResponse {
     }
 }
 
+/// the `sent_seq` a dispatched `TrackerAnnounce` carries — response
+/// handlers echo it so stale completions (aborted, re-dispatched)
+/// are dropped like upstream's destroyed `tracker_connection`s.
+fn seq_of(out: &[SessionOut], url: &str, v: PV) -> u64 {
+    out.iter()
+        .find_map(|o| match o {
+            SessionOut::TrackerAnnounce {
+                url: u, v: vv, seq, ..
+            } if u == url && *vv == v => Some(*seq),
+            _ => None,
+        })
+        .expect("announce effect")
+}
+
 /// hybrid torrent: `due()` picks one announce per supported
 /// info-hash version — upstream runs `announce_with_tracker` per
 /// (socket, version) and hybrid torrents announce both hashes.
@@ -95,11 +109,14 @@ fn failed_version_only_touches_announced_slot() {
     let mut out = Vec::new();
     s.tracker_announce_due(Instant::now(), 0, &mut out);
     assert_eq!(out.len(), 2);
+    let seq_v1 = seq_of(&out, "http://tr/announce", PV::V1);
+    let seq_v2 = seq_of(&out, "http://tr/announce", PV::V2);
     // v2 answers, v1 fails.
     s.on_announce_response(
         &t_ih(2),
         "http://tr/announce",
         PV::V2,
+        seq_v2,
         Ok(ok_reply()),
         None,
         &mut Vec::new(),
@@ -108,6 +125,7 @@ fn failed_version_only_touches_announced_slot() {
         &t_ih(2),
         "http://tr/announce",
         PV::V1,
+        seq_v1,
         Err(AnnounceError::TimedOut),
         None,
         &mut Vec::new(),
@@ -141,10 +159,12 @@ fn http_410_dont_try_again() {
     let mut out = Vec::new();
     s.tracker_announce_due(Instant::now(), 0, &mut out);
     assert_eq!(out.len(), 1);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
     s.on_announce_response(
         &t_ih(3),
         "http://tr/announce",
         PV::V1,
+        seq,
         Err(AnnounceError::Http(HttpError::Status(410))),
         None,
         &mut Vec::new(),
@@ -174,10 +194,16 @@ fn tracker_error_alert_fields() {
     s.add_torrent(t);
     s.pop_alerts();
 
+    // arm a request — a completion only counts against an in-flight
+    // announce (upstream destroys aborted `tracker_connection`s).
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
     s.on_announce_response(
         &t_ih(4),
         "http://tr/announce",
         PV::V1,
+        seq,
         Err(AnnounceError::Http(HttpError::Status(503))),
         None,
         &mut Vec::new(),
@@ -206,11 +232,13 @@ fn failure_retry_interval_overrides_backoff() {
 
     let mut out = Vec::new();
     s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
     let before = Instant::now();
     s.on_announce_response(
         &t_ih(5),
         "http://tr/announce",
         PV::V1,
+        seq,
         Err(AnnounceError::Failure {
             message: "too popular".into(),
             interval: 7200,
@@ -283,11 +311,13 @@ fn failure_cascades_to_next_tier() {
     let mut out = Vec::new();
     s.tracker_announce_due(Instant::now(), 0, &mut out);
     assert_eq!(out.len(), 1);
+    let seq = seq_of(&out, "http://dead/announce", PV::V1);
     let mut out = Vec::new();
     s.on_announce_response(
         &t_ih(6),
         "http://dead/announce",
         PV::V1,
+        seq,
         Err(AnnounceError::TimedOut),
         None,
         &mut out,
@@ -318,14 +348,16 @@ fn completed_burst_emits_completed_once() {
     // `started` announce first (fresh slot → ev=2).
     let mut out = Vec::new();
     s.tracker_announce_due(Instant::now(), 0, &mut out);
-    let SessionOut::TrackerAnnounce { params, .. } = &out[0] else {
+    let SessionOut::TrackerAnnounce { params, seq, .. } = &out[0] else {
         panic!("announce effect")
     };
     assert_eq!(params.event, 2);
+    let seq1 = *seq;
     s.on_announce_response(
         &t_ih(7),
         "http://tr/announce",
         PV::V1,
+        seq1,
         Ok(ok_reply()),
         None,
         &mut Vec::new(),
@@ -339,14 +371,16 @@ fn completed_burst_emits_completed_once() {
     let mut out = Vec::new();
     s.tracker_announce_due(Instant::now(), 0, &mut out);
     assert_eq!(out.len(), 1);
-    let SessionOut::TrackerAnnounce { params, .. } = &out[0] else {
+    let SessionOut::TrackerAnnounce { params, seq, .. } = &out[0] else {
         panic!("announce effect")
     };
     assert_eq!(params.event, 1, "burst must carry completed");
+    let seq2 = *seq;
     s.on_announce_response(
         &t_ih(7),
         "http://tr/announce",
         PV::V1,
+        seq2,
         Ok(ok_reply()),
         None,
         &mut Vec::new(),
@@ -378,13 +412,18 @@ fn trackerid_echo_and_fallback() {
 
     // fallback — the entry has no trackerid yet, so the request
     // carries `m_trackerid` (the effect's `tracker_id` field, which
-    // the driver moves into the announce params).
+    // the driver moves into the announce params). `trackerid` is
+    // binary upstream — carried as bytes end-to-end.
     let mut out = Vec::new();
     s.tracker_announce_due(Instant::now(), 0, &mut out);
-    let SessionOut::TrackerAnnounce { tracker_id, .. } = &out[0] else {
+    let SessionOut::TrackerAnnounce {
+        tracker_id, seq, ..
+    } = &out[0]
+    else {
         panic!("announce effect")
     };
-    assert_eq!(tracker_id, "from-params");
+    assert_eq!(tracker_id, b"from-params");
+    let seq = *seq;
 
     // the tracker assigns its own id → entry wins on the next one,
     // `trackerid_alert` posts.
@@ -394,13 +433,14 @@ fn trackerid_echo_and_fallback() {
         &t_ih(8),
         "http://tr/announce",
         PV::V1,
+        seq,
         Ok(resp),
         None,
         &mut Vec::new(),
     );
     assert_eq!(
         s.torrents.get(&t_ih(8)).unwrap().trackers.trackers[0].tracker_id,
-        "from-tracker"
+        b"from-tracker"
     );
     assert!(
         s.pop_alerts().iter().any(
@@ -413,7 +453,7 @@ fn trackerid_echo_and_fallback() {
     let SessionOut::TrackerAnnounce { tracker_id, .. } = &out[0] else {
         panic!("announce effect")
     };
-    assert_eq!(tracker_id, "from-tracker");
+    assert_eq!(tracker_id, b"from-tracker");
 }
 
 /// `announce_params` carries real byte counters — `left` is
@@ -473,10 +513,12 @@ fn scrape_emits_per_version_for_hybrid() {
     assert_eq!(scrapes[1].1, [11u8; 20]);
 }
 
-/// the scrape reply lands on the entry (`scrape_*` fields) and
-/// `verified` — a working scrape marks the tracker verified.
+/// the scrape reply lands on the entry (`scrape_*` fields) but does
+/// NOT mark it `verified` — upstream `torrent::scrape_response`
+/// never touches `ae->verified`; only announce replies do
+/// (`tracker_response` sets `verified = true`).
 #[test]
-fn scrape_reply_marks_entry_verified() {
+fn scrape_reply_does_not_verify() {
     let mut t = torrent(11);
     t.add_tracker("http://tr/announce".into(), 0, SOURCE_CLIENT);
     let mut s = session();
@@ -487,7 +529,508 @@ fn scrape_reply_marks_entry_verified() {
     resp.incomplete = 3;
     s.on_scrape_response(&t_ih(11), "http://tr/announce", PV::V1, Ok(resp));
     let t = s.torrents.get(&t_ih(11)).unwrap();
-    assert!(t.trackers.trackers[0].verified);
+    assert!(!t.trackers.trackers[0].verified);
     assert_eq!(t.trackers.trackers[0].scrape_complete, 7);
     assert_eq!(t.trackers.trackers[0].scrape_incomplete, 3);
+}
+
+/// `stop_tracker_timeout <= 0` upstream suppresses the whole
+/// stopped-announce leg (`announce_with_tracker` returns before any
+/// work): no request, no bookkeeping, no error alert. With a real
+/// timeout the `stopped` announce goes out — the gate is the
+/// timeout, not the pause path.
+#[test]
+fn stopped_suppressed_when_timeout_zero() {
+    for timeout in [Duration::ZERO, Duration::from_secs(10)] {
+        let mut t = torrent(20);
+        t.add_tracker("http://tr/announce".into(), 0, SOURCE_CLIENT);
+        let mut s = session();
+        s.settings.stop_tracker_timeout = timeout;
+        s.add_torrent(t);
+        s.pop_alerts();
+
+        // deliver `started` so the slot owes a `stopped` on pause.
+        let mut out = Vec::new();
+        s.tracker_announce_due(Instant::now(), 0, &mut out);
+        let seq = seq_of(&out, "http://tr/announce", PV::V1);
+        s.on_announce_response(
+            &t_ih(20),
+            "http://tr/announce",
+            PV::V1,
+            seq,
+            Ok(ok_reply()),
+            None,
+            &mut Vec::new(),
+        );
+        s.pop_alerts();
+
+        let mut out = Vec::new();
+        s.set_paused(&t_ih(20), true, &mut out);
+        let stopped = out.iter().any(|o| {
+            matches!(
+                o,
+                SessionOut::TrackerAnnounce { params, .. } if params.event == 3
+            )
+        });
+        let t = s.torrents.get(&t_ih(20)).unwrap();
+        if timeout.is_zero() {
+            assert!(!stopped, "zero timeout must suppress the stopped announce");
+            // no bookkeeping at all — the slot stays pristine.
+            assert_eq!(t.trackers.trackers[0].endpoints[0].v1.fails, 0);
+            assert!(
+                !s.pop_alerts()
+                    .iter()
+                    .any(|a| matches!(a, Alert::TrackerError { .. }))
+            );
+        } else {
+            assert!(stopped, "nonzero timeout must send the stopped announce");
+        }
+    }
+}
+
+/// `session_impl::pause` → `abort_all_requests`: in-flight
+/// non-stopped requests are aborted BEFORE torrents get
+/// session-paused — each abort runs `fail(announce_skipped)`
+/// bookkeeping (fails++, message, alert) and the driver is told to
+/// drop queued requests. A late completion is dropped stale.
+#[test]
+fn session_pause_aborts_in_flight() {
+    let mut t = torrent(21);
+    t.add_tracker("http://tr/announce".into(), 0, SOURCE_CLIENT);
+    let mut s = session();
+    s.add_torrent(t);
+    s.pop_alerts();
+
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
+    assert!(
+        s.torrents.get(&t_ih(21)).unwrap().trackers.trackers[0].endpoints[0]
+            .v1
+            .updating
+    );
+
+    let mut out = Vec::new();
+    s.set_session_paused(true, &mut out);
+    assert!(
+        out.iter()
+            .any(|o| matches!(o, SessionOut::AbortTrackerRequests))
+    );
+    let t = s.torrents.get(&t_ih(21)).unwrap();
+    let ep = &t.trackers.trackers[0].endpoints[0];
+    assert_eq!(ep.v1.fails, 1);
+    assert!(!ep.v1.updating);
+    assert_eq!(ep.message, "announce skipped");
+    assert!(s.pop_alerts().iter().any(|a| matches!(
+        a,
+        Alert::TrackerError { error, .. } if error == "announce skipped"
+    )));
+
+    // the aborted exchange's late reply must not relatch the slot.
+    let mut out = Vec::new();
+    s.on_announce_response(
+        &t_ih(21),
+        "http://tr/announce",
+        PV::V1,
+        seq,
+        Ok(ok_reply()),
+        None,
+        &mut out,
+    );
+    let t = s.torrents.get(&t_ih(21)).unwrap();
+    assert!(!t.trackers.trackers[0].verified);
+    assert_eq!(t.trackers.trackers[0].endpoints[0].v1.fails, 1);
+}
+
+/// a completion whose `sent_seq` doesn't match the live request is
+/// dropped wholesale — no state latches, no alerts (upstream's
+/// aborted `tracker_connection` object is simply gone).
+#[test]
+fn stale_completion_dropped() {
+    let mut t = torrent(22);
+    t.add_tracker("http://tr/announce".into(), 0, SOURCE_CLIENT);
+    let mut s = session();
+    s.add_torrent(t);
+    s.pop_alerts();
+
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
+
+    let mut out = Vec::new();
+    s.on_announce_response(
+        &t_ih(22),
+        "http://tr/announce",
+        PV::V1,
+        seq + 1,
+        Ok(ok_reply()),
+        None,
+        &mut out,
+    );
+    let t = s.torrents.get(&t_ih(22)).unwrap();
+    let ep = &t.trackers.trackers[0].endpoints[0];
+    // the live request is still in flight; nothing was applied.
+    assert!(ep.v1.updating);
+    assert_eq!(ep.v1.fails, 0);
+    assert!(!t.trackers.trackers[0].verified);
+    assert!(
+        !s.pop_alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::TrackerReply { .. } | Alert::TrackerError { .. }))
+    );
+}
+
+/// `send_tracker_request` stamps `next_announce = min_announce =
+/// now` at dispatch — a stale tracker `min interval` must not delay
+/// the failure backoff of the request just sent.
+#[test]
+fn dispatch_resets_stale_min_announce() {
+    let mut t = torrent(23);
+    t.add_tracker("http://tr/announce".into(), 0, SOURCE_CLIENT);
+    let mut s = session();
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
+    // the tracker pins a huge min interval on us.
+    let mut resp = ok_reply();
+    resp.min_interval = 7200;
+    let t0 = Instant::now();
+    s.on_announce_response(
+        &t_ih(23),
+        "http://tr/announce",
+        PV::V1,
+        seq,
+        Ok(resp),
+        None,
+        &mut Vec::new(),
+    );
+    {
+        let t = s.torrents.get(&t_ih(23)).unwrap();
+        let a = &t.trackers.trackers[0].endpoints[0].v1;
+        assert!(a.min_announce.unwrap() >= t0 + Duration::from_secs(7199));
+    }
+    // a manual reannounce bypasses `min` (`ignore_min_interval`) —
+    // dispatch must reset the slot's timers so the failure below
+    // schedules from `now`, not from the stale min.
+    use bitdaemon_session::session::ReannounceFlags;
+    let mut out = Vec::new();
+    s.force_announce(
+        &t_ih(23),
+        None,
+        0,
+        ReannounceFlags::IGNORE_MIN_INTERVAL | ReannounceFlags::HIGH_PRIORITY,
+        &mut out,
+    );
+    let seq2 = seq_of(&out, "http://tr/announce", PV::V1);
+    let t1 = Instant::now();
+    {
+        let t = s.torrents.get(&t_ih(23)).unwrap();
+        let a = &t.trackers.trackers[0].endpoints[0].v1;
+        assert!(a.min_announce.unwrap() < t1 + Duration::from_secs(60));
+    }
+    s.on_announce_response(
+        &t_ih(23),
+        "http://tr/announce",
+        PV::V1,
+        seq2,
+        Err(AnnounceError::TimedOut),
+        None,
+        &mut Vec::new(),
+    );
+    let t = s.torrents.get(&t_ih(23)).unwrap();
+    let a = &t.trackers.trackers[0].endpoints[0].v1;
+    let next = a.next_announce.unwrap();
+    assert!(
+        next < t1 + Duration::from_secs(7200),
+        "stale min must not delay retry"
+    );
+    assert!(next >= t1 + Duration::from_secs(5));
+}
+
+/// `torrent::add_tracker` — a real insertion marks
+/// `need_save_resume(if_metadata_changed)` and, when the torrent is
+/// announcing, triggers an immediate `announce_with_tracker`
+/// (routed via `pending_out` for handle-API calls).
+#[test]
+fn add_tracker_marks_resume_and_announces() {
+    let mut t = torrent(24);
+    t.add_tracker("http://tr/announce".into(), 0, SOURCE_CLIENT);
+    t.announcing = true;
+    // the test's seeding add counts as a change — clear it so the
+    // assertions below isolate the `Session::add_tracker` leg.
+    t.need_save_resume = bitdaemon_common::flags::ResumeDataFlags::NONE;
+    let mut s = session();
+    s.add_torrent(t);
+
+    // ctor-seeded tracker is NOT a user change — no metadata dirty.
+    let t = s.torrents.get(&t_ih(24)).unwrap();
+    assert!(
+        !t.need_save_resume
+            .contains(bitdaemon_common::flags::ResumeDataFlags::IF_METADATA_CHANGED)
+    );
+
+    // retire the seeded tracker's announce first — a fresh
+    // `announce_state` scan picks the first due entry, so the
+    // existing tracker must not be due for the new one to win.
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
+    s.on_announce_response(
+        &t_ih(24),
+        "http://tr/announce",
+        PV::V1,
+        seq,
+        Ok(ok_reply()),
+        None,
+        &mut Vec::new(),
+    );
+
+    // tier -1 inserts ahead of the covering tier-0 entry — the
+    // `announce_state` scan picks it and the announce goes out
+    // synchronously (upstream `m_announcing && added →
+    // announce_with_tracker()`).
+    s.add_tracker(&t_ih(24), "http://new/announce".into(), -1, SOURCE_CLIENT);
+    let t = s.torrents.get(&t_ih(24)).unwrap();
+    assert!(
+        t.need_save_resume
+            .contains(bitdaemon_common::flags::ResumeDataFlags::IF_METADATA_CHANGED)
+    );
+    assert!(s.pending_out.iter().any(|o| matches!(
+        o,
+        SessionOut::TrackerAnnounce { url, .. } if url == "http://new/announce"
+    )));
+
+    // a duplicate URL is a no-op — no extra dirty marking beyond
+    // what the first add already set, no second announce.
+    s.pending_out.clear();
+    let t = s.torrents.get_mut(&t_ih(24)).unwrap();
+    t.need_save_resume = bitdaemon_common::flags::ResumeDataFlags::NONE;
+    s.add_tracker(&t_ih(24), "http://new/announce".into(), 1, SOURCE_CLIENT);
+    let t = s.torrents.get(&t_ih(24)).unwrap();
+    assert!(
+        !t.need_save_resume
+            .contains(bitdaemon_common::flags::ResumeDataFlags::IF_METADATA_CHANGED)
+    );
+    assert!(s.pending_out.is_empty());
+}
+
+/// `torrent::replace_trackers` — rebuild + `need_save_resume`, then
+/// an immediate announce when the torrent is announcing and the
+/// list is non-empty.
+#[test]
+fn replace_trackers_announces_when_announcing() {
+    let mut t = torrent(25);
+    t.add_tracker("http://old/announce".into(), 0, SOURCE_CLIENT);
+    t.announcing = true;
+    let mut s = session();
+    s.add_torrent(t);
+
+    s.replace_trackers(&t_ih(25), &[("http://fresh/announce".into(), 0)]);
+    let t = s.torrents.get(&t_ih(25)).unwrap();
+    assert_eq!(t.trackers.trackers.len(), 1);
+    assert_eq!(t.trackers.trackers[0].url, "http://fresh/announce");
+    assert!(
+        t.need_save_resume
+            .contains(bitdaemon_common::flags::ResumeDataFlags::IF_METADATA_CHANGED)
+    );
+    assert!(s.pending_out.iter().any(|o| matches!(
+        o,
+        SessionOut::TrackerAnnounce { url, .. } if url == "http://fresh/announce"
+    )));
+}
+
+/// `if (i.pid == m_peer_id) continue` — a dict-form peer entry
+/// carrying our own peer_id is never added to the swarm.
+#[test]
+fn self_peer_id_skipped() {
+    let mut t = torrent(26);
+    t.add_tracker("http://tr/announce".into(), 0, SOURCE_CLIENT);
+    let mut s = session();
+    s.add_torrent(t);
+
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
+
+    let us = s.peer_id;
+    let mut resp = ok_reply();
+    resp.peers = vec![
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            6881,
+        ),
+        std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+            6881,
+        ),
+    ];
+    resp.peer_ids = vec![Some(us.as_bytes().to_vec()), Some(vec![9u8; 20])];
+    s.on_announce_response(
+        &t_ih(26),
+        "http://tr/announce",
+        PV::V1,
+        seq,
+        Ok(resp),
+        None,
+        &mut Vec::new(),
+    );
+    let t = s.torrents.get(&t_ih(26)).unwrap();
+    assert_eq!(t.peer_list.num_peers(), 1);
+}
+
+/// `trackerid_alert` only fires when the tracker-assigned id
+/// *changes* — an identical or empty `tracker id` is silent.
+#[test]
+fn trackerid_alert_only_on_change() {
+    let mut t = torrent(27);
+    t.add_tracker("http://tr/announce".into(), 0, SOURCE_CLIENT);
+    let mut s = session();
+    s.add_torrent(t);
+    s.pop_alerts();
+
+    // announce → tracker assigns "tid-x" → alert.
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
+    let mut resp = ok_reply();
+    resp.interval = 0;
+    resp.min_interval = 0;
+    resp.tracker_id = Some(b"tid-x".to_vec());
+    s.on_announce_response(
+        &t_ih(27),
+        "http://tr/announce",
+        PV::V1,
+        seq,
+        Ok(resp),
+        None,
+        &mut Vec::new(),
+    );
+    assert!(
+        s.pop_alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::Trackerid { .. }))
+    );
+
+    // same id again → no alert.
+    s.pop_alerts();
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
+    let mut resp = ok_reply();
+    resp.interval = 0;
+    resp.min_interval = 0;
+    resp.tracker_id = Some(b"tid-x".to_vec());
+    s.on_announce_response(
+        &t_ih(27),
+        "http://tr/announce",
+        PV::V1,
+        seq,
+        Ok(resp),
+        None,
+        &mut Vec::new(),
+    );
+    assert!(
+        !s.pop_alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::Trackerid { .. }))
+    );
+
+    // absent trackerid → no alert, stored id kept.
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
+    let mut resp = ok_reply();
+    resp.interval = 0;
+    resp.min_interval = 0;
+    resp.tracker_id = None;
+    s.on_announce_response(
+        &t_ih(27),
+        "http://tr/announce",
+        PV::V1,
+        seq,
+        Ok(resp),
+        None,
+        &mut Vec::new(),
+    );
+    assert!(
+        !s.pop_alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::Trackerid { .. }))
+    );
+    assert_eq!(
+        s.torrents.get(&t_ih(27)).unwrap().trackers.trackers[0].tracker_id,
+        b"tid-x"
+    );
+}
+
+/// a `warning message` in the announce reply lands on the endpoint's
+/// `message` slot (upstream `aep->message = warning_message`).
+#[test]
+fn warning_message_lands_on_entry() {
+    let mut t = torrent(28);
+    t.add_tracker("http://tr/announce".into(), 0, SOURCE_CLIENT);
+    let mut s = session();
+    s.add_torrent(t);
+    s.pop_alerts();
+
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
+    let mut resp = ok_reply();
+    resp.warning_message = Some("careful now".into());
+    s.on_announce_response(
+        &t_ih(28),
+        "http://tr/announce",
+        PV::V1,
+        seq,
+        Ok(resp),
+        None,
+        &mut Vec::new(),
+    );
+    let t = s.torrents.get(&t_ih(28)).unwrap();
+    assert_eq!(t.trackers.trackers[0].endpoints[0].message, "careful now");
+    assert!(s.pop_alerts().iter().any(|a| matches!(
+        a,
+        Alert::TrackerWarning { msg, .. } if msg == "careful now"
+    )));
+}
+
+/// `trackerid` is binary upstream (`std::string`, not utf8) — a
+/// non-UTF-8 id must round-trip losslessly: stored verbatim on the
+/// entry and echoed verbatim on the next announce.
+#[test]
+fn trackerid_binary_round_trip() {
+    let mut t = torrent(29);
+    t.add_tracker("http://tr/announce".into(), 0, SOURCE_CLIENT);
+    let mut s = session();
+    s.add_torrent(t);
+    s.pop_alerts();
+
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now(), 0, &mut out);
+    let seq = seq_of(&out, "http://tr/announce", PV::V1);
+    let binary_tid = vec![0xff, 0x00, 0xfe, 0x80];
+    let mut resp = ok_reply();
+    resp.tracker_id = Some(binary_tid.clone());
+    s.on_announce_response(
+        &t_ih(29),
+        "http://tr/announce",
+        PV::V1,
+        seq,
+        Ok(resp),
+        None,
+        &mut Vec::new(),
+    );
+    assert_eq!(
+        s.torrents.get(&t_ih(29)).unwrap().trackers.trackers[0].tracker_id,
+        binary_tid
+    );
+    let mut out = Vec::new();
+    s.tracker_announce_due(Instant::now() + Duration::from_secs(3601), 0, &mut out);
+    let SessionOut::TrackerAnnounce { tracker_id, .. } = &out[0] else {
+        panic!("announce effect")
+    };
+    assert_eq!(tracker_id, &binary_tid);
 }

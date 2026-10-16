@@ -277,13 +277,17 @@ pub fn parse_scrape_response(
 
 /// The full `udp_tracker_connection` exchange: connect → announce,
 /// over any `DatagramSocket`. `read_timeout` bounds each step.
+/// Replies from a source other than `target` are ignored upstream
+/// (`on_receive`: `m_target != ep` → drop).
 pub async fn udp_announce<S: DatagramSocket>(
     socket: &S,
     target: SocketAddr,
     req: &AnnounceRequest,
     read_timeout: Duration,
 ) -> Result<AnnounceResponse, UdpTrackerError> {
-    let tid: u32 = rand::random();
+    // `update_transaction_id` — `random(0xfffffffe) + 1` upstream
+    // (never 0, never 0xffffffff).
+    let tid: u32 = rand::random::<u32>() % 0xffff_fffe + 1;
     // `udp_socket::tracker_connection` — the per-datagram proxy gate.
     socket
         .send_to_flags(
@@ -295,16 +299,19 @@ pub async fn udp_announce<S: DatagramSocket>(
 
     let mut buf = vec![0u8; 2048];
     let conn_id = loop {
-        let (n, _from) = match timeout(read_timeout, socket.recv_from(&mut buf)).await {
+        let (n, from) = match timeout(read_timeout, socket.recv_from(&mut buf)).await {
             Ok(r) => r?,
             Err(_) => return Err(UdpTrackerError::Timeout),
         };
+        if from != target {
+            continue;
+        }
         if let Ok(id) = parse_connect_response(&buf[..n], tid) {
             break id;
         }
     };
 
-    let tid2: u32 = rand::random();
+    let tid2: u32 = rand::random::<u32>() % 0xffff_fffe + 1;
     socket
         .send_to_flags(
             &build_announce(conn_id, tid2, req),
@@ -314,10 +321,13 @@ pub async fn udp_announce<S: DatagramSocket>(
         .await?;
 
     loop {
-        let (n, _from) = match timeout(read_timeout, socket.recv_from(&mut buf)).await {
+        let (n, from) = match timeout(read_timeout, socket.recv_from(&mut buf)).await {
             Ok(r) => r?,
             Err(_) => return Err(UdpTrackerError::Timeout),
         };
+        if from != target {
+            continue;
+        }
         match parse_announce_response(&buf[..n], ACTION_ANNOUNCE, tid2, target.is_ipv6()) {
             Err(UdpTrackerError::UnexpectedReply) => continue, // ignore stale packets
             r => return r,

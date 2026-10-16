@@ -17,6 +17,14 @@ pub const RETRY_MIN: Duration = Duration::from_secs(5);
 /// `tracker_retry_delay_max`.
 pub const RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 
+/// `parse_url_components`'s hostname out-param — empty on a
+/// malformed URL like upstream's error path leaves it.
+fn url_hostname(url: &str) -> String {
+    bitdaemon_net::parse_url::parse_url_components(url)
+        .map(|c| c.hostname)
+        .unwrap_or_default()
+}
+
 /// `is_tracker_protocol_supported` — can this build dispatch the URL
 /// scheme of a tracker announce? Upstream gates it on build flags
 /// (`http` always, `https` under TORRENT_USE_SSL, `udp`, `ws`/`wss`
@@ -68,6 +76,15 @@ pub struct AnnounceInfohash {
     /// `tracker_request::triggered_manually` — the in-flight copy;
     /// makes `tracker_reply`/`scrape_reply` alerts unconditional.
     pub sent_manual: bool,
+    /// `req.kind & tracker_request::high_priority` of the in-flight
+    /// request — a failure cascade re-announces with the same
+    /// priority (`announce_with_tracker(r.event, r.high_priority)`).
+    pub sent_high_priority: bool,
+    /// request identity of the in-flight exchange — a stale
+    /// completion (e.g. an announce aborted by
+    /// `abort_all_requests` whose reply still arrived) is dropped
+    /// instead of re-latching slot state.
+    pub sent_seq: u64,
 }
 
 impl AnnounceInfohash {
@@ -208,8 +225,10 @@ fn trigger_entry(e: &mut AnnounceEntry, t: Instant, ignore_min: bool) {
 pub struct AnnounceEntry {
     /// `url`.
     pub url: String,
-    /// `trackerid` — the `trackerid` from the last response.
-    pub tracker_id: String,
+    /// `trackerid` — the `trackerid` from the last response. Binary
+    /// (upstream `std::string` is bytes, not necessarily UTF-8);
+    /// echoed verbatim on later announces.
+    pub tracker_id: Vec<u8>,
     /// `tier` — lower = tried first.
     pub tier: i32,
     /// `fail_limit` — per-tracker max retries (0 = infinite).
@@ -240,7 +259,7 @@ impl AnnounceEntry {
     pub fn new(url: impl Into<String>, tier: i32) -> Self {
         Self {
             url: url.into(),
-            tracker_id: String::new(),
+            tracker_id: Vec::new(),
             tier,
             fail_limit: 0,
             endpoints: vec![AnnounceEndpoint {
@@ -370,15 +389,20 @@ pub struct TrackerList {
 
 impl TrackerList {
     /// `add_tracker` — insert keeping tier order, dedup by url;
-    /// a dup merges `source` bits into the existing entry.
-    pub fn add(&mut self, e: AnnounceEntry) {
+    /// a dup merges `source` bits into the existing entry and
+    /// reports `false` (upstream callers key `need_save_resume` on
+    /// whether the URL actually inserted).
+    pub fn add(&mut self, e: AnnounceEntry) -> bool {
         let mut e = e;
+        if e.url.is_empty() {
+            return false;
+        }
         if e.source == 0 {
             e.source = SOURCE_CLIENT;
         }
         if let Some(k) = self.trackers.iter_mut().find(|t| t.url == e.url) {
             k.source |= e.source;
-            return;
+            return false;
         }
         let pos = self
             .trackers
@@ -386,6 +410,7 @@ impl TrackerList {
             .position(|t| t.tier > e.tier)
             .unwrap_or(self.trackers.len());
         self.trackers.insert(pos, e);
+        true
     }
 
     /// `next_announce` — the first tracker (lowest tier) that is
@@ -456,24 +481,23 @@ impl TrackerList {
         }
     }
 
-    /// `tracker_list::prioritize_udp_trackers` — hoist each `udp:`
-    /// entry above the non-UDP entries of the same tier
-    /// (`prefer_udp_trackers` default true upstream). Stable inside
-    /// the tier; `last_working` follows its entry.
+    /// `tracker_list::prioritize_udp_trackers` — for each `udp://`
+    /// entry, find the first *earlier* non-udp tracker serving the
+    /// **same hostname** and swap their positions (the swap crosses
+    /// tier boundaries upstream — only same-host http/ws mirrors of
+    /// a udp tracker get reordered). A udp entry with no same-host
+    /// predecessor stays put.
     pub fn prioritize_udp_trackers(&mut self) {
         let mut i = 0;
         while i < self.trackers.len() {
-            if !self.trackers[i].url.starts_with("udp:") {
-                let Some(j) = self.trackers[i + 1..]
+            if self.trackers[i].url.starts_with("udp://") {
+                let udp_host = url_hostname(&self.trackers[i].url);
+                if let Some(j) = self.trackers[..i]
                     .iter()
-                    .position(|t| t.tier == self.trackers[i].tier && t.url.starts_with("udp:"))
-                    .map(|p| p + i + 1)
-                else {
-                    i += 1;
-                    continue;
-                };
-                self.trackers[i..=j].rotate_right(1);
-                continue;
+                    .position(|t| !t.url.starts_with("udp://") && url_hostname(&t.url) == udp_host)
+                {
+                    self.trackers.swap(i, j);
+                }
             }
             i += 1;
         }
@@ -639,16 +663,17 @@ impl TrackerList {
 
     /// `tracker_list::stop_announcing` — arms every slot at `now`
     /// (the `stopped` announce sent right after goes out
-    /// immediately), and drops `updating` — upstream's in-flight
-    /// announces are aborted by `session_impl::pause`'s
-    /// `tracker_manager::abort_all_requests`.
+    /// immediately). `updating` is NOT cleared upstream: a request
+    /// in flight keeps its slot until its reply/failure lands —
+    /// session pause aborts them through `abort_all_requests`
+    /// (the `AnnounceError::Skipped` completion), which is what
+    /// clears `updating` there.
     pub fn stop_announcing(&mut self, now: Instant) {
         for t in &mut self.trackers {
             for e in &mut t.endpoints {
                 for a in [&mut e.v1, &mut e.v2] {
                     a.next_announce = Some(now);
                     a.min_announce = Some(now);
-                    a.updating = false;
                 }
             }
         }

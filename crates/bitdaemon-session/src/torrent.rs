@@ -1579,7 +1579,20 @@ impl Torrent {
         };
         for (i, url) in atp.trackers.iter().enumerate() {
             let tier = atp.tracker_tiers.get(i).copied().unwrap_or(0);
-            t.add_tracker(String::from_utf8_lossy(url).into_owned(), tier, trk_source);
+            // ctor feeds `m_trackers.add_tracker` directly —
+            // `torrent::add_tracker`'s resume-dirty mark is for
+            // the post-construction API only.
+            let mut e = crate::tracker_list::AnnounceEntry::new(
+                String::from_utf8_lossy(url).into_owned(),
+                tier,
+            );
+            e.source = trk_source;
+            t.trackers.add(e);
+        }
+        // `prefer_udp_trackers` — same-host udp mirrors move ahead
+        // of their http/ws counterparts (upstream ctor, `torrent.cpp`).
+        if s.prefer_udp_trackers {
+            t.trackers.prioritize_udp_trackers();
         }
         // upstream ctor seeds the per-torrent caps and class-backed
         // rate limits (`state_update = false` — construction isn't a
@@ -3406,11 +3419,19 @@ impl Torrent {
     }
 
     /// is the `tracker_source` bit (`source_torrent`/
-    /// `source_magnet_link`/`source_client`).
-    pub fn add_tracker(&mut self, url: String, tier: i32, source: u8) {
+    /// `source_magnet_link`/`source_client`). `torrent::add_tracker`
+    /// returns whether the URL actually inserted (a dup only merges
+    /// `source` bits) — the resume-dirty mark is paid on a real add.
+    /// The immediate `announce_with_tracker` when `m_announcing`
+    /// runs at the session layer (it needs the effect channel).
+    pub fn add_tracker(&mut self, url: String, tier: i32, source: u8) -> bool {
         let mut e = crate::tracker_list::AnnounceEntry::new(url, tier);
         e.source = source;
-        self.trackers.add(e);
+        let added = self.trackers.add(e);
+        if added {
+            self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_METADATA_CHANGED;
+        }
+        added
     }
 
     /// `torrent::bytes_left` — payload bytes still wanted:
@@ -8392,11 +8413,20 @@ impl Torrent {
     }
 
     /// `replace_trackers` (upstream `torrent::replace_trackers`) —
-    /// swap the whole announce list.
-    pub fn replace_trackers(&mut self, trackers: &[(String, i32)]) {
+    /// swap the whole announce list: fresh state per entry (upstream
+    /// `tracker_list::replace` clears `m_last_working` and every
+    /// announce_infohash), `prefer_udp_trackers` reorder on the new
+    /// list, resume-dirty. The immediate `announce_with_tracker`
+    /// when `m_announcing` runs at the session layer.
+    pub fn replace_trackers(&mut self, trackers: &[(String, i32)], prefer_udp: bool) {
         self.trackers = crate::tracker_list::TrackerList::default();
         for (url, tier) in trackers {
-            self.add_tracker(url.clone(), *tier, crate::tracker_list::SOURCE_CLIENT);
+            let mut e = crate::tracker_list::AnnounceEntry::new(url.clone(), *tier);
+            e.source = crate::tracker_list::SOURCE_CLIENT;
+            self.trackers.add(e);
+        }
+        if prefer_udp {
+            self.trackers.prioritize_udp_trackers();
         }
         self.need_save_resume |= bitdaemon_common::flags::ResumeDataFlags::IF_METADATA_CHANGED;
     }
@@ -10526,8 +10556,25 @@ impl Torrent {
             stop_when_ready: self.stop_when_ready,
             storage_mode: self.storage_mode,
             // `last_working_url()` — the most recent tracker to
-            // answer; empty until an announce succeeds.
-            current_tracker: self.trackers.last_working_url.clone(),
+            // answer; when none did, upstream falls back to the
+            // first `verified` entry whose endpoints all have a
+            // supported announce in flight.
+            current_tracker: if !self.trackers.last_working_url.is_empty() {
+                self.trackers.last_working_url.clone()
+            } else {
+                let supports = [self.info_hashes.has_v1(), self.info_hashes.has_v2()];
+                self.trackers
+                    .trackers
+                    .iter()
+                    .filter(|e| e.verified)
+                    .find(|e| {
+                        e.endpoints.iter().all(|ep| {
+                            (supports[0] && ep.v1.updating) || (supports[1] && ep.v2.updating)
+                        })
+                    })
+                    .map(|e| e.url.clone())
+                    .unwrap_or_default()
+            },
             name: if flags.contains(StatusFlags::QUERY_NAME) {
                 self.name.clone()
             } else {

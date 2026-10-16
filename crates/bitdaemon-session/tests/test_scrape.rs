@@ -75,7 +75,9 @@ fn scrape_cycle() {
     assert_eq!(e.scrape_complete, 42);
     assert_eq!(e.scrape_incomplete, 17);
     assert_eq!(e.scrape_downloaded, 500);
-    assert!(e.verified);
+    // upstream `torrent::scrape_response` never touches `verified` —
+    // only announce replies mark the tracker verified.
+    assert!(!e.verified);
     // other entry untouched
     let j = t.trackers.find("http://other/announce").unwrap();
     assert_eq!(t.trackers.trackers[j].scrape_complete, -1);

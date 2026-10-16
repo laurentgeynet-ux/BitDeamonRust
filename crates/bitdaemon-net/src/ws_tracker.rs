@@ -104,6 +104,8 @@ pub fn build_announce(p: &AnnounceParams, offers: &[(Vec<u8>, String)]) -> Strin
     if p.event != 0 && (1..=4).contains(&p.event) {
         payload["event"] = json!(EVENT_STRING[(p.event - 1) as usize]);
     }
+    // upstream `do_send` always emits the `offers` array — empty when
+    // the torrent has no RTC offers to share this announce.
     let mut arr = Vec::new();
     for (id, sdp) in offers {
         arr.push(json!({
@@ -111,9 +113,7 @@ pub fn build_announce(p: &AnnounceParams, offers: &[(Vec<u8>, String)]) -> Strin
             "offer": { "type": "offer", "sdp": sdp },
         }));
     }
-    if !arr.is_empty() {
-        payload["offers"] = json!(arr);
-    }
+    payload["offers"] = json!(arr);
     serde_json::to_string(&payload).unwrap_or_default()
 }
 

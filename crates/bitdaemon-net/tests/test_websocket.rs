@@ -329,3 +329,31 @@ async fn ws_announce_correlated_failure_propagates() {
     assert_eq!(r.interval, 0);
     assert_eq!(r.complete, 0);
 }
+
+/// upstream `websocket_tracker_connection::do_send` always emits an
+/// `offers` array — empty when the torrent has no RTC offers to
+/// share (trackers key offer routing on the field's presence).
+#[test]
+fn ws_announce_always_sends_offers() {
+    use bitdaemon_net::ws_tracker::{build_announce, latin1_utf8};
+
+    let v: serde_json::Value =
+        serde_json::from_str(&build_announce(&announce_params(), &[])).unwrap();
+    assert_eq!(v["offers"], serde_json::json!([]));
+
+    // with offers: offer_id is latin-1 verbatim, sdp under `offer`.
+    let offer_id = vec![0x61u8; 20];
+    let v: serde_json::Value = serde_json::from_str(&build_announce(
+        &announce_params(),
+        &[(offer_id.clone(), "sdp-body".into())],
+    ))
+    .unwrap();
+    let offers = v["offers"].as_array().unwrap();
+    assert_eq!(offers.len(), 1);
+    assert_eq!(
+        offers[0]["offer_id"].as_str().unwrap(),
+        latin1_utf8(&offer_id)
+    );
+    assert_eq!(offers[0]["offer"]["sdp"].as_str().unwrap(), "sdp-body");
+    assert_eq!(offers[0]["offer"]["type"].as_str().unwrap(), "offer");
+}

@@ -173,10 +173,13 @@ fn connect_boost_fires_on_tracker_response() {
     });
     let ih = s.add_torrent(torrent(1, 0));
     let mut out = Vec::new();
+    // the URL isn't a tracker entry — the stale-completion check is
+    // skipped like upstream's `announce_entry` lookup miss.
     s.on_announce_response(
         &ih,
         "http://t/announce",
         bitdaemon_common::info_hash::ProtocolVersion::V1,
+        0,
         Ok(bitdaemon_net::http_tracker::TrackerResponse {
             interval: 1800,
             min_interval: -1,
@@ -208,6 +211,7 @@ fn connect_boost_fires_on_tracker_response() {
         &ih,
         "http://t/announce",
         bitdaemon_common::info_hash::ProtocolVersion::V1,
+        0,
         Ok(bitdaemon_net::http_tracker::TrackerResponse {
             interval: 1800,
             min_interval: -1,

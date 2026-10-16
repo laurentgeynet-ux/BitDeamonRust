@@ -298,6 +298,18 @@ fn force_announce_emits_effects() {
     // announce_to_all_tiers/trackers=false, only the first working
     // tracker announces.
     assert_eq!(urls, vec!["http://a/announce"]);
+    let seq_a = out
+        .iter()
+        .find_map(|e| {
+            if let SessionOut::TrackerAnnounce { url, seq, .. } = e
+                && url == "http://a/announce"
+            {
+                Some(*seq)
+            } else {
+                None
+            }
+        })
+        .expect("announce effect");
 
     // single index — `force_tracker_request(idx)` bypasses the tier
     // failover and reaches entry 1 directly.
@@ -313,6 +325,18 @@ fn force_announce_emits_effects() {
         &out[0],
         SessionOut::TrackerAnnounce { url, .. } if url == "http://b/announce"
     ));
+    let seq_b = out
+        .iter()
+        .find_map(|e| {
+            if let SessionOut::TrackerAnnounce { url, seq, .. } = e
+                && url == "http://b/announce"
+            {
+                Some(*seq)
+            } else {
+                None
+            }
+        })
+        .expect("announce effect");
 
     // with announce_to_all_tiers the scan reaches every due tracker.
     // both are in-flight from the announces above — upstream
@@ -327,6 +351,7 @@ fn force_announce_emits_effects() {
         &ih,
         "http://a/announce",
         bitdaemon_common::info_hash::ProtocolVersion::V1,
+        seq_a,
         Ok(reply.clone()),
         None,
         &mut out,
@@ -335,6 +360,7 @@ fn force_announce_emits_effects() {
         &ih,
         "http://b/announce",
         bitdaemon_common::info_hash::ProtocolVersion::V1,
+        seq_b,
         Ok(reply),
         None,
         &mut out,

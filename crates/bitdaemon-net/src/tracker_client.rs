@@ -145,15 +145,24 @@ fn udp_waiter(demux: &UdpTrackerDemux, tid: u32) -> UdpWaiter<'_> {
     }
 }
 
+/// Receive the next reply for `tid`, dropping packets that didn't
+/// come from `expected` (upstream `on_receive`: `m_target != ep` →
+/// ignore; a `None` expected = proxied hostname target, where
+/// upstream accepts any source since `m_target` is unspecified).
 async fn wait_reply(
     waiter: &mut UdpWaiter<'_>,
     timeout: Duration,
+    expected: Option<SocketAddr>,
 ) -> Result<Vec<u8>, UdpTrackerError> {
-    tokio::time::timeout(timeout, waiter.rx.recv())
-        .await
-        .map_err(|_| UdpTrackerError::Timeout)?
-        .map(|(_from, buf)| buf)
-        .ok_or(UdpTrackerError::Timeout)
+    loop {
+        let (from, buf) = tokio::time::timeout(timeout, waiter.rx.recv())
+            .await
+            .map_err(|_| UdpTrackerError::Timeout)?
+            .ok_or(UdpTrackerError::Timeout)?;
+        if expected.is_none_or(|e| e == from) {
+            return Ok(buf);
+        }
+    }
 }
 
 /// announce parameters shared by both protocols — the fields of
@@ -493,8 +502,12 @@ async fn udp_connect(
     let pkt = build_connect(tid);
     let _ = tracker.send(dgram, &pkt).await?;
     stats.sent += pkt.len() as i64 + 28; // UDP/IP header estimate
+    let expected = match tracker {
+        UdpTarget::Addr(a) => Some(a),
+        UdpTarget::Name { .. } => None,
+    };
     loop {
-        let buf = wait_reply(&mut w, timeouts.receive).await?;
+        let buf = wait_reply(&mut w, timeouts.receive, expected).await?;
         stats.recv += buf.len() as i64 + 28;
         match parse_connect_response(&buf, tid) {
             Ok(id) => {
@@ -573,8 +586,12 @@ pub async fn announce_udp(
     let pkt = build_announce(conn_id, tid, &req);
     let _ = tracker.send(dgram, &pkt).await?;
     stats.sent += pkt.len() as i64 + 28;
+    let expected = match tracker {
+        UdpTarget::Addr(a) => Some(a),
+        UdpTarget::Name { .. } => None,
+    };
     loop {
-        let buf = wait_reply(&mut w, timeouts.receive).await?;
+        let buf = wait_reply(&mut w, timeouts.receive, expected).await?;
         stats.recv += buf.len() as i64 + 28;
         match parse_announce_response(&buf, 1, tid, tracker.is_ipv6()) {
             Ok(r) => {
@@ -618,8 +635,12 @@ pub async fn scrape_udp(
     let mut w = udp_waiter(demux, tid);
     let _ = tracker.send(dgram, &pkt).await?;
     stats.sent += pkt.len() as i64 + 28;
+    let expected = match tracker {
+        UdpTarget::Addr(a) => Some(a),
+        UdpTarget::Name { .. } => None,
+    };
     loop {
-        let buf = wait_reply(&mut w, timeouts.receive).await?;
+        let buf = wait_reply(&mut w, timeouts.receive, expected).await?;
         stats.recv += buf.len() as i64 + 28;
         match parse_scrape_response(&buf, tid) {
             Ok(v) => {

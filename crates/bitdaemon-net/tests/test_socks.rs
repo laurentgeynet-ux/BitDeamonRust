@@ -386,7 +386,9 @@ async fn udp_announce_flow() {
             Box::pin(async move {
                 let r = self.inner.lock().unwrap().remove(0);
                 buf[..r.len()].copy_from_slice(&r);
-                Ok((r.len(), SocketAddr::from(([127, 0, 0, 1], 9999))))
+                // replies come from the tracker itself — upstream
+                // `on_receive` drops packets from any other source.
+                Ok((r.len(), self.local))
             })
         }
         fn local_addr(&self) -> SocketAddr {

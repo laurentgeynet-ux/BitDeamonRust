@@ -57,6 +57,76 @@ fn tier_ordering_and_failover() {
     assert_eq!(due, vec![(1, ProtocolVersion::V1)]); // only tier-2 remains
 }
 
+/// upstream `test_prioritize_udp_noop` — udp entries only swap with
+/// earlier non-udp entries *serving the same hostname*; distinct
+/// hostnames leave the order untouched.
+#[test]
+fn prioritize_udp_noop_distinct_hosts() {
+    let mut l = TrackerList::default();
+    l.add(AnnounceEntry::new("http://example1.com/announce", 0));
+    l.add(AnnounceEntry::new("http://example2.com/announce", 0));
+    l.add(AnnounceEntry::new("http://example3.com/announce", 0));
+    l.add(AnnounceEntry::new("udp://example4.com/announce", 0));
+    l.prioritize_udp_trackers();
+    assert_eq!(
+        l.trackers
+            .iter()
+            .map(|t| t.url.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "http://example1.com/announce",
+            "http://example2.com/announce",
+            "http://example3.com/announce",
+            "udp://example4.com/announce",
+        ]
+    );
+}
+
+/// upstream `test_prioritize_udp` — the udp entry *swaps* positions
+/// with the first earlier same-hostname non-udp entry (it is a
+/// positional swap, not a hoist-to-front).
+#[test]
+fn prioritize_udp_swaps_same_hostname() {
+    let mut l = TrackerList::default();
+    l.add(AnnounceEntry::new("http://example1.com/announce", 0));
+    l.add(AnnounceEntry::new("http://example2.com/announce", 0));
+    l.add(AnnounceEntry::new("http://example3.com/announce", 0));
+    l.add(AnnounceEntry::new("udp://example1.com/announce", 0));
+    l.prioritize_udp_trackers();
+    assert_eq!(
+        l.trackers
+            .iter()
+            .map(|t| t.url.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "udp://example1.com/announce",
+            "http://example2.com/announce",
+            "http://example3.com/announce",
+            "http://example1.com/announce",
+        ]
+    );
+}
+
+/// upstream `test_prioritize_udp_tier` — the same-hostname swap
+/// crosses tier boundaries.
+#[test]
+fn prioritize_udp_crosses_tiers() {
+    let mut l = TrackerList::default();
+    l.add(AnnounceEntry::new("http://example1.com/announce", 0));
+    l.add(AnnounceEntry::new("udp://example1.com/announce", 2));
+    l.prioritize_udp_trackers();
+    assert_eq!(
+        l.trackers
+            .iter()
+            .map(|t| t.url.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "udp://example1.com/announce",
+            "http://example1.com/announce",
+        ]
+    );
+}
+
 #[test]
 fn alert_mask_and_queue_limit() {
     // `peer_disconnected_alert` is CONNECT category upstream.

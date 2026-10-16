@@ -9,6 +9,34 @@ Until `1.0.0`, breaking changes may occur in any release.
 
 ### Fixed
 
+- **Tracker parity, round 2 (A04)**: the residual deviations from the
+  post-apply re-audit are resolved. `prioritize_udp_trackers` now
+  performs upstream's same-hostname udp↔non-udp *swap* across tiers
+  and is actually invoked at the torrent ctor and
+  `replace_trackers` under `prefer_udp_trackers` (it was dead code
+  with wrong intra-tier semantics). `stop_tracker_timeout <= 0`
+  fully suppresses stopped announces — no more phantom
+  `fails++`/`TrackerError` on pause. Dispatch stamps
+  `next_announce = min_announce = now` so stale `min interval`
+  values no longer delay post-failure retries. `add_tracker` marks
+  resume data dirty and both `add_tracker`/`replace_trackers`
+  announce immediately when the torrent is announcing. Session
+  pause aborts in-flight non-stopped announces with
+  `announce_skipped` bookkeeping (upstream `abort_all_requests`)
+  and a per-request `sent_seq` drops stale completions.
+  `trackerid` is lossless bytes end-to-end with the alert fired
+  only on change, `warning message` lands on the endpoint's
+  `message` field, dict-peers echoing our own `peer_id` are
+  skipped, scrape replies no longer mark the tracker `verified`,
+  `ipv4`/`ipv6` announce params are populated for private
+  non-anonymous torrents from the listen sockets, forced by-index
+  announces honor `announce_trackers`, the failure cascade
+  propagates `high_priority`, UDP tracker replies from a wrong
+  source endpoint are ignored, endpoint resolution filters
+  address family symmetrically, `stopped` announces resolve DNS
+  cache-only, and the WS announce clamps `numwant` to
+  `max_webtorrent_offers`, always serializes `offers`, and
+  short-circuits `num_want == 0`.
 - **uTP transport parity, round 3 (A05)**: the nagle drain no longer
   computes remaining space with unsigned arithmetic — a buffered
   packet resumed under a lower effective MTU (probe → floor

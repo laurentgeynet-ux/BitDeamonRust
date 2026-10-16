@@ -108,6 +108,9 @@ struct AnnounceDone {
     /// `r.info_hash`'s version — which `announce_infohash` slot the
     /// response bookkeeping lands on.
     v: bitdaemon_common::info_hash::ProtocolVersion,
+    /// the request's `sent_seq` — stale completions (aborted,
+    /// re-dispatched) are dropped by `on_announce_response`.
+    seq: u64,
     result: Result<bitdaemon_net::http_tracker::TrackerResponse, AnnounceError>,
     /// `scrape_request` — routes to `on_scrape_response`.
     scrape: bool,
@@ -126,7 +129,10 @@ struct AnnounceDone {
 struct AnnounceJob {
     ih: Sha1Hash,
     url: String,
-    tracker_id: String,
+    /// `trackerid` — verbatim bytes (upstream `trackerid` is binary).
+    tracker_id: Vec<u8>,
+    /// `sent_seq` — request identity echoed back on completion.
+    seq: u64,
     v: bitdaemon_common::info_hash::ProtocolVersion,
     params: bitdaemon_net::tracker_client::AnnounceParams,
 }
@@ -1068,6 +1074,7 @@ impl Engine {
                     &a.ih,
                     &a.url,
                     a.v,
+                    a.seq,
                     a.result,
                     a.source_ip,
                     out,
@@ -1374,6 +1381,7 @@ impl Engine {
                     ih,
                     url,
                     tracker_id,
+                    seq,
                     v,
                     params,
                 } => {
@@ -1381,9 +1389,22 @@ impl Engine {
                         ih,
                         url,
                         tracker_id,
+                        seq,
                         v,
                         params,
                     });
+                }
+                SessionOut::AbortTrackerRequests => {
+                    // `tracker_manager::abort_all_requests` — drop
+                    // every *queued* non-stopped announce (the slots
+                    // already got `announce_skipped` bookkeeping
+                    // session-side; in-flight tasks complete and are
+                    // dropped stale via `sent_seq`).
+                    self.http_announce_queue.retain(|j| j.params.event == 3);
+                    slock(&self.session).counters.set(
+                        bitdaemon_session::counters::Counter::NumQueuedTrackerAnnounces,
+                        i64::try_from(self.http_announce_queue.len()).unwrap_or(i64::MAX),
+                    );
                 }
                 SessionOut::WebSeedFetch {
                     ih,
@@ -1581,6 +1602,7 @@ impl Engine {
             ih,
             url,
             tracker_id,
+            seq,
             v,
             mut params,
         } = job;
@@ -1590,8 +1612,11 @@ impl Engine {
         let demux = self.udp_tracker_demux.clone();
         let resolver = self.resolver.clone();
         let session = Arc::clone(&self.session);
+        // `stopped` announces resolve cache-only — a real DNS query
+        // can stall shutdown for the whole `stop_tracker_timeout`.
+        let stopped = params.event == 3;
         let (opts, timeouts, completion, user_agent) =
-            Self::tracker_settings(&session, params.private_torrent, params.event == 3);
+            Self::tracker_settings(&session, params.private_torrent, stopped);
         let (validate_https, ssl_ctx) = {
             let ses = slock(&session);
             (
@@ -1602,7 +1627,7 @@ impl Engine {
         self.tasks_forget();
         let handle = tokio::spawn(async move {
             params.url = url.clone();
-            params.tracker_id = tracker_id.into_bytes();
+            params.tracker_id = tracker_id;
             let mut stats = bitdaemon_net::http_conn::WireStats::default();
             let mut source_ip = None;
             let parsed = bitdaemon_net::parse_url::parse_url_components(&url);
@@ -1616,6 +1641,7 @@ impl Engine {
                             ih,
                             url,
                             v,
+                            seq,
                             result: Err(AnnounceError::Op {
                                 op: "hostname_lookup",
                                 message: "no datagram transport injected".into(),
@@ -1670,6 +1696,7 @@ impl Engine {
                             port,
                             v4,
                             &params.filter,
+                            stopped,
                         )
                         .await
                         {
@@ -1714,6 +1741,31 @@ impl Engine {
                     // upstream never delivers peer lists here, only
                     // RTC offers + interval/complete stats
                     let port = u16::try_from(c.port).unwrap_or(80);
+                    // `tracker_manager::queue_request`: num_want is
+                    // clamped to `max_webtorrent_offers`, and a ws
+                    // request that ends up wanting zero offers is
+                    // failed with `torrent_aborted` without ever
+                    // connecting (upstream ws requests are announced
+                    // on persistent connections; a stopped announce —
+                    // num_want 0 — never reaches the wire).
+                    let max_offers = slock(&session).settings.max_webtorrent_offers.max(0);
+                    params.num_want = params.num_want.min(max_offers);
+                    if params.num_want == 0 {
+                        let _ = tx.send(AnnounceDone {
+                            ih,
+                            url,
+                            v,
+                            seq,
+                            result: Err(AnnounceError::Op {
+                                op: "connect",
+                                message: "torrent aborted".into(),
+                            }),
+                            scrape: false,
+                            http: false,
+                            source_ip,
+                        });
+                        return;
+                    }
                     match resolve(&resolver, &c.hostname, port)
                         .await
                         .and_then(|a| filter_tracker_addr(&params.filter, a))
@@ -1748,15 +1800,16 @@ impl Engine {
                                 .and_then(|r| {
                                     // upstream `on_read`: a `failure
                                     // reason` reports the announce as
-                                    // failed — `tracker_request_error`
-                                    // (`0ee23cc89`). Frames without
-                                    // info_hash are filtered inside
-                                    // `announce_ws` (`73f4832de`).
+                                    // failed with a 120 s retry hint
+                                    // (`tracker_request_error` …
+                                    // `seconds32(120)`). Frames
+                                    // without info_hash are filtered
+                                    // inside `announce_ws` (`73f4832de`).
                                     if let Some(reason) = r.failure_reason {
                                         return Err(AnnounceError::Failure {
                                             message: reason,
-                                            interval: 0,
-                                            min_interval: 0,
+                                            interval: 120,
+                                            min_interval: 120,
                                         });
                                     }
                                     Ok(bitdaemon_net::http_tracker::TrackerResponse {
@@ -1817,6 +1870,7 @@ impl Engine {
                                 &mut stats,
                                 &ssl_ctx,
                                 validate_https,
+                                stopped,
                             )
                             .await;
                             source_ip = src;
@@ -1848,13 +1902,22 @@ impl Engine {
             // can't dial through a proxy anyway — they're dropped
             // upstream); IP literals always resolve for free.
             if let Ok(r) = &mut result {
-                let resolve_hostnames = {
+                let (resolve_hostnames, our_pid) = {
                     let s = slock(&session);
-                    !s.settings.proxy_hostnames
-                        || !s.settings.proxy_peer_connections
-                        || s.settings.proxy_type == bitdaemon_net::proxy::ProxyType::None
+                    (
+                        !s.settings.proxy_hostnames
+                            || !s.settings.proxy_peer_connections
+                            || s.settings.proxy_type == bitdaemon_net::proxy::ProxyType::None,
+                        s.peer_id,
+                    )
                 };
                 for hp in r.hostname_peers.clone() {
+                    // same `i.pid == m_peer_id` skip as the session's
+                    // `peer_ids` leg — hostname peers never reach that
+                    // array, so the check happens at resolve time.
+                    if hp.peer_id.as_deref() == Some(our_pid.as_bytes()) {
+                        continue;
+                    }
                     if !resolve_hostnames && !bitdaemon_net::ip_helpers::is_ip_address(&hp.ip) {
                         continue;
                     }
@@ -1867,6 +1930,7 @@ impl Engine {
                 ih,
                 url,
                 v,
+                seq,
                 result,
                 scrape: false,
                 http,
@@ -1912,6 +1976,7 @@ impl Engine {
                             ih,
                             url,
                             v,
+                            seq: 0,
                             result: Err(AnnounceError::Op {
                                 op: "hostname_lookup",
                                 message: "no datagram transport injected".into(),
@@ -1967,7 +2032,9 @@ impl Engine {
                         // still applies the session filter via `req.filter`
                         // … which `scrape_tracker` leaves unset, so the
                         // endpoints go in unfiltered like upstream.
-                        match udp_tracker_endpoints(&resolver, &c.hostname, port, v4, &None).await {
+                        match udp_tracker_endpoints(&resolver, &c.hostname, port, v4, &None, false)
+                            .await
+                        {
                             Err(e) => Err(e),
                             Ok(eps) => {
                                 let mut result = Err(AnnounceError::TimedOut);
@@ -2013,6 +2080,7 @@ impl Engine {
                             ih,
                             url,
                             v,
+                            seq: 0,
                             result: Err(AnnounceError::Op {
                                 op: "bittorrent",
                                 message: "scrape not available".into(),
@@ -2053,6 +2121,7 @@ impl Engine {
                         &mut stats,
                         &ssl_ctx,
                         validate_https,
+                        false,
                     )
                     .await;
                     source_ip = src;
@@ -2077,6 +2146,7 @@ impl Engine {
                 ih,
                 url,
                 v,
+                seq: 0,
                 result,
                 scrape: true,
                 http: false,
@@ -5792,7 +5862,7 @@ async fn resolve(
     hostname: &str,
     port: u16,
 ) -> Result<SocketAddr, String> {
-    resolve_all(r, hostname, port)
+    resolve_all(r, hostname, port, ResolveFlags::default())
         .await?
         .into_iter()
         .next()
@@ -5802,17 +5872,20 @@ async fn resolve(
 /// `resolve` keeping the whole endpoint list — upstream's tracker
 /// connections iterate `endpoints()` and retry each one on failure
 /// (`udp_tracker_connection::fail` drops the dead target and moves
-/// to the next).
+/// to the next). `cache_only` = `event == stopped` upstream
+/// (resolver cache answers only — a real lookup can stall shutdown
+/// for the whole `stop_tracker_timeout`).
 async fn resolve_all(
     r: &Option<BoxedResolver>,
     hostname: &str,
     port: u16,
+    flags: ResolveFlags,
 ) -> Result<Vec<SocketAddr>, String> {
     if let Ok(addr) = format!("{hostname}:{port}").parse::<SocketAddr>() {
         return Ok(vec![addr]);
     }
     match r {
-        Some(r) => resolve_host(r.as_ref(), hostname, port, ResolveFlags::default())
+        Some(r) => resolve_host(r.as_ref(), hostname, port, flags)
             .await
             .map_err(|e| e.to_string()),
         None => Err(format!("no resolver injected for {hostname}")),
@@ -5850,26 +5923,36 @@ async fn resolve_for_socket(
 }
 
 /// `udp_tracker_connection::name_lookup` — resolve all endpoints,
-/// drop the ones the datagram socket cannot reach (address family),
-/// then the `ip_filter` leg: all-filtered → `banned_by_ip_filter`.
-/// (No SSRF leg for UDP upstream.)
+/// drop the ones the datagram socket cannot reach (`can_route` is
+/// symmetric on family: a v4 socket can't reach v6 and a v6 socket
+/// can't reach v4), then the `ip_filter` leg: all-filtered →
+/// `banned_by_ip_filter`. (No SSRF leg for UDP upstream.)
+/// `stopped` announces resolve `cache_only` upstream.
 async fn udp_tracker_endpoints(
     r: &Option<BoxedResolver>,
     hostname: &str,
     port: u16,
     v4_socket: bool,
     filter: &Option<std::sync::Arc<bitdaemon_net::ip_filter::IpFilter>>,
+    stopped: bool,
 ) -> Result<Vec<SocketAddr>, AnnounceError> {
-    let mut eps = resolve_all(r, hostname, port)
-        .await
-        .map_err(|e| AnnounceError::Op {
-            op: "hostname_lookup",
-            message: e,
-        })?;
-    // `can_route` — a v4 datagram socket can't reach v6 endpoints.
-    if v4_socket {
-        eps.retain(|a| a.is_ipv4());
-    }
+    let mut eps = resolve_all(
+        r,
+        hostname,
+        port,
+        ResolveFlags {
+            cache_only: stopped,
+            abort_on_shutdown: true,
+        },
+    )
+    .await
+    .map_err(|e| AnnounceError::Op {
+        op: "hostname_lookup",
+        message: e,
+    })?;
+    // `can_route` — a datagram socket only reaches endpoints of its
+    // own address family.
+    eps.retain(|a| a.is_ipv4() == v4_socket);
     if eps.is_empty() {
         return Err(AnnounceError::Op {
             op: "hostname_lookup",
@@ -5901,13 +5984,22 @@ async fn http_tracker_endpoints(
     path: &str,
     filter: &Option<std::sync::Arc<bitdaemon_net::ip_filter::IpFilter>>,
     ssrf_mitigation: bool,
+    stopped: bool,
 ) -> Result<Vec<SocketAddr>, AnnounceError> {
-    let mut eps = resolve_all(r, hostname, port)
-        .await
-        .map_err(|e| AnnounceError::Op {
-            op: "hostname_lookup",
-            message: e,
-        })?;
+    let mut eps = resolve_all(
+        r,
+        hostname,
+        port,
+        ResolveFlags {
+            cache_only: stopped,
+            abort_on_shutdown: true,
+        },
+    )
+    .await
+    .map_err(|e| AnnounceError::Op {
+        op: "hostname_lookup",
+        message: e,
+    })?;
     if ssrf_mitigation && eps.iter().any(|e| e.ip().is_loopback()) {
         // `parse_url_components`-level check upstream: an announce
         // to localhost must look like a standard `/announce` path.
@@ -6030,6 +6122,9 @@ async fn tracker_http_exchange(
     stats: &mut bitdaemon_net::http_conn::WireStats,
     ssl_ctx: &Option<SslCtxParts>,
     validate_https: bool,
+    // `event == stopped` → `resolver_interface::cache_only`
+    // upstream (no fresh DNS on the shutdown path).
+    stopped: bool,
 ) -> (
     Result<bitdaemon_net::http_tracker::TrackerResponse, AnnounceError>,
     Option<std::net::IpAddr>,
@@ -6058,6 +6153,7 @@ async fn tracker_http_exchange(
             &c.path,
             filter,
             ssrf_mitigation,
+            stopped,
         )
         .await
         {

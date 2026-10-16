@@ -1403,24 +1403,24 @@ impl TorrentHandle {
             .unwrap_or_default()
     }
 
-    /// `torrent_handle::replace_trackers`.
+    /// `torrent_handle::replace_trackers` — rebuilds the tier list
+    /// and announces immediately when the torrent is mid-announce
+    /// (upstream `m_announcing` leg); effects drain via
+    /// `pending_out`.
     pub fn replace_trackers(&self, trackers: &[(String, i32)]) {
-        {
-            let mut s = lock(&self.session);
-            if let Some(t) = s.torrents.get_mut(&self.info_hash) {
-                t.replace_trackers(trackers);
-            }
-        }
+        lock(&self.session).replace_trackers(&self.info_hash, trackers);
     }
 
-    /// `torrent_handle::add_tracker(url, tier)`.
+    /// `torrent_handle::add_tracker(url, tier)` — marks resume data
+    /// dirty on a real insert and announces immediately while
+    /// `m_announcing` (upstream `torrent::add_tracker`).
     pub fn add_tracker(&self, url: String, tier: i32) {
-        {
-            let mut s = lock(&self.session);
-            if let Some(t) = s.torrents.get_mut(&self.info_hash) {
-                t.add_tracker(url, tier, crate::tracker_list::SOURCE_CLIENT);
-            }
-        }
+        lock(&self.session).add_tracker(
+            &self.info_hash,
+            url,
+            tier,
+            crate::tracker_list::SOURCE_CLIENT,
+        );
     }
 
     /// `torrent_handle::ban_peer` — ban + drop the live connection.
