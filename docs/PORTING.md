@@ -4,7 +4,7 @@ This file is the **single source of truth** for port status.
 Update it **in the same commit** as the code it describes — see
 `AGENTS.md` §5 and §7.
 
-Upstream: `libtorrent` @ `v2.1.2-45-gc019e80ef`
+Upstream: `libtorrent` @ `v2.1.2-62-ge7381c7bc`
 (local checkout `D:\Projet\libtorrent\libtorrent` — read-only).
 
 ## Status legend

@@ -9,7 +9,7 @@
 //! (`bitdaemon-session`, `bitdaemon-core`, …) — the facade surface will
 //! stabilize at 1.0.
 //!
-//! Upstream reference: libtorrent `master` @ `v2.1.2-45-gc019e80ef`.
+//! Upstream reference: libtorrent `master` @ `v2.1.2-62-ge7381c7bc`.
 //! Port status: see `docs/PORTING.md`. Design decisions: `docs/adr/`.
 
 #![forbid(unsafe_code)]

@@ -1,6 +1,6 @@
 # ROADMAP — libtorrent → Rust port (complete-fidelity edition)
 
-Port of **all of** libtorrent `master` @ `v2.1.2-45-gc019e80ef`
+Port of **all of** libtorrent `master` @ `v2.1.2-62-ge7381c7bc`
 (~170k LOC C++: ~114k `src/*.cpp` + `src/kademlia/*`, ~55k
 `include/**/*.hpp`) to 100% safe Rust — every behavioral file ported,
 every gap explicitly reasoned. See [ADR-0010](docs/adr/0010-complete-port.md).

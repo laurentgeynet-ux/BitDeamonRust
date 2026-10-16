@@ -31,7 +31,7 @@ A BitTorrent client library ported from
 
 ## Reference implementation
 
-This project tracks libtorrent `master` at `v2.1.2-45-gc019e80ef`
+This project tracks libtorrent `master` at `v2.1.2-62-ge7381c7bc`
 (~170 000 lines of C++). The goal is a **semantically faithful** port:
 same wire behavior, same resume-data format, same `.session` state
 format — but expressed with idiomatic Rust APIs, `tokio` async I/O and
@@ -66,7 +66,8 @@ Supports multiple `.torrent` files and magnets in one session,
 `--peer host:port`, IPv6 (`--port6`), HTTPS/UDP trackers, DHT, uTP,
 UPnP/NAT-PMP port mapping, SOCKS5/HTTP proxies (`--proxy`,
 `--proxy-auth`, peer + tracker + DHT UDP lanes) and OS-cache
-control (`--no-os-cache`, `--no-os-read-cache`, `--no-upnp`). It
+control (`--no-os-cache`, `--no-os-read-cache`, `--no-upnp`) and
+uTP/TCP balance policy (`--mixed-mode`). It
 loads upstream-format fastresume files (`--resume`), writes
 `<infohash>.resume` on shutdown — both directions round-trip with
 libtorrent — and restores a full session from `--session <file>`
