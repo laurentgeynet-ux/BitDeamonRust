@@ -6,14 +6,14 @@ Chaque audit = un skill `.devin/skills/audit-NN-vW-<slug>/` lançable via `/audi
 
 | # | Audit | Périmètre | Statut |
 |---|---|---|---|
-| A01 | Codec peer-wire & framing | Encodage/décodage de tous les messages, bornes de longueur, entrées malformées, handshake. | à faire |
-| A02 | Protocoles d'extension (ut_metadata, ut_pex, lt_*, suggest, smartban, holepunch) | Extensions BEP-10 : métadata, pex, dont_have/have_none, suggest+allowed_fast, smart_ban, upload_only, holepunch. | done — commit `6dfcdca` |
+| A01 | Codec peer-wire & framing | Encodage/décodage de tous les messages, bornes de longueur, entrées malformées, handshake. | done — rapport |
+| A02 | Protocoles d'extension (ut_metadata, ut_pex, lt_*, suggest, smartban, holepunch) | Extensions BEP-10 : métadata, pex, dont_have/have_none, suggest+allowed_fast, smart_ban, upload_only, holepunch. | done — commit `461f305` |
 | A03 | Chiffrement MSE/PE | Handshake DH, crypto_provide/select, RC4, padding, politiques enc. | done — commit `33a77de` |
-| A04 | Trackers (HTTP/UDP announce, scrape, backoff, tiers) | Cycle announce complet : events, backoff, failover tiers, scrape, réponses, erreurs. | done — commits `bea03c0` + résiduel round 2 (rapport §Application) |
-| A05 | Transport uTP | utp_stream : paquets, états connexion, resend, delay/rtt, MTU, buffers out-of-order, fermeture. | à faire |
-| A06 | Web seeds (HTTP peer) | web_peer_connection/http_seed_connection : GET ranges, keep-alive, erreurs, retry, comptabilité par seed. | à faire |
-| A07 | Cycle de vie des pairs & admission | attach/detach, états de connexion, limites half-open, taxonomie des disconnects, admission entrante. | done — commits `05fbb80` + `06b0090` (round 2, D16–D21) |
-| A08 | Chemin download (request→write) & rejects | request_a_block → add_request → send_block_requests → Piece → on_reject → timeouts/snub/endgame | done — commit `cbee65c` |
+| A04 | Trackers (HTTP/UDP announce, scrape, backoff, tiers) | Cycle announce complet : events, backoff, failover tiers, scrape, réponses, erreurs. | à faire |
+| A05 | Transport uTP | utp_stream : paquets, états connexion, resend, delay/rtt, MTU, buffers out-of-order, fermeture. | done — rapport |
+| A06 | Web seeds (HTTP peer) | web_peer_connection/http_seed_connection : GET ranges, keep-alive, erreurs, retry, comptabilité par seed. | done — rapport |
+| A07 | Cycle de vie des pairs & admission | attach/detach, états de connexion, limites half-open, taxonomie des disconnects, admission entrante. | done — commit `05fbb80` |
+| A08 | Chemin download (request→write) & rejects | request_a_block → add_request → send_block_requests → Piece → on_reject → timeouts/snub/endgame | done — commit `a03693f` |
 | A09 | Chemin upload/read (Request → fill_send_buffer → async_read) | Request entrant → validation → upload queue → read disque → Piece ; choke drain, rejects, compteurs | done — rapport |
 | A10 | Cycle de vie des pièces | incoming_piece → flush → hash → piece_verified → Have → hash_failed → restore | done — rapport |
 | A11 | Choker & optimistic unchoke | Sélection des pairs unchokés : comparateurs, quotas, rotation optimiste, interaction snub/seed. | done — commit `88dd59e` |
@@ -34,7 +34,7 @@ Chaque audit = un skill `.devin/skills/audit-NN-vW-<slug>/` lançable via `/audi
 | A26 | DHT (krpc, traversals, items, sécurité) | Mainline DHT : messages, traversals, tokens, BEP-44/51, routage, refresh, boot, rate limiting. | done — rapport |
 | A27 | Glue engine/session | engine.rs : boucle dispatch, ordonnancement commandes, timers, pont disque, starvation. | done — commit `4ab62e2` |
 | A28 | Bandwidth manager & peer classes | Quotas par canal, request_bandwidth, class filters, rate channels, mixed mode, overhead. | done — commit `c8a2d65` |
-| A29 | Sweep conformité compteurs/stats | Chaque `Counter` ↔ sites upstream inc/dec/set ; session_stats snapshot ; sliding_average. | à faire |
+| A29 | Sweep conformité compteurs/stats | Chaque `Counter` ↔ sites upstream inc/dec/set ; session_stats snapshot ; sliding_average. | done — rapport + apply `audit/29-counters-sweep` |
 
 *Statut* : `done` est dérivé de la section `## Résultat` du rapport
 d'audit — régénérer après merge : `python docs/audits/_gen_audits.py`.
@@ -100,7 +100,7 @@ traverse net/dht/disk/core).
 | Vague | Audits | Raison |
 |---|---|---|
 | 1 — isolés | A05 | modules/crates disjoints (utp, proxy, dht, disk×2, core/path, nat) |
-| 2 — session-edge | A06 | fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés |
+| 2 — session-edge | A04, A06 | fichiers dédiés (resume, settings, picker, engine, peer_class, tracker*, web_seed*, ssl) — edges torrent/session modérés |
 | 3 — net-peer | A01 | `peer_wire.rs` commun aux deux → séquentiels entre eux |
 | 5 — final | A29 | transverse (sweep compteurs), seul, en dernier |
 

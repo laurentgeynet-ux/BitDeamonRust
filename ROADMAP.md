@@ -496,13 +496,24 @@ qBittorrent-class UI.
 ## Phase G — 1.0 ⬜
 
 - [x] `PORTING.md` = 100% resolved rows (the completion metric) — every upstream file is `ported`/`verified`/`won't port`/`n/a`.
-- [ ] Alert/API surface = upstream parity (Phases K/L — ADR-0023);
-      `session_params` `alert_mask` interop fixture green.
+- [x] Alert/API surface = upstream parity (Phases K/L — ADR-0023);
+      `session_params` `alert_mask` interop fixture green
+      (`alert_mask_persists_in_session_params`).
 - [ ] Public API freeze on `bitdaemon` facade (semver).
 - [ ] Crates.io publish order: common → bencode → core → disk →
       (mmap, opt) → net → dht → session → sim → bitdaemon → cli.
-- [ ] `cargo deny` licenses/advisories green; MSRV pinned in
-      `rust-toolchain.toml`.
+- [x] `cargo deny` licenses/advisories green (rustls 0.23.46 —
+      RUSTSEC-2026-0346..49; `paste` unmaintained documented-ignore,
+      proc-macro build-time dep of `netroute`); MSRV pinned
+      (`rust-version = "1.85"` + `rust-toolchain.toml` + CI job).
+- [ ] **Duplicate-request waste** — the 2026-10-16 live benchmark
+      (`ubuntu-26.04.1-desktop`, C:) shows ~33 % extra downloaded
+      blocks (progress counter reached 133 % at completion, zero
+      hash failures): pieces fetched more than once across peers.
+      Likely missing snubbing/cancel dedup in the request path or
+      endgame. Target: upstream parity — compare `request_a_block`/
+      `cancel_block` dedup semantics vs `peer_connection.cpp`, and
+      measure waste on the Phase G benchmark.
 - [ ] **TODO sweep** — the four `TODO` markers left in the tree
       (2026-10-15 audit):
   - [x] `bitdaemon-session/src/lib.rs` — stale: `Session`/`TorrentHandle`
