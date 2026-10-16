@@ -857,7 +857,8 @@ round 1 (`compare_peer` source-mask, éviction `>10%` connecting).
 
 - Branche `audit/07-peer-lifecycle-r2`, worktree
   `LibtorrentRust-a07` (même worktree que le round 1).
-- Commit apply : `47c896c`
-  `fix(peer-lifecycle): round-2 apply of audit A07 (D16-D21)`.
+- Commit apply : `06b0090`
+  `fix(peer-lifecycle): round-2 apply of audit A07 (D16-D21)`
+  (hash post-rebase ; merge `07733d0`).
 - Fragment changelog : `docs/audits/changelog/A07.md` (réécrit —
   l'original avait été agrégé dans `CHANGELOG.md` par `23e8868`).
