@@ -5611,10 +5611,12 @@ impl Torrent {
                 }
             }
         }
-        // upstream re-evaluates `interesting`→`interested` after any
-        // incoming peer message (bitfield/have/have_all flip the
-        // `m_interesting` bit).
-        self.update_interest(peer_id, counters, out);
+        // upstream defers the interest recompute (`m_need_interest_
+        // update` + one posted `do_update_interest`): have-family
+        // handlers mark the conn dirty in `dispatch`, and the drain
+        // runs once here — messages that can't change interest
+        // (`Piece`, `Request`, keepalive, …) skip the rescan.
+        self.do_update_interest(peer_id, counters, out);
     }
 
     /// `on_holepunch` dispatch — BEP-55 relay logic. `rendezvous`
@@ -6313,20 +6315,37 @@ impl Torrent {
         self.superseed_piece(peer, Some(piece), next, out);
     }
 
-    /// `request_a_block` for one peer — `drive_requests` emits the
-    /// wire `Request`s the caller sends.
-    /// `torrent::update_peer_interest` + `peer_connection::
-    /// update_interest` — recompute whether the peer has anything
-    /// we want, then send `Interested`/`NotInterested` on the wire
-    /// when the state flips. Upstream recalcs per peer on
-    /// bitfield/have/dont_have and when our own bitfield changes
-    /// (piece verified → maybe not interesting anymore).
-    pub fn update_interest(
+    /// `peer_connection::update_interest` — mark the conn dirty.
+    /// Upstream only posts one deferred `do_update_interest` per
+    /// dirty period, so several have-family events between drains
+    /// collapse into a single rescan. Our drain runs at the tail of
+    /// `apply_peer_effects` (once per message batch) or right after
+    /// torrent-side mark loops — never eagerly per event.
+    pub fn update_interest(&mut self, peer_id: u64) {
+        if let Some(c) = self.peers.get_mut(&peer_id) {
+            c.need_interest_update = true;
+        }
+    }
+
+    /// `peer_connection::do_update_interest` — the deferred drain:
+    /// clears the dirty flag (upstream clears it *before* the
+    /// early-outs, so an unready conn stays clean), rescans the
+    /// peer's have-set, emits `Interested`/`NotInterested` on a
+    /// flip, then re-checks redundancy. No-op when the conn isn't
+    /// dirty — the per-message tail calls this unconditionally.
+    fn do_update_interest(
         &mut self,
         peer_id: u64,
         counters: &crate::counters::Counters,
         out: &mut Vec<TorrentEffect>,
     ) {
+        if self
+            .peers
+            .get_mut(&peer_id)
+            .is_none_or(|c| !std::mem::take(&mut c.need_interest_update))
+        {
+            return;
+        }
         // upstream `do_update_interest`: `m_have_piece.empty()`
         // (nothing to scan — an empty bitfield-sized peer was never
         // initialized; magnets store a sized-zero bitfield whose size
@@ -6399,6 +6418,28 @@ impl Torrent {
         self.disconnect_if_redundant(peer_id, out);
     }
 
+    /// Runs the deferred `do_update_interest` for every conn marked
+    /// dirty since the last drain — upstream's posted callbacks after
+    /// the current message queue is flushed. Torrent-side mark sites
+    /// (piece gained/failed, upload mode, priority sweeps) call this
+    /// once after their mark loop so N marks still collapse into one
+    /// scan per conn.
+    pub fn drain_interest_updates(
+        &mut self,
+        counters: &crate::counters::Counters,
+        out: &mut Vec<TorrentEffect>,
+    ) {
+        let ids: Vec<u64> = self
+            .peers
+            .iter()
+            .filter(|(_, c)| c.need_interest_update)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.do_update_interest(id, counters, out);
+        }
+    }
+
     /// `peer_connection::disconnect_if_redundant` — under
     /// `close_redundant_connections`, a remote that is upload-only
     /// (BEP-21 flag, seed, or have-all) is redundant when we can't
@@ -6417,6 +6458,13 @@ impl Torrent {
         // upstream `m_disconnecting` early-out — a conn mid-teardown
         // never gets a second DisconnectPeer.
         if c.disconnecting {
+            return false;
+        }
+        // upstream `m_need_interest_update` early-out — while the
+        // deferred re-eval is pending the conn keeps its stale
+        // `interesting` bit and is never dropped for it; the drain's
+        // own `disconnect_if_redundant` tail re-checks right after.
+        if c.need_interest_update {
             return false;
         }
         if !self.close_redundant_connections {
@@ -6468,7 +6516,8 @@ impl Torrent {
     ) {
         let ids: Vec<u64> = self.peers.keys().copied().collect();
         for id in ids {
-            self.update_interest(id, counters, out);
+            self.update_interest(id);
+            self.do_update_interest(id, counters, out);
         }
     }
 
@@ -7712,13 +7761,12 @@ impl Torrent {
                 continue;
             }
             // `received_piece` — gaining a piece the peer already has
-            // may have removed its last interesting one.
+            // may have removed its last interesting one. Upstream
+            // only marks `update_interest` (deferred drain); the
+            // dirty flag gates `disconnect_if_redundant` below, so
+            // the `Have` announce still precedes any drop.
             if has_it {
-                let at = out.len();
-                self.update_interest(id, counters, out);
-                if disconnected(out, at) {
-                    continue;
-                }
+                self.update_interest(id);
             }
             let at = out.len();
             self.disconnect_if_redundant(id, out);
@@ -7766,7 +7814,9 @@ impl Torrent {
         }
         // interest re-check — upstream filters `is_interesting &&
         // has_piece(index)`: gaining a piece can only shrink our
-        // interest in peers that actually hold it.
+        // interest in peers that actually hold it. Mark + drain:
+        // upstream's deferred `do_update_interest` runs after the
+        // announce loop, which is exactly where we are.
         let ids: Vec<u64> = self
             .peers
             .iter()
@@ -7774,8 +7824,9 @@ impl Torrent {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            self.update_interest(id, counters, out);
+            self.update_interest(id);
         }
+        self.drain_interest_updates(counters, out);
         if !loading_resume {
             // `set_need_save_resume(if_download_progress)` +
             // `state_updated` — download progress changed.
@@ -8656,7 +8707,8 @@ impl Torrent {
     ) {
         let ids: Vec<u64> = self.peers.keys().copied().collect();
         for pid in ids {
-            self.update_interest(pid, counters, out);
+            self.update_interest(pid);
+            self.do_update_interest(pid, counters, out);
         }
         if self.checking || self.checking_resume {
             return;
@@ -10246,13 +10298,18 @@ impl Torrent {
             .map(|(id, _)| *id)
             .collect();
         for id in targets {
-            self.update_interest(id, counters, out);
+            // upstream marks `update_interest` (deferred) then drives
+            // `request_a_block`/`send_block_requests` on the still-
+            // stale bit — same order here: mark, drive, drain after
+            // the loop.
+            self.update_interest(id);
             // upstream `request_a_block` return →
             // `hash_fail_piece_picks`.
             if self.drive_peer(id, s, counters, out) {
                 counters.add(crate::counters::Counter::HashFailPiecePicks, 1);
             }
         }
+        self.drain_interest_updates(counters, out);
     }
 
     /// `torrent::seed_rank` — auto-manage priority score; verbatim
@@ -11392,10 +11449,10 @@ impl Torrent {
             let ids: Vec<u64> = self.peers.keys().copied().collect();
             for pid in ids {
                 // upstream: upload-only peers re-evaluate interest
-                // first (we may want to keep them as uploaders),
-                // then every conn's request queues clear.
+                // first (we may want to keep them as uploaders) —
+                // mark now, drain after the cancel loop.
                 if self.peers.get(&pid).is_some_and(|c| c.remote_upload_only) {
-                    self.update_interest(pid, counters, out);
+                    self.update_interest(pid);
                 }
                 let key = self.peers.get(&pid).and_then(PeerConn::peer_key);
                 if let Some(c) = self.peers.get_mut(&pid) {
@@ -11432,6 +11489,7 @@ impl Torrent {
                     });
                 }
             }
+            self.drain_interest_updates(counters, out);
             self.upload_mode_time = Some(Instant::now());
         } else {
             // reset `last_connected` — the swarm becomes dialable
@@ -11441,10 +11499,13 @@ impl Torrent {
             }
             let ids: Vec<u64> = self.peers.keys().copied().collect();
             for pid in ids {
-                self.update_interest(pid, counters, out);
-                // `send_block_requests` — re-open the download pump.
+                self.update_interest(pid);
+                // `send_block_requests` — re-open the download pump
+                // on the still-stale `m_interesting` bit; the drain
+                // runs after the loop like upstream's deferred post.
                 self.drive_peer(pid, s, counters, out);
             }
+            self.drain_interest_updates(counters, out);
         }
     }
 
